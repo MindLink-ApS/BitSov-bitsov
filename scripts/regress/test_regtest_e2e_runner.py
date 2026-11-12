@@ -85,7 +85,7 @@ def wait_until(check, timeout=10):
 
 
 class RunnerCleanup(unittest.TestCase):
-    def check_cleanup(self, mode, expected, sig=None, group=False, launch=False):
+    def check_cleanup(self, mode, expected, sig=None, group=False, launch=False, runner=RUNNER):
         with tempfile.TemporaryDirectory(prefix="bitsov-runner-check-") as temporary:
             directory = Path(temporary)
             cargo = directory / "cargo"
@@ -102,7 +102,7 @@ class RunnerCleanup(unittest.TestCase):
                 env["PYTHONPATH"] = str(directory)
             data = None
             with (directory / "runner.log").open("w+") as log:
-                runner = subprocess.Popen(["bash", str(RUNNER)], env=env,
+                runner = subprocess.Popen(["bash", str(runner)], env=env,
                                           stdout=log, stderr=log,
                                           start_new_session=True)
                 try:
@@ -140,6 +140,39 @@ class RunnerCleanup(unittest.TestCase):
 
     def test_signal_during_child_launch(self):
         self.check_cleanup("signal", 143, launch=True)
+
+
+class RecoveryRunnerCleanup(RunnerCleanup):
+    def check_cleanup(self, *args, **kwargs):
+        super().check_cleanup(*args, **kwargs, runner=RUNNER.with_name("recover_regtest.sh"))
+
+
+class RecoveryRunnerSelection(unittest.TestCase):
+    def test_scenario_selection_skip_and_failure(self):
+        for missing, cargo_exit in ((False, 0), (False, 17), (True, 0), (True, 17)):
+            with self.subTest(missing=missing, cargo_exit=cargo_exit), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                cargo = directory / "cargo"
+                cargo.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PROBE\"\nexit " + str(cargo_exit) + "\n")
+                cargo.chmod(0o755)
+                probe = directory / "args"
+                env = dict(os.environ, PATH=f"{directory}:{os.environ['PATH']}",
+                           BITCOIND_EXE=str(directory / "missing") if missing else shutil.which("true"),
+                           REGTEST_ALLOW_MISSING="1", PROBE=str(probe))
+                result = subprocess.run(["bash", str(RUNNER.with_name("recover_regtest.sh"))],
+                                        env=env, capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, cargo_exit or (77 if missing else 0),
+                                 result.stdout + result.stderr)
+                args = probe.read_text().splitlines()
+                for required in ("test", "--offline", "--locked", "konsensus-lightning", "recover_regtest"):
+                    self.assertIn(required, args)
+                self.assertEqual("--no-run" in args, missing)
+                self.assertEqual("--ignored" in args, not missing)
+                if not missing:
+                    self.assertIn("recover_force_closed_channel_from_seed_after_data_loss", args)
+                    self.assertIn("--test-threads=1", args)
+                    self.assertIn("--exact", args)
+                self.assertEqual("SKIP recover regtest:" in result.stdout, missing and cargo_exit == 0)
 
 
 class MissingFixtures(unittest.TestCase):
