@@ -106,7 +106,10 @@ mod tests {
                 "unbound interface included in endpoints"
             );
         }
-        assert_eq!(endpoints, ["relay.example:9737"]);
+        assert_eq!(
+            endpoints,
+            ["relay.example:9737".to_owned(), bound.to_string()]
+        );
     }
 
     #[test]
