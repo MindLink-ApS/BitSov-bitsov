@@ -25,7 +25,7 @@ async fn overdue_socket_detach_closes_resume_before_expiry_and_survives_restart(
         deadline_ms: 71_000, ..paid };
     store.call_put(&peer, ID, &paid).await.unwrap();
     let mut detach = MediaDetach {
-        generation: Arc::new(tokio::sync::Mutex::new(2)), expected_generation: 1, only_unpaid: false,
+        generation: Arc::new(tokio::sync::Mutex::new(2)), expected_generation: 1, only_unpaid: false, may_hangup_live: true,
     };
     assert_eq!(detach_callee_media(&store, &peer, ID, 71_001, &detach).await.unwrap(), MediaDetachOutcome::Complete);
     assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(paid.clone()));

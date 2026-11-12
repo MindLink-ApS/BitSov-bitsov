@@ -98,7 +98,6 @@ impl CallMediaAdmission for PaidCallAdmission {
     }
 
     async fn media_detached(&self, peer: &NodeId, call_id: &str, detach: MediaDetach) {
-        // Pending detaches are not replayed at startup; exhausted retries are not journaled.
         for attempt in 1..=DETACH_ATTEMPTS {
             match konsensus_api::calls::detach_callee_media(self.storage.as_ref(), peer, call_id, now_ms(), &detach).await {
                 Ok(MediaDetachOutcome::Complete) => return,
@@ -585,6 +584,7 @@ impl CallMediaRouter {
             let detach = MediaDetach {
                 generation: Arc::clone(&route.generation), expected_generation: route.generation_id,
                 only_unpaid: reason == EndReason::NotAdmitted,
+                may_hangup_live: !route.admission_ended.load(Ordering::Acquire),
             };
             tokio::spawn(async move { admission.media_detached(&peer, &call_id, detach).await; });
         }

@@ -975,33 +975,84 @@ async fn drop_after_not_admitted_prevents_late_resume() {
     assert_eq!(ended.deadline_ms, expired.deadline_ms);
 }
 
-#[tokio::test]
-async fn admission_loss_preserves_a_live_callee_until_its_socket_drops() {
-    use konsensus_core::payloads::call::{CallEntry, HangupReason, Phase, Side};
+async fn transient_read_error_then_socket_drop(overdue: bool) {
+    use konsensus_api::calls::MediaDetach;
+    use konsensus_core::payloads::call::{self as rules, CallEntry, Pending, Phase, Side};
     use konsensus_storage::{SqliteStorage, Storage};
+
+    struct ObservedAdmission {
+        paid: super::PaidCallAdmission,
+        completed: tokio::sync::Semaphore,
+    }
+    #[async_trait]
+    impl CallMediaAdmission for ObservedAdmission {
+        async fn call_media_admitted(&self, peer: &NodeId, call_id: &str, now: u64) -> bool {
+            self.paid.call_media_admitted(peer, call_id, now).await
+        }
+        async fn media_detached(&self, peer: &NodeId, call_id: &str, detach: MediaDetach) {
+            self.paid.media_detached(peer, call_id, detach).await;
+            self.completed.add_permits(1);
+        }
+    }
+
     let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
     let now = super::now_ms();
-    let paid = CallEntry {
+    let mut paid = CallEntry {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
-        pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
+        pending: Some(Pending { operation_id: "pending-signal".into(), kind: 403, request_hash: "request".into() }),
+        paid_until_ms: Some(now + 60_000), next_block_seq: 1,
         end_reason: None, unpaid_notice_used: false,
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
+    let admission = Arc::new(ObservedAdmission {
+        paid: super::PaidCallAdmission::new(store.clone()), completed: tokio::sync::Semaphore::new(0),
+    });
     let f = fixture();
-    let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
+    let router = CallMediaRouter::new(f.link, admission.clone());
     let attachment = router.attach(&peer(), CALL, None).await.unwrap();
-    let route = router.routes().get(&(peer(), CALL.to_string())).cloned().unwrap();
-    router.end_route(CALL, &route, super::EndReason::NotAdmitted);
-    drop(route);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(store.call_get(&peer(), CALL).await.unwrap().unwrap(), paid,
-        "admission failure alone must not change a live row");
+    if overdue {
+        paid.deadline_ms = now - 1;
+        paid.paid_until_ms = Some(now - 10_001);
+        store.call_put(&peer(), CALL, &paid).await.unwrap();
+    }
+    sqlx::query("ALTER TABLE call_state RENAME TO unavailable_call_state")
+        .execute(store.pool()).await.unwrap();
+    assert!(store.call_get(&peer(), CALL).await.is_err());
+    tokio::time::timeout(Duration::from_secs(2), attachment.from_node.closed())
+        .await.expect("the admission read failure closes the media queues");
+    assert_eq!(router.routed_calls(), 0);
+    assert!(attachment.to_node.is_closed());
+    // Match the media handler releasing its attachment when a queue closes.
     drop(attachment);
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while store.call_get(&peer(), CALL).await.unwrap().unwrap().end_reason != Some(HangupReason::Hangup) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }).await.expect("the removed route's socket drop must still end the live call");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    sqlx::query("ALTER TABLE unavailable_call_state RENAME TO call_state")
+        .execute(store.pool()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(6), admission.completed.acquire_many(2))
+        .await.expect("both teardown notifications finish after storage recovers")
+        .unwrap().forget();
+    let stored = store.call_get(&peer(), CALL).await.unwrap().unwrap();
+    if overdue {
+        let mut closed = paid;
+        closed.paid_until_ms = Some(0);
+        assert_eq!(stored, closed, "overdue socket cleanup only closes resume");
+        assert_eq!(rules::receive_block(Some(stored), 1, super::now_ms()), Err(rules::CallRefusal::UnknownCall),
+            "overdue socket cleanup keeps settlement closed");
+    } else {
+        assert_eq!(stored, paid, "read recovery and socket cleanup preserve the paid live row");
+        assert!(stored.media_admitted(super::now_ms()));
+        let replacement = router.attach(&peer(), CALL, None).await.unwrap();
+        assert!(!replacement.to_node.is_closed() && !replacement.from_node.is_closed());
+    }
+}
+
+#[tokio::test]
+async fn admission_read_error_and_socket_drop_preserve_a_paid_live_callee() {
+    transient_read_error_then_socket_drop(false).await;
+}
+
+#[tokio::test]
+async fn admission_read_error_and_socket_drop_mark_an_overdue_live_callee() {
+    transient_read_error_then_socket_drop(true).await;
 }
 
 #[tokio::test]
@@ -1149,7 +1200,7 @@ async fn unpaid_detach_preserves_minimum_burn_lifetime() {
     };
     store.call_put(&peer(), CALL, &expired).await.unwrap();
     let detach = MediaDetach {
-        generation: Arc::new(tokio::sync::Mutex::new(1)), expected_generation: 1, only_unpaid: true,
+        generation: Arc::new(tokio::sync::Mutex::new(1)), expected_generation: 1, only_unpaid: true, may_hangup_live: true,
     };
     detach_callee_media(&store, &peer(), CALL, now, &detach).await.unwrap();
     let before_minimum = now + rules::BURN_MIN_MS - 1;
@@ -1177,7 +1228,7 @@ async fn socket_drop_after_paid_deadline_preserves_unpaid() {
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     let mut detach = MediaDetach {
-        generation: Arc::new(tokio::sync::Mutex::new(1)), expected_generation: 1, only_unpaid: true,
+        generation: Arc::new(tokio::sync::Mutex::new(1)), expected_generation: 1, only_unpaid: true, may_hangup_live: true,
     };
     let cut = now;
     assert_eq!(detach_callee_media(store.as_ref(), &peer(), CALL, cut, &detach).await.unwrap(), MediaDetachOutcome::PendingExpiry);

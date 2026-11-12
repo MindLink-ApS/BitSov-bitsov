@@ -91,6 +91,8 @@ pub struct MediaDetach {
     pub expected_generation: u64,
     /// Admission loss alone may close an Unpaid resume window, never a Live row.
     pub only_unpaid: bool,
+    /// Whether socket teardown may end a Live call before its paid deadline.
+    pub may_hangup_live: bool,
 }
 
 /// Whether teardown completed or must wait for ordinary expiry maintenance.
@@ -116,7 +118,7 @@ pub async fn detach_callee_media(store: Store<'_>, peer: &NodeId, call_id: &str,
         }
         return Ok(MediaDetachOutcome::PendingExpiry);
     }
-    if !((!detach.only_unpaid && entry.phase == rules::Phase::Live)
+    if !((!detach.only_unpaid && detach.may_hangup_live && entry.phase == rules::Phase::Live)
         || (entry.phase == rules::Phase::Ended && entry.end_reason == Some(rules::HangupReason::Unpaid))) { return Ok(MediaDetachOutcome::Complete); }
     if entry.phase == rules::Phase::Ended {
         // Zero closes resume without changing Unpaid or its replay deadline.
