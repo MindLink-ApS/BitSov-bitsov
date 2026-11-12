@@ -22,6 +22,47 @@ A running node does not print its release on start. Builds that include #540
 version, `2`. On rc22 and earlier, check the
 binary with `--version`.
 
+## rc23 → rc24
+
+End calls and reconcile pending payments using their existing operation IDs
+before stopping BitSov. Take a consistent backup of the complete data directory
+and, when used, the PostgreSQL database. Retain config, wallet/channel, pairing,
+session and operation state together. Leave separately managed Lightning
+services running. Do not re-run `init` or rewind current state to an older copy.
+
+Verify the future signed artifact for the correct platform, stage it beside
+the retained binary, and check that `--version` reports `konsensus 0.3.0-rc24`.
+Review tier consistency, API bind settings, optional media settings and the
+configured source with `chain-tip` without changing or accepting it implicitly.
+Switch the binary and restart with the same config, data and normal owner
+controls. There are no new SQL migrations or stored-format changes since rc23;
+the forward-only migrations and encrypted record markers from rc23 still apply.
+Nodes coming from rc22 or earlier must also follow [rc22 → rc23](#rc22--rc23).
+
+Inspect migration and aggregate record-upgrade logs; retain every completion
+marker and investigate unreadable or unwritable data. Check `node_version`,
+health, identity, contacts, channels, chain source and `money_ready`. Initial
+wallet sync alone does not establish payment readiness. Resolve
+`chain_unavailable` by restoring source availability and freshness before
+priced work. Read session state on both peers and confirm a message in each
+direction on signet. Reconcile pending results before retrying.
+
+A paid call now ends when the callee's app connection is lost, including a
+brief network interruption, instead of continuing to charge. The cutoff runs
+on the callee's node and requires rc24 there. With an rc23 callee, the old
+behaviour remains and the caller can pay further blocks. Update both nodes
+before paid calls; do not run paid calls while versions are mixed. After both
+nodes are upgraded, check a call and its closing result within the configured
+cap. Keep the upgraded data intact.
+
+A pending detach is not replayed after a restart. A media-drop hangup does not
+notify the peer; the peer's node ends the call at the next refused renewal,
+about 65 seconds later. Keep unresolved operation IDs and reconcile results
+before further spending. Prefer rolling forward; existing
+[rollback constraints](#rollback-constraints) remain. No rc24 → rc23 retained-node
+rollback rehearsal is recorded. See the [rc24 operator checklist](releases/v0.3.0-rc24.md#4-retained-nodes-rc23--rc24)
+for the complete upgrade sequence and remaining release gates.
+
 ## rc22 → rc23
 
 rc23 includes forward-only storage upgrades and session recovery changes. Stop

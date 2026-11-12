@@ -5,6 +5,18 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+## [0.3.0-rc24] — 2026-11-12
+
+- A paid call now ends when the callee's app connection is lost, including a
+  brief network interruption, instead of continuing to charge. This protection
+  requires the callee's node to run rc24. With an rc23 callee, the old behaviour
+  remains and further blocks can be paid. Update both nodes before paid calls;
+  do not run paid calls while versions are mixed.
+- A pending detach is not replayed after a restart. A media-drop hangup does
+  not notify the peer; the peer's node ends the call at the next refused
+  renewal, about 65 seconds later. See the [rc24 notes and checklist](docs/releases/v0.3.0-rc24.md)
+  and [rc23 → rc24 upgrade steps](docs/UPGRADING.md#rc23--rc24).
+
 ## [0.3.0-rc23] — 2026-11-09
 
 - Setup cancellation leaves the comparison-attempt budget unchanged. Setup
