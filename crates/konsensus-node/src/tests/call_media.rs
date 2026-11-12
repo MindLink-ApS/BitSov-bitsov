@@ -1255,3 +1255,173 @@ async fn socket_drop_after_paid_deadline_preserves_unpaid() {
     assert_eq!(ended.next_block_seq, paid.next_block_seq);
     assert!(rules::receive_block(Some(ended), 1, cut).is_err());
 }
+
+// Recovery must remain possible after the bounded callback has returned.
+#[tokio::test]
+async fn durable_detach_replays_after_exhausted_writes() {
+    durable_detach_recovery(false).await;
+}
+
+#[tokio::test]
+async fn durable_detach_replays_after_restart() {
+    durable_detach_recovery(true).await;
+}
+
+async fn durable_detach_recovery(restart: bool) {
+    use konsensus_api::calls;
+    use konsensus_core::payloads::call::{self as rules, CallEntry, HangupReason, Pending, Phase, Side};
+    use konsensus_storage::{SqliteStorage, Storage};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("detach.sqlite");
+    let store = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+    let now = super::now_ms();
+    let paid = CallEntry {
+        side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
+        pending: Some(Pending { operation_id: "signal".into(), kind: 403, request_hash: "binding".into() }),
+        paid_until_ms: Some(now + 60_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    store.call_put(&peer(), CALL, &paid).await.unwrap();
+    let mut operation = konsensus_storage::OutboxOperation::prepared("signal".into(), peer().to_hex(), 403, "binding".into());
+    operation.state = "paying".into();
+    assert!(store.insert_outbox_operation(&operation).await.unwrap());
+    sqlx::query("CREATE TRIGGER unavailable_detach BEFORE UPDATE ON call_state BEGIN SELECT RAISE(ABORT, 'write unavailable'); END")
+        .execute(store.pool()).await.unwrap();
+    let f = fixture();
+    let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
+    drop(router.attach(&peer(), CALL, None).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(6500)).await;
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap().unwrap(), paid);
+    sqlx::query("DROP TRIGGER unavailable_detach").execute(store.pool()).await.unwrap();
+    drop(router);
+    let store = if restart {
+        drop(store);
+        Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap())
+    } else { store };
+    if restart { calls::recover(store.as_ref()).await.unwrap(); }
+    else { calls::expire_calls(store.as_ref(), now).await.unwrap(); }
+    let ended = store.call_get(&peer(), CALL).await.unwrap().unwrap();
+    assert_eq!(ended.phase, Phase::Ended, "replay must end detached media after storage recovers");
+    assert_eq!(ended.end_reason, Some(HangupReason::Hangup));
+    assert_eq!(ended.pending, paid.pending);
+    assert_eq!(ended.next_block_seq, 1);
+    assert_eq!(ended.paid_until_ms, paid.paid_until_ms);
+    assert!(rules::receive_block(Some(ended.clone()), 1, now).is_err());
+    calls::recover(store.as_ref()).await.unwrap();
+    calls::expire_calls(store.as_ref(), now + 1000).await.unwrap();
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap().unwrap(), ended, "repeated replay must preserve all evidence");
+}
+
+#[tokio::test]
+async fn durable_detach_startup_recovers_before_any_callback() {
+    use konsensus_api::calls;
+    use konsensus_core::payloads::call::{CallEntry, HangupReason, Phase, Side};
+    use konsensus_storage::{SqliteStorage, Storage};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("orphan.sqlite");
+    let store = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
+    let now = super::now_ms();
+    let paid = CallEntry {
+        side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
+        pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    store.call_put(&peer(), CALL, &paid).await.unwrap();
+    let f = fixture();
+    let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
+    let attachment = router.attach(&peer(), CALL, None).await.unwrap();
+    let (shutdown, rx) = tokio::sync::watch::channel(false);
+    let running = router.spawn(rx);
+    shutdown.send(true).unwrap();
+    running.await.unwrap();
+    drop(attachment);
+    drop(router);
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap().unwrap(), paid);
+    drop(store);
+    let reopened = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    calls::recover(&reopened).await.unwrap();
+    let ended = reopened.call_get(&peer(), CALL).await.unwrap().unwrap();
+    assert_eq!(ended.phase, Phase::Ended, "startup must recover a lost attachment without a detach callback");
+    assert_eq!(ended.end_reason, Some(HangupReason::Hangup));
+    assert_eq!(ended.next_block_seq, 1);
+    calls::recover(&reopened).await.unwrap();
+    assert_eq!(reopened.call_get(&peer(), CALL).await.unwrap().unwrap(), ended);
+}
+
+#[tokio::test]
+#[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+async fn durable_detach_postgres_replays_exhaustion_and_restart() {
+    use konsensus_api::calls;
+    use konsensus_core::payloads::call::{self as rules, CallEntry, HangupReason, Phase, Side};
+    use konsensus_storage::{PostgresStorage, Storage};
+    let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let name = format!("detach_retry_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+    let db_url = format!("{}/{name}", url.rsplit_once('/').unwrap().0);
+    for (restart, call_id) in [(false, CALL), (true, OTHER_CALL)] {
+        let (logs, _trace) = capture_logs();
+        let store = Arc::new(PostgresStorage::connect(&db_url).await.unwrap());
+        let control = sqlx::PgPool::connect(&db_url).await.unwrap();
+        let now = super::now_ms();
+        let paid = CallEntry {
+            side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
+            pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
+            end_reason: None, unpaid_notice_used: false,
+        };
+        store.call_put(&peer(), call_id, &paid).await.unwrap();
+        sqlx::raw_sql("CREATE FUNCTION fail_detach_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'write unavailable'; END $$; CREATE TRIGGER fail_detach BEFORE UPDATE ON call_state FOR EACH ROW EXECUTE FUNCTION fail_detach_write();")
+            .execute(&control).await.unwrap();
+        let f = fixture();
+        let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
+        drop(router.attach(&peer(), call_id, None).await.unwrap());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !String::from_utf8_lossy(&logs.0.lock().unwrap()).contains("call media detachment retries exhausted") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("the bounded callback must exhaust its lifecycle retries");
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("call media detachment state update failed").count(), 5);
+        assert_eq!(store.call_get(&peer(), call_id).await.unwrap().unwrap(), paid);
+        let attempts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_media_detach_intents WHERE event = 'detach' AND call_id = $1")
+            .bind(call_id).fetch_one(&control).await.unwrap();
+        assert_eq!(attempts, 1, "one durable intent covers all five failed lifecycle writes");
+        sqlx::raw_sql("DROP TRIGGER fail_detach ON call_state; DROP FUNCTION fail_detach_write();").execute(&control).await.unwrap();
+        drop(router);
+        let store = if restart { drop(store); Arc::new(PostgresStorage::connect(&db_url).await.unwrap()) } else { store };
+        if restart { calls::recover(store.as_ref()).await.unwrap(); }
+        else { calls::expire_calls(store.as_ref(), now).await.unwrap(); }
+        let ended = store.call_get(&peer(), call_id).await.unwrap().unwrap();
+        assert_eq!(ended.phase, Phase::Ended);
+        assert_eq!(ended.end_reason, Some(HangupReason::Hangup));
+        assert_eq!(ended.next_block_seq, 1);
+        assert_eq!(ended.paid_until_ms, paid.paid_until_ms);
+        assert!(rules::receive_block(Some(ended.clone()), 1, now).is_err());
+        calls::recover(store.as_ref()).await.unwrap();
+        assert_eq!(store.call_get(&peer(), call_id).await.unwrap().unwrap(), ended);
+        control.close().await;
+    }
+    sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
+    admin.close().await;
+}
+
+#[tokio::test]
+async fn durable_detach_unavailable_publication_refuses_the_socket() {
+    use konsensus_core::payloads::call::{CallEntry, Phase, Side};
+    use konsensus_storage::{SqliteStorage, Storage};
+    let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let now = super::now_ms();
+    let paid = CallEntry {
+        side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
+        pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    store.call_put(&peer(), CALL, &paid).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_publish BEFORE INSERT ON call_media_detach_intents BEGIN SELECT RAISE(ABORT, 'journal unavailable'); END")
+        .execute(store.pool()).await.unwrap();
+    let f = fixture();
+    let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
+    assert_eq!(router.attach(&peer(), CALL, None).await.err(), Some(AttachRefusal::Unavailable));
+    assert_eq!(router.routed_calls(), 0);
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap().unwrap(), paid);
+}
