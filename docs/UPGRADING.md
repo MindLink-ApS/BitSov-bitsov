@@ -47,17 +47,26 @@ wallet sync alone does not establish payment readiness. Resolve
 priced work. Read session state on both peers and confirm a message in each
 direction on signet. Reconcile pending results before retrying.
 
-A paid call now ends when the callee's app connection is lost, including a
-brief network interruption, instead of continuing to charge. The cutoff runs
-on the callee's node and requires rc24 there. With an rc23 callee, the old
-behaviour remains and the caller can pay further blocks. Update both nodes
-before paid calls; do not run paid calls while versions are mixed. After both
-nodes are upgraded, check a call and its closing result within the configured
-cap. Keep the upgraded data intact.
+A paid call now ends after the callee's app connection is lost, including a
+brief network interruption, when the callee's node records the disconnect.
+The cutoff runs on the callee's node and requires rc24 there. With an rc23
+callee, the old behaviour remains and the caller can pay further blocks.
+Update both nodes before paid calls; do not run paid calls while versions are
+mixed. After both nodes are upgraded, wait until both report payment-ready
+(`money_ready` is true) and their channels are usable before the paid check.
+Then check a call and its closing result within the configured cap. Keep the
+upgraded data intact.
 
-A pending detach is not replayed after a restart. A media-drop hangup does not
-notify the peer; the peer's node ends the call at the next refused renewal,
-about 65 seconds later. Keep unresolved operation IDs and reconcile results
+If the callee's node cannot record the disconnect, either because the write
+still fails after its retries or because the node stops before the write,
+the call can stay live without media until it expires unpaid. The caller can
+keep paying for blocks meanwhile. Hang up from the caller side as soon as
+audio stops and reconcile any further paid blocks. A pending disconnect is
+not replayed after a restart; durable replay is planned for a later release.
+
+A media-drop hangup does not notify the peer; after a recorded cutoff, the
+peer's node ends the call at the next refused renewal, observed at about
+66 to 67 seconds. Keep unresolved operation IDs and reconcile results
 before further spending. Prefer rolling forward; existing
 [rollback constraints](#rollback-constraints) remain. No rc24 → rc23 retained-node
 rollback rehearsal is recorded. See the [rc24 operator checklist](releases/v0.3.0-rc24.md#4-retained-nodes-rc23--rc24)
