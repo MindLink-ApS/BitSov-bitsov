@@ -582,10 +582,11 @@ pub async fn prepare_incoming_block<'a>(store: Store<'a>, peer: &NodeId, plainte
         // A socket can stop while expiry's durable write is in flight. The
         // final ownership snapshot orders this admission after that stop.
         // A protected Live row keeps its paid interval but cannot renew it.
-        match media_detach::media_attachment_stopped(store, peer, &signal.call_id).await {
-            Ok(true) => Err(CallRefusal::UnknownCall),
-            Ok(false) => rules::receive_block(entry, seq, now),
-            Err(_) => Err(CallRefusal::Invalid("call media state unavailable")),
+        if media_detach::media_attachment_stopped(store, peer, &signal.call_id).await
+            .map_err(|_| CallRefusal::Invalid("call media state unavailable"))? {
+            Err(CallRefusal::UnknownCall)
+        } else {
+            rules::receive_block(entry, seq, now)
         }
     } else { rules::receive_block(entry, seq, now) };
     Ok(IncomingBlock { _guard: guard, store, peer: *peer, signal, next })
@@ -854,7 +855,6 @@ pub(crate) async fn release_abandoned(store: Store<'_>, operation_id: &str) -> R
 /// operation journal. Ambiguous ones stay for a same-operation retry. Run
 /// before the receive loop and the outbox resend start.
 pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_storage::StorageError> {
-    replay_media_detaches(store, now_ms(), true).await?;
     let (mut committed, mut released) = (0, 0);
     for (peer, call_id, entry) in store.call_pending().await? {
         let Some(p) = entry.pending.clone() else { continue };

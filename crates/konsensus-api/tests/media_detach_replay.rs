@@ -39,6 +39,7 @@ fn intent(generation: u64, only_unpaid: bool, may_hangup_live: bool) -> PendingM
         generation,
         only_unpaid,
         may_hangup_live,
+        has_stop_policy: true,
     }
 }
 fn detach(generation: u64, only_unpaid: bool, may_hangup_live: bool) -> MediaDetach {
@@ -205,9 +206,9 @@ async fn completion_append_failure_replays_an_already_committed_write_once() {
     let generation = store.call_media_publish(&peer(), CALL).await.unwrap();
     sqlx::query("CREATE TRIGGER fail_completion BEFORE INSERT ON call_media_detach_intents WHEN NEW.event = 'complete' BEGIN SELECT RAISE(ABORT, 'completion unavailable'); END")
         .execute(store.pool()).await.unwrap();
-    assert!(calls::replay_media_detaches(&store, *NOW, true)
+    calls::replay_media_detaches(&store, *NOW, true)
         .await
-        .is_err());
+        .unwrap();
     let ended = store.call_get(&peer(), CALL).await.unwrap().unwrap();
     assert_eq!(ended.phase, Phase::Ended);
     assert_eq!(
@@ -785,4 +786,282 @@ async fn pending_media_stopped_live_refuses_renewal_until_replacement() {
         recovered.refusal().is_none(),
         "a published replacement can renew the still-paid call"
     );
+}
+
+#[tokio::test]
+async fn publication_read_failure_preserves_paid_live_during_maintenance() {
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let store: Arc<dyn Storage> = db.clone();
+    let original = paid();
+    store.call_put(&peer(), CALL, &original).await.unwrap();
+    sqlx::query("CREATE TRIGGER publication_read_failure AFTER INSERT ON call_media_heads BEGIN UPDATE call_state SET side = 'unavailable'; END")
+        .execute(db.pool()).await.unwrap();
+    assert!(calls::publish_media_attachment(&store, &peer(), CALL)
+        .await
+        .is_err());
+    assert!(store
+        .call_media_generation(&peer(), CALL)
+        .await
+        .unwrap()
+        .is_some());
+    sqlx::query("DROP TRIGGER publication_read_failure")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    store.call_put(&peer(), CALL, &original).await.unwrap();
+    calls::expire_calls(store.as_ref(), *NOW).await.unwrap();
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap(), Some(original));
+    assert!(store.call_media_has_pending(&peer(), CALL).await.unwrap());
+}
+
+#[tokio::test]
+async fn reservation_recovery_preserves_a_fresh_attachment() {
+    let store: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    calls::replay_media_detaches(store.as_ref(), *NOW, true)
+        .await
+        .unwrap();
+    let original = CallEntry {
+        pending: None,
+        ..paid()
+    };
+    store.call_put(&peer(), CALL, &original).await.unwrap();
+    calls::publish_media_attachment(&store, &peer(), CALL)
+        .await
+        .unwrap();
+    calls::recover(store.as_ref()).await.unwrap();
+    calls::expire_calls(store.as_ref(), *NOW).await.unwrap();
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap(), Some(original));
+    assert!(calls::call_media_admitted(store.as_ref(), &peer(), CALL, *NOW).await);
+}
+
+#[derive(Clone, Default)]
+struct ReplayLog(Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for ReplayLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ReplayLog {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+#[tokio::test]
+async fn startup_replay_continues_after_individual_state_errors() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    for id in ["bad-state", "bad-write", CALL] {
+        db.call_put(&peer(), id, &paid()).await.unwrap();
+        db.call_media_publish(&peer(), id).await.unwrap();
+    }
+    sqlx::query("UPDATE call_state SET side = 'unavailable' WHERE call_id = 'bad-state'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER replay_write_failure BEFORE UPDATE ON call_state WHEN OLD.call_id = 'bad-write' BEGIN SELECT RAISE(ABORT, 'write unavailable'); END")
+        .execute(db.pool()).await.unwrap();
+    use tracing::instrument::WithSubscriber;
+    let logs = ReplayLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish();
+    calls::replay_media_detaches(&db, *NOW, true)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&logs.0.lock().unwrap())
+            .matches("call media detach replay failed")
+            .count(),
+        2
+    );
+    assert_eq!(
+        db.call_get(&peer(), CALL).await.unwrap().unwrap().phase,
+        Phase::Ended
+    );
+    assert!(db
+        .call_media_has_pending(&peer(), "bad-state")
+        .await
+        .unwrap());
+    assert!(db
+        .call_media_has_pending(&peer(), "bad-write")
+        .await
+        .unwrap());
+    sqlx::query("DROP TRIGGER replay_write_failure")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.call_put(&peer(), "bad-state", &paid()).await.unwrap();
+    calls::replay_media_detaches(&db, *NOW, true).await.unwrap();
+    assert!(db.call_media_pending(0, 256).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn startup_replay_skips_a_full_page_of_undecodable_heads() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    for index in 0..256 {
+        db.call_media_publish(&peer(), &format!("bad-{index}"))
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE call_media_heads SET peer = 'unavailable'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.call_put(&peer(), CALL, &paid()).await.unwrap();
+    db.call_media_publish(&peer(), CALL).await.unwrap();
+    use tracing::instrument::WithSubscriber;
+    let logs = ReplayLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish();
+    calls::replay_media_detaches(&db, *NOW, true)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&logs.0.lock().unwrap())
+            .matches("call media pending row unavailable")
+            .count(),
+        256
+    );
+    assert_eq!(
+        db.call_get(&peer(), CALL).await.unwrap().unwrap().phase,
+        Phase::Ended
+    );
+    let retained: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM call_media_heads WHERE completed = 0")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(retained, 256);
+}
+
+#[tokio::test]
+async fn startup_replay_requires_a_readable_pending_list() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    sqlx::query("DROP TABLE call_media_heads")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(calls::replay_media_detaches(&db, *NOW, true).await.is_err());
+}
+
+#[tokio::test]
+async fn cancelled_publication_preserves_paid_live_during_maintenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        SqliteStorage::open(dir.path().join("publication.sqlite").to_str().unwrap())
+            .await
+            .unwrap(),
+    );
+    let store: Arc<dyn Storage> = db.clone();
+    let original = paid();
+    store.call_put(&peer(), CALL, &original).await.unwrap();
+    sqlx::raw_sql("ALTER TABLE call_state RENAME TO saved_call_state; CREATE VIEW call_state AS SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms + CASE WHEN EXISTS (SELECT 1 FROM call_media_heads) THEN (WITH RECURSIVE delay(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM delay WHERE x < 5000000) SELECT SUM(x)*0 FROM delay) ELSE 0 END AS paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM saved_call_state;")
+        .execute(db.pool()).await.unwrap();
+    let publishing = store.clone();
+    let task =
+        tokio::spawn(
+            async move { calls::publish_media_attachment(&publishing, &peer(), CALL).await },
+        );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while db
+            .call_media_generation(&peer(), CALL)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !task.is_finished(),
+        "the final state read remains in progress"
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    sqlx::raw_sql("DROP VIEW call_state; ALTER TABLE saved_call_state RENAME TO call_state;")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    calls::expire_calls(store.as_ref(), *NOW).await.unwrap();
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap(), Some(original));
+    assert!(store.call_media_has_pending(&peer(), CALL).await.unwrap());
+}
+
+#[tokio::test]
+#[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+async fn postgres_startup_replay_continues_after_individual_errors() {
+    let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let name = format!("media_recovery_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let db_url = format!("{}/{name}", url.rsplit_once('/').unwrap().0);
+    let db = konsensus_storage::PostgresStorage::connect(&db_url)
+        .await
+        .unwrap();
+    for index in 0..256 {
+        db.call_media_publish(&peer(), &format!("bad-{index}"))
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE call_media_heads SET peer = 'unavailable'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for id in ["bad-state", "bad-write", CALL] {
+        db.call_put(&peer(), id, &paid()).await.unwrap();
+        db.call_media_publish(&peer(), id).await.unwrap();
+    }
+    sqlx::query("UPDATE call_state SET side = 'unavailable' WHERE call_id = 'bad-state'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE FUNCTION fail_recovery_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.call_id = 'bad-write' THEN RAISE EXCEPTION 'write unavailable'; END IF; RETURN NEW; END $$; CREATE TRIGGER recovery_write_failure BEFORE UPDATE ON call_state FOR EACH ROW EXECUTE FUNCTION fail_recovery_write();")
+        .execute(db.pool()).await.unwrap();
+    calls::replay_media_detaches(&db, *NOW, true).await.unwrap();
+    assert_eq!(
+        db.call_get(&peer(), CALL).await.unwrap().unwrap().phase,
+        Phase::Ended
+    );
+    assert!(db
+        .call_media_has_pending(&peer(), "bad-state")
+        .await
+        .unwrap());
+    assert!(db
+        .call_media_has_pending(&peer(), "bad-write")
+        .await
+        .unwrap());
+    sqlx::raw_sql(
+        "DROP TRIGGER recovery_write_failure ON call_state; DROP FUNCTION fail_recovery_write();",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    db.call_put(&peer(), "bad-state", &paid()).await.unwrap();
+    calls::replay_media_detaches(&db, *NOW, true).await.unwrap();
+    assert!(db.call_media_pending(0, 256).await.unwrap().is_empty());
+    sqlx::query("DROP TABLE call_media_heads")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(calls::replay_media_detaches(&db, *NOW, true).await.is_err());
+    sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
 }

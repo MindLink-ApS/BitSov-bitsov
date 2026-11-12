@@ -119,6 +119,7 @@ pub async fn detach_callee_media(
         generation: detach.expected_generation,
         only_unpaid: detach.only_unpaid,
         may_hangup_live: detach.may_hangup_live,
+        has_stop_policy: true,
     };
     apply(store, now, &intent).await
 }
@@ -229,6 +230,7 @@ pub(super) async fn media_attachment_stopped(
 /// Replay before startup accepts call work, and on each expiry tick. Startup
 /// also recovers armed attachments whose detach callback was lost with the process.
 /// Runtime leaves active routes alone and preserves policies during journal outages.
+/// Individual row errors remain pending; a list read error stops the replay.
 pub async fn replay_media_detaches(
     store: Store<'_>,
     now: u64,
@@ -236,7 +238,6 @@ pub async fn replay_media_detaches(
 ) -> Result<(), StorageError> {
     let _guard = lock().lock().await;
     let mut after = 0;
-    let mut failure = None;
     loop {
         let pending = store.call_media_pending(after, 256).await?;
         if pending.is_empty() {
@@ -249,6 +250,10 @@ pub async fn replay_media_detaches(
                 // Keep the policy that protects non-overdue paid Live rows.
                 intent.only_unpaid = false;
             } else {
+                // Runtime requires a recorded stop policy before ending Live media.
+                if !intent.has_stop_policy {
+                    intent.may_hangup_live = false;
+                }
                 let active = attachments().lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(state) = active
                     .get(&key(store, intent.peer, &intent.call_id))
@@ -263,12 +268,8 @@ pub async fn replay_media_detaches(
             }
             if let Err(error) = apply(store, now, &intent).await {
                 tracing::warn!(%error, "call media detach replay failed");
-                failure = Some(error);
             }
         }
     }
-    match failure {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    Ok(())
 }

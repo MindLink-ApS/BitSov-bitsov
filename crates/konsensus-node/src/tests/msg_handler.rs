@@ -6402,3 +6402,76 @@ async fn recovery_reconnect_deferral_expiry_ends_live_and_reconnected_standing()
     assert!(!net.db.has_nonce(&env.nonce).await.unwrap());
     net.stop().await;
 }
+
+#[tokio::test]
+async fn media_state_read_failure_keeps_paid_block_retryable() {
+    use konsensus_core::payloads::call::{CallEntry, Phase, Side};
+    use konsensus_message::ControlEvent;
+    let net = receive_loop().await;
+    let call_id = "0123456789abcdef0123456789abcdef";
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let original = CallEntry {
+        side: Side::Callee,
+        phase: Phase::Live,
+        deadline_ms: now + 30_000,
+        pending: None,
+        paid_until_ms: Some(now + 20_000),
+        next_block_seq: 1,
+        end_reason: None,
+        unpaid_notice_used: false,
+    };
+    net.db
+        .call_put(net.alice.node_id(), call_id, &original)
+        .await
+        .unwrap();
+    let body = format!(r#"{{"call_id":"{call_id}","seq":1}}"#);
+    let env = net
+        .paid_envelope(404, net.ciphertext(body.as_bytes()).await)
+        .await;
+    net.db
+        .record_call_block_invoice(
+            net.alice.node_id(),
+            call_id,
+            1,
+            &env.payment_proof.payment_hash,
+            now + 60_000,
+        )
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE call_media_heads RENAME TO saved_media_heads")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    let response = net.verdict(&env).await;
+    assert!(
+        matches!(response, ControlEvent::MessageRejected { ref reason, .. }
+        if reason.contains("call media state unavailable")),
+        "{response:?}"
+    );
+    assert_eq!(net.receipt_state(&env).await, None);
+    assert!(!net.db.has_nonce(&env.nonce).await.unwrap());
+    assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    assert_eq!(
+        net.db.call_get(net.alice.node_id(), call_id).await.unwrap(),
+        Some(original.clone())
+    );
+    sqlx::query("ALTER TABLE saved_media_heads RENAME TO call_media_heads")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked { .. }
+    ));
+    assert_eq!(net.receipt_state(&env).await, Some(1));
+    let renewed = net
+        .db
+        .call_get(net.alice.node_id(), call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(renewed.phase, Phase::Live);
+    assert_eq!(renewed.next_block_seq, 2);
+    assert!(renewed.paid_until_ms.unwrap() > original.paid_until_ms.unwrap());
+    net.stop().await;
+}

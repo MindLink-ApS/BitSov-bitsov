@@ -1298,8 +1298,10 @@ async fn durable_detach_recovery(restart: bool) {
         drop(store);
         Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap())
     } else { store };
-    if restart { calls::recover(store.as_ref()).await.unwrap(); }
-    else { calls::expire_calls(store.as_ref(), now).await.unwrap(); }
+    if restart {
+        calls::replay_media_detaches(store.as_ref(), now, true).await.unwrap();
+        calls::recover(store.as_ref()).await.unwrap();
+    } else { calls::expire_calls(store.as_ref(), now).await.unwrap(); }
     let ended = store.call_get(&peer(), CALL).await.unwrap().unwrap();
     assert_eq!(ended.phase, Phase::Ended, "replay must end detached media after storage recovers");
     assert_eq!(ended.end_reason, Some(HangupReason::Hangup));
@@ -1313,7 +1315,7 @@ async fn durable_detach_recovery(restart: bool) {
 }
 
 #[tokio::test]
-async fn durable_detach_startup_recovers_before_any_callback() {
+async fn node_restart_ends_attached_callee_live_call() {
     use konsensus_api::calls;
     use konsensus_core::payloads::call::{CallEntry, HangupReason, Phase, Side};
     use konsensus_storage::{SqliteStorage, Storage};
@@ -1339,9 +1341,13 @@ async fn durable_detach_startup_recovers_before_any_callback() {
     assert_eq!(store.call_get(&peer(), CALL).await.unwrap().unwrap(), paid);
     drop(store);
     let reopened = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    calls::replay_media_detaches(&reopened, now, true).await.unwrap();
     calls::recover(&reopened).await.unwrap();
     let ended = reopened.call_get(&peer(), CALL).await.unwrap().unwrap();
-    assert_eq!(ended.phase, Phase::Ended, "startup must recover a lost attachment without a detach callback");
+    assert_eq!(ended.phase, Phase::Ended, "startup resolves the previous process attachment");
+    assert_eq!(ended.paid_until_ms, paid.paid_until_ms);
+    assert!(now < paid.paid_until_ms.unwrap());
+    assert!(reopened.call_media_pending(0, 256).await.unwrap().is_empty());
     assert_eq!(ended.end_reason, Some(HangupReason::Hangup));
     assert_eq!(ended.next_block_seq, 1);
     calls::recover(&reopened).await.unwrap();
@@ -1389,8 +1395,10 @@ async fn durable_detach_postgres_replays_exhaustion_and_restart() {
         sqlx::raw_sql("DROP TRIGGER fail_detach ON call_state; DROP FUNCTION fail_detach_write();").execute(&control).await.unwrap();
         drop(router);
         let store = if restart { drop(store); Arc::new(PostgresStorage::connect(&db_url).await.unwrap()) } else { store };
-        if restart { calls::recover(store.as_ref()).await.unwrap(); }
-        else { calls::expire_calls(store.as_ref(), now).await.unwrap(); }
+        if restart {
+            calls::replay_media_detaches(store.as_ref(), now, true).await.unwrap();
+            calls::recover(store.as_ref()).await.unwrap();
+        } else { calls::expire_calls(store.as_ref(), now).await.unwrap(); }
         let ended = store.call_get(&peer(), call_id).await.unwrap().unwrap();
         assert_eq!(ended.phase, Phase::Ended);
         assert_eq!(ended.end_reason, Some(HangupReason::Hangup));

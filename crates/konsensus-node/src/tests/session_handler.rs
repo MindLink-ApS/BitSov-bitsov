@@ -7545,7 +7545,7 @@ async fn pending_media_invoice_serializes_lifecycle_and_head_reads() {
     let ended = rules::CallEntry { phase: rules::Phase::Ended, end_reason: Some(rules::HangupReason::Hangup), ..paid };
     storage.call_put(&peer, id, &ended).await.unwrap();
     let intent = konsensus_storage::call_media::PendingMediaDetach {
-        peer, call_id: id.into(), generation, only_unpaid: false, may_hangup_live: true,
+        peer, call_id: id.into(), generation, only_unpaid: false, may_hangup_live: true, has_stop_policy: true,
     };
     storage.call_media_record_detach(&intent, false).await.unwrap();
     storage.call_media_record_detach(&intent, true).await.unwrap();

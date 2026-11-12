@@ -1852,10 +1852,16 @@ impl Storage for SqliteStorage {
     }
 
     async fn call_media_pending(&self, after: u64, max: u32) -> Result<Vec<crate::call_media::PendingMediaDetach>, StorageError> {
-        let after = i64::try_from(after).map_err(|_| StorageError::Conversion("attachment generation overflow".into()))?;
-        let rows: Vec<crate::call_media::IntentRow> = sqlx::query_as("SELECT h.generation, h.peer, h.call_id, e.only_unpaid, e.may_hangup_live FROM call_media_heads h JOIN call_media_detach_intents e ON e.id = h.latest_event WHERE h.completed = 0 AND h.generation > ? ORDER BY h.generation LIMIT ?")
-            .bind(after).bind(i64::from(max)).fetch_all(&self.pool).await?;
-        rows.into_iter().map(crate::call_media::decode_intent).collect()
+        let mut after = i64::try_from(after).map_err(|_| StorageError::Conversion("attachment generation overflow".into()))?;
+        loop {
+            let rows: Vec<crate::call_media::IntentRow> = sqlx::query_as("SELECT h.generation, h.peer, h.call_id, e.only_unpaid, e.may_hangup_live, CASE WHEN e.event = 'attached' THEN 0 ELSE 1 END FROM call_media_heads h JOIN call_media_detach_intents e ON e.id = h.latest_event WHERE h.completed = 0 AND h.generation > ? ORDER BY h.generation LIMIT ?")
+                .bind(after).bind(i64::from(max)).fetch_all(&self.pool).await?;
+            let Some(last) = rows.last() else { return Ok(Vec::new()) };
+            after = last.0;
+            let decoded = crate::call_media::decode_intents(rows);
+            if !decoded.is_empty() { return Ok(decoded); }
+            // Advance through undecodable pages while retaining their pending heads.
+        }
     }
 
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
