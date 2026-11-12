@@ -83,8 +83,6 @@ try:
         if result == 0 and build_only:
             print("SKIP recover regtest: compiled; BITCOIND_EXE unavailable. No daemons started.", flush=True)
             raise SystemExit(77)
-        if result == 0:
-            print("RECOVER REGTEST completed; seed-only force-close recovery", flush=True)
         raise SystemExit(result)
     except subprocess.TimeoutExpired:
         print("RECOVER-REGTEST timeout; terminating the test and its daemons", flush=True)
