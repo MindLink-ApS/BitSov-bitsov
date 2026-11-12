@@ -34,8 +34,12 @@ async fn entry(app: &app::App, peer: &NodeId) -> CallEntry {
 }
 
 async fn socket(app: &app::App, peer: &NodeId) -> Result<Socket, u16> {
+    socket_for(app, peer, CALL).await
+}
+
+async fn socket_for(app: &app::App, peer: &NodeId, call_id: &str) -> Result<Socket, u16> {
     let mut request = format!(
-        "ws://{}/api/v1/calls/{CALL}/media?peer={}",
+        "ws://{}/api/v1/calls/{call_id}/media?peer={}",
         app.media_addr.unwrap(),
         peer.to_hex()
     )
@@ -843,4 +847,118 @@ async fn recovery_waits_until_both_sessions_have_switched() {
 #[ignore = "real Bitcoin Core + electrs; scripts/regress/two_node_paid_call_e2e.sh"]
 async fn one_minute_duration_cap() {
     scenario(1, 1, HangupReason::DurationCap).await;
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real Bitcoin Core + electrs; scripts/regress/two_node_paid_call_e2e.sh"]
+async fn client_detach_stops_renewals_and_unanswered_calls_still_expire() {
+    let mut lane = lane(5, false).await;
+    let (aid, bid) = (lane.aid, lane.bid);
+    for (call_id, cut_callee) in [
+        ("10000000000000000000000000000001", true),
+        ("10000000000000000000000000000002", false),
+    ] {
+        let (caller, callee) = (&mut lane.caller, &mut lane.callee);
+        let (status, body) = compose(caller, &bid, 400,
+            json!({"v":1, "call_id":call_id, "media":"audio", "sdp":SDP}), SIGNAL_PRICE).await;
+        assert_eq!(status, StatusCode::OK, "offer: {body}");
+        recv_kind(callee, &aid, 400).await;
+        let (status, body) = compose(callee, &aid, 401,
+            json!({"v":1, "call_id":call_id, "sdp":SDP}), SIGNAL_PRICE).await;
+        assert_eq!(status, StatusCode::OK, "answer: {body}");
+        recv_kind(caller, &bid, 401).await;
+        let (status, body) = compose(caller, &bid, 404,
+            json!({"call_id":call_id, "seq":0}), PRICE).await;
+        assert_eq!(status, StatusCode::OK, "block zero: {body}");
+        recv_kind(callee, &aid, 404).await;
+        settle(&lane.a, body["payment_hash"].as_str().unwrap()).await;
+        settle(&lane.b, body["payment_hash"].as_str().unwrap()).await;
+        let initial = caller.state.storage.call_get(&bid, call_id).await.unwrap().unwrap();
+        let mut a_socket = socket_for(caller, &bid, call_id).await.unwrap();
+        let mut b_socket = socket_for(callee, &aid, call_id).await.unwrap();
+        let mut seq = 0;
+        audio_until(&mut a_socket, &mut b_socket, now_ms() + 5_000, &mut seq).await;
+        let before = lane.a.list_payments(100).await.unwrap().into_iter()
+            .filter(|p| p.direction == PaymentDirection::Outgoing && p.amount_msat == PRICE).count();
+        let cut = std::time::Instant::now();
+        let mut survivor = if cut_callee { drop(b_socket); a_socket } else { drop(a_socket); b_socket };
+        let generations = (
+            caller.state.transport.connected_since(&bid).await.unwrap(),
+            callee.state.transport.connected_since(&aid).await.unwrap(),
+        );
+        let mut renewal_attempted = false;
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                tick.tick().await;
+                // The surviving client keeps sending even with no received audio.
+                let _ = survivor.send(Message::Binary(packet(seq, 0xa0))).await;
+                seq += 1;
+                let a_entry = caller.state.storage.call_get(&bid, call_id).await.unwrap().unwrap();
+                let b_entry = callee.state.storage.call_get(&aid, call_id).await.unwrap().unwrap();
+                if cut_callee && !renewal_attempted && now_ms() >= initial.next_block_due_ms().unwrap() {
+                    renewal_attempted = true;
+                    let (status, body) = compose(caller, &bid, 404,
+                        json!({"call_id":call_id, "seq":1}), PRICE).await;
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "detached callee must refuse renewal: {body}");
+                    assert_eq!(body["reason"], "call_block_unpayable", "{body}");
+                }
+                if a_entry.phase == Phase::Ended && b_entry.phase == Phase::Ended { break; }
+            }
+        }).await.expect("both calls must end within 90 seconds of client cut");
+        assert_eq!(renewal_attempted, cut_callee);
+        for (app, peer) in [(&*caller, bid), (&*callee, aid)] {
+            let ended = app.state.storage.call_get(&peer, call_id).await.unwrap().unwrap();
+            assert_eq!(ended.next_block_seq, 1, "no post-cut block admitted");
+            if cut_callee && peer == aid {
+                assert_eq!(ended.end_reason, Some(HangupReason::Hangup));
+            } else {
+                assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
+            }
+        }
+        assert_eq!(lane.a.list_payments(100).await.unwrap().into_iter()
+            .filter(|p| p.direction == PaymentDirection::Outgoing && p.amount_msat == PRICE).count(), before,
+            "no new media payment after the cut");
+        assert_eq!((caller.state.transport.connected_since(&bid).await.unwrap(),
+            callee.state.transport.connected_since(&aid).await.unwrap()), generations, "both nodes stay connected");
+        // Pre-cut frames may already be buffered in the survivor's receive queue.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(message)) = survivor.next().await {
+                if matches!(message, Message::Close(_)) { break; }
+            }
+        }).await.expect("surviving media socket closes");
+        wait("cut call reservation released", || async {
+            caller.service.call_spend_status(&bid.to_hex(), call_id).unwrap().closed
+        }).await;
+        println!("client detach callee={cut_callee} closed_ms={} paid_blocks=1", cut.elapsed().as_millis());
+    }
+    let call_id = "10000000000000000000000000000003";
+    let (status, body) = compose(&lane.caller, &bid, 400,
+        json!({"v":1, "call_id":call_id, "media":"audio", "sdp":SDP}), SIGNAL_PRICE).await;
+    assert_eq!(status, StatusCode::OK, "unanswered offer: {body}");
+    recv_kind(&mut lane.callee, &aid, 400).await;
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let mut open = false;
+            for (app, peer) in [(&lane.caller, bid), (&lane.callee, aid)] {
+                let (status, calls) = app.get(&format!("/api/v1/calls?peer={}", peer.to_hex()), false).await;
+                assert_eq!(status, StatusCode::OK, "{calls}");
+                open |= calls.as_array().unwrap().iter().any(|c| c["id"] == call_id);
+            }
+            if !open { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }).await.expect("unanswered call expires");
+    for (app, peer) in [(&lane.caller, bid), (&lane.callee, aid)] {
+        let ended = app.state.storage.call_get(&peer, call_id).await.unwrap().unwrap().at(now_ms()).unwrap();
+        assert_eq!(ended.phase, Phase::Ended);
+        assert_eq!(ended.end_reason, Some(HangupReason::Timeout));
+        assert_eq!(ended.next_block_seq, 0);
+        assert_eq!(ended.paid_until_ms, None);
+    }
+    lane.caller.stop().await;
+    lane.callee.stop().await;
+    lane.a.shutdown().await.unwrap();
+    lane.b.shutdown().await.unwrap();
 }
