@@ -7,6 +7,9 @@ mod call_media;
 mod chain_tip;
 #[path = "cli/chain_tip.rs"]
 mod chain_tip_cmd;
+#[cfg(unix)]
+#[path = "cli/config_dir.rs"]
+mod config_dir;
 mod claim_code;
 mod cli;
 mod config;
@@ -1197,6 +1200,10 @@ async fn cmd_start(
     // Relative configs must become absolute before any parent()/data_dir use.
     let config_path = owner_cmd::absolute_config_path(config_path)?;
     let config_path = config_path.as_path();
+    // The bytes this start is built from. Construction re-checks them under its
+    // lifetime state lease: a config changed meanwhile (for example by
+    // `konsensus chain-tip` during a slow chain-source check) stops the start.
+    let config_at_load = std::fs::read(config_path).ok();
     let (startup_mode, mut config) = owner_cmd::prepare_start(
         config_path,
         is_home_profile(password_source, local_owner_device),
@@ -1397,6 +1404,14 @@ async fn cmd_start(
     };
 
     info!(node_id = %node.node_id(), "node built");
+    if config_changed_since(config_path, config_at_load.as_deref()) {
+        node.shutdown();
+        anyhow::bail!(
+            "{} changed while the node was starting (for example by `konsensus chain-tip`); \
+             start the node again so it uses the new config",
+            config_path.display()
+        );
+    }
 
     drop(mnemonic_password); // Local mode retains only the zeroizing signer, not the password.
     let services = start_node_services(
@@ -1420,6 +1435,17 @@ async fn cmd_start(
     .await?;
     info!("konsensus node stopped");
     Ok(())
+}
+
+/// True when the config file no longer holds the bytes a start was built from,
+/// or can no longer be read. A start whose config could not be read at load
+/// has nothing to compare and is left alone.
+fn config_changed_since(path: &Path, at_load: Option<&[u8]>) -> bool {
+    match (std::fs::read(path), at_load) {
+        (Ok(now), Some(then)) => now != then,
+        (Err(_), Some(_)) => true,
+        (_, None) => false,
+    }
 }
 
 /// Start services without owning the node, so cancellation always leaves its

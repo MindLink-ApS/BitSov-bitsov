@@ -642,3 +642,20 @@ fn init_encrypted_then_read_with_wrong_password_fails() -> Result<()> {
     assert!(err.is_err(), "wrong password must fail decryption");
     Ok(())
 }
+
+/// A start re-checks its config under the lifetime lease: different bytes, a
+/// vanished file, or an unreadable one stop it; unchanged bytes, or nothing to
+/// compare against, let it run.
+#[test]
+fn config_changed_since_detects_an_edit_during_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("konsensus.toml");
+    std::fs::write(&path, "a\n").unwrap();
+    let at_load = std::fs::read(&path).unwrap();
+    assert!(!super::config_changed_since(&path, Some(&at_load)));
+    std::fs::write(&path, "b\n").unwrap();
+    assert!(super::config_changed_since(&path, Some(&at_load)));
+    std::fs::remove_file(&path).unwrap();
+    assert!(super::config_changed_since(&path, Some(&at_load)));
+    assert!(!super::config_changed_since(&path, None));
+}

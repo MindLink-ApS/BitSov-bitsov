@@ -492,6 +492,11 @@ struct WriteFiles {
     backup: PathBuf,
     backup_temp: PathBuf,
     config_temp: PathBuf,
+    // The same four as names inside the config's directory (no directory part).
+    config_name: std::ffi::OsString,
+    backup_name: std::ffi::OsString,
+    backup_temp_name: std::ffi::OsString,
+    config_temp_name: std::ffi::OsString,
 }
 
 impl WriteFiles {
@@ -503,13 +508,39 @@ impl WriteFiles {
             .into_owned();
         let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         let unique = || uuid::Uuid::new_v4().simple().to_string();
+        Self::from_parts(
+            config_path,
+            config_path.with_file_name(format!("{name}.before-chain-tip-{stamp}")),
+            config_path.with_file_name(format!(".{name}.before-chain-tip-{}.tmp", unique())),
+            config_path.with_file_name(format!(".{name}.chain-tip-{}.tmp", unique())),
+        )
+    }
+
+    fn from_parts(config: &Path, backup: PathBuf, backup_temp: PathBuf, config_temp: PathBuf) -> Result<Self> {
+        let name = |p: &Path| p.file_name().map(|n| n.to_os_string()).context("path has no file name");
         Ok(Self {
-            config: config_path.to_path_buf(),
-            backup: config_path.with_file_name(format!("{name}.before-chain-tip-{stamp}")),
-            backup_temp: config_path
-                .with_file_name(format!(".{name}.before-chain-tip-{}.tmp", unique())),
-            config_temp: config_path.with_file_name(format!(".{name}.chain-tip-{}.tmp", unique())),
+            config_name: name(config)?,
+            backup_name: name(&backup)?,
+            backup_temp_name: name(&backup_temp)?,
+            config_temp_name: name(&config_temp)?,
+            config: config.to_path_buf(),
+            backup,
+            backup_temp,
+            config_temp,
         })
+    }
+
+    /// Like `new`, but with the given config temporary (the replace-only test helper).
+    #[cfg(all(unix, test))]
+    fn with_temp(config: &Path, temp: &Path) -> Result<Self> {
+        let mut files = Self::new(config)?;
+        files.config_temp_name = temp.file_name().context("path has no file name")?.to_os_string();
+        files.config_temp = temp.to_path_buf();
+        Ok(files)
+    }
+
+    fn names(&self) -> [&std::ffi::OsStr; 4] {
+        [&self.config_name, &self.backup_name, &self.backup_temp_name, &self.config_temp_name]
     }
 
     fn all(&self) -> [&Path; 4] {
@@ -596,83 +627,151 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+/// Refuse if any file the node reads (the recovery phrase or a credential) is,
+/// or would become, one of the names this command writes in the pinned
+/// directory: same object by `(device, inode)`, or a path whose directory is
+/// this directory and whose name is one of the written names.
+#[cfg(unix)]
+fn refuse_if_input_is_written_in(
+    dir: &crate::config_dir::ConfigDir,
+    old: &NodeConfig,
+    new_chain: Option<&ChainConfig>,
+    files: &WriteFiles,
+) -> Result<()> {
+    use crate::config_dir::path_id;
+    for input in input_files(old, new_chain) {
+        let input_id = path_id(&input)
+            .map_err(|e| refuse(format!("could not inspect {} ({e})", input.display())))?;
+        let parent = input.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let in_this_dir = matches!(path_id(parent), Ok(Some(id)) if id == dir.id());
+        for written in files.names() {
+            let entry = dir
+                .entry_id(written)
+                .map_err(|e| refuse(format!("could not inspect {} ({e})", Path::new(written).display())))?;
+            let same_object = input_id.is_some() && entry.is_some() && input_id == entry;
+            let same_name = in_this_dir
+                && input
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().to_lowercase() == written.to_string_lossy().to_lowercase());
+            if same_object || same_name {
+                return Err(refuse(format!(
+                    "{} is the same file as {}, which this command writes or replaces; \
+                     give it its own file first",
+                    input.display(),
+                    Path::new(written).display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Mode 0600, never overwritten. Written to a fresh temporary (create_new)
 /// and fsynced first, then linked to the backup name, so a failed write never
-/// leaves a partial file under that name. Only a temporary this call created
-/// is removed.
-fn write_backup(files: &WriteFiles, bytes: &[u8]) -> Result<PathBuf> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut created = false;
-    let written = options.open(&files.backup_temp).and_then(|mut file| {
-        created = true;
-        file.write_all(bytes)?;
-        #[cfg(test)]
-        if FAIL_BACKUP_AFTER_WRITE.replace(false) {
-            return Err(std::io::Error::other("injected backup failure"));
-        }
-        file.sync_all()?;
-        // A hard link fails if the name exists: an earlier backup is never replaced.
-        std::fs::hard_link(&files.backup_temp, &files.backup)
-    });
-    if created {
-        let _ = std::fs::remove_file(&files.backup_temp);
-    }
-    written.map_err(|e| {
+/// leaves a partial file under that name. Only the temporary this call created
+/// is removed, and only while its name still points at it.
+#[cfg(unix)]
+fn backup_in(dir: &crate::config_dir::ConfigDir, files: &WriteFiles, bytes: &[u8]) -> Result<PathBuf> {
+    let failed = |e: std::io::Error| {
         refuse(format!(
             "could not write the backup {} ({e}); try again in a second",
             files.backup.display()
         ))
-    })?;
+    };
+    let created = dir.create_new(&files.backup_temp_name, bytes).map_err(failed)?;
+    #[cfg(test)]
+    if FAIL_BACKUP_AFTER_WRITE.replace(false) {
+        dir.remove_if(&files.backup_temp_name, created);
+        return Err(failed(std::io::Error::other("injected backup failure")));
+    }
+    // A hard link fails if the name exists: an earlier backup is never replaced.
+    let linked = dir.link(&files.backup_temp_name, &files.backup_name);
+    dir.remove_if(&files.backup_temp_name, created);
+    linked.map_err(failed)?;
     Ok(files.backup.clone())
 }
 
-/// Replace the config through `temp`, a fresh sibling created with
-/// create_new: write, fsync, rename over the config, fsync the directory.
-/// Unlike the shared config writer's fixed temporary name, it can never be
-/// an existing file. On failure only that temporary is removed.
-fn replace_config(path: &Path, temp: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+/// Replace the config through a fresh temporary in the pinned directory:
+/// write, fsync, rename over the config, fsync the directory. On failure only
+/// the temporary this call created is removed.
+#[cfg(unix)]
+fn replace_in(dir: &crate::config_dir::ConfigDir, files: &WriteFiles, bytes: &[u8]) -> Result<()> {
+    let created = dir
+        .create_new(&files.config_temp_name, bytes)
+        .map_err(|e| refuse(format!("could not create {} ({e})", files.config_temp.display())))?;
+    if let Err(e) = dir.rename(&files.config_temp_name, &files.config_name) {
+        dir.remove_if(&files.config_temp_name, created);
+        return Err(refuse(format!("could not replace {} ({e})", files.config.display())));
     }
-    let mut file = options
-        .open(temp)
-        .map_err(|e| refuse(format!("could not create {} ({e})", temp.display())))?;
-    let staged = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::rename(temp, path));
-    drop(file);
-    if let Err(e) = staged {
-        let _ = std::fs::remove_file(temp);
+    dir.sync().map_err(|e| {
+        anyhow::anyhow!(
+            "{} was replaced but its directory could not be synced ({e})",
+            files.config.display()
+        )
+    })
+}
+
+/// Backup then replace, every step inside one directory opened and checked
+/// once. Re-reads the config through that directory and refuses if it no longer
+/// matches the bytes that were checked.
+#[cfg(unix)]
+fn write_pinned(
+    files: &WriteFiles,
+    original: &[u8],
+    edited: &[u8],
+    old: &NodeConfig,
+    new_chain: &ChainConfig,
+) -> Result<PathBuf> {
+    let dir = crate::config_dir::ConfigDir::open(&files.config).map_err(|e| refuse(format!("{e:#}")))?;
+    #[cfg(test)]
+    AFTER_PIN.with(|hook| {
+        if let Some(f) = hook.take() {
+            f()
+        }
+    });
+    let current = dir
+        .read(&files.config_name)
+        .map_err(|e| refuse(format!("could not re-read {} ({e})", files.config.display())))?;
+    if current != original {
         return Err(refuse(format!(
-            "could not replace {} ({e})",
-            path.display()
+            "{} changed while the source was checked; run the command again",
+            files.config.display()
         )));
     }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    std::fs::File::open(parent)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "{} was replaced but its directory could not be synced ({e})",
-                path.display()
-            )
-        })
+    refuse_if_input_is_written_in(&dir, old, Some(new_chain), files)?;
+    let backup = backup_in(&dir, files, &current)?;
+    replace_in(&dir, files, edited).map_err(|e| {
+        anyhow::anyhow!("{e:#}. The previous config is kept at {}", backup.display())
+    })?;
+    Ok(backup)
+}
+
+#[cfg(not(unix))]
+fn write_pinned(_: &WriteFiles, _: &[u8], _: &[u8], _: &NodeConfig, _: &ChainConfig) -> Result<PathBuf> {
+    Err(refuse("chain-tip can only rewrite a config on Unix"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once right after the directory is pinned (tests only), e.g. to
+    /// retarget a parent symlink between the checks and the writes.
+    pub(crate) static AFTER_PIN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The backup step alone (tests): opens and checks the directory, then writes.
+#[cfg(all(unix, test))]
+fn write_backup(files: &WriteFiles, bytes: &[u8]) -> Result<PathBuf> {
+    let dir = crate::config_dir::ConfigDir::open(&files.config).map_err(|e| refuse(format!("{e:#}")))?;
+    backup_in(&dir, files, bytes)
+}
+
+/// The replace step alone (tests). `temp` must be `files.config_temp`.
+#[cfg(all(unix, test))]
+fn replace_config(path: &Path, temp: &Path, bytes: &[u8]) -> Result<()> {
+    let files = WriteFiles::with_temp(path, temp)?;
+    let dir = crate::config_dir::ConfigDir::open(path).map_err(|e| refuse(format!("{e:#}")))?;
+    replace_in(&dir, &files, bytes)
 }
 
 fn had_esplora_credentials(config: &NodeConfig) -> bool {
@@ -978,10 +1077,10 @@ pub async fn run(args: ChainTipArgs) -> Result<()> {
         )));
     }
     refuse_if_input_is_written(&config, Some(&new.chain), &files)?;
-    let backup = write_backup(&files, &current)?;
-    replace_config(&path, &files.config_temp, edited.as_bytes()).map_err(|e| {
-        anyhow::anyhow!("{e:#}. The previous config is kept at {}", backup.display())
-    })?;
+    // From here every read-back and write goes through one directory handle,
+    // opened and checked once (owned by this user, not writable by others), so
+    // a parent path changed after the checks cannot redirect any write.
+    let backup = write_pinned(&files, current.as_slice(), edited.as_bytes(), &config, &new.chain)?;
     println!("{summary}");
     println!("Previous config kept at {}", backup.display());
     println!(

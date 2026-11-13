@@ -510,3 +510,110 @@ fn same_file_sees_symlinks_and_aliases() {
     ));
     assert!(!same_file(&dir.path().join("other"), &file));
 }
+
+/// A config whose recovery phrase is `phrase` (Light tier, mock chain).
+#[cfg(unix)]
+fn config_reading(dir: &Path, phrase: &Path) -> NodeConfig {
+    NodeConfig::default_for_tier(crate::config::NodeTier::Light, phrase.to_path_buf(), dir)
+}
+
+/// The reviewed race: the config path goes through a symlinked directory. The
+/// checks pass against directory A; right after the directory is pinned the
+/// symlink is pointed at the directory holding the recovery phrase under the
+/// config's own name. Every write must still land in A: the phrase survives,
+/// A's config is replaced, and A holds the backup of the original.
+#[cfg(unix)]
+#[test]
+fn a_parent_symlink_changed_after_the_checks_cannot_redirect_the_writes() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let a = root.path().join("a");
+    let private = root.path().join("private");
+    for d in [&a, &private] {
+        std::fs::create_dir(d).unwrap();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let phrase = private.join("konsensus.toml");
+    std::fs::write(&phrase, "synthetic recovery words\n").unwrap();
+    std::fs::write(a.join("konsensus.toml"), "original\n").unwrap();
+    let link = root.path().join("node");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    let config_path = link.join("konsensus.toml");
+    let files = WriteFiles::new(&config_path).unwrap();
+    let config = config_reading(root.path(), &phrase);
+
+    let (link2, private2) = (link.clone(), private.clone());
+    AFTER_PIN.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            std::fs::remove_file(&link2).unwrap();
+            std::os::unix::fs::symlink(&private2, &link2).unwrap();
+        }))
+    });
+    let backup = write_pinned(&files, b"original\n", b"edited\n", &config, &ChainConfig::Mock).unwrap();
+    assert!(AFTER_PIN.with(|h| h.borrow().is_none()), "the retarget did not run");
+    assert_eq!(std::fs::read_to_string(&phrase).unwrap(), "synthetic recovery words\n");
+    assert_eq!(std::fs::read_to_string(a.join("konsensus.toml")).unwrap(), "edited\n");
+    let backup_in_a = a.join(backup.file_name().unwrap());
+    assert_eq!(std::fs::read_to_string(&backup_in_a).unwrap(), "original\n");
+    let private_names: Vec<String> = std::fs::read_dir(&private)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(private_names, ["konsensus.toml"], "written into the recovery directory: {private_names:?}");
+}
+
+/// A config directory that group or others can write is refused before any
+/// write: someone else could swap names inside it.
+#[cfg(unix)]
+#[test]
+fn a_config_directory_others_can_write_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let shared = root.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let config_path = shared.join("konsensus.toml");
+    std::fs::write(&config_path, "original\n").unwrap();
+    let files = WriteFiles::new(&config_path).unwrap();
+    let config = config_reading(root.path(), &root.path().join("phrase.txt"));
+    let error = write_pinned(&files, b"original\n", b"edited\n", &config, &ChainConfig::Mock)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("can be written by other users"), "{error}");
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "original\n");
+    assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 1);
+}
+
+/// The recovery phrase at one of the written names in the pinned directory
+/// (here: the backup name) is refused, and nothing is written.
+#[cfg(unix)]
+#[test]
+fn a_recovery_phrase_at_a_written_name_in_the_pinned_directory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("konsensus.toml");
+    std::fs::write(&config_path, "original\n").unwrap();
+    let files = WriteFiles::new(&config_path).unwrap();
+    std::fs::write(&files.backup, "synthetic recovery words\n").unwrap();
+    let config = config_reading(dir.path(), &files.backup);
+    let error = write_pinned(&files, b"original\n", b"edited\n", &config, &ChainConfig::Mock)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("is the same file as"), "{error}");
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "original\n");
+    assert_eq!(std::fs::read_to_string(&files.backup).unwrap(), "synthetic recovery words\n");
+}
+
+/// Cleanup removes a temporary only while the name still points at the file
+/// this operation created; an entry swapped in under that name is kept.
+#[cfg(unix)]
+#[test]
+fn cleanup_keeps_an_entry_swapped_in_under_the_temporary_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let pinned = crate::config_dir::ConfigDir::open(&dir.path().join("konsensus.toml")).unwrap();
+    let name = std::ffi::OsStr::new(".t.tmp");
+    let created = pinned.create_new(name, b"ours\n").unwrap();
+    std::fs::remove_file(dir.path().join(".t.tmp")).unwrap();
+    std::fs::write(dir.path().join(".t.tmp"), "someone else's\n").unwrap();
+    pinned.remove_if(name, created);
+    assert_eq!(std::fs::read_to_string(dir.path().join(".t.tmp")).unwrap(), "someone else's\n");
+}
