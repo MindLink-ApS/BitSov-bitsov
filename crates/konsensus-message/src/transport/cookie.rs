@@ -117,7 +117,7 @@ struct KeyGenerations {
     previous: Option<Zeroizing<[u8; 32]>>,
 }
 
-fn fresh_secret() -> Zeroizing<[u8; 32]> {
+pub(super) fn fresh_secret() -> Zeroizing<[u8; 32]> {
     let mut secret = Zeroizing::new([0u8; 32]);
     rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, secret.as_mut()).expect("OS randomness unavailable");
     secret
