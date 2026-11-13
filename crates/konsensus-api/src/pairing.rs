@@ -4497,7 +4497,7 @@ fn load_box_transport_key_with_io(
             let mut file = options.open(&temporary)?;
             let published = (|| -> io::Result<()> {
                 let mut secret = zeroize::Zeroizing::new([0u8; 32]);
-                rand::rng().fill_bytes(secret.as_mut());
+                rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, secret.as_mut()).expect("OS randomness unavailable");
                 file.write_all(secret.as_ref())?;
                 file.sync_all()?;
                 // Publish a complete, synced key without clobbering a winner

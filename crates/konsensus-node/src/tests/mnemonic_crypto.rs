@@ -201,3 +201,18 @@ fn pre_zeroize_v1_fixture_still_decrypts() {
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
     );
 }
+
+/// Two encryptions differ in the salt and in the nonce, each field on its own.
+/// That both come straight from the operating system (a forked process does not
+/// repeat them) is checked in `tests/os_rng.rs`, which forks in a
+/// single-threaded process.
+#[test]
+fn salt_and_nonce_differ_between_encryptions() {
+    let header = || {
+        let out = encrypt_mnemonic("abandon ability able about above absent absorb abstract absurd abuse access accident", "a long enough password").unwrap();
+        out[1..1 + SALT_LEN + NONCE_LEN].to_vec()
+    };
+    let (a, b) = (header(), header());
+    assert_ne!(a[..SALT_LEN], b[..SALT_LEN], "salt repeated");
+    assert_ne!(a[SALT_LEN..], b[SALT_LEN..], "nonce repeated");
+}

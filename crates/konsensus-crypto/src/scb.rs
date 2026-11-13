@@ -6,7 +6,6 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce as AesNonce,
 };
-use rand::Rng;
 
 const MAGIC: &[u8; 8] = b"BSOVSCB1";
 const AAD: &[u8] = b"bitsov-scb-backup-v1";
@@ -56,7 +55,7 @@ pub fn encrypt_scb(plaintext: &[u8], master_aes_key: &[u8; 32]) -> Result<Vec<u8
         .map_err(|e| ScbCryptoError::Crypto(format!("key init: {e}")))?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::rng().fill_bytes(&mut nonce_bytes);
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut nonce_bytes).expect("OS randomness unavailable");
     let nonce = AesNonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(
