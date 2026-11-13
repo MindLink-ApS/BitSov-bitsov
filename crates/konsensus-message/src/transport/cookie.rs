@@ -36,7 +36,6 @@ use std::sync::Mutex as StdMutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
-use rand::Rng;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -120,7 +119,7 @@ struct KeyGenerations {
 
 fn fresh_secret() -> Zeroizing<[u8; 32]> {
     let mut secret = Zeroizing::new([0u8; 32]);
-    rand::rng().fill_bytes(secret.as_mut());
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, secret.as_mut()).expect("OS randomness unavailable");
     secret
 }
 
