@@ -1902,6 +1902,66 @@ fn lightning_config_backend_name() {
 // ── Config load/save roundtrip tests ───────────────────────────────
 
 #[test]
+fn generated_config_documents_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    for tier in [NodeTier::Cloud, NodeTier::Light, NodeTier::Full] {
+        let config = NodeConfig::default_for_tier(tier, PathBuf::from("/dev/null"), dir.path());
+        let path = dir.path().join("konsensus.toml");
+        config.save(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let document: toml::Table = content.parse().unwrap();
+        assert_eq!(document["tier"].as_str(), Some(tier.to_string().as_str()));
+        assert_eq!(document["pricing"]["chat_msat"].as_integer(), Some(10));
+        assert_eq!(document["relay"]["enabled"].as_bool(), Some(false));
+
+        let parsed: NodeConfig = toml::from_str(&content).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&config).unwrap()
+        );
+        let loaded = NodeConfig::load(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&config).unwrap()
+        );
+        loaded.save(&path).unwrap();
+        let saved: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(saved, document);
+    }
+}
+
+#[test]
+fn edited_config_document_preserves_fields_on_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let config =
+        NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), dir.path());
+    let mut document: toml::Table = toml::to_string_pretty(&config).unwrap().parse().unwrap();
+    document["node"]
+        .as_table_mut()
+        .unwrap()
+        .insert("hosted_by".into(), "Workshop \"box\" \\ shelf".into());
+    document["pricing"]["chat_msat"] = 1234.into();
+    let path = dir.path().join("konsensus.toml");
+    std::fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+
+    let loaded = NodeConfig::load(&path).unwrap();
+    assert_eq!(
+        loaded.node.hosted_by.as_deref(),
+        Some("Workshop \"box\" \\ shelf")
+    );
+    assert_eq!(loaded.pricing.chat_msat, 1234);
+    assert_eq!(loaded.tier, NodeTier::Light);
+    assert!(!loaded.relay.enabled);
+    loaded.save(&path).unwrap();
+    let reloaded = NodeConfig::load(&path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&reloaded).unwrap(),
+        serde_json::to_value(&loaded).unwrap()
+    );
+}
+
+#[test]
 fn config_save_and_load_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let mnemonic_path = dir.path().join("mnemonic.txt");

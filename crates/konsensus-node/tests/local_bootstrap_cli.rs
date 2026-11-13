@@ -269,7 +269,7 @@ async fn descriptor_bootstrap_restart_intent_and_no_secret_logs() {
     assert!(result.get("mnemonic").is_none());
     terminal(&mut node, &log).await;
     drop(node);
-    let cfg: toml::Value = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    let cfg: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
     assert_eq!(
         cfg["identity"]["mnemonic_file"].as_str().unwrap(),
         dir.path().join("identity/mnemonic.enc").to_str().unwrap()

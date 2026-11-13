@@ -584,7 +584,7 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     assert_eq!(status.code(), Some(75), "{}", logs(&log));
     drop(node);
 
-    let cfg: toml::Value = std::fs::read_to_string(&f.config).unwrap().parse().unwrap();
+    let cfg: toml::Table = std::fs::read_to_string(&f.config).unwrap().parse().unwrap();
     let enc = f.dir.path().join("identity/mnemonic.enc");
     assert_eq!(
         cfg["identity"]["mnemonic_file"].as_str().unwrap(),
