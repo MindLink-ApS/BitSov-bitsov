@@ -84,6 +84,54 @@ pub async fn call_media_admitted(store: Store<'_>, peer: &NodeId, call_id: &str,
     store.call_get(peer, call_id).await.ok().flatten().is_some_and(|entry| entry.media_admitted(now))
 }
 
+/// A teardown request for one local media attachment generation.
+pub struct MediaDetach {
+    /// Shared with attachment publication; held until the durable write completes.
+    pub generation: std::sync::Arc<tokio::sync::Mutex<u64>>,
+    pub expected_generation: u64,
+    /// Admission loss alone may close an Unpaid resume window, never a Live row.
+    pub only_unpaid: bool,
+    /// Whether socket teardown may end a Live call before its paid deadline.
+    pub may_hangup_live: bool,
+}
+
+/// Whether teardown completed or must wait for ordinary expiry maintenance.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MediaDetachOutcome {
+    Complete,
+    PendingExpiry,
+}
+
+/// End a callee call only while its attachment generation is still current.
+/// Preserve pending evidence and replay retention for ordinary reconciliation.
+pub async fn detach_callee_media(store: Store<'_>, peer: &NodeId, call_id: &str, now: u64, detach: &MediaDetach) -> Result<MediaDetachOutcome, konsensus_storage::StorageError> {
+    let generation = detach.generation.lock().await;
+    if *generation != detach.expected_generation { return Ok(MediaDetachOutcome::Complete); }
+    let _guard = lock().lock().await;
+    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(MediaDetachOutcome::Complete) };
+    if entry.side != rules::Side::Callee { return Ok(MediaDetachOutcome::Complete); }
+    // Maintenance owns expiry and its terminal notice; socket loss only closes resume.
+    if entry.phase == rules::Phase::Live && now > entry.deadline_ms {
+        if !detach.only_unpaid && entry.paid_until_ms != Some(0) {
+            entry.paid_until_ms = Some(0);
+            store.call_put(peer, call_id, &entry).await?;
+        }
+        return Ok(MediaDetachOutcome::PendingExpiry);
+    }
+    if !((!detach.only_unpaid && detach.may_hangup_live && entry.phase == rules::Phase::Live)
+        || (entry.phase == rules::Phase::Ended && entry.end_reason == Some(rules::HangupReason::Unpaid))) { return Ok(MediaDetachOutcome::Complete); }
+    if entry.phase == rules::Phase::Ended {
+        // Zero closes resume without changing Unpaid or its replay deadline.
+        entry.paid_until_ms = Some(0);
+    } else {
+        entry.phase = rules::Phase::Ended;
+        entry.end_reason = Some(rules::HangupReason::Hangup);
+        entry.deadline_ms = entry.deadline_ms.max(now.saturating_add(rules::TOMBSTONE_MS));
+    }
+    store.call_put(peer, call_id, &entry).await?;
+    Ok(MediaDetachOutcome::Complete)
+}
+
 /// End expired calls durably, retaining pending evidence and tombstones.
 /// Only callee entries are returned for a best-effort 403 Unpaid notification.
 pub async fn expire_calls(store: Store<'_>, now: u64) -> Result<Vec<(NodeId, String)>, konsensus_storage::StorageError> {
@@ -946,6 +994,7 @@ pub async fn block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextC
 pub async fn receive_block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher, own: &NodeId, peer: &NodeId,
     id: &konsensus_core::MessageId, paid_until_ms: u64,
 ) -> Result<(), konsensus_storage::StorageError> {
+    if paid_until_ms == 0 { return Ok(()); }
     if !store.is_pending_dispatched(id, peer, own).await? { return Ok(()); }
     let Some(envelope) = store.get_message(id).await? else { return Ok(()) };
     if envelope.kind != konsensus_core::kind::KIND_CALL_BLOCK || envelope.sender != *own

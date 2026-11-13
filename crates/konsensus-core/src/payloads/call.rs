@@ -327,6 +327,7 @@ pub struct CallEntry {
     pub deadline_ms: u64,
     pub pending: Option<Pending>,
     /// Last paid boundary; absent until block zero settles.
+    /// Zero on a callee closes resume, including while awaiting expiry.
     pub paid_until_ms: Option<u64>,
     pub next_block_seq: u32,
     pub end_reason: Option<HangupReason>,
@@ -554,6 +555,9 @@ fn check_block(entry: &CallEntry, seq: u32, now_ms: u64) -> Result<(), CallRefus
 fn apply_block(entry: CallEntry, seq: u32, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     if seq != entry.next_block_seq || u64::from(seq) >= MAX_CALL_MS / CALL_BLOCK_MS {
         return Err(CallRefusal::Sequence);
+    }
+    if entry.side == Side::Callee && entry.paid_until_ms == Some(0) {
+        return Err(CallRefusal::UnknownCall);
     }
     let end = match (entry.phase, entry.end_reason) {
         (Phase::Live, _) => entry.deadline_ms,

@@ -13,6 +13,24 @@ also live on the corresponding GitHub pre-release pages.
   a password on the command line, and a machine declared as run for someone else.
   What an approval can authorize and all spending limits are unchanged.
 
+## [0.3.0-rc24] — 2026-11-12
+
+- A paid call now ends after the callee's app connection is lost, including a
+  brief network interruption, when the callee's node records the disconnect.
+  This protection requires the callee's node to run rc24. With an rc23 callee,
+  the old behaviour remains and further blocks can be paid. Update both nodes
+  before paid calls; do not run paid calls while versions are mixed.
+- If the callee's node cannot record the disconnect, either because the write
+  still fails after its retries or because the node stops before the write,
+  the call can stay live without media until it expires unpaid. The caller
+  can keep paying for blocks meanwhile. Hang up from the caller side as soon
+  as audio stops and reconcile any further paid blocks. A pending disconnect
+  is not replayed after a restart; durable replay is planned for a later release.
+- A media-drop hangup does not notify the peer; after a recorded cutoff, the
+  peer's node ends the call at the next refused renewal, observed at about
+  66 to 67 seconds. See the [rc24 notes and checklist](docs/releases/v0.3.0-rc24.md)
+  and [rc23 → rc24 upgrade steps](docs/UPGRADING.md#rc23--rc24).
+
 ## [0.3.0-rc23] — 2026-11-09
 
 - Setup cancellation leaves the comparison-attempt budget unchanged. Setup

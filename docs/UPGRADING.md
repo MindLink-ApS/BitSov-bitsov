@@ -30,6 +30,56 @@ A running node does not print its release on start. Builds that include #540
 version, `2`. On rc22 and earlier, check the
 binary with `--version`.
 
+## rc23 → rc24
+
+End calls and reconcile pending payments using their existing operation IDs
+before stopping BitSov. Take a consistent backup of the complete data directory
+and, when used, the PostgreSQL database. Retain config, wallet/channel, pairing,
+session and operation state together. Leave separately managed Lightning
+services running. Do not re-run `init` or rewind current state to an older copy.
+
+Verify the future signed artifact for the correct platform, stage it beside
+the retained binary, and check that `--version` reports `konsensus 0.3.0-rc24`.
+Review tier consistency, API bind settings, optional media settings and the
+configured source with `chain-tip` without changing or accepting it implicitly.
+Switch the binary and restart with the same config, data and normal owner
+controls. There are no new SQL migrations or stored-format changes since rc23;
+the forward-only migrations and encrypted record markers from rc23 still apply.
+Nodes coming from rc22 or earlier must also follow [rc22 → rc23](#rc22--rc23).
+
+Inspect migration and aggregate record-upgrade logs; retain every completion
+marker and investigate unreadable or unwritable data. Check `node_version`,
+health, identity, contacts, channels, chain source and `money_ready`. Initial
+wallet sync alone does not establish payment readiness. Resolve
+`chain_unavailable` by restoring source availability and freshness before
+priced work. Read session state on both peers and confirm a message in each
+direction on signet. Reconcile pending results before retrying.
+
+A paid call now ends after the callee's app connection is lost, including a
+brief network interruption, when the callee's node records the disconnect.
+The cutoff runs on the callee's node and requires rc24 there. With an rc23
+callee, the old behaviour remains and the caller can pay further blocks.
+Update both nodes before paid calls; do not run paid calls while versions are
+mixed. After both nodes are upgraded, wait until both report payment-ready
+(`money_ready` is true) and their channels are usable before the paid check.
+Then check a call and its closing result within the configured cap. Keep the
+upgraded data intact.
+
+If the callee's node cannot record the disconnect, either because the write
+still fails after its retries or because the node stops before the write,
+the call can stay live without media until it expires unpaid. The caller can
+keep paying for blocks meanwhile. Hang up from the caller side as soon as
+audio stops and reconcile any further paid blocks. A pending disconnect is
+not replayed after a restart; durable replay is planned for a later release.
+
+A media-drop hangup does not notify the peer; after a recorded cutoff, the
+peer's node ends the call at the next refused renewal, observed at about
+66 to 67 seconds. Keep unresolved operation IDs and reconcile results
+before further spending. Prefer rolling forward; existing
+[rollback constraints](#rollback-constraints) remain. No rc24 → rc23 retained-node
+rollback rehearsal is recorded. See the [rc24 operator checklist](releases/v0.3.0-rc24.md#4-retained-nodes-rc23--rc24)
+for the complete upgrade sequence and remaining release gates.
+
 ## rc22 → rc23
 
 rc23 includes forward-only storage upgrades and session recovery changes. Stop
