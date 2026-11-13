@@ -96,3 +96,7 @@ secp256k1 = "0.29"
 # WebSocket client for the in-process two-node call media test; the server
 # side is axum's own (same tungstenite already in the tree).
 tokio-tungstenite = "0.24"
+
+[[test]]
+name = "os_rng"
+harness = false

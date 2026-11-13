@@ -52,3 +52,7 @@ rand.workspace = true
 [[bench]]
 name = "crypto_bench"
 harness = false
+
+[[test]]
+name = "os_rng"
+harness = false
