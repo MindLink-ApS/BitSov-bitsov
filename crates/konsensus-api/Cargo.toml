@@ -61,3 +61,7 @@ tower = { workspace = true, features = ["util"] }
 futures.workspace = true
 bitcoin.workspace = true
 secp256k1 = "0.29"
+
+[[test]]
+name = "os_rng"
+harness = false

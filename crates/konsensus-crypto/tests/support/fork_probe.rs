@@ -1,45 +1,69 @@
-//! Fork-based test helper shared by the os_rng integration tests.
+//! Fork-based checks shared by the os_rng test targets. Each target runs its own
+//! `main` instead of libtest, so `main` runs on the process's only thread and
+//! every `fork` below happens before any other thread exists. That invariant is
+//! checked (`thread_count`), not assumed.
 #![allow(dead_code)]
 
-pub const PROBE_ENV: &str = "OS_RNG_FORK_PROBE";
+use std::process::ExitCode;
 
-/// Run `body` in a fresh, single-threaded run of this same test (re-executing
-/// the test binary with `--exact --test-threads=1`), so the `fork` inside
-/// happens in a process with no other threads. `module` is `module_path!()`
-/// and `name` the test function, which together give libtest's test name.
-pub fn in_single_thread_probe(module: &str, name: &str, body: impl FnOnce()) {
-    if std::env::var_os(PROBE_ENV).is_some() {
-        body();
-        return;
-    }
-    let test = match module.split_once("::") {
-        Some((_, path)) => format!("{path}::{name}"),
-        None => name.to_string(),
-    };
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([test.as_str(), "--exact", "--test-threads=1"])
-        .env(PROBE_ENV, "1")
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success() && stdout.contains("test result: ok. 1 passed"),
-        "single-threaded probe of {test} failed:\n{stdout}\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+/// Threads in this process, where the platform reports it.
+#[cfg(target_os = "linux")]
+pub fn thread_count() -> Option<usize> {
+    std::fs::read_dir("/proc/self/task").ok().map(|d| d.count())
 }
 
-/// Inside a probe: draw once, fork, draw in parent and child, and report
-/// whether the two draws differ. A per-thread userspace generator copied by
-/// `fork` repeats; a direct operating-system read does not.
+/// Threads in this process, where the platform reports it.
+#[cfg(target_os = "macos")]
+pub fn thread_count() -> Option<usize> {
+    // SAFETY: proc_taskinfo is plain data, so all-zero bytes are a valid value.
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: `info` is a writable buffer of `size` bytes for our own pid.
+    let n = unsafe {
+        libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDTASKINFO, 0, (&mut info as *mut libc::proc_taskinfo).cast(), size)
+    };
+    (n == size).then_some(info.pti_threadnum as usize)
+}
+
+/// Threads in this process, where the platform reports it.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn thread_count() -> Option<usize> {
+    None
+}
+
+/// Run each named check in order on the main thread; print libtest-style lines
+/// and fail the target if any check panics.
+pub fn run(checks: &[(&str, fn())]) -> ExitCode {
+    let mut failed = 0;
+    for (name, check) in checks {
+        if std::panic::catch_unwind(*check).is_ok() {
+            println!("test {name} ... ok");
+        } else {
+            println!("test {name} ... FAILED");
+            failed += 1;
+        }
+    }
+    let verdict = if failed == 0 { "ok" } else { "FAILED" };
+    println!("\ntest result: {verdict}. {} passed; {failed} failed", checks.len() - failed);
+    if failed == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// Draw once, fork, draw in parent and child, and report whether the two draws
+/// differ. A per-thread userspace generator copied by `fork` repeats; a direct
+/// operating-system read does not. The warm-up and both measured draws stay in
+/// this one process.
 pub fn draws_differ_across_fork(draw: impl Fn() -> Vec<u8>) -> bool {
-    assert!(std::env::var_os(PROBE_ENV).is_some(), "call inside in_single_thread_probe");
     let _warm = draw();
+    let threads = thread_count();
+    // Linux and macOS report the count, so a missing answer fails rather than skips.
+    if cfg!(any(target_os = "linux", target_os = "macos")) || threads.is_some() {
+        assert_eq!(threads, Some(1), "fork needs a single-threaded process");
+    }
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: fds has room for two descriptors.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
-    // SAFETY: this process runs a single thread (see in_single_thread_probe),
-    // so the child may allocate and run library code before it exits.
+    // SAFETY: the process has exactly one thread (checked above), so the child
+    // may allocate and run library code before it exits.
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork failed");
     if pid == 0 {
