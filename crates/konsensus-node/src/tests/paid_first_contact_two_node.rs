@@ -45,6 +45,8 @@ use crate::msg_handler::{run as run_msg_handler, MsgHandlerDeps};
 
 const JWT_SECRET: &str = "paid-first-contact-regression-jwt-secret";
 const CHAT_MSAT: u64 = 2_000;
+/// The owner's total cap on each compose: above every price used here.
+const OWNER_TOTAL_CAP_MSAT: u64 = 1_000_000;
 
 /// Longest a session may take to form: one self-heal tick (15 s) plus round
 /// trips, inside compose's own 25 s session wait.
@@ -783,7 +785,9 @@ impl Node {
         )
     }
 
-    /// The owner's uncapped chat to `to`, through the real compose route.
+    /// The owner's chat to `to`, through the real compose route, under a total
+    /// cap above every price these tests use (a payment to a peer without an
+    /// open session needs one), so the cap never decides an outcome here.
     async fn compose(&self, to: &NodeId, text: &str) -> (StatusCode, serde_json::Value) {
         self.post(
             "/api/v1/messages/compose",
@@ -791,6 +795,7 @@ impl Node {
                 "recipient": to.to_hex(),
                 "kind": konsensus_core::kind::KIND_CHAT,
                 "plaintext": text,
+                "max_total_msat": OWNER_TOTAL_CAP_MSAT,
             }),
         )
         .await
