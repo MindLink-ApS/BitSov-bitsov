@@ -201,3 +201,75 @@ fn pre_zeroize_v1_fixture_still_decrypts() {
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
     );
 }
+
+/// The salt and the nonce come straight from the operating system: a forked
+/// process does not repeat the parent's next values (a per-thread userspace
+/// generator would), and two encryptions differ in each field separately.
+#[cfg(unix)]
+#[test]
+fn salt_and_nonce_are_fresh_os_draws() {
+    let header = || {
+        let out = encrypt_mnemonic("abandon ability able about above absent absorb abstract absurd abuse access accident", "a long enough password").unwrap();
+        out[1..1 + SALT_LEN + NONCE_LEN].to_vec()
+    };
+    // Each field on its own: a fresh other field must not hide a repeated one.
+    assert!(
+        draws_differ_across_fork(|| header()[..SALT_LEN].to_vec()),
+        "salt repeats across fork"
+    );
+    assert!(
+        draws_differ_across_fork(|| header()[SALT_LEN..].to_vec()),
+        "nonce repeats across fork"
+    );
+    let (a, b) = (header(), header());
+    assert_ne!(a[..SALT_LEN], b[..SALT_LEN], "salt repeated");
+    assert_ne!(a[SALT_LEN..], b[SALT_LEN..], "nonce repeated");
+}
+
+/// Draw once, fork, draw in both processes: true when the two draws differ
+/// (a per-thread userspace generator copied by fork would repeat).
+#[cfg(unix)]
+fn draws_differ_across_fork(draw: impl Fn() -> Vec<u8>) -> bool {
+    let _warm = draw();
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: fds has room for two descriptors.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+    // SAFETY: the child only draws, writes to the pipe and exits.
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "fork failed");
+    if pid == 0 {
+        let code = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&draw)) {
+            Ok(bytes) => {
+                // SAFETY: valid buffer and descriptor.
+                let n = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()) };
+                if n as usize == bytes.len() { 0 } else { 2 }
+            }
+            Err(_) => 1,
+        };
+        // SAFETY: leave the child without running the parent's destructors.
+        unsafe { libc::_exit(code) };
+    }
+    let ours = draw();
+    let mut theirs = vec![0u8; ours.len()];
+    // SAFETY: close our copy of the write end so a dead child yields EOF.
+    unsafe { libc::close(fds[1]) };
+    let mut poll = libc::pollfd { fd: fds[0], events: libc::POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd; 20 s bound.
+    let ready = unsafe { libc::poll(&mut poll, 1, 20_000) };
+    let n = if ready == 1 {
+        // SAFETY: valid buffer of theirs.len() bytes.
+        unsafe { libc::read(fds[0], theirs.as_mut_ptr().cast(), theirs.len()) }
+    } else {
+        // SAFETY: pid is our child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        -1
+    };
+    let mut status = 0;
+    // SAFETY: reap our child; close the read end.
+    unsafe {
+        libc::waitpid(pid, &mut status, 0);
+        libc::close(fds[0]);
+    }
+    assert_eq!(n as usize, ours.len(), "the forked child did not report its draw");
+    ours != theirs
+}
