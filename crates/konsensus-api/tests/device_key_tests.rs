@@ -899,7 +899,7 @@ fn a_v1_signature_or_a_previous_epoch_does_not_open_a_grant() {
         .request_device_key(
             &client.client_id,
             &device.public_hex(),
-            "Rasmus's MacBook",
+            "Alice's MacBook",
             &device.proof(&client.client_id),
         )
         .unwrap();
