@@ -89,6 +89,12 @@ pub enum Command {
         /// (0 = stdin). UTF-8, at most 4096 bytes; trailing CR/LF is removed.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with = "encrypt")]
         password_fd: Option<i32>,
+
+        /// Bitcoin network to write into the config: `[lightning] network` and
+        /// the `[lightning]` and `[chain]` server URLs. Mainnet is not supported
+        /// in this beta: `start` refuses it unless `[node] allow_mainnet = true`.
+        #[arg(long, value_parser = crate::config::INIT_NETWORKS, default_value = crate::config::DEFAULT_INIT_NETWORK)]
+        network: String,
     },
 
     /// Start the node using an existing configuration.
@@ -227,6 +233,12 @@ pub enum Command {
         /// Encrypt the mnemonic file; empty or whitespace-only passwords are rejected.
         #[arg(long)]
         encrypt: Option<Option<String>>,
+
+        /// Bitcoin network to write into the config: `[lightning] network` and
+        /// the `[lightning]` and `[chain]` server URLs. Mainnet is not supported
+        /// in this beta: `start` refuses it unless `[node] allow_mainnet = true`.
+        #[arg(long, value_parser = crate::config::INIT_NETWORKS, default_value = crate::config::DEFAULT_INIT_NETWORK)]
+        network: String,
     },
 
     /// Sign an auth challenge and print the hex Ed25519 signature.

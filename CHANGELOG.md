@@ -5,6 +5,17 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- `init` and `restore` take `--network signet|regtest|bitcoin` (default
+  `signet`) and write `[lightning] network` and the matching `[lightning]` and
+  `[chain]` server URLs. The last line printed names the network.
+- `start` refuses a mainnet `[lightning] network` with `mainnet_not_approved`
+  unless `[node] allow_mainnet = true` is set by hand. `starter_hub.allow_mainnet`
+  does not count. **An existing mainnet config, including a start with no config
+  file, is refused until that key is added.**
+- `start` refuses a known public server on another network than
+  `[lightning] network` before any network I/O; the runtime source check now
+  reports `chain_network_mismatch`.
+
 ## [0.3.0-rc24] — 2026-11-12
 
 - A paid call now ends after the callee's app connection is lost, including a

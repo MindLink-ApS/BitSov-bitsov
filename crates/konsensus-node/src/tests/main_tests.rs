@@ -22,7 +22,7 @@ fn init_light_tier_creates_config_and_mnemonic() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("light"), None, None)?;
+    cmd_init(&dir, true, Some("light"), None, None, "signet")?;
 
     let config_path = dir.join("konsensus.toml");
     let mnemonic_path = dir.join("mnemonic.txt");
@@ -44,7 +44,7 @@ fn init_full_tier_creates_config() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("full"), None, None)?;
+    cmd_init(&dir, true, Some("full"), None, None, "signet")?;
     let config_path = dir.join("konsensus.toml");
     assert!(
         config_path.exists(),
@@ -82,7 +82,7 @@ fn init_cloud_tier_creates_config() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("cloud"), None, None)?;
+    cmd_init(&dir, true, Some("cloud"), None, None, "signet")?;
 
     let config = crate::config::NodeConfig::load(&dir.join("konsensus.toml"))?;
     assert_eq!(config.tier, crate::config::NodeTier::Cloud);
@@ -94,10 +94,10 @@ fn init_rejects_already_initialized() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("light"), None, None)?;
+    cmd_init(&dir, true, Some("light"), None, None, "signet")?;
 
     // Second init must fail
-    let err = cmd_init(&dir, true, Some("light"), None, None).unwrap_err();
+    let err = cmd_init(&dir, true, Some("light"), None, None, "signet").unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("already initialized"),
@@ -111,7 +111,7 @@ fn init_rejects_unknown_tier() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    let err = cmd_init(&dir, true, Some("enterprise"), None, None).unwrap_err();
+    let err = cmd_init(&dir, true, Some("enterprise"), None, None, "signet").unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("unknown tier"),
@@ -126,7 +126,7 @@ fn init_non_interactive_defaults_to_light() -> Result<()> {
     let dir = tmp.path().join("node");
 
     // non_interactive=true, tier_arg=None → defaults to Light
-    cmd_init(&dir, true, None, None, None)?;
+    cmd_init(&dir, true, None, None, None, "signet")?;
 
     let config = crate::config::NodeConfig::load(&dir.join("konsensus.toml"))?;
     assert_eq!(config.tier, crate::config::NodeTier::Light);
@@ -144,6 +144,7 @@ fn init_with_encryption_creates_enc_file() -> Result<()> {
         Some("light"),
         Some(Some("test-pw".to_string())),
         None,
+        "signet",
     )?;
 
     let enc_path = dir.join("mnemonic.enc");
@@ -171,7 +172,7 @@ fn restore_creates_config_and_mnemonic() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None)?;
+    cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None, "signet")?;
 
     let config_path = dir.join("konsensus.toml");
     let mnemonic_path = dir.join("mnemonic.txt");
@@ -187,11 +188,11 @@ fn restore_creates_config_and_mnemonic() -> Result<()> {
 fn restore_fences_embedded_lightning_without_blocking_identity_only_tiers() -> Result<()> {
     let tmp = TempDir::new()?;
     let full = tmp.path().join("full");
-    cmd_restore(&full, Some(TEST_MNEMONIC), Some("full"), None)?;
+    cmd_restore(&full, Some(TEST_MNEMONIC), Some("full"), None, "signet")?;
     assert!(konsensus_lightning::recover::ensure_normal_start(&full.join("ldk")).is_err());
     for tier in ["light", "cloud"] {
         let dir = tmp.path().join(tier);
-        cmd_restore(&dir, Some(TEST_MNEMONIC), Some(tier), None)?;
+        cmd_restore(&dir, Some(TEST_MNEMONIC), Some(tier), None, "signet")?;
         konsensus_lightning::recover::ensure_normal_start(&dir.join("ldk"))
             .map_err(anyhow::Error::msg)?;
     }
@@ -203,9 +204,9 @@ fn restore_rejects_already_initialized() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None)?;
+    cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None, "signet")?;
 
-    let err = cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None).unwrap_err();
+    let err = cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None, "signet").unwrap_err();
     assert!(format!("{err}").contains("restore requires an empty directory"));
     Ok(())
 }
@@ -220,6 +221,7 @@ fn restore_rejects_invalid_mnemonic() -> Result<()> {
         Some("invalid mnemonic words that are not bip39"),
         Some("light"),
         None,
+        "signet",
     )
     .unwrap_err();
     let msg = format!("{err}");
@@ -240,6 +242,7 @@ fn restore_with_encryption() -> Result<()> {
         Some(TEST_MNEMONIC),
         Some("full"),
         Some(Some("secret".to_string())),
+        "signet",
     )?;
 
     let enc_path = dir.join("mnemonic.enc");
@@ -255,7 +258,7 @@ fn restore_into_empty_dir_prepares_initialized_start() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None)?;
+    cmd_restore(&dir, Some(TEST_MNEMONIC), Some("light"), None, "signet")?;
 
     assert!(
         dir.join("NODE_INITIALIZED").exists(),
@@ -448,7 +451,7 @@ fn init_then_node_id_matches() -> Result<()> {
     let tmp = TempDir::new()?;
     let dir = tmp.path().join("node");
 
-    cmd_init(&dir, true, Some("light"), None, None)?;
+    cmd_init(&dir, true, Some("light"), None, None, "signet")?;
 
     // Read the generated mnemonic
     let mnemonic = std::fs::read_to_string(dir.join("mnemonic.txt"))?;
@@ -472,7 +475,7 @@ fn restore_produces_same_identity_as_original() -> Result<()> {
     // Init a node
     let tmp1 = TempDir::new()?;
     let dir1 = tmp1.path().join("node");
-    cmd_init(&dir1, true, Some("light"), None, None)?;
+    cmd_init(&dir1, true, Some("light"), None, None, "signet")?;
 
     // Read the generated mnemonic
     let mnemonic = std::fs::read_to_string(dir1.join("mnemonic.txt"))?;
@@ -481,7 +484,7 @@ fn restore_produces_same_identity_as_original() -> Result<()> {
     // Restore in a new directory using the same mnemonic
     let tmp2 = TempDir::new()?;
     let dir2 = tmp2.path().join("node");
-    cmd_restore(&dir2, Some(mnemonic.trim()), Some("light"), None)?;
+    cmd_restore(&dir2, Some(mnemonic.trim()), Some("light"), None, "signet")?;
 
     let restored_mnemonic = std::fs::read_to_string(dir2.join("mnemonic.txt"))?;
     let restored_id = konsensus_core::NodeIdentity::from_mnemonic(restored_mnemonic.trim(), "")?;
@@ -635,6 +638,7 @@ fn init_encrypted_then_read_with_wrong_password_fails() -> Result<()> {
         Some("light"),
         Some(Some("correct-pw".to_string())),
         None,
+        "signet",
     )?;
 
     let enc_path = dir.join("mnemonic.enc");
