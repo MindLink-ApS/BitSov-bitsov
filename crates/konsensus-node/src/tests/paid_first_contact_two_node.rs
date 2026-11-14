@@ -490,7 +490,9 @@ struct Node {
     wallet: Arc<SharedMockProvider>,
     routing: Arc<konsensus_routing::RoutingTable>,
     peer_prices: Arc<konsensus_pricing::PeerPriceCache>,
-    peer_ln_pubkeys: Arc<tokio::sync::Mutex<HashMap<NodeId, String>>>,
+    peer_ln_pubkeys: Arc<
+        tokio::sync::Mutex<HashMap<NodeId, konsensus_core::lightning_binding::PeerLightningKey>>,
+    >,
     router: axum::Router,
     auth: String,
     front_door: konsensus_api::handlers::front_door::FrontDoorStore,
@@ -1408,6 +1410,7 @@ async fn m8_paid_payee_gets_no_peer_exchange_lightning_or_gossip() {
             &Frame::LightningInfo {
                 ln_pubkey: "02".repeat(33),
                 ln_addr: None,
+                identity_sig: vec![],
             },
         )
         .await

@@ -30,7 +30,7 @@ async fn established_chat_prices_with_a_chain_outage() {
                 ..Default::default()
             }, chain.clone()));
             let state = Arc::new(AppState { transport: transport.clone(), chain: chain.clone(), pricing, ..(*base).clone() });
-            state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
+            state.peer_ln_pubkeys.lock().await.insert(peer, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
             if let Some(price) = peer_price {
                 state.peer_prices.update(peer, std::collections::HashMap::from([("communication".to_string(), price)]), 850_000, 144, 0.0).await;
             }

@@ -112,7 +112,7 @@ async fn recovery(stored: bool) {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(a_id, "02aaaa".repeat(5));
+        .insert(a_id, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
     // The test drives X3DH and acknowledgement explicitly; no scheduler or sleep
     // decides which side has switched.
     let init = a

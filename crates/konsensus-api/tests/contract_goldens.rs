@@ -348,11 +348,10 @@ async fn call_fixture() -> (
     let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
     let mut state = common::test_state_with_lightning_and_storage(wallet, store.clone());
     let peer = common::setup_e2ee_session(&state.session_manager).await;
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer, format!("02{}", "ab".repeat(32)));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "ab".repeat(32))),
+    );
     let transport = Arc::new(common::ConnectedStubTransport::new(
         vec![peer],
         state.invoice_requests.clone(),

@@ -65,7 +65,7 @@ async fn send_with_wallet(is_room: bool, chain: Arc<dyn ChainProvider>, peer_pri
     let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], base.invoice_requests.clone()));
     let pricing = if peer_price == 0 { Arc::new(FreePricing) as Arc<dyn konsensus_core::traits::pricing::PricingEngine> } else { base.pricing.clone() };
     let state = Arc::new(AppState { transport, chain, pricing, ..(*base).clone() });
-    state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(peer, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
     // Valid for one block from height 1: expired by any real tip, still
     // within its wall-clock age, and "valid" against height 0.
     if peer_price > 0 {
@@ -408,7 +408,7 @@ async fn a_resumed_admission_with_a_kept_quote_pays_nothing_without_a_tip() {
         pricing: Arc::new(FreePricing),
         ..(*base).clone()
     });
-    state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(peer, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
     let envelope = konsensus_core::UkmEnvelopeBuilder::new(
         konsensus_core::kind::KIND_CHAT,
         *state.identity.node_id(),
@@ -462,7 +462,7 @@ async fn the_payment_path_itself_needs_a_chain_tip() {
     let stub = Arc::new(common::ConnectedStubTransport::new(vec![peer], base.invoice_requests.clone()));
     let chain = Arc::new(common::TipDownChain::down());
     let state = Arc::new(AppState { transport: stub.clone(), chain: chain.clone(), ..(*base).clone() });
-    state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(peer, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
     let error = konsensus_api::handlers::messages::create_payment_proof(&state, 2_000, &peer).await.unwrap_err();
     assert!(error.to_string().contains("the chain source has no current tip"), "{error}");
     assert_eq!(chain.reads(), 1);
@@ -561,7 +561,7 @@ async fn a_payment_refreshes_its_tip_after_waiting() {
             let chain = Arc::new(common::TipDownChain::after(good_reads));
             let state = Arc::new(AppState { transport, chain: chain.clone(), ..(*base).clone() });
             if !delay_invoice {
-                state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
+                state.peer_ln_pubkeys.lock().await.insert(peer, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
             }
             let result = konsensus_api::handlers::messages::create_payment_proof(&state, 2_000, &peer).await;
             assert_eq!(result.is_ok(), pays, "invoice={delay_invoice}, delay={seconds}: {:?}", result.as_ref().err());
@@ -593,7 +593,7 @@ async fn journal_wait(cancel_refresh: bool) {
         let chain = Arc::new(common::TipDownChain::after(usize::MAX));
         let state = Arc::new(AppState { transport, chain: chain.clone(), ..(*base).clone() });
         if keysend {
-            state.peer_ln_pubkeys.lock().await.insert(peer, "02aaaa".repeat(5));
+            state.peer_ln_pubkeys.lock().await.insert(peer, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
         }
         let gate = Arc::new(common::PeerWriteGate::default());
         *storage.outbox_dispatch_gate.lock().unwrap() = Some(gate.clone());
