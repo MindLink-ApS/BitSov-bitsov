@@ -346,7 +346,7 @@ impl App {
             transport: Arc::clone(transport) as Arc<dyn MessageTransport>,
             session_manager: Arc::clone(sessions),
             jwt_secret: JWT_SECRET.into(),
-            auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            auth_challenges: konsensus_api::AuthChallenges::new(),
             pairing: Some(pairing.0.clone()),
             cors_enabled: false,
             operator_probes_enabled: true,
@@ -678,6 +678,7 @@ impl App {
             .await;
         assert_eq!(status, StatusCode::OK, "compose: {body}");
         assert_eq!(body["delivered"], true, "{body}");
+        assert_eq!(body["accepted"], true, "{body}");
         let message = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let message = receiver.received.recv().await.unwrap();

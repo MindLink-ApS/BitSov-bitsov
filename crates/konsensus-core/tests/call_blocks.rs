@@ -9,6 +9,15 @@ fn answered() -> CallEntry {
 }
 
 #[test]
+fn closed_callee_marker_refuses_late_blocks_before_and_after_expiry() {
+    let paid = calls::receive_block(Some(answered()), 0, 1_000).unwrap();
+    let cut = CallEntry { paid_until_ms: Some(0), ..paid };
+    for entry in [cut.clone(), cut.at(71_001).unwrap()] {
+        assert_eq!(calls::receive_block(Some(entry), 1, 71_001), Err(CallRefusal::UnknownCall));
+    }
+}
+
+#[test]
 fn call_blocks_on_time_extend_fixed_boundaries_and_expose_due_time() {
     let entry = answered();
     assert!(

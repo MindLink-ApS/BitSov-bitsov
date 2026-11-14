@@ -1,8 +1,7 @@
 //! Identity endpoints — node identity information and recovery.
 
-use crate::auth::scoped::{ScopedAuth, Identity, Read};
+use crate::auth::scoped::{Identity, Read, ScopedAuth};
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::extract::State;
 use axum::routing::{get, post};
@@ -176,15 +175,7 @@ fn read_plaintext_mnemonic_zeroizing(
 /// already used, or expired. Mirrors the consumption semantics of
 /// `POST /api/v1/auth/token` so the reveal re-auth is exactly as strong.
 async fn consume_challenge(state: &AppState, challenge: &str) -> Result<(), ApiError> {
-    let now = Instant::now();
-    let mut challenges = state.auth_challenges.lock().await;
-    let expires_at = challenges.remove(challenge).ok_or_else(|| {
-        ApiError::Unauthorized("auth challenge is unknown or already used".into())
-    })?;
-    if expires_at <= now {
-        return Err(ApiError::Unauthorized("auth challenge expired".into()));
-    }
-    Ok(())
+    state.auth_challenges.consume(challenge).await
 }
 
 /// `POST /api/v1/identity/mnemonic` — reveal the node's mnemonic for backup.

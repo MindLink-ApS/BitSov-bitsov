@@ -525,6 +525,13 @@ pub struct LdkProvider {
     /// Hex payment hash of each outgoing `PaymentSuccessful`/`PaymentFailed`,
     /// fed by the same consumer; a wake-up hint for settlement polls only.
     outgoing_tx: broadcast::Sender<String>,
+    /// Unix expiry of invoices this process created. The sidecar stores a
+    /// payment-hash hex and a timestamp, so expired pending rows can be removed
+    /// without keeping the BOLT11 string.
+    invoice_expiries: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    invoice_expiry_path: Option<PathBuf>,
+    /// Re-checks the chain source's network while LDK runs.
+    network_watch: Option<Arc<NetworkWatch>>,
 }
 
 impl std::fmt::Debug for LdkProvider {
@@ -789,7 +796,7 @@ impl LdkProvider {
             .map(konsensus_chain::bearer::BearerAuth::from_file)
             .transpose()
             .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
-        let auth_transport = auth
+        let mut auth_transport = auth
             .as_ref()
             .map(|auth| {
                 konsensus_chain::bearer::BearerFailover::new(
@@ -816,14 +823,15 @@ impl LdkProvider {
             .clone()
             .map(konsensus_chain::BitcoindProvider::new)
             .transpose()
-            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
+            .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?
+            .map(|provider| Arc::new(provider.with_network(network)));
         let electrum = config
             .electrum
             .clone()
             .map(konsensus_chain::ElectrumProvider::new)
             .transpose()
             .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?
-            .map(Arc::new);
+            .map(|provider| Arc::new(provider.with_network(network)));
         if let Some(url) = &config.rgs_url {
             validate_startup_url("rgs_url", url)?;
         }
@@ -929,10 +937,33 @@ impl LdkProvider {
                 })?;
         }
 
+        // Local settings are valid. LDK is built only after its chain source
+        // has answered on the configured network.
+        let mut esplora_install = None;
+        if let Some(provider) = &bitcoind {
+            check_chain_source_network(
+                network,
+                &SourceProbe::Bitcoind(Arc::clone(provider)),
+                &config.network,
+            )
+            .await?;
+        } else if let Some(provider) = &electrum {
+            check_chain_source_network(
+                network,
+                &SourceProbe::Electrum(Arc::clone(provider)),
+                &config.network,
+            )
+            .await?;
+        } else {
+            let install = select_verified_esplora_urls(network, &mut config, auth.as_ref()).await?;
+            auth_transport = install.transport.clone();
+            esplora_install = Some(install);
+        }
+
         // Validate all local settings before the first network request. The budget
         // includes preflight; only the two Esplora fee-barrier errors are retried.
         let started = Instant::now();
-        let (node, _, baseline) = if let Some(rpc) = &config.bitcoind {
+        let (node, selected, baseline) = if let Some(rpc) = &config.bitcoind {
             let (user, password) = rpc
                 .credentials()
                 .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?;
@@ -979,9 +1010,36 @@ impl LdkProvider {
             start_esplora_with_retry(builder, &config, chosen, started, auth_transport).await?
         };
         info!(network = %config.network, chain_backend = if bitcoind.is_some() { "bitcoind" } else if electrum.is_some() { "electrum" } else { "esplora" }, "LDK embedded Lightning node started");
+        // Watch only what LDK's client uses: the authenticated failover set,
+        // or the one URL that unauthenticated startup selected.
+        let source = if let Some(provider) = &bitcoind {
+            SourceProbe::Bitcoind(Arc::clone(provider))
+        } else if let Some(provider) = &electrum {
+            SourceProbe::Electrum(Arc::clone(provider))
+        } else {
+            esplora_watch_source(
+                esplora_install.expect("esplora startup was checked"),
+                auth.as_ref(),
+                &config.esplora_url,
+                selected,
+            )?
+        };
+        let network_watch = Arc::new(NetworkWatch::new(network, source, NETWORK_RECHECK_INTERVAL));
 
         let node = Arc::new(node);
         let drainer_shutdown = Arc::new(AtomicBool::new(false));
+        let invoice_expiry_path = config.storage_dir.join("pending-invoice-expiry.tsv");
+        let invoice_expiries = match load_invoice_expiries(&invoice_expiry_path).and_then(|map| {
+            let map = reconcile_invoice_expiries(&node, map);
+            store_invoice_expiries(&invoice_expiry_path, &map)?;
+            Ok(std::sync::Mutex::new(map))
+        }) {
+            Ok(map) => map,
+            Err(error) => {
+                let _ = node.stop();
+                return Err(error);
+            }
+        };
         let scb_producer = Arc::new(ScbProducer::new(
             config.storage_dir,
             config.scb_backup_dir,
@@ -1020,7 +1078,6 @@ impl LdkProvider {
                 Arc::new(LdkJitBackend(Arc::clone(&node))),
             )
         });
-        let bitcoind = bitcoind.map(Arc::new);
         if bitcoind.is_some() || electrum.is_some() {
             let rpc = bitcoind.clone();
             let server = electrum.clone();
@@ -1080,6 +1137,9 @@ impl LdkProvider {
             drainer_shutdown,
             inbound_tx,
             outgoing_tx,
+            invoice_expiry_path: Some(invoice_expiry_path),
+            invoice_expiries,
+            network_watch: Some(network_watch),
         };
         // Reconcile durable reservations against the selected chain source on
         // startup, then retry periodically. Source failure never unlocks coins.
@@ -1129,7 +1189,50 @@ impl LdkProvider {
             drainer_shutdown: Arc::new(AtomicBool::new(true)),
             inbound_tx,
             outgoing_tx,
+            invoice_expiries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            invoice_expiry_path: None,
+            network_watch: None,
         }
+    }
+
+    fn remember_invoice_expiry(&self, hash: &str, expires_at: u64) -> Result<(), LightningError> {
+        let mut map = self
+            .invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(hash.to_string(), expires_at);
+        if let Some(path) = &self.invoice_expiry_path {
+            store_invoice_expiries(path, &map)?;
+        }
+        Ok(())
+    }
+
+    fn take_due_invoice_expiries(&self, now_unix: u64) -> Vec<String> {
+        let map = self
+            .invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.iter()
+            .filter(|(_, expires_at)| **expires_at <= now_unix)
+            .map(|(hash, _)| hash.clone())
+            .collect()
+    }
+
+    fn clear_invoice_expiry(&self, hash: &str) -> Result<(), LightningError> {
+        let mut map = self
+            .invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The wallet record is already absent or terminal. Drop its memory
+        // entry even if the durable clear fails, so repeated failed issuance
+        // cannot accumulate phantom holds. Load reconciliation removes any
+        // stale sidecar row left by that failure.
+        if map.remove(hash).is_some() {
+            if let Some(path) = &self.invoice_expiry_path {
+                store_invoice_expiries(path, &map)?;
+            }
+        }
+        Ok(())
     }
 
     fn chain_visibility(&self) -> crate::onchain::ChainVisibility {
@@ -1411,10 +1514,7 @@ impl LdkProvider {
                     "LDK: payment failed"
                 );
             }
-            ldk_node::Event::ChannelReady {
-                channel_id,
-                ..
-            } => {
+            ldk_node::Event::ChannelReady { channel_id, .. } => {
                 info!(channel_id = %channel_id, "LDK: channel ready");
             }
             ldk_node::Event::ChannelClosed {
@@ -1567,29 +1667,69 @@ impl Drop for LdkProvider {
 
 #[async_trait]
 impl LightningProvider for LdkProvider {
-    fn starter_network(&self) -> Option<String> { Some(self.node.config().network.to_string()) }
-    async fn sign_message(&self, message: &[u8]) -> Result<String, LightningError> { Ok(self.node.sign_message(message)) }
-    async fn verify_message(&self, message: &[u8], signature: &str, pubkey: &str) -> Result<bool, LightningError> {
-        let Ok(key) = pubkey.parse() else { return Ok(false); };
+    fn starter_network(&self) -> Option<String> {
+        Some(self.node.config().network.to_string())
+    }
+    async fn sign_message(&self, message: &[u8]) -> Result<String, LightningError> {
+        Ok(self.node.sign_message(message))
+    }
+    async fn verify_message(
+        &self,
+        message: &[u8],
+        signature: &str,
+        pubkey: &str,
+    ) -> Result<bool, LightningError> {
+        let Ok(key) = pubkey.parse() else {
+            return Ok(false);
+        };
         Ok(self.node.verify_signature(message, signature, &key))
     }
-    async fn connect_peer(&self, pubkey: &str, address: &str, persist: bool) -> Result<(), LightningError> {
-        let key = pubkey.parse().map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
-        let address = address.parse().map_err(|_| LightningError::PaymentNotDispatched("invalid peer address".into()))?;
+    async fn connect_peer(
+        &self,
+        pubkey: &str,
+        address: &str,
+        persist: bool,
+    ) -> Result<(), LightningError> {
+        let key = pubkey
+            .parse()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
+        let address = address
+            .parse()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid peer address".into()))?;
         let node = self.node.clone();
-        tokio::task::spawn_blocking(move || node.connect(key,address,persist)).await
+        tokio::task::spawn_blocking(move || node.connect(key, address, persist))
+            .await
             .map_err(|_| LightningError::Backend("peer worker failed".into()))?
             .map_err(|_| LightningError::Backend("peer connection failed".into()))
     }
-    async fn list_peers(&self) -> Result<Vec<konsensus_core::traits::lightning::LightningPeer>, LightningError> {
-        Ok(self.node.list_peers().into_iter().map(|p| konsensus_core::traits::lightning::LightningPeer { pubkey:p.node_id.to_string(),address:p.address.to_string(),connected:p.is_connected }).collect())
+    async fn list_peers(
+        &self,
+    ) -> Result<Vec<konsensus_core::traits::lightning::LightningPeer>, LightningError> {
+        Ok(self
+            .node
+            .list_peers()
+            .into_iter()
+            .map(|p| konsensus_core::traits::lightning::LightningPeer {
+                pubkey: p.node_id.to_string(),
+                address: p.address.to_string(),
+                connected: p.is_connected,
+            })
+            .collect())
     }
     async fn suppress_peer_address(&self, pubkey: &str) -> Result<(), LightningError> {
-        let key = pubkey.parse().map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
-        self.node.suppress_peer_address(key).map_err(|_| LightningError::PaymentNotDispatched("peer privacy persistence failed".into()))
+        let key = pubkey
+            .parse()
+            .map_err(|_| LightningError::PaymentNotDispatched("invalid peer key".into()))?;
+        self.node.suppress_peer_address(key).map_err(|_| {
+            LightningError::PaymentNotDispatched("peer privacy persistence failed".into())
+        })
     }
     async fn channel_is_ready(&self, id: &str) -> Result<bool, LightningError> {
-        Ok(self.node.list_channels().iter().any(|c| c.channel_id.to_string()==id && c.is_channel_ready))
+        Ok(self
+            .node
+            .list_channels()
+            .iter()
+            .any(|c| c.channel_id.to_string() == id && c.is_channel_ready))
     }
 
     fn channel_safety(&self) -> Option<konsensus_core::traits::lightning::ChannelSafetyStatus> {
@@ -1639,6 +1779,11 @@ impl LightningProvider for LdkProvider {
     }
 
     async fn money_ready(&self) -> bool {
+        // Never ready on a source seen on another network, or one not
+        // re-checked recently.
+        if !self.network_watch.as_ref().is_none_or(|watch| watch.poll()) {
+            return false;
+        }
         let status = self.node.status();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1748,6 +1893,18 @@ impl LightningProvider for LdkProvider {
         let payment_hash = hex::encode(AsRef::<[u8]>::as_ref(ldk_invoice.payment_hash()));
         let bolt11 = ldk_invoice.to_string();
         let created_at = ldk_invoice.duration_since_epoch().as_secs();
+        let expires_at = bolt11
+            .parse::<lightning_invoice::Bolt11Invoice>()
+            .ok()
+            .and_then(|invoice| invoice.expires_at())
+            .map(|end| end.as_secs())
+            .unwrap_or_else(|| created_at.saturating_add(u64::from(expiry_secs)));
+        if let Err(error) = self.remember_invoice_expiry(&payment_hash, expires_at) {
+            // Never publish an invoice whose expiry could not be made durable.
+            // Failed rollback remains in the in-memory map and is reconciled on restart.
+            let _ = self.forget_pending_invoice(&payment_hash).await;
+            return Err(error);
+        }
 
         Ok(Invoice {
             bolt11,
@@ -1757,6 +1914,59 @@ impl LightningProvider for LdkProvider {
             expiry_secs,
             created_at,
         })
+    }
+
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        let Ok(bytes) = hex::decode(payment_hash) else {
+            return Ok(false);
+        };
+        if bytes.len() != 32 {
+            return Ok(false);
+        }
+        let payment = self.node.list_payments().into_iter().find(|payment| {
+            payment.direction == ldk_node::payment::PaymentDirection::Inbound
+                && payment_hash_from_kind(&payment.kind)
+                    .is_some_and(|hash| hash.0.as_slice() == bytes.as_slice())
+        });
+        let Some(payment) = payment else {
+            self.clear_invoice_expiry(payment_hash)?;
+            return Ok(false);
+        };
+        if payment.status != LdkPaymentStatus::Pending {
+            self.clear_invoice_expiry(payment_hash)?;
+            return Ok(false);
+        }
+        let payment_id = payment.id;
+        let removed = self
+            .node
+            .remove_pending_inbound_payment(&payment_id)
+            .map_err(|error| {
+                LightningError::Backend(format!("LDK pending payment removal failed: {error}"))
+            })?;
+        self.clear_invoice_expiry(payment_hash)?;
+        Ok(removed)
+    }
+
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        let due = self.take_due_invoice_expiries(now_unix);
+        let mut removed = 0u32;
+        for hash in due {
+            if self.forget_pending_invoice(&hash).await? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        let map = self
+            .invoice_expiries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(map
+            .iter()
+            .map(|(hash, expires_at)| (hash.clone(), *expires_at))
+            .collect())
     }
 
     async fn create_stateless_invoice(
@@ -2496,6 +2706,332 @@ fn derive_ldk_entropy(bip39_seed: &[u8]) -> [u8; 64] {
     output
 }
 
+/// Bound on one Core or Electrum network check. A slow source counts as
+/// unreachable. Esplora endpoints are bounded one by one instead, so a slow
+/// endpoint never discards another endpoint's answer.
+const CHAIN_NETWORK_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often a running node asks its chain source for its network again.
+const NETWORK_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The embedded node's chain source, as it is asked for its network.
+#[derive(Clone)]
+pub(crate) enum SourceProbe {
+    Bitcoind(Arc<konsensus_chain::BitcoindProvider>),
+    Electrum(Arc<konsensus_chain::ElectrumProvider>),
+    /// The Esplora API URLs LDK's client actually uses. `primary` is a
+    /// primary-only authenticated transport, set only when `urls[0]` is the
+    /// authenticated primary; it never fails over, so another endpoint's
+    /// answer is never credited to the primary.
+    Esplora {
+        urls: Vec<String>,
+        primary: Option<Arc<konsensus_chain::bearer::BearerFailover>>,
+    },
+}
+
+impl SourceProbe {
+    fn service(&self) -> &'static str {
+        match self {
+            Self::Bitcoind(_) => "bitcoind",
+            Self::Electrum(_) => "electrum",
+            Self::Esplora { .. } => "esplora",
+        }
+    }
+
+    /// Ask the source now. For Esplora, any URL on another network is a
+    /// mismatch, and one URL in use answering is enough to pass.
+    async fn check(&self, network: bitcoin::Network) -> konsensus_chain::NetworkCheck {
+        async fn bounded(
+            check: impl std::future::Future<Output = konsensus_chain::NetworkCheck>,
+        ) -> konsensus_chain::NetworkCheck {
+            tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check)
+                .await
+                .unwrap_or(konsensus_chain::NetworkCheck::Unavailable)
+        }
+        match self {
+            Self::Bitcoind(provider) => bounded(provider.verify_network()).await,
+            Self::Electrum(provider) => bounded(provider.verify_network()).await,
+            // Each endpoint is bounded on its own inside the check.
+            Self::Esplora { urls, primary } => {
+                let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
+                let result = konsensus_chain::network::verify_esplora_api_urls(
+                    network,
+                    &urls,
+                    primary.as_deref(),
+                )
+                .await;
+                match result.check {
+                    konsensus_chain::NetworkCheck::Mismatch(mismatch) => {
+                        konsensus_chain::NetworkCheck::Mismatch(mismatch)
+                    }
+                    _ if result.verified.contains(&true) => konsensus_chain::NetworkCheck::Verified,
+                    _ => konsensus_chain::NetworkCheck::Unavailable,
+                }
+            }
+        }
+    }
+}
+
+/// An unverified source is unavailable: the caller retries, and LDK is not
+/// built, reads nothing and syncs nothing in the meantime.
+fn network_not_verified(network: &str, service: &str) -> LightningError {
+    LightningError::ChainSourceUnavailable {
+        network: network.into(),
+        service: service.into(),
+        attempts: 1,
+        elapsed_ms: 0,
+        cause: "chain source has not yet answered on the configured network".into(),
+    }
+}
+
+/// Start only on a source verified on the configured network. Another
+/// network refuses the start; no answer is unavailable (retry, not ready).
+async fn check_chain_source_network(
+    network: bitcoin::Network,
+    source: &SourceProbe,
+    configured: &str,
+) -> Result<(), LightningError> {
+    use konsensus_chain::NetworkCheck;
+    match source.check(network).await {
+        NetworkCheck::Verified => {
+            info!(network = %configured, "chain source network verified");
+            Ok(())
+        }
+        NetworkCheck::Mismatch(mismatch) => {
+            Err(LightningError::InvalidStartupConfig(mismatch.to_string()))
+        }
+        NetworkCheck::Unavailable | NetworkCheck::NotConfigured => {
+            warn!(network = %configured, "chain source network not verified yet; not starting LDK");
+            Err(network_not_verified(configured, source.service()))
+        }
+    }
+}
+
+/// LDK's Esplora endpoints for one start, each verified on the configured
+/// network.
+pub(crate) struct EsploraInstall {
+    /// Authenticated failover over verified endpoints only, when credentials
+    /// are configured.
+    transport: Option<Arc<konsensus_chain::bearer::BearerFailover>>,
+    /// Verified URLs the transport may use, primary first when in use.
+    urls: Vec<String>,
+    /// The authenticated primary is among `urls`.
+    primary_in_use: bool,
+}
+
+/// Check LDK's Esplora URLs and keep only verified ones for this start. Any
+/// URL on another network refuses the start. A primary that does not answer
+/// is replaced by a verified fallback, as an unreachable primary already is.
+/// With credentials, requests keep the primary's URL as their routing prefix
+/// but go only to the verified fallback, without credentials; the primary
+/// is not used and no token is requested.
+async fn select_verified_esplora_urls(
+    network: bitcoin::Network,
+    config: &mut LdkConfig,
+    auth: Option<&Arc<konsensus_chain::bearer::BearerAuth>>,
+) -> Result<EsploraInstall, LightningError> {
+    use konsensus_chain::bearer::BearerFailover;
+    use konsensus_chain::NetworkCheck;
+    let config_error = |e: konsensus_chain::bearer::CredentialsError| {
+        LightningError::InvalidStartupConfig(e.to_string())
+    };
+    let primary_transport = auth
+        .map(|auth| BearerFailover::new(auth.clone(), &config.esplora_url, Vec::new()))
+        .transpose()
+        .map_err(config_error)?;
+    let mut urls = vec![config.esplora_url.as_str()];
+    urls.extend(config.esplora_url_fallback.as_deref());
+    // Bounded per endpoint, so an endpoint that answered keeps its answer
+    // while another one is slow or silent.
+    let result = konsensus_chain::network::verify_esplora_api_urls(
+        network,
+        &urls,
+        primary_transport.as_deref(),
+    )
+    .await;
+    let unavailable = || network_not_verified(&config.network, "esplora");
+    if let NetworkCheck::Mismatch(mismatch) = result.check {
+        return Err(LightningError::InvalidStartupConfig(mismatch.to_string()));
+    }
+    let primary = config.esplora_url.clone();
+    let install = match result.verified.as_slice() {
+        [true] | [true, true] => EsploraInstall {
+            transport: auth
+                .map(|auth| {
+                    BearerFailover::new(
+                        auth.clone(),
+                        &primary,
+                        config.esplora_url_fallback.iter().cloned().collect(),
+                    )
+                })
+                .transpose()
+                .map_err(config_error)?,
+            urls: std::iter::once(primary)
+                .chain(config.esplora_url_fallback.clone())
+                .collect(),
+            primary_in_use: auth.is_some(),
+        },
+        [true, false] => {
+            warn!(
+                "esplora fallback has not answered on the configured network; starting without it"
+            );
+            config.esplora_url_fallback = None;
+            EsploraInstall {
+                transport: auth
+                    .map(|auth| BearerFailover::new(auth.clone(), &primary, Vec::new()))
+                    .transpose()
+                    .map_err(config_error)?,
+                urls: vec![primary],
+                primary_in_use: auth.is_some(),
+            }
+        }
+        [false, true] => {
+            warn!("esplora primary has not answered on the configured network; starting on the fallback");
+            let fallback = config
+                .esplora_url_fallback
+                .clone()
+                .expect("a second URL is the fallback");
+            match auth {
+                Some(auth) => EsploraInstall {
+                    transport: Some(
+                        BearerFailover::fallbacks_only(
+                            auth.clone(),
+                            &primary,
+                            vec![fallback.clone()],
+                        )
+                        .map_err(config_error)?,
+                    ),
+                    urls: vec![fallback],
+                    primary_in_use: false,
+                },
+                None => {
+                    config.esplora_url = fallback.clone();
+                    config.esplora_url_fallback = None;
+                    EsploraInstall {
+                        transport: None,
+                        urls: vec![fallback],
+                        primary_in_use: false,
+                    }
+                }
+            }
+        }
+        _ => {
+            warn!(network = %config.network, "chain source network not verified yet; not starting LDK");
+            return Err(unavailable());
+        }
+    };
+    info!(network = %config.network, "chain source network verified");
+    Ok(install)
+}
+
+/// What the running watch asks: exactly the endpoints LDK's client uses.
+/// With credentials, that is the verified failover set, the primary asked
+/// only through a primary-only transport. Without, it is the one URL that
+/// startup selected (`selected`), not the other configured endpoint.
+pub(crate) fn esplora_watch_source(
+    install: EsploraInstall,
+    auth: Option<&Arc<konsensus_chain::bearer::BearerAuth>>,
+    primary_url: &str,
+    selected: String,
+) -> Result<SourceProbe, LightningError> {
+    Ok(match (auth, install.transport.is_some()) {
+        (Some(auth), true) => SourceProbe::Esplora {
+            primary: install
+                .primary_in_use
+                .then(|| {
+                    konsensus_chain::bearer::BearerFailover::new(
+                        auth.clone(),
+                        primary_url,
+                        Vec::new(),
+                    )
+                })
+                .transpose()
+                .map_err(|e| LightningError::InvalidStartupConfig(e.to_string()))?,
+            urls: install.urls,
+        },
+        _ => SourceProbe::Esplora {
+            urls: vec![selected],
+            primary: None,
+        },
+    })
+}
+
+/// Re-checks a running node's chain source. A source seen on another
+/// network is refused for good; one not verified for three intervals keeps
+/// money not ready until it answers again.
+pub(crate) struct NetworkWatch {
+    network: bitcoin::Network,
+    source: SourceProbe,
+    interval: Duration,
+    last_asked: std::sync::Mutex<Instant>,
+    last_verified: std::sync::Mutex<Instant>,
+    running: AtomicBool,
+    refused: AtomicBool,
+}
+
+impl NetworkWatch {
+    /// Built right after a successful check.
+    pub(crate) fn new(network: bitcoin::Network, source: SourceProbe, interval: Duration) -> Self {
+        Self {
+            network,
+            source,
+            interval,
+            last_asked: std::sync::Mutex::new(Instant::now()),
+            last_verified: std::sync::Mutex::new(Instant::now()),
+            running: AtomicBool::new(false),
+            refused: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether money may be ready; starts a re-check when one is due.
+    pub(crate) fn poll(self: &Arc<Self>) -> bool {
+        if self.refused.load(Ordering::Acquire) {
+            return false;
+        }
+        let due = self
+            .last_asked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
+            >= self.interval;
+        if due && !self.running.swap(true, Ordering::AcqRel) {
+            let watch = Arc::clone(self);
+            tokio::spawn(async move {
+                let check = watch.source.check(watch.network).await;
+                let now = Instant::now();
+                *watch
+                    .last_asked
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = now;
+                match check {
+                    konsensus_chain::NetworkCheck::Verified => {
+                        *watch
+                            .last_verified
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = now;
+                    }
+                    konsensus_chain::NetworkCheck::Mismatch(mismatch) => {
+                        error!("{mismatch}");
+                        watch.refused.store(true, Ordering::Release);
+                    }
+                    _ => {}
+                }
+                watch.running.store(false, Ordering::Release);
+            });
+        }
+        self.last_verified
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
+            < self.interval.saturating_mul(3)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refused(&self) -> bool {
+        self.refused.load(Ordering::Acquire)
+    }
+}
+
 /// Parse a network string into a bitcoin::Network.
 fn parse_network(network: &str) -> Result<bitcoin::Network, LightningError> {
     match network.to_lowercase().as_str() {
@@ -2507,6 +3043,112 @@ fn parse_network(network: &str) -> Result<bitcoin::Network, LightningError> {
             "unknown network: {other}"
         ))),
     }
+}
+
+fn load_invoice_expiries(
+    path: &std::path::Path,
+) -> Result<std::collections::HashMap<String, u64>, LightningError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(LightningError::Backend(format!(
+                "invoice expiry read failed: {error}"
+            )))
+        }
+    };
+    let mut map = std::collections::HashMap::new();
+    // Both legacy and atomic writers terminate every record with a newline.
+    // A crash may truncate inside the decimal expiry; that is still a valid
+    // integer, but is not a committed record and must use orphan recovery.
+    for line in text
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+    {
+        let mut parts = line.split_whitespace();
+        let (Some(hash), Some(expires_at)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if hash.len() == 64
+            && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && parts.next().is_none()
+        {
+            if let Ok(expires_at) = expires_at.parse::<u64>() {
+                map.insert(hash.to_string(), expires_at);
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Deadline of a pending invoice with no usable sidecar row. LDK does not keep
+/// a BOLT11's expiry, and nothing proves such an invoice is a short-lived
+/// service invoice (an owner invoice may run for days), so it is never guessed.
+pub(crate) const UNKNOWN_INVOICE_EXPIRY: u64 = u64::MAX;
+
+fn migrate_service_invoice_expiry(recorded: Option<u64>, _updated_at: u64) -> u64 {
+    recorded.unwrap_or(UNKNOWN_INVOICE_EXPIRY)
+}
+
+/// Repair the sidecar against durable wallet state.
+/// A saved deadline is kept. A missing one is recorded as unknown, which no
+/// sweep ever treats as expired.
+fn reconcile_invoice_expiries(
+    node: &ldk_node::Node,
+    mut recorded: std::collections::HashMap<String, u64>,
+) -> std::collections::HashMap<String, u64> {
+    node.list_payments()
+        .into_iter()
+        .filter_map(|payment| {
+            if payment.direction != ldk_node::payment::PaymentDirection::Inbound
+                || payment.status != LdkPaymentStatus::Pending
+            {
+                return None;
+            }
+            let hash = match &payment.kind {
+                LdkPaymentKind::Bolt11 { hash, .. } => hex::encode(hash.0),
+                LdkPaymentKind::Bolt11Jit { hash, .. } => {
+                    recorded.remove(&hex::encode(hash.0));
+                    return None;
+                }
+                _ => return None,
+            };
+            let expires_at = migrate_service_invoice_expiry(
+                recorded.remove(&hash),
+                payment.latest_update_timestamp,
+            );
+            Some((hash, expires_at))
+        })
+        .collect()
+}
+
+fn store_invoice_expiries(
+    path: &std::path::Path,
+    map: &std::collections::HashMap<String, u64>,
+) -> Result<(), LightningError> {
+    use std::io::Write;
+    let write = || -> std::io::Result<()> {
+        let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let temporary = path.with_extension("tmp");
+        // The provider's map mutex serializes writers. A leftover regular temp
+        // file from an interrupted write is safely replaced on the next attempt.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)?;
+        for (hash, expires_at) in map {
+            writeln!(file, "{hash} {expires_at}")?;
+        }
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    };
+    write().map_err(|error| {
+        LightningError::Backend(format!("invoice expiry persistence failed: {error}"))
+    })
 }
 
 /// Extract payment hash from an LDK PaymentKind.
