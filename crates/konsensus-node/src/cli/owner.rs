@@ -276,6 +276,22 @@ pub fn terminal_safe(text: &str) -> String {
         .collect()
 }
 
+/// Preserve JSON values while escaping terminal-sensitive Unicode.
+fn terminal_json(value: &serde_json::Value) -> Result<String, serde_json::Error> {
+    Ok(serde_json::to_string(value)?
+        .chars()
+        .map(|c| {
+            let invisible = matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}');
+            if c.is_control() || invisible {
+                format!("\\u{:04x}", u32::from(c))
+            } else {
+                c.to_string()
+            }
+        })
+        .collect())
+}
+
 /// `println!` for lines that carry control-socket text: the whole line goes
 /// through [`terminal_safe`].
 macro_rules! safe_println {
@@ -290,6 +306,9 @@ fn report(resp: ControlResponse) -> Result<()> {
             Ok(())
         }
         ControlResponse::Error { message } => {
+            if message.starts_with("node_stopping:") {
+                anyhow::bail!("{}", terminal_safe(&message));
+            }
             if message
                 .split_once(':')
                 .is_some_and(|(code, _)| code == control::MALFORMED_CONTROL_REQUEST)
@@ -311,7 +330,7 @@ fn report(resp: ControlResponse) -> Result<()> {
 pub async fn cmd_lock_status(config_path: &Path) -> Result<()> {
     match send(config_path, ControlRequest::LockStatus {}).await? {
         ControlResponse::LockStatus { status } => {
-            println!("{}", serde_json::to_string(&status)?);
+            println!("{}", terminal_json(&status)?);
             Ok(())
         }
         error @ ControlResponse::Error { .. } => report(error),
