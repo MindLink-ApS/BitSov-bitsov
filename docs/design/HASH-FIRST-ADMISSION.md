@@ -25,7 +25,7 @@ Legacy and rc23 connections retain today's behaviour under §7's transition deci
 - Complete authenticated Hello/HelloAck using the existing framing, then pin the mutually supported mode for the connection from that exchange. The mode is never inferred from a subsequent record's length or content.
 - A connection in this mode never falls back to legacy framing or the old paid-message path. Unknown versions fail closed under §3.
 - During the transition, a node may accept old-style paid messages from peers that did not advertise the capability. The stronger claim applies only to connections in the new mode, never to the node as a whole.
-- Any legacy retry permitted by the transition policy requires a separate connection negotiated in legacy mode; it is not a fallback within a new-mode connection.
+- Any legacy retry permitted by the transition policy requires a separate connection negotiated in legacy mode, opened by the sender with a Hello that omits the capability (§4); it is not a fallback within a new-mode connection.
 
 ## 3. Rule A: common fixed-size first record
 
@@ -122,7 +122,12 @@ For a payment hash on the receiver's own ledger:
 
 - **Eligibility, existing checks:** what the gate's settlement verification already enforces today: settlement, direction, payment hash, amounts, preimage, exclusion of channel-funding payments, and the recipient. **Proposed additions** (not enforced today; each needs its own implementation and tests): a purpose tag and an expiry window per payment. A cached `PriceTable` offer is never proof of payment.
 - **Reservation is atomic**, done in the same step as the eligibility check, so two connections racing with the same hash admit at most one message.
-- **Binding:** knowing a hash is not authority. Keying a reservation on the connection's key alone does not prove who paid. The contract therefore needs a **durable hash-to-payer binding** recorded when the payment settles (from what the payer committed to before paying). A reservation succeeds only when the authenticated static key of the Noise session matches that binding. A hash with no recorded binding is refused in hash-first mode, and the payer uses the legacy path during the transition. If B presents A's unused hash first, it is refused, and A's admission still succeeds afterwards, including across a restart.
+- **Binding:** knowing a hash is not authority. Keying a reservation on the connection's key alone does not prove who paid. The contract therefore needs a **durable hash-to-payer binding** recorded when the payment settles (from what the payer committed to before paying). A reservation succeeds only when the authenticated static key of the Noise session matches that binding. A hash with no recorded binding is refused in hash-first mode with the distinct result `unbound_hash`. The receiver reads no body, closes the connection and leaves the hash `settled-unused`, so the payment is not consumed. Two peers that both advertise the capability always pin hash-first on a connection (§2), so that connection cannot fall back. Instead the contract defines:
+  - **Prevention:** a sender pays a peer it reaches in hash-first mode only by a method that records the binding before the payment settles. Keysend records none today, so it is not used for such a peer until it does; compose takes the binding-recording path instead.
+  - **Recovery during the transition:** after `unbound_hash`, the sender may open a separate connection whose Hello omits the capability. That connection is negotiated in legacy mode, and the same hash may be admitted there through the old path, under §7 item 1.
+  - **After the transition:** the legacy path is closed and `unbound_hash` is final. What happens to such a settled payment is §7 item 7.
+
+  If B presents A's unused hash first, it is refused, and A's admission still succeeds afterwards, including across a restart.
 - **Acceptance boundary:** the transition to `consumed` and the durable acceptance of the envelope happen in **one storage transaction**, after the envelope passes the existing gate checks (signature, freshness, nonce) and before any acknowledgement is sent. The recovery outcomes are:
   - crash before that transaction: the hash returns to `settled-unused` and the envelope was never accepted;
   - crash after it: the envelope is accepted and the hash is consumed;
@@ -171,6 +176,7 @@ Record exact heads, build flags and benchmark environment with every result.
 4. Whether to ship Level A first with the weaker claim, or go straight to Level B.
 5. Exact finite caps for each control kind, set from benchmarks and published in the implementation PR as required by §3.3.
 6. The list of frame kinds carried in the new mode, starting from §3.5's proposed coverage and preserving decoder separation.
+7. Unbound payments: whether keysend records a hash-to-payer binding before the transition ends, so it stays usable in hash-first mode, and what happens to a settled payment refused as `unbound_hash` once the legacy path is closed.
 
 ## 8. What this does not change
 
