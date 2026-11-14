@@ -548,8 +548,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                                 &purpose,
                                 privileged,
                                 storage.as_ref(),
+                                pricing.as_ref(),
                                 &session_manager,
                                 lightning.as_ref(),
+                                min_admission_cost_msat,
                                 &transport,
                                 source_ip,
                                 &mut last_admission_refusal,
@@ -1877,6 +1879,12 @@ async fn handle_price_query(
                     return;
                 }
             };
+            // A minute quote is the current payable tariff, without a trust discount.
+            let price_msat = if kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                konsensus_core::gate::price_with_floor_msat(price_msat, min_admission_cost_msat)
+            } else {
+                price_msat
+            };
             let frame = Frame::PriceResponse {
                 kind,
                 price_msat,
@@ -2986,8 +2994,10 @@ async fn handle_call_block_invoice_requested(
     purpose: &str,
     privileged: bool,
     storage: &dyn konsensus_storage::Storage,
+    pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
     session_manager: &SessionManager,
     lightning: &dyn LightningProvider,
+    min_admission_cost_msat: u64,
     transport: &Arc<NoiseTransport>,
     source_ip: std::net::IpAddr,
     refusals: &mut crate::invoice_refusals::RefusalLimits,
@@ -3007,12 +3017,14 @@ async fn handle_call_block_invoice_requested(
     }
     match prepare_call_block_invoice(
         storage,
+        pricing,
         session_manager,
         peer_id,
         purpose,
         amount_msat,
         request_id,
         lightning,
+        min_admission_cost_msat,
         invoices,
     )
     .await
@@ -3047,12 +3059,14 @@ async fn handle_call_block_invoice_requested(
 #[allow(clippy::too_many_arguments)]
 async fn prepare_call_block_invoice(
     storage: &dyn konsensus_storage::Storage,
+    pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
     session_manager: &SessionManager,
     peer: &NodeId,
     purpose: &str,
     amount_msat: u64,
     request_id: &str,
     lightning: &dyn LightningProvider,
+    min_admission_cost_msat: u64,
     invoices: &mut crate::peer_invoices::PeerInvoiceBook,
 ) -> Result<konsensus_core::traits::lightning::Invoice, &'static str> {
     const REFUSED: &str = konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE;
@@ -3103,6 +3117,18 @@ async fn prepare_call_block_invoice(
         )
     };
     validate().await?;
+    // A delivery quote may honour an earlier settled payment, but cannot
+    // authorize a new minute invoice at an old (or caller-selected) price.
+    // Checked before the binding cap and the invoice book, so a stale price uses no quota.
+    let current_price = pricing
+        .get_price_msat(konsensus_core::kind::KIND_CALL_BLOCK)
+        .await
+        .map_err(|_| REFUSED)?;
+    let current_price =
+        konsensus_core::gate::price_with_floor_msat(current_price, min_admission_cost_msat);
+    if amount_msat != current_price {
+        return Err(konsensus_api::invoice_refusal::CALL_PRICE_CHANGED);
+    }
     // The binding cap is what stops a repeat from filling the wallet. Check it
     // before create_invoice: recording the hash afterwards cannot un-mint one.
     let outstanding = storage

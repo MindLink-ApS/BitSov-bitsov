@@ -119,7 +119,7 @@ async fn answer_block_price_query(
 // SQLx must progress on another worker while the invoice responder records
 // the callee's binding. The wallet supports keysend, as a real LN peer does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
+async fn known_ln_peer_call_block_uses_undiscounted_bound_invoice_and_is_admitted() {
     use axum::{body::Body, http::Request};
     use konsensus_core::traits::lightning::LightningProvider;
     use konsensus_lightning::MockLightningProvider;
@@ -174,6 +174,10 @@ async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
     ).unwrap()), 401, None, now).unwrap();
     callee_store.call_put(&caller_id, ID, &rules::CallEntry { side: rules::Side::Callee, ..caller.clone() }).await.unwrap();
     state.storage.call_put(&peer, ID, &caller).await.unwrap();
+    // A prior price table's trust discount must not alter the fresh minute tariff.
+    state.peer_prices.update(peer, std::collections::HashMap::from([
+        ("kind:404".into(), 23_000),
+    ]), 850_000, 0, 0.25).await;
     let plaintext = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
     let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
         .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
@@ -201,6 +205,68 @@ async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
     calls::prepare_incoming_block(callee_store.as_ref(), &caller_id, Some(&plaintext), hash)
         .await.unwrap().commit(&konsensus_core::MessageId::from_bytes([0; 32])).await.unwrap();
     assert!(calls::call_media_admitted(callee_store.as_ref(), &caller_id, ID, now + 1).await);
+}
+
+#[tokio::test]
+async fn owner_call_block_price_refusal_ends_the_call_without_payment_or_retry() {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use konsensus_core::traits::lightning::LightningProvider;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let balance = wallet.get_balance_msat().await.unwrap();
+    let mut state = common::test_state_with_lightning(wallet.clone());
+    let (_, identity) = konsensus_core::NodeIdentity::generate().unwrap();
+    let peer = *identity.node_id();
+    let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
+    state.session_manager.initiate_session(&peer, &target.prekey_bundle().await).await.unwrap();
+    let requests = state.invoice_requests.clone();
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], requests.clone())
+        .with_invoice_responder(move |id, _| {
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                if let Some(tx) = requests.lock().await.remove(&id) {
+                    let _ = tx.send(Err(konsensus_api::state::InvoiceResponseError {
+                        recipient: peer, reason: "konsensus:call_price_changed".into(),
+                    }));
+                }
+            });
+            None
+        }));
+    let mutable = Arc::get_mut(&mut state).unwrap();
+    mutable.transport = transport.clone();
+    mutable.storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let caller = rules::receive(Some(rules::commit(
+        rules::reserve(None, 400, "offer", "hash", now).unwrap(), "offer", now,
+    ).unwrap()), 401, None, now).unwrap();
+    state.storage.call_put(&peer, ID, &caller).await.unwrap();
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"operation_id":operation_id,"recipient":peer.to_hex(),
+            "kind":404,"plaintext":format!(r#"{{"call_id":"{ID}","seq":0}}"#),"wait_ack_ms":0}).to_string())).unwrap();
+    let (response, ()) = tokio::join!(common::test_router(state.clone()).oneshot(request),
+        answer_block_price_query(&state, &transport, peer));
+    let response = response.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "call_price_changed", "{body}");
+    assert_eq!(body["retry_allowed"], false, "{body}");
+    let entry = state.storage.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(entry.phase, Phase::Ended);
+    assert_eq!(entry.end_reason, Some(HangupReason::Failed));
+    assert!(entry.pending.is_none());
+    let op = state.storage.get_outbox_operation(&operation_id).await.unwrap().unwrap();
+    assert_eq!(op.settled_msat, 0);
+    assert!(op.payment_hash.is_none());
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+    assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
+    assert!(transport.sent_envelopes.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
