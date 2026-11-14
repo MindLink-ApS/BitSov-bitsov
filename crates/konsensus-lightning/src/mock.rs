@@ -162,9 +162,9 @@ impl MockLightningProvider {
 
     /// Generate a random preimage and its SHA256 hash.
     fn generate_proof() -> ([u8; 32], [u8; 32]) {
-        use rand::RngCore;
+        use rand::Rng;
         let mut preimage = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut preimage);
+        rand::rng().fill_bytes(&mut preimage);
         let hash: [u8; 32] = Sha256::digest(preimage).into();
         (preimage, hash)
     }

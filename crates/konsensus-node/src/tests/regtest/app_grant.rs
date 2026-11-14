@@ -132,7 +132,7 @@ async fn approve(app: &mut app::App, root: &OwnerApprovalKey, requested_max: u64
 async fn pair(minutes: u16, caller_max: u64) -> paid_call::Pair {
     let roots = [(); 2].map(|_| {
         let mut seed = [0; 64];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         OwnerApprovalKey::from_seed(&seed, &[9; 32]).unwrap()
     });
     let calls = |block_msat| app::CallOptions {

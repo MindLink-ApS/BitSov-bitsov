@@ -123,10 +123,10 @@ fn ratchet_skip_limit_enforced() {
 
 #[test]
 fn x3dh_ephemeral_key_is_unique_per_initiation() {
-    let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_public = PublicKey::from(&alice_secret);
 
-    let bob_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let bob_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let bob_signing = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let bob_public = PublicKey::from(&bob_secret);
     let spk = SignedPreKey::generate();
@@ -153,10 +153,10 @@ fn x3dh_ephemeral_key_is_unique_per_initiation() {
 
 #[test]
 fn x3dh_tampered_signed_prekey_rejected() {
-    let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_public = PublicKey::from(&alice_secret);
 
-    let bob_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let bob_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let bob_signing = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
     let bob_public = PublicKey::from(&bob_secret);
     let spk = SignedPreKey::generate();
@@ -182,17 +182,17 @@ fn x3dh_tampered_signed_prekey_rejected() {
 fn x3dh_man_in_the_middle_detected() {
     // If an attacker substitutes their own identity key, the shared secret
     // won't match, preventing MITM attacks.
-    let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_public = PublicKey::from(&alice_secret);
 
-    let bob_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let bob_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let bob_signing = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
 
     let spk = SignedPreKey::generate();
     let sig = bob_signing.sign(spk.public.as_bytes());
 
     // Attacker creates their own identity key
-    let attacker_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let attacker_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let attacker_public = PublicKey::from(&attacker_secret);
 
     let bundle = PrekeyBundle {

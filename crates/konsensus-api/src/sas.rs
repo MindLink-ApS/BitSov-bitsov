@@ -1,5 +1,5 @@
 //! SAS v1: fixed-length binary transcript, never a mnemonic recovery phrase.
-use rand::RngCore;
+use rand::TryRng;
 use std::{
     fmt,
     io::{self, Read, Write},
@@ -73,7 +73,9 @@ pub fn initialize(dir: &Path) -> io::Result<(ClaimCode, bool)> {
     }
     let mut code = Zeroizing::new([0; 18]);
     let mut random = Zeroizing::new([0u8; 16]);
-    rand::rngs::OsRng.fill_bytes(random.as_mut());
+    rand::rngs::SysRng
+        .try_fill_bytes(random.as_mut())
+        .expect("OS randomness unavailable");
     for (out, byte) in code.iter_mut().zip(random.iter()) {
         *out = ALPHABET[(byte & 31) as usize];
     }

@@ -25,7 +25,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce as AesNonce,
 };
 use async_trait::async_trait;
-use rand::RngCore;
+use rand::Rng;
 
 use crate::error::StorageError;
 
@@ -854,7 +854,7 @@ impl<S: RecoveryStore> EncryptedRecoveryStore<S> {
 
     fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, StorageError> {
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = AesNonce::from_slice(&nonce_bytes);
 
         let encrypted = self

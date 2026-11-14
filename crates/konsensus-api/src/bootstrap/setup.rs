@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rand::RngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -260,7 +260,9 @@ async fn read_body(request: Request, next: Next) -> Response {
 }
 fn random() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS randomness unavailable");
     hex::encode(bytes)
 }
 fn escape(text: &str) -> String {

@@ -160,11 +160,11 @@ impl Drop for SenderKeyState {
 impl SenderKeyState {
     /// Generate a new sender key state with random keys.
     pub fn generate() -> Self {
-        use rand::RngCore;
+        use rand::Rng;
         let mut chain_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut chain_key);
+        rand::rng().fill_bytes(&mut chain_key);
 
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut aes_gcm::aead::OsRng);
 
         Self {
             chain_key,
@@ -190,12 +190,12 @@ impl SenderKeyState {
     /// Called when a member is removed from the group. The old chain key is
     /// discarded — the removed member cannot derive future message keys.
     pub fn rotate(&mut self) {
-        use rand::RngCore;
+        use rand::Rng;
         let mut chain_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut chain_key);
+        rand::rng().fill_bytes(&mut chain_key);
 
         self.chain_key = chain_key;
-        self.signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        self.signing_key = ed25519_dalek::SigningKey::generate(&mut aes_gcm::aead::OsRng);
         self.message_count = 0;
         self.generation += 1;
     }

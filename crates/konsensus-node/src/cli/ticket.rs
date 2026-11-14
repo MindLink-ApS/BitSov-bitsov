@@ -7,7 +7,7 @@ use konsensus_api::{
     pairing::{fsync_dir_strict, load_box_transport_key, restrict_dir, write_protected},
     remote_access::{PairLink, PAIR_LINK_VERSION},
 };
-use rand::RngCore;
+use rand::Rng;
 
 use crate::{config::NodeConfig, owner_cmd::data_dir_of};
 
@@ -61,7 +61,7 @@ pub fn lock_ticket(dir: &Path) -> Result<File> {
 
 pub fn new_code() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 

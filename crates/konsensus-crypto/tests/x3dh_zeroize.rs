@@ -50,10 +50,10 @@ fn make_bob_bundle(
 
 #[test]
 fn x3dh_zeroize_round_trip_with_opk() {
-    let alice_identity_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_identity_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_identity_public = PublicKey::from(&alice_identity_secret);
 
-    let bob_identity_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let bob_identity_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let bob_identity_public = PublicKey::from(&bob_identity_secret);
     let bob_signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
 
@@ -80,10 +80,10 @@ fn x3dh_zeroize_round_trip_with_opk() {
 
 #[test]
 fn x3dh_zeroize_round_trip_without_opk() {
-    let alice_identity_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_identity_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_identity_public = PublicKey::from(&alice_identity_secret);
 
-    let bob_identity_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let bob_identity_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let bob_identity_public = PublicKey::from(&bob_identity_secret);
     let bob_signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
 

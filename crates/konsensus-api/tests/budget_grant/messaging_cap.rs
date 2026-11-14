@@ -42,7 +42,7 @@ impl Renewal {
     /// Sign and apply a new envelope for the peer at `per_act_max_msat`.
     pub(super) fn renew(&self, per_act_max_msat: u64) {
         let mut nonce = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce);
         let intent = pairing::RelationIntent {
             device_key_id: self.key_id.clone(),
             peer: self.peer.clone(),

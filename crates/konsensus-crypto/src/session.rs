@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::record_cipher::{RecordCipher, LegacyReadPolicy, SESSION_KEY_CONTEXT};
 use async_trait::async_trait;
 use ed25519_dalek::Signer;
-use rand::RngCore;
+use rand::Rng;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -302,7 +302,7 @@ impl SessionManager {
         let session_cipher = Self::derive_session_cipher(&identity);
 
         // Half the id space stays above the base, far more than a boot can use.
-        let base = rand::thread_rng().next_u32() / 2;
+        let base = rand::rng().next_u32() / 2;
         let otpks = (base..base + 10).map(OneTimePreKey::generate).collect();
 
         Self {

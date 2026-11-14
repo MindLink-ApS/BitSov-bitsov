@@ -11,7 +11,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use rand::RngCore;
+use rand::TryRng;
 use reqwest::{header::HeaderValue, Client, Url};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::json;
@@ -681,7 +681,7 @@ impl LightningProvider for ClnProvider {
         expiry_secs: u32,
     ) -> Result<Invoice, LightningError> {
         let mut random = [0u8; 16];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut random)
             .map_err(|_| error("CLN invoice label generation failed"))?;
         let label = format!("bitsov:{}", hex::encode(random));
