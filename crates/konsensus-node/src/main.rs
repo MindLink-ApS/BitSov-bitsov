@@ -144,9 +144,10 @@ async fn main() -> Result<()> {
             tier,
             encrypt,
             password_fd,
+            network,
         } => {
             let password = password_fd.map(password::read_password_fd).transpose()?;
-            cmd_init(&dir, non_interactive, tier.as_deref(), encrypt, password)?;
+            cmd_init(&dir, non_interactive, tier.as_deref(), encrypt, password, &network)?;
         }
         Command::Start {
             config,
@@ -307,8 +308,9 @@ async fn main() -> Result<()> {
             mnemonic,
             tier,
             encrypt,
+            network,
         } => {
-            cmd_restore(&dir, mnemonic.as_deref(), tier.as_deref(), encrypt)?;
+            cmd_restore(&dir, mnemonic.as_deref(), tier.as_deref(), encrypt, &network)?;
         }
         Command::NodeId {
             mnemonic,
@@ -466,7 +468,10 @@ fn cmd_init(
     tier_arg: Option<&str>,
     encrypt: Option<Option<String>>,
     password: Option<Zeroizing<String>>,
+    network: &str,
 ) -> Result<()> {
+    // Before any prompt or file: an unknown network writes nothing.
+    ensure_init_network(network)?;
     let password = mnemonic_encryption_password(encrypt, password, non_interactive)?;
     use crate::config::NodeTier;
 
@@ -529,8 +534,9 @@ fn cmd_init(
     .with_context(|| format!("failed to write mnemonic to {}", mnemonic_path.display()))?;
     drop(password); // Last use: do not retain the password during config I/O.
 
-    // Generate tier-specific config
-    let config = NodeConfig::default_for_tier(tier, final_mnemonic_path.clone(), dir);
+    // Generate tier-specific config on the chosen network
+    let config =
+        NodeConfig::default_for_tier_on_network(tier, network, final_mnemonic_path.clone(), dir)?;
     config
         .save(&config_path)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
@@ -584,13 +590,41 @@ fn cmd_init(
         }
     }
     print_network_notice(&config);
+    println!();
+    println!("{}", network_line(&config));
 
     Ok(())
 }
 
+/// `--network` for `init` and `restore`: one of [`config::INIT_NETWORKS`].
+fn ensure_init_network(network: &str) -> Result<()> {
+    anyhow::ensure!(
+        config::INIT_NETWORKS.contains(&network),
+        "unknown network '{network}'. Valid options: {}",
+        config::INIT_NETWORKS.join(", ")
+    );
+    Ok(())
+}
+
+/// The last line `init` and `restore` print: the network the written config
+/// pays on. Mock backends are regtest whatever `--network` says.
+fn network_line(config: &NodeConfig) -> String {
+    let network = match &config.lightning {
+        LightningConfig::Mock { .. } | LightningConfig::SharedMock { .. } => {
+            "regtest (mock Lightning and chain; --network applies to the full tier)".to_string()
+        }
+        lightning => match lightning.chain_source_network() {
+            Some(network) => konsensus_chain::network::network_name(network).to_string(),
+            None => "not set by this Lightning backend".to_string(),
+        },
+    };
+    format!("Network:    {network}")
+}
+
 /// Lines naming the Bitcoin network a freshly written config pays on, when that
-/// is mainnet. `init` and `restore` write `network = "bitcoin"` today, while this
-/// beta supports signet only, so the owner is told before the first start.
+/// is mainnet. `init` and `restore` write it only with `--network bitcoin`,
+/// while this beta supports signet only, so the owner is told before the first
+/// start that `start` will refuse it.
 fn network_notice(config: &NodeConfig) -> Vec<String> {
     if config.lightning.bitcoin_network().as_deref() != Some("bitcoin") {
         return Vec::new();
@@ -599,7 +633,11 @@ fn network_notice(config: &NodeConfig) -> Vec<String> {
         "NOTE: This config uses the Bitcoin mainnet ([lightning] network = \"bitcoin\").".into(),
         "      Mainnet is not supported in this beta. Before the first start, switch".into(),
         "      [lightning] network and the [lightning] and [chain] server URLs to signet:".into(),
-        "      see docs/QUICKSTART-SIGNET.md, step 2.".into(),
+        "      see docs/QUICKSTART-SIGNET.md, step 2. Until then `konsensus start`".into(),
+        format!(
+            "      refuses this config ({}) unless [node] allow_mainnet = true.",
+            config::MAINNET_NOT_APPROVED
+        ),
     ]
 }
 
@@ -620,8 +658,12 @@ fn cmd_restore(
     mnemonic_arg: Option<&str>,
     tier_arg: Option<&str>,
     encrypt: Option<Option<String>>,
+    network: &str,
 ) -> Result<()> {
     use crate::config::NodeTier;
+
+    // Before any prompt or file: an unknown network writes nothing.
+    ensure_init_network(network)?;
 
     let password = mnemonic_encryption_password(encrypt, None, false)?;
 
@@ -716,8 +758,9 @@ fn cmd_restore(
     )
     .with_context(|| format!("failed to write mnemonic to {}", mnemonic_path.display()))?;
 
-    // Generate tier-specific config
-    let config = NodeConfig::default_for_tier(tier, final_mnemonic_path.clone(), dir);
+    // Generate tier-specific config on the chosen network
+    let config =
+        NodeConfig::default_for_tier_on_network(tier, network, final_mnemonic_path.clone(), dir)?;
     config
         .save(&config_path)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
@@ -747,6 +790,7 @@ fn cmd_restore(
     }
     print_network_notice(&config);
     println!();
+    println!("{}", network_line(&config));
 
     Ok(())
 }
@@ -1262,6 +1306,11 @@ async fn cmd_start(
         // `prepare_start` has already turned this into an error.
         konsensus_api::bootstrap::StartupMode::Refuse(_) => unreachable!(),
     }
+
+    // Before any lease, page, unlock wait, chain source or Lightning state:
+    // an unapproved mainnet (`mainnet_not_approved`) or a known server URL on
+    // another network (`chain_network_mismatch`) refuses the start.
+    config.validate_bitcoin_network()?;
 
     // Fail before waiting for unlock; construction checks again under its lifetime lease.
     {
@@ -3166,5 +3215,268 @@ mod network_notice_tests {
             let (_dir, config) = fresh(tier);
             assert!(network_notice(&config).is_empty(), "{}", tier.description());
         }
+    }
+
+    #[test]
+    fn the_mainnet_notice_names_the_start_refusal() {
+        let (_dir, config) = fresh(NodeTier::Full);
+        let text = network_notice(&config).join("\n");
+        assert!(text.contains("mainnet_not_approved"), "{text}");
+        assert!(text.contains("[node] allow_mainnet = true"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod init_network_tests {
+    use super::*;
+    use crate::config::ChainConfig;
+
+    fn on(tier: NodeTier, network: &str) -> (tempfile::TempDir, NodeConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = NodeConfig::default_for_tier_on_network(
+            tier,
+            network,
+            dir.path().join("mnemonic.txt"),
+            dir.path(),
+        )
+        .unwrap();
+        (dir, config)
+    }
+
+    fn urls(config: &NodeConfig) -> (String, Option<String>, String, Option<String>) {
+        let LightningConfig::Ldk {
+            esplora_url,
+            esplora_url_fallback,
+            ..
+        } = &config.lightning
+        else {
+            panic!("full tier writes an LDK backend");
+        };
+        let ChainConfig::Esplora {
+            api_url,
+            esplora_url_fallback: chain_fallback,
+            ..
+        } = &config.chain
+        else {
+            panic!("full tier writes an Esplora chain");
+        };
+        (
+            esplora_url.clone(),
+            esplora_url_fallback.clone(),
+            api_url.clone(),
+            chain_fallback.clone(),
+        )
+    }
+
+    #[test]
+    fn the_default_init_network_is_signet() {
+        assert_eq!(config::DEFAULT_INIT_NETWORK, "signet");
+        let cli = Cli::parse_from(["konsensus", "init"]);
+        let Command::Init { network, .. } = cli.command else {
+            panic!("expected Init command");
+        };
+        assert_eq!(network, "signet");
+        let cli = Cli::parse_from(["konsensus", "restore"]);
+        let Command::Restore { network, .. } = cli.command else {
+            panic!("expected Restore command");
+        };
+        assert_eq!(network, "signet");
+        for bad in ["testnet", "mainnet", "SIGNET"] {
+            assert!(Cli::try_parse_from(["konsensus", "init", "--network", bad]).is_err());
+            assert!(Cli::try_parse_from(["konsensus", "restore", "--network", bad]).is_err());
+        }
+    }
+
+    #[test]
+    fn each_network_writes_matching_lightning_and_chain_urls() {
+        let (_d, signet) = on(NodeTier::Full, "signet");
+        assert_eq!(signet.lightning.bitcoin_network().as_deref(), Some("signet"));
+        assert_eq!(
+            urls(&signet),
+            (
+                "https://mempool.space/signet/api".into(),
+                Some("https://blockstream.info/signet/api".into()),
+                "https://mempool.space/signet".into(),
+                Some("https://blockstream.info/signet".into()),
+            )
+        );
+        let (_d, regtest) = on(NodeTier::Full, "regtest");
+        assert_eq!(regtest.lightning.bitcoin_network().as_deref(), Some("regtest"));
+        assert_eq!(
+            urls(&regtest),
+            (
+                "http://localhost:3002/api".into(),
+                None,
+                "http://localhost:3002".into(),
+                None,
+            )
+        );
+        // Mainnet keeps exactly the provider pair a plain default writes.
+        let (_d, bitcoin) = on(NodeTier::Full, "bitcoin");
+        let (_d2, plain) = {
+            let dir = tempfile::tempdir().unwrap();
+            let c = NodeConfig::default_for_tier(
+                NodeTier::Full,
+                dir.path().join("mnemonic.txt"),
+                dir.path(),
+            );
+            (dir, c)
+        };
+        assert_eq!(bitcoin.lightning.bitcoin_network().as_deref(), Some("bitcoin"));
+        assert_eq!(urls(&bitcoin), urls(&plain));
+        // Every fresh config passes the offline network check.
+        for config in [&signet, &regtest, &bitcoin] {
+            config.refuse_known_chain_url_on_another_network().unwrap();
+        }
+        assert!(NodeConfig::default_for_tier_on_network(
+            NodeTier::Full,
+            "testnet",
+            PathBuf::from("m"),
+            Path::new(".")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mock_tiers_are_unchanged_by_the_network() {
+        for tier in [NodeTier::Light, NodeTier::Cloud] {
+            let (_d, config) = on(tier, "bitcoin");
+            assert!(matches!(config.lightning, LightningConfig::Mock { .. }));
+            assert!(matches!(config.chain, ChainConfig::Mock));
+            config.validate_bitcoin_network().unwrap();
+            assert!(network_line(&config).starts_with("Network:    regtest (mock"));
+        }
+    }
+
+    #[test]
+    fn the_network_line_names_the_written_network() {
+        for (network, line) in [
+            ("signet", "Network:    signet"),
+            ("regtest", "Network:    regtest"),
+            ("bitcoin", "Network:    bitcoin (mainnet)"),
+        ] {
+            let (_d, config) = on(NodeTier::Full, network);
+            assert_eq!(network_line(&config), line);
+        }
+    }
+
+    #[test]
+    fn start_refuses_mainnet_unless_the_owner_opted_in() {
+        let (_d, mut config) = on(NodeTier::Full, "bitcoin");
+        let error = config.validate_bitcoin_network().unwrap_err().to_string();
+        assert!(error.starts_with("mainnet_not_approved: "), "{error}");
+        assert!(error.contains("allow_mainnet = true"), "{error}");
+        // The starter-hub opt-in is a different key and does not count.
+        config.starter_hub.allow_mainnet = true;
+        assert!(config.refuse_unapproved_mainnet().is_err());
+        config.starter_hub.allow_mainnet = false;
+        config.node.allow_mainnet = true;
+        config.validate_bitcoin_network().unwrap();
+        // A mainnet CLN backend is refused the same way.
+        let (_d, mut cln) = on(NodeTier::Full, "signet");
+        cln.lightning = toml::from_str(
+            "backend = \"cln\"\nrest_url = \"https://127.0.0.1:3010\"\n\
+             ca_cert_path = \"/tmp/ca.pem\"\nrune_file = \"/tmp/rune\"\nnetwork = \"bitcoin\"\n",
+        )
+        .unwrap();
+        cln.chain = ChainConfig::Mock;
+        let error = cln.validate_bitcoin_network().unwrap_err().to_string();
+        assert!(error.starts_with("mainnet_not_approved: "), "{error}");
+        // Signet and regtest need no opt-in.
+        for network in ["signet", "regtest"] {
+            let (_d, config) = on(NodeTier::Full, network);
+            config.validate_bitcoin_network().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_mainnet_opt_in_is_read_from_node_and_never_written() {
+        let (_d, config) = on(NodeTier::Full, "bitcoin");
+        let mut table: toml::Table = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let node = table
+            .entry("node")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .unwrap();
+        assert!(!node.contains_key("allow_mainnet"), "{node:?}");
+        node.insert("allow_mainnet".into(), true.into());
+        let opted: NodeConfig = toml::from_str(&toml::to_string(&table).unwrap()).unwrap();
+        assert!(opted.node.allow_mainnet);
+        opted.validate_bitcoin_network().unwrap();
+    }
+
+    #[test]
+    fn a_lightning_and_chain_network_mismatch_is_refused() {
+        // Signet [lightning] with a mainnet [chain] left over from an old config.
+        let (_d, mut config) = on(NodeTier::Full, "signet");
+        if let ChainConfig::Esplora { api_url, .. } = &mut config.chain {
+            *api_url = "https://blockstream.info".into();
+        }
+        let error = config.validate_bitcoin_network().unwrap_err().to_string();
+        assert!(error.starts_with("chain_network_mismatch: "), "{error}");
+        assert!(error.contains("[chain] api_url"), "{error}");
+        assert!(error.contains("bitcoin (mainnet)"), "{error}");
+
+        // A mainnet fallback in [lightning], with or without `/api` and a slash.
+        let (_d, mut config) = on(NodeTier::Full, "signet");
+        if let LightningConfig::Ldk {
+            esplora_url_fallback,
+            ..
+        } = &mut config.lightning
+        {
+            *esplora_url_fallback = Some("https://mempool.space/api/".into());
+        }
+        let error = config.validate_bitcoin_network().unwrap_err().to_string();
+        assert!(error.contains("[lightning] esplora_url_fallback"), "{error}");
+
+        // Mainnet [lightning] (opted in) with signet [chain] URLs.
+        let (_d, mut config) = on(NodeTier::Full, "bitcoin");
+        config.node.allow_mainnet = true;
+        if let ChainConfig::Esplora {
+            esplora_url_fallback,
+            ..
+        } = &mut config.chain
+        {
+            *esplora_url_fallback = Some("https://blockstream.info/signet".into());
+        }
+        let error = config.validate_bitcoin_network().unwrap_err().to_string();
+        assert!(error.starts_with("chain_network_mismatch: "), "{error}");
+
+        // Regtest [lightning] with a signet server.
+        let (_d, mut config) = on(NodeTier::Full, "regtest");
+        if let LightningConfig::Ldk { esplora_url, .. } = &mut config.lightning {
+            *esplora_url = "https://mempool.space/signet/api".into();
+        }
+        assert!(config.validate_bitcoin_network().is_err());
+    }
+
+    #[test]
+    fn unknown_or_unused_urls_are_left_to_the_source_check() {
+        // A server this check does not know is not refused offline.
+        let (_d, mut config) = on(NodeTier::Full, "signet");
+        if let ChainConfig::Esplora { api_url, .. } = &mut config.chain {
+            *api_url = "https://esplora.example.invalid".into();
+        }
+        config.validate_bitcoin_network().unwrap();
+        // With Bitcoin Core as [chain], LDK reads Core, not its own URLs.
+        let (_d, mut config) = on(NodeTier::Full, "signet");
+        config.chain = toml::from_str(
+            "backend = \"bitcoind\"\nrpc_host = \"127.0.0.1\"\nrpc_port = 38332\n\
+             cookie_file = \"/tmp/.cookie\"\n",
+        )
+        .unwrap();
+        if let LightningConfig::Ldk { esplora_url, .. } = &mut config.lightning {
+            *esplora_url = "https://blockstream.info/api".into();
+        }
+        config.validate_bitcoin_network().unwrap();
+        // A backend that states no network is not checked.
+        let (_d, mut config) = on(NodeTier::Light, "signet");
+        config.chain = ChainConfig::Esplora {
+            api_url: "https://blockstream.info".into(),
+            esplora_url_fallback: None,
+            credentials_file: None,
+            accept_third_party_tip: false,
+        };
+        config.validate_bitcoin_network().unwrap();
     }
 }

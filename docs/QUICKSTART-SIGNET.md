@@ -173,11 +173,49 @@ encrypt it at rest instead, add `--encrypt` and type a password when asked
 (then `start` prompts for it, or read [password input](operations/password-input.md)
 for launchers).
 
-`init` writes a **mainnet** Lightning network and mainnet chain URLs into a fresh
-config today. Switch them to signet before the first start. Open
-`~/bitsov-signet/konsensus.toml` and change these keys in place, leaving
-everything else as written (do not paste a second `[lightning]` or `[chain]`
-table; TOML rejects duplicates):
+`init` writes signet unless told otherwise (`--network signet` is the
+default): `[lightning] network = "signet"` and the signet Esplora URLs in both
+`[lightning]` and `[chain]`. Its last line of output names the network:
+
+```text
+Network:    signet
+```
+
+The fresh config names these signet servers:
+
+```toml
+[lightning]
+backend = "ldk"
+network = "signet"
+esplora_url = "https://mempool.space/signet/api"
+esplora_url_fallback = "https://blockstream.info/signet/api"
+
+[chain]
+backend = "esplora"
+api_url = "https://mempool.space/signet"
+esplora_url_fallback = "https://blockstream.info/signet"
+```
+
+They are the signet endpoints of two public Esplora operators; any
+Esplora-compatible signet server works. Your own Bitcoin Core or an Electrum
+server are different backends, configured as described in
+[chain source](CHAIN-SOURCE.md) instead of these URLs. A public Esplora can
+link the addresses your wallet watches to your IP; that is the trade-off of
+not running your own chain source.
+
+One key is still yours to add. Open `~/bitsov-signet/konsensus.toml` and add
+`hub_only_channels = false` to the existing `[lightning]` table (do not paste a
+second `[lightning]` table; TOML rejects duplicates):
+
+```toml
+[lightning]
+hub_only_channels = false
+```
+
+**Older configs.** A config written by an `init` or `restore` from before the
+`--network` flag says `network = "bitcoin"` and names mainnet URLs, and `start`
+refuses it with `mainnet_not_approved`. Either run `init` again into a new
+directory, or change these keys in place, leaving everything else as written:
 
 ```toml
 [lightning]
@@ -193,14 +231,13 @@ api_url = "https://mempool.space/signet"
 esplora_url_fallback = "https://blockstream.info/signet"
 ```
 
-The URLs are the signet endpoints of the same two public Esplora operators
-`init` already wrote; any Esplora-compatible signet server works. Your own
-Bitcoin Core or an Electrum server are different backends, configured as
-described in [chain source](CHAIN-SOURCE.md) instead of these URLs. A public
-Esplora can link the addresses your wallet watches to your IP; that is the
-trade-off of not running your own chain source.
+`start` also refuses (`chain_network_mismatch`) a config that names one of these
+public Esplora servers for another network than `[lightning] network`, for
+example a signet `[lightning]` left with a mainnet `[chain]` URL, so a
+half-finished edit does not start. Other servers are checked when the node
+first asks them which chain they serve.
 
-`hub_only_channels = false` is new in this file. By default an embedded LDK
+`hub_only_channels = false` is the one manual edit. By default an embedded LDK
 node opens channels only to a configured hub or LSP, because nothing watches a
 home node's channels while it is offline yet, and a fresh config has no hub.
 Step 7 opens a channel straight to your contact, which needs this opt-out. It
@@ -444,7 +481,7 @@ signet-specific steps are marked.
 | Step | Ran | Notes |
 | --- | --- | --- |
 | 1. Build | partly | A debug build (`cargo build -p konsensus-node`, not `--release`) on stable 1.97.0, before `rust-toolchain.toml` (1.99.1) landed on main; neither pinned toolchain was installed in the session |
-| 2. `init --tier full`, config edit | yes | Fresh config confirmed to contain `network = "bitcoin"` and mainnet URLs; after the edit the node starts, logs `network=signet`, and reports `money_ready: false` because the Esplora servers were unreachable from the session |
+| 2. `init --tier full`, config edit | yes | Run before the `--network` flag: the fresh config then contained `network = "bitcoin"` and mainnet URLs; after the edit the node started, logged `network=signet`, and reported `money_ready: false` because the Esplora servers were unreachable from the session. The signet default of `init` and `restore` is covered by the node's CLI tests |
 | 3. `start --owner-control` | yes | Signet config above, and two mock nodes on loopback ports |
 | 4. Owner token, `status` | yes | `docs/ops/owner-token.sh` on both nodes; the `api` helper checked for GET and POST, and `ps` showed no process carrying the token |
 | 5. Faucet, `funding-address`, one confirmation | **untested in CI** | Needs a reachable signet Esplora and a faucet; the route and its `network` field were read from source, and on a mock node it answers 400 as expected |
