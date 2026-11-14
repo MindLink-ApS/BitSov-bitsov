@@ -1,6 +1,6 @@
 //! The inbound gate over the production wrappers, on a backend whose chain sync
 //! has lapsed: a settlement already in the local store counts, nothing else does.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use konsensus_core::traits::lightning::{
 };
 use konsensus_core::types::Recipient;
 use konsensus_core::{PaymentProof, UkmEnvelope, UkmEnvelopeBuilder};
-use konsensus_lightning::{CircuitBreakerLightning, RecoveringLightning};
+use konsensus_lightning::{CircuitBreakerConfig, CircuitBreakerLightning, RecoveringLightning};
 use konsensus_storage::{PaidAcceptance, SqliteStorage, Storage, StorageNonceAdapter};
 use sha2::{Digest, Sha256};
 
@@ -24,10 +24,15 @@ struct Store {
     funding: AtomicBool,
     cutoff: Mutex<Option<u64>>,
     record: Mutex<Option<PaymentDetails>>,
+    /// The settlement read fails as a broken backend would.
+    broken: AtomicBool,
+    /// Reads that reached the store.
+    reads: AtomicUsize,
 }
 
 impl Store {
     fn read(&self, hash: &str) -> Result<PaymentDetails, LightningError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
         self.record
             .lock()
             .unwrap()
@@ -51,7 +56,11 @@ impl LightningProvider for Store {
         self.read(hash).map(|_| self.funding.load(Ordering::SeqCst))
     }
     async fn get_payment_status(&self, hash: &str) -> Result<PaymentDetails, LightningError> {
-        self.read(hash)
+        let details = self.read(hash);
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(LightningError::Backend("store read failed".into()));
+        }
+        details
     }
     async fn create_invoice(&self, amount_msat: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
         Ok(Invoice {
@@ -105,6 +114,8 @@ impl Node {
             funding: false.into(),
             cutoff: Some(SETTLED_AT).into(),
             record: stored.into(),
+            broken: false.into(),
+            reads: AtomicUsize::new(0),
         });
         let backend = store.clone() as Arc<dyn LightningProvider>;
         let recovering = RecoveringLightning::new(
@@ -361,5 +372,26 @@ async fn ordinary_status_reads_stay_refused_while_not_ready() {
     assert!(matches!(node.money.verify_payment(&hash).await, Err(LightningError::NotReady)));
     assert!(matches!(node.verifier.get_payment_status(&hash).await, Err(LightningError::NotReady)));
     assert!(node.money.gate_payment_status(&hash).await.is_ok());
+    node.money.shutdown().await.unwrap();
+}
+
+/// A failing backend is not a sync lapse: its errors reach the circuit breaker,
+/// which then stops further reads from reaching it.
+#[tokio::test]
+async fn backend_errors_while_not_ready_open_the_circuit() {
+    let node = Node::start(false, Some(record(PaymentStatus::Settled, PaymentDirection::Incoming))).await;
+    node.store.broken.store(true, Ordering::SeqCst);
+    let peer = sender();
+    for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+        let refusal = node.gate(&node.envelope(&peer, proof())).await.unwrap_err();
+        assert!(
+            matches!(&refusal, GateRejection::LightningUnavailable(reason) if reason.contains("store read failed")),
+            "{refusal:?}"
+        );
+    }
+    let reads = node.store.reads.load(Ordering::SeqCst);
+    let refusal = node.gate(&node.envelope(&peer, proof())).await.unwrap_err();
+    assert!(matches!(refusal, GateRejection::LightningUnavailable(_)), "{refusal:?}");
+    assert_eq!(node.store.reads.load(Ordering::SeqCst), reads, "open circuit makes no backend hit");
     node.money.shutdown().await.unwrap();
 }

@@ -291,9 +291,13 @@ impl CircuitBreakerLightning {
                     "settlement verification timed out — fail-closed".into(),
                 ))
             }
-            // The backend answered in time: a refusal the gate expects says
-            // nothing about its health, and must not lock out other payments.
-            Ok(Err(e @ (LightningError::NotReady | LightningError::PaymentNotFound(_)))) => {
+            // A refusal from above the backend (it is not ready) says nothing
+            // about the backend's health either way: leave the state as it is.
+            // Dropping `call` releases a half-open probe reservation.
+            Ok(Err(e @ LightningError::NotReady)) => Err(e),
+            // The backend answered in time that it has no such payment: a
+            // healthy answer, which must not lock out other payments.
+            Ok(Err(e @ LightningError::PaymentNotFound(_))) => {
                 self.record_success(call.generation);
                 Err(e)
             }
@@ -348,6 +352,8 @@ impl LightningProvider for CircuitBreakerLightning {
         self.inner.accept_liquidity(owner, id).await
     }
     async fn is_funding_payment(&self, hash: &str) -> Result<bool, LightningError> {
+        // The gate asks this first: an open circuit fails closed here too.
+        self.available_generation()?;
         tokio::time::timeout(self.cfg.call_timeout, self.inner.is_funding_payment(hash)).await
             .map_err(|_| LightningError::Backend("funding-purpose lookup timeout".into()))?
     }
@@ -448,6 +454,8 @@ mod tests {
         in_flight: AtomicU32,
         /// High-water mark of concurrent in-flight calls.
         max_in_flight: AtomicU32,
+        /// Total `is_funding_payment` calls that reached the backend.
+        funding_calls: AtomicU32,
     }
 
     impl FakeProvider {
@@ -458,6 +466,7 @@ mod tests {
                 calls: AtomicU32::new(0),
                 in_flight: AtomicU32::new(0),
                 max_in_flight: AtomicU32::new(0),
+                funding_calls: AtomicU32::new(0),
             })
         }
         fn set(&self, b: Behavior) {
@@ -488,6 +497,10 @@ mod tests {
 
     #[async_trait]
     impl LightningProvider for FakeProvider {
+        async fn is_funding_payment(&self, _hash: &str) -> Result<bool, LightningError> {
+            self.funding_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }
         async fn get_payment_status(
             &self,
             _payment_hash: &str,
@@ -916,7 +929,7 @@ mod tests {
         }
     }
 
-    // A half-open probe that gets such an answer closes the circuit.
+    // A half-open probe the backend answers with "not found" closes the circuit.
     #[tokio::test]
     async fn expected_refusal_closes_a_half_open_circuit() {
         let fake = FakeProvider::new(Behavior::Error);
@@ -925,10 +938,48 @@ mod tests {
             assert!(cb.gate_payment_status("hash").await.is_err());
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
-        *fake.behavior.lock().unwrap() = Behavior::NotReady;
-        assert!(matches!(cb.gate_payment_status("hash").await, Err(LightningError::NotReady)));
+        *fake.behavior.lock().unwrap() = Behavior::NotFound;
+        assert!(matches!(cb.gate_payment_status("hash").await, Err(LightningError::PaymentNotFound(_))));
         *fake.behavior.lock().unwrap() = Behavior::Settled;
         assert!(cb.gate_payment_status("hash").await.is_ok(), "the probe answered, the circuit is closed");
+    }
+
+    // A refusal from the stack above the backend says nothing about its
+    // health: a half-open probe answered that way leaves the circuit half-open.
+    #[tokio::test]
+    async fn not_ready_answer_does_not_close_a_half_open_circuit() {
+        let fake = FakeProvider::new(Behavior::Error);
+        let cb = CircuitBreakerLightning::new(fake.clone(), fast_cfg());
+        for _ in 0..3 {
+            assert!(cb.gate_payment_status("hash").await.is_err());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        fake.set(Behavior::NotReady);
+        assert!(matches!(cb.gate_payment_status("hash").await, Err(LightningError::NotReady)));
+        // The next probe fails, so the circuit opens again at once.
+        fake.set(Behavior::Error);
+        assert!(matches!(cb.gate_payment_status("hash").await, Err(LightningError::Backend(_))));
+        let calls = fake.calls.load(Ordering::SeqCst);
+        assert!(cb.gate_payment_status("hash").await.is_err());
+        assert_eq!(fake.calls.load(Ordering::SeqCst), calls, "open circuit makes no backend hit");
+    }
+
+    // The gate's funding lookup comes first; an open circuit must stop it too.
+    #[tokio::test]
+    async fn open_circuit_fast_fails_the_funding_lookup() {
+        let fake = FakeProvider::new(Behavior::Error);
+        let cb = CircuitBreakerLightning::new(fake.clone(), fast_cfg());
+        for _ in 0..3 {
+            assert!(cb.gate_payment_status("hash").await.is_err());
+        }
+        assert!(matches!(cb.is_funding_payment("hash").await, Err(LightningError::Backend(_))));
+        assert_eq!(fake.funding_calls.load(Ordering::SeqCst), 0, "open circuit makes no backend hit");
+        // Closed again, the lookup reaches the backend.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        fake.set(Behavior::Settled);
+        assert!(cb.gate_payment_status("hash").await.is_ok());
+        assert!(!cb.is_funding_payment("hash").await.unwrap());
+        assert_eq!(fake.funding_calls.load(Ordering::SeqCst), 1);
     }
 
     // Freshness headers: the wrapper must report the inner wallet's sync

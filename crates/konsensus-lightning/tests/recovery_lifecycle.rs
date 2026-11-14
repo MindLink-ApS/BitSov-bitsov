@@ -308,6 +308,10 @@ struct Store {
     funding: bool,
     cutoff: std::sync::Mutex<Option<u64>>,
     record: std::sync::Mutex<Option<PaymentDetails>>,
+    /// Reads fail as a broken backend would.
+    broken: std::sync::atomic::AtomicBool,
+    /// Reads that reached the store.
+    reads: AtomicUsize,
 }
 
 impl Store {
@@ -317,9 +321,15 @@ impl Store {
             funding: false,
             cutoff: Some(SYNCED).into(),
             record: record.into(),
+            broken: false.into(),
+            reads: AtomicUsize::new(0),
         })
     }
     fn read(&self, hash: &str) -> Result<PaymentDetails, LightningError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(LightningError::Backend("store read failed".into()));
+        }
         self.record
             .lock()
             .unwrap()
@@ -505,5 +515,27 @@ async fn ready_gate_read_answers_exactly_like_the_ordinary_read() {
         provider.gate_payment_status("aa").await,
         Err(LightningError::PaymentNotFound(_))
     ));
+    provider.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn not_ready_gate_read_reports_a_backend_error() {
+    let store = Store::new(false, Some(record(PaymentStatus::Settled, PaymentDirection::Incoming)));
+    store.broken.store(true, Ordering::SeqCst);
+    let provider = over(store).await;
+    // A failing backend is a failure, not a sync lapse.
+    assert!(matches!(provider.gate_payment_status("aa").await, Err(LightningError::Backend(_))));
+    assert!(matches!(provider.is_funding_payment("aa").await, Err(LightningError::Backend(_))));
+    provider.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn not_ready_gate_reads_never_reach_a_backend_without_a_cutoff() {
+    let store = Store::new(false, Some(record(PaymentStatus::Settled, PaymentDirection::Incoming)));
+    *store.cutoff.lock().unwrap() = None;
+    let provider = over(store.clone()).await;
+    assert!(matches!(provider.is_funding_payment("aa").await, Err(LightningError::NotReady)));
+    assert!(matches!(provider.gate_payment_status("aa").await, Err(LightningError::NotReady)));
+    assert_eq!(store.reads.load(Ordering::SeqCst), 0, "nothing it could confirm, so no call");
     provider.shutdown().await.unwrap();
 }

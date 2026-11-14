@@ -343,6 +343,10 @@ impl LightningProvider for RecoveringLightning {
     /// record answers while not ready. An unknown hash stays `NotReady` there.
     async fn is_funding_payment(&self, hash: &str) -> Result<bool, LightningError> {
         let (p, ready) = self.store_reader()?;
+        // With no cutoff the gate's read can confirm nothing; do not ask.
+        if !ready && p.gate_settlement_cutoff().is_none() {
+            return Err(LightningError::NotReady);
+        }
         match p.is_funding_payment(hash).await {
             Err(LightningError::PaymentNotFound(_)) if !ready => Err(LightningError::NotReady),
             result => result,
@@ -431,17 +435,25 @@ impl LightningProvider for RecoveringLightning {
             return p.gate_payment_status(payment_hash).await;
         }
         // While not ready this can only confirm an inbound settlement recorded
-        // while the chain view was recent. Anything else keeps the refusal it
-        // has always had.
+        // while the chain view was recent. With no such time on record there is
+        // nothing to confirm, so the backend is not asked at all.
+        let Some(cutoff) = p.gate_settlement_cutoff() else {
+            return Err(LightningError::NotReady);
+        };
         match p.gate_payment_status(payment_hash).await {
             Ok(details)
                 if details.status == PaymentStatus::Settled
                     && details.direction == PaymentDirection::Incoming
-                    && p.gate_settlement_cutoff().is_some_and(|cutoff| details.timestamp <= cutoff) =>
+                    && details.timestamp <= cutoff =>
             {
                 Ok(details)
             }
-            _ => Err(LightningError::NotReady),
+            // Any other answer keeps the refusal it has always had.
+            Ok(_) | Err(LightningError::PaymentNotFound(_) | LightningError::NotReady) => {
+                Err(LightningError::NotReady)
+            }
+            // A failing backend is a failure, not a sync lapse.
+            Err(e) => Err(e),
         }
     }
     async fn verify_payment(&self, payment_hash: &str) -> Result<PaymentDetails, LightningError> {
