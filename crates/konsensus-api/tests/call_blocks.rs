@@ -8,6 +8,88 @@ use konsensus_storage::{SqliteStorage, Storage};
 
 const ID: &str = "0123456789abcdef0123456789abcdef";
 
+#[tokio::test]
+async fn overdue_socket_detach_closes_resume_before_expiry_and_survives_restart() {
+    use calls::{detach_callee_media, MediaDetach, MediaDetachOutcome};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("calls.db");
+    let store = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    let peer = NodeId::from_bytes([17; 32]);
+    let paid = rules::receive_block(Some(rules::commit(rules::reserve(
+        Some(rules::receive(None, 400, None, 0).unwrap()), 401, "answer", "hash", 1_000,
+    ).unwrap(), "answer", 1_000).unwrap()), 0, 1_000).unwrap();
+    let paid = rules::reserve(Some(paid), 403, "notice", "notice-hash", 71_001).unwrap();
+    // Keep the stored overdue Live phase while retaining pending notice evidence.
+    let paid = rules::CallEntry { phase: Phase::Live, end_reason: None,
+        deadline_ms: 71_000, ..paid };
+    store.call_put(&peer, ID, &paid).await.unwrap();
+    let mut detach = MediaDetach {
+        generation: Arc::new(tokio::sync::Mutex::new(2)), expected_generation: 1, only_unpaid: false, may_hangup_live: true,
+    };
+    assert_eq!(detach_callee_media(&store, &peer, ID, 71_001, &detach).await.unwrap(), MediaDetachOutcome::Complete);
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(paid.clone()));
+    detach.expected_generation = 2;
+    detach.only_unpaid = true;
+    assert_eq!(detach_callee_media(&store, &peer, ID, 71_001, &detach).await.unwrap(), MediaDetachOutcome::PendingExpiry);
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(paid.clone()));
+    detach.only_unpaid = false;
+    assert_eq!(detach_callee_media(&store, &peer, ID, 71_001, &detach).await.unwrap(), MediaDetachOutcome::PendingExpiry);
+    let closed = rules::CallEntry { paid_until_ms: Some(0), ..paid };
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(closed.clone()));
+    let reopened = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    assert_eq!(reopened.call_get(&peer, ID).await.unwrap(), Some(closed.clone()));
+    assert_eq!(rules::receive_block(Some(closed.clone()), 1, 71_001), Err(rules::CallRefusal::UnknownCall));
+    *detach.generation.lock().await = 3;
+    assert_eq!(detach_callee_media(&reopened, &peer, ID, 71_001, &detach).await.unwrap(), MediaDetachOutcome::Complete);
+    assert!(!calls::call_media_admitted(&reopened, &peer, ID, 71_001).await);
+    assert_eq!(calls::expire_calls(&reopened, 71_001).await.unwrap(), vec![(peer, ID.into())]);
+    let expired = reopened.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(expired, rules::CallEntry { phase: Phase::Ended,
+        end_reason: Some(HangupReason::Unpaid), deadline_ms: 71_000 + rules::TOMBSTONE_MS, ..closed });
+    assert_eq!(rules::receive_block(Some(expired), 1, 71_001), Err(rules::CallRefusal::UnknownCall));
+    assert!(calls::expire_calls(&reopened, 71_002).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn zero_block_grant_preserves_unpaid_caller_and_pending_evidence() {
+    use konsensus_core::{UkmEnvelopeBuilder, Recipient, PaymentProof};
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let own = NodeId::from_bytes([18; 32]);
+    let peer = NodeId::from_bytes([19; 32]);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let caller = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Live,
+        deadline_ms: now + 30_000, paid_until_ms: None, next_block_seq: 0,
+        pending: None, end_reason: None, unpaid_notice_used: false };
+    let pending = rules::reserve_block(Some(caller), 0, "zero-grant", "request", now).unwrap();
+    let envelope = UkmEnvelopeBuilder::new(404, own, Recipient::Node(peer), vec![],
+        PaymentProof::new([20; 32], [21; 32], 23_000)).build();
+    store.store_message(&envelope).await.unwrap();
+    let mut op = konsensus_storage::OutboxOperation::prepared("zero-grant".into(), peer.to_hex(), 404, "request".into());
+    op.state = "sent".into();
+    op.message_id = Some(envelope.id.to_hex());
+    op.recovery = serde_json::to_vec(&serde_json::json!({
+        "call_block": [ID, 0], "dispatched": true, "expected_msat": 23_000,
+        "fee_ceiling_msat": 0, "admission_msat": 0,
+    })).unwrap();
+    store.insert_outbox_operation(&op).await.unwrap();
+    store.queue_pending_delivery(&envelope.id, &peer).await.unwrap();
+    store.mark_pending_sent(&envelope.id, &peer).await.unwrap();
+    let cipher = konsensus_crypto::PlaintextCacheCipher::new(&[22; 32]);
+    for entry in [pending.clone(), pending.at(now + 30_001).unwrap()] {
+        store.call_put(&peer, ID, &entry).await.unwrap();
+        calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, 0).await.unwrap();
+        assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(entry));
+        assert!(store.is_pending_dispatched(&envelope.id, &peer, &own).await.unwrap());
+    }
+    calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.unwrap();
+    let granted = store.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(granted.phase, Phase::Live);
+    assert_eq!(granted.paid_until_ms, Some(now + 60_000));
+    assert_eq!(granted.next_block_seq, 1);
+    assert!(granted.pending.is_none());
+}
+
 async fn answer_block_price_query(
     state: &konsensus_api::state::AppState,
     transport: &common::ConnectedStubTransport,
@@ -672,7 +754,7 @@ async fn callee_grant_resumes_caller_after_unpaid_notice_and_is_bound_to_paid_me
     assert!(calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.is_err());
     assert!(store.is_pending_dispatched(&envelope.id, &peer, &own).await.unwrap());
     let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
-    store.store_message_plaintext(&envelope.id, &cipher.encrypt(body.as_bytes()).unwrap()).await.unwrap();
+    store.store_message_plaintext(&envelope.id, &cipher.encrypt(&envelope.id.to_hex(), body.as_bytes()).unwrap()).await.unwrap();
     calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.unwrap();
     let upgraded = store.get_outbox_operation_by_message(&envelope.id).await.unwrap().unwrap();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&upgraded.recovery).unwrap()["call_block"], serde_json::json!([ID, 0]));

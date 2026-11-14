@@ -5,12 +5,15 @@
 pub mod calendar;
 pub mod contacts;
 pub mod encrypted;
+pub mod record_upgrade;
 pub mod error;
 pub mod fiat_snapshots;
 pub mod models;
 pub mod postgres;
 pub mod reactions;
 pub mod recovery;
+#[cfg(test)]
+mod schema_catalog;
 pub mod sqlite;
 pub mod traits;
 pub mod whitelist_backup;
@@ -31,7 +34,7 @@ pub use recovery::{
     RecoveryTrustee, SqliteRecoveryStore,
 };
 pub use sqlite::SqliteStorage;
-pub use traits::{PaidAcceptance, Storage};
+pub use traits::{PaidAcceptance, Storage, MAX_DEFERRALS_PER_PROOF, MAX_DEFERRALS_PER_SENDER, ENVELOPE_DEFERRAL_TTL_MS, DEFERRAL_CLEANUP_BATCH};
 pub use whitelist_backup::WhitelistBackup;
 
 pub mod invites {

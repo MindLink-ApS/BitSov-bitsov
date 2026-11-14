@@ -35,6 +35,8 @@ use konsensus_core::traits::chain::{
     BlockHeader, ChainError, ChainProvider, FeeEstimate, TrustLevel,
 };
 
+use crate::network::{NetworkCheck, NetworkGate, ReportedNetwork};
+
 /// Maximum age of a cached tip height, shared by callers of one provider.
 const TIP_HEIGHT_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -92,7 +94,17 @@ pub struct EsploraProvider {
     active: AtomicUsize,
     transport: Option<Arc<dyn HttpTransport>>,
     bearer: Option<Arc<dyn HttpTransport>>,
-    tip_height: Mutex<Option<(u64, Instant)>>,
+    /// Cached tip height, when it was fetched, and the endpoint it came from.
+    tip_height: Mutex<Option<CachedHeight>>,
+    network: Option<NetworkGate>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedHeight {
+    height: u64,
+    fetched_at: Instant,
+    /// Index of the endpoint that served `height`.
+    endpoint: usize,
 }
 
 /// JSON response from `/api/block/{hash}`.
@@ -167,6 +179,65 @@ impl EsploraProvider {
             transport: None,
             bearer: None,
             tip_height: Mutex::new(None),
+            network: None,
+        }
+    }
+
+    /// Use no endpoint until its genesis block is this network's. One
+    /// endpoint on another network refuses the provider for good, with no
+    /// fallback to the others.
+    ///
+    /// Reconnect: a lost connection or timeout on an endpoint ends its check,
+    /// and the endpoint is asked again before its next use, including a
+    /// failover. HTTP answers such as "not found" do not.
+    pub fn with_network(mut self, network: bitcoin::Network) -> Self {
+        self.network = Some(NetworkGate::new(network, "esplora", self.endpoints.len()));
+        self
+    }
+
+    /// Check every configured endpoint now. `Verified` needs all of them;
+    /// an unreachable one leaves the result `Unavailable`.
+    pub async fn verify_network(&self) -> NetworkCheck {
+        let Some(gate) = &self.network else {
+            return NetworkCheck::NotConfigured;
+        };
+        gate.invalidate_all();
+        for index in 0..self.endpoints.len() {
+            let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
+            if self.ensure_network(gate, index, timeout).await.is_err() && gate.refusal().is_err() {
+                break;
+            }
+        }
+        gate.check()
+    }
+
+    async fn ensure_network(
+        &self,
+        gate: &NetworkGate,
+        index: usize,
+        timeout: std::time::Duration,
+    ) -> Result<(), ChainError> {
+        gate.refusal()?;
+        if gate.is_verified(index) {
+            return Ok(());
+        }
+        let genesis = crate::network::esplora_genesis(|path| async move {
+            self.fetch(
+                index,
+                &path,
+                timeout,
+                Some(crate::network::MAX_GENESIS_ANSWER_BYTES),
+                &|text: &str| Ok(text.to_owned()),
+            )
+            .await
+        })
+        .await;
+        match genesis {
+            Ok(hash) => gate.record(index, ReportedNetwork::from_genesis_hash(hash)),
+            Err(error) => {
+                gate.invalidate(index);
+                Err(error)
+            }
         }
     }
 
@@ -183,8 +254,18 @@ impl EsploraProvider {
     /// requests share the same limiter as LDK for each configured API endpoint.
     pub(crate) async fn recovery_broadcast(&self, raw: &str) -> Result<String, ChainError> {
         let index = self.active.load(Ordering::Relaxed);
+        let timeout = std::time::Duration::from_secs(self.config.timeout_secs);
+        if let Some(gate) = &self.network {
+            self.ensure_network(gate, index, timeout).await?;
+        }
         let (base, limiter) = &self.endpoints[index];
-        let request = self.client.post(format!("{base}/tx")).body(raw.to_owned());
+        // Set on the request, so the configured budget also holds through
+        // the authenticated transport, whose client has none of its own.
+        let request = self
+            .client
+            .post(format!("{base}/tx"))
+            .timeout(timeout)
+            .body(raw.to_owned());
         let response = limiter
             .run(false, || async {
                 match if index == 0 {
@@ -197,14 +278,25 @@ impl EsploraProvider {
                 }
             })
             .await
-            .map_err(|_| ChainError::Connection("recovery broadcast unavailable".into()))?;
+            .map_err(|_| {
+                self.lost_connection(index);
+                ChainError::Connection("recovery broadcast unavailable".into())
+            })?;
         if !response.status().is_success() {
             return Err(ChainError::Backend("recovery broadcast rejected".into()));
         }
-        response
-            .text()
-            .await
-            .map_err(|_| ChainError::Backend("recovery broadcast response unavailable".into()))
+        response.text().await.map_err(|_| {
+            self.lost_connection(index);
+            ChainError::Connection("recovery broadcast response unavailable".into())
+        })
+    }
+
+    /// The connection to an endpoint failed: it must show its network again
+    /// before its next use.
+    fn lost_connection(&self, index: usize) {
+        if let Some(gate) = &self.network {
+            gate.invalidate(index);
+        }
     }
 
     async fn get_parsed<T>(
@@ -212,8 +304,19 @@ impl EsploraProvider {
         path: &str,
         parse: impl Fn(&str) -> Result<T, ChainError>,
     ) -> Result<T, ChainError> {
+        self.get_parsed_from(path, parse)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// Like `get_parsed`, also naming the endpoint that answered.
+    async fn get_parsed_from<T>(
+        &self,
+        path: &str,
+        parse: impl Fn(&str) -> Result<T, ChainError>,
+    ) -> Result<(T, usize), ChainError> {
         let mut last_error = ChainError::NotAvailable("no usable Esplora endpoint".into());
-        for (index, (base, limiter)) in self.endpoints.iter().enumerate() {
+        for index in 0..self.endpoints.len() {
             // Admission's outer readiness deadline is five seconds. Reserve
             // four for the complete height lookup, divided across endpoints,
             // so even a blackholed primary leaves time to try every fallback.
@@ -222,49 +325,86 @@ impl EsploraProvider {
             } else {
                 std::time::Duration::from_secs(self.config.timeout_secs)
             };
-            let result = tokio::time::timeout(timeout, async {
-                let request = self.client.get(format!("{base}{path}")).timeout(timeout);
-                let response = limiter
-                    .run(false, || async {
-                        match if index == 0 {
-                            self.bearer.as_ref().or(self.transport.as_ref())
-                        } else {
-                            self.transport.as_ref()
-                        } {
-                            Some(transport) => transport.execute(request).await,
-                            None => Ok(request.send().await?),
-                        }
-                    })
-                    .await
-                    .map_err(|error| match error {
-                        esplora_client::Error::Reqwest(_) => {
-                            ChainError::Connection("Esplora connection unavailable".into())
-                        }
-                        _ => ChainError::NotAvailable("Esplora request unavailable".into()),
-                    })?;
-                if !response.status().is_success() {
-                    return Err(ChainError::Backend(format!(
-                        "{path}: {}",
-                        response.status()
-                    )));
+            if let Some(gate) = &self.network {
+                match self.ensure_network(gate, index, timeout).await {
+                    Ok(()) => {}
+                    // A wrong network is never skipped in favour of a fallback.
+                    Err(error) if gate.refusal().is_err() => return Err(error),
+                    Err(error) => {
+                        last_error = error;
+                        continue;
+                    }
                 }
-                let text = response
-                    .text()
-                    .await
-                    .map_err(|_| ChainError::Backend("Esplora body unavailable".into()))?;
-                parse(&text)
-            })
-            .await
-            .unwrap_or_else(|_| Err(ChainError::NotAvailable("Esplora request timed out".into())));
-            match result {
+            }
+            match self.fetch(index, path, timeout, None, &parse).await {
                 Ok(value) => {
                     self.active.store(index, Ordering::Relaxed);
-                    return Ok(value);
+                    return Ok((value, index));
                 }
-                Err(error) => last_error = error,
+                Err(error) => {
+                    // A lost connection or timeout, not an HTTP answer such
+                    // as "not found": ask the endpoint again before reuse.
+                    if let (Some(gate), ChainError::Connection(_) | ChainError::NotAvailable(_)) =
+                        (&self.network, &error)
+                    {
+                        gate.invalidate(index);
+                    }
+                    last_error = error
+                }
             }
         }
         Err(last_error)
+    }
+
+    async fn fetch<T>(
+        &self,
+        index: usize,
+        path: &str,
+        timeout: std::time::Duration,
+        // `Some` stops the body at that many bytes. Genesis checks pass the
+        // small answer cap. Other reads stay uncapped, as they were.
+        max_body: Option<usize>,
+        parse: &impl Fn(&str) -> Result<T, ChainError>,
+    ) -> Result<T, ChainError> {
+        let (base, limiter) = &self.endpoints[index];
+        tokio::time::timeout(timeout, async {
+            let request = self.client.get(format!("{base}{path}")).timeout(timeout);
+            let response = limiter
+                .run(false, || async {
+                    match if index == 0 {
+                        self.bearer.as_ref().or(self.transport.as_ref())
+                    } else {
+                        self.transport.as_ref()
+                    } {
+                        Some(transport) => transport.execute(request).await,
+                        None => Ok(request.send().await?),
+                    }
+                })
+                .await
+                .map_err(|error| match error {
+                    esplora_client::Error::Reqwest(_) => {
+                        ChainError::Connection("Esplora connection unavailable".into())
+                    }
+                    _ => ChainError::NotAvailable("Esplora request unavailable".into()),
+                })?;
+            if !response.status().is_success() {
+                return Err(ChainError::Backend(format!(
+                    "{path}: {}",
+                    response.status()
+                )));
+            }
+            let text = match max_body {
+                Some(max) => crate::network::read_limited_text(response, max).await?,
+                None => response
+                    .text()
+                    .await
+                    // Headers arrived but the body did not: a lost connection.
+                    .map_err(|_| ChainError::Connection("Esplora body unavailable".into()))?,
+            };
+            parse(&text)
+        })
+        .await
+        .unwrap_or_else(|_| Err(ChainError::NotAvailable("Esplora request timed out".into())))
     }
 
     pub(crate) async fn get_text(&self, path: &str) -> Result<String, ChainError> {
@@ -285,6 +425,9 @@ impl EsploraProvider {
 
 #[async_trait]
 impl ChainProvider for EsploraProvider {
+    fn refusal(&self) -> Result<(), ChainError> {
+        self.network.as_ref().map_or(Ok(()), |gate| gate.refusal())
+    }
     fn chain_view(&self) -> konsensus_core::traits::chain::ChainView {
         konsensus_core::traits::chain::ChainView {
             backend: "esplora",
@@ -292,6 +435,7 @@ impl ChainProvider for EsploraProvider {
             host: reqwest::Url::parse(&self.endpoints[self.active.load(Ordering::Relaxed)].0)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned)),
+            explorer_default: false,
         }
     }
 
@@ -304,14 +448,28 @@ impl ChainProvider for EsploraProvider {
         // Hold the async lock through refresh so concurrent callers share its
         // result. Check freshness after locking; never fall back to stale data.
         let mut cached = self.tip_height.lock().await;
-        if let Some((height, fetched_at)) = *cached {
-            if fetched_at.elapsed() < TIP_HEIGHT_CACHE_TTL {
-                return Ok(height);
+        if let Some(gate) = &self.network {
+            // A refused source serves no height, cached or not.
+            if let Err(error) = gate.refusal() {
+                *cached = None;
+                return Err(error);
+            }
+        }
+        if let Some(entry) = *cached {
+            // Serve the cache only while the endpoint it came from is still
+            // verified. Another endpoint in use since then proves nothing
+            // about this height.
+            let verified = self
+                .network
+                .as_ref()
+                .is_none_or(|gate| gate.is_verified(entry.endpoint));
+            if verified && entry.fetched_at.elapsed() < TIP_HEIGHT_CACHE_TTL {
+                return Ok(entry.height);
             }
         }
 
-        let height = self
-            .get_parsed("/blocks/tip/height", |text| {
+        let (height, endpoint) = self
+            .get_parsed_from("/blocks/tip/height", |text| {
                 let height = text
                     .trim()
                     .parse::<u64>()
@@ -323,7 +481,11 @@ impl ChainProvider for EsploraProvider {
             })
             .await?;
 
-        *cached = Some((height, Instant::now()));
+        *cached = Some(CachedHeight {
+            height,
+            fetched_at: Instant::now(),
+            endpoint,
+        });
         debug!(height, "got block height");
         Ok(height)
     }
@@ -429,8 +591,11 @@ impl ChainProvider for EsploraProvider {
 
     async fn is_synced_with_height(&self, _height: u64) -> bool {
         // This backend defines sync as availability of a tip. The caller's
-        // successful bounded-age height read already established that.
-        true
+        // successful bounded-age height read already established that,
+        // unless the source has since been refused.
+        self.network
+            .as_ref()
+            .is_none_or(|gate| gate.refusal().is_ok())
     }
 }
 

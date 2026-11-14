@@ -17,6 +17,16 @@ ignoreUntil = 2027-02-03
 reason = "Unmaintained rustls-pemfile 1.0.4 is transitive through sqlx-core 0.8.0; tracked as known dependency-island debt until the sqlx/ldk-node bump."
 
 [[IgnoredVulns]]
+id = "RUSTSEC-2026-0441"
+ignoreUntil = 2027-02-09T00:00:00Z
+reason = "Maintenance-only notice for pin-utils 0.1.0, with no vulnerability or patched release identified by this advisory. Its only consumer is nix 0.25.1 through optional electrsd 0.36.1 (konsensus-lightning/ldk-integration-test), absent from the default shipped node. Version 0.1.1 remains unmaintained. Recheck electrsd/nix upgrades and any new pin-utils consumers; remove when pin-utils leaves the graph. Expires 2027-02-09."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0459"
+ignoreUntil = 2026-12-09T00:00:00Z
+reason = "Bundled libsqlite3-sys 0.28.0 is vulnerable to process-memory disclosure when opening a crafted database and mismatched-page-size sibling WAL. Applicability waiver ONLY for exclusively trusted local DB/WAL provenance in SQLx, LDK, tower and durable-relay stores. Custom/external paths, operator-prepared databases and manually restored backups require the same trust; untrusted or externally writable files are NOT covered. Directory permissions, header probes and record encryption do not authenticate existing files or patch SQLite. Peers do not supply raw database files; mnemonic restore creates fresh state and whitelist restore authenticates record JSON. Fix >=0.39 requires coordinated SQLx/rusqlite changes, not a lockfile-only bump. Recheck import/restore, path/permission and dependency changes; remove on upgrade or loss of trusted-file provenance. Expires 2026-12-09. Full scope: .cargo/audit.toml."
+
+[[IgnoredVulns]]
 id = "GHSA-82j2-j2ch-gfr8"
 ignoreUntil = 2027-02-03
 reason = "Duplicate OSV advisory for the rustls-webpki 0.101.7 legacy island; same risk acceptance as RUSTSEC-2026-0104 in deny.toml."

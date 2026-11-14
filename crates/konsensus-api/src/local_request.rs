@@ -15,6 +15,7 @@ use axum::{
 pub(crate) struct LocalRequestPolicy {
     authorities: Vec<String>,
     browser_origins: Vec<HeaderValue>,
+    loopback_origins: Vec<String>,
 }
 
 impl LocalRequestPolicy {
@@ -25,22 +26,62 @@ impl LocalRequestPolicy {
             format!("127.0.0.1:{port}"),
             format!("[::1]:{port}"),
         ];
+        let mut loopback_authorities = authorities.clone();
         if !addr.ip().is_unspecified() {
             authorities.push(addr.to_string());
+            if addr.ip().is_loopback() {
+                loopback_authorities.push(addr.to_string());
+            }
         }
         // HTTP clients and browsers omit the default port from Host and Origin.
         // Derive aliases only from the configured authorities, never the request.
         if port == 80 {
-            let portless = authorities
-                .iter()
-                .filter_map(|authority| authority.strip_suffix(":80").map(str::to_owned))
-                .collect::<Vec<_>>();
-            authorities.extend(portless);
+            for values in [&mut authorities, &mut loopback_authorities] {
+                let portless = values
+                    .iter()
+                    .filter_map(|authority| authority.strip_suffix(":80").map(str::to_owned))
+                    .collect::<Vec<_>>();
+                values.extend(portless);
+            }
         }
         Self {
             authorities,
             browser_origins,
+            loopback_origins: loopback_authorities
+                .iter()
+                .map(|authority| format!("http://{authority}"))
+                .collect(),
         }
+    }
+
+    pub(crate) fn validate_auth_browser(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<(), LocalRequestRejection> {
+        let mut sites = headers.get_all("sec-fetch-site").iter();
+        if let Some(site) = sites.next() {
+            if !matches!(site.to_str(), Ok("same-origin" | "none")) || sites.next().is_some() {
+                return Err(forbidden(
+                    "local_fetch_site_forbidden",
+                    "Browser fetch must originate from this API or a direct navigation",
+                ));
+            }
+        }
+        let mut origins = headers.get_all(header::ORIGIN).iter();
+        if let Some(origin) = origins.next() {
+            let valid_origin = origin.to_str().ok().is_some_and(|value| {
+                self.loopback_origins
+                    .iter()
+                    .any(|allowed| value.eq_ignore_ascii_case(allowed))
+            });
+            if !valid_origin || origins.next().is_some() {
+                return Err(forbidden(
+                    "local_origin_forbidden",
+                    "Origin must name this API's loopback origin",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn validate(&self, headers: &HeaderMap) -> Result<(), LocalRequestRejection> {
@@ -131,5 +172,16 @@ pub(crate) async fn guard(
     next: Next,
 ) -> Result<Response, LocalRequestRejection> {
     policy.validate(request.headers())?;
+    Ok(next.run(request).await)
+}
+
+pub(crate) async fn auth_browser_guard(
+    policy: Option<Extension<LocalRequestPolicy>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, LocalRequestRejection> {
+    if let Some(Extension(policy)) = policy {
+        policy.validate_auth_browser(request.headers())?;
+    }
     Ok(next.run(request).await)
 }

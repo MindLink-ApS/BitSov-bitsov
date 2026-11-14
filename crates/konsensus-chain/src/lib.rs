@@ -21,8 +21,13 @@ pub use bitcoind::{BitcoindConfig, BitcoindProvider};
 pub mod bearer;
 pub mod esplora;
 pub mod mock;
+pub mod network;
 
 pub use esplora::{EsploraConfig, EsploraProvider};
 pub use mock::{MockChainConfig, MockChainProvider};
+pub use network::{NetworkCheck, NetworkMismatch};
 
 pub mod recovery;
+
+pub mod tip;
+pub use tip::FreshTip;

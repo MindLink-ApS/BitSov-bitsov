@@ -28,3 +28,5 @@ pub use plaintext_cache::{PlaintextCacheCipher, PlaintextCacheError};
 pub use x3dh::{
     OneTimePreKey, PrekeyBundle, SignedPreKey, X3dhError, X3dhInitiation, X3dhSharedSecret,
 };
+
+pub mod record_cipher;

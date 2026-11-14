@@ -493,7 +493,7 @@ async fn send_file_inner(
         .pricing
         .get_price_msat(KIND_FILE_REF)
         .await
-        .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+        .map_err(crate::error::pricing_error)?;
 
     let all_in = super::messages::caps::check_payment(&state, super::messages::caps::payable(price_msat), req.max_routing_fee_msat, req.max_total_msat)?;
     *ceiling.lock().unwrap_or_else(|e| e.into_inner()) = Some(all_in - super::messages::caps::payable(price_msat));
@@ -546,7 +546,7 @@ async fn send_file_inner(
 
     // Create real payment proof — requests invoice from recipient (Principle 2).
     let mut admission = super::messages::FirstContactCharge::default();
-    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission, Some(KIND_FILE_REF), &mut admission).await.map_err(|error| admission.error(error));
+    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission, Some(KIND_FILE_REF), &mut admission, None).await.map_err(|error| admission.error(error));
     if matches!(&paid, Err(ApiError::PaymentUnresolved(_))) && admission.readmission_blocks_message {
         debit.settled(&peer_key, admission.settled_msat.saturating_sub(admission.readmission_msat));
     } else if let Err(ApiError::PaymentProofUnavailable { amount_msat, .. }) = &paid {
