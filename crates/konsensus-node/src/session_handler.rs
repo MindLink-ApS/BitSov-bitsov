@@ -3188,3 +3188,7 @@ mod paid_first_contact_two_node;
 #[cfg(test)]
 #[path = "tests/session_race_two_node.rs"]
 mod session_race_two_node;
+
+#[cfg(test)]
+#[path = "tests/sim_many_nodes.rs"]
+mod sim_many_nodes;
