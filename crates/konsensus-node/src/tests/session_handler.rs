@@ -7475,3 +7475,86 @@ async fn legacy_unreadable_lookup_failure_retains_paid_state_and_withholds_confi
     assert_eq!(op.last_error.as_deref(), Some(initial));
     assert_eq!(reopened.count_pending_deliveries().await.unwrap(), 1);
 }
+
+#[tokio::test]
+async fn pending_media_invoice_refuses_stopped_media_until_replacement() {
+    use konsensus_core::payloads::call as rules;
+    use konsensus_api::calls::{publish_media_attachment, stop_media_attachment, MediaDetach};
+    let storage: Arc<dyn konsensus_storage::Storage> = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let paid = rules::CallEntry {
+        side: rules::Side::Callee, phase: rules::Phase::Live, deadline_ms: now + 30_000,
+        pending: None, paid_until_ms: Some(now + 20_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    rules::validate_block_invoice(&paid, 1, now).unwrap();
+    storage.call_put(&peer, id, &paid).await.unwrap();
+    let generation = publish_media_attachment(&storage, &peer, id).await.unwrap();
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let sessions = session_with(&peer).await;
+    let purpose = format!("{}{id}:1", rules::CALL_BLOCK_INVOICE_PREFIX);
+    let mut invoices = ready_invoice_book().await;
+    prepare_call_block_invoice(storage.as_ref(), &sessions, &peer, &purpose, 23_000, "active", &wallet, &mut invoices).await.unwrap();
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 1);
+    let stopped = MediaDetach {
+        generation: Arc::new(tokio::sync::Mutex::new(generation)), expected_generation: generation,
+        only_unpaid: true, may_hangup_live: false,
+    };
+    stop_media_attachment(storage.as_ref(), &peer, id, &stopped);
+    let refused = prepare_call_block_invoice(storage.as_ref(), &sessions, &peer, &purpose, 23_000, "stopped", &wallet, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 1, "no payable invoice for an attachment known to have stopped");
+    assert_eq!(storage.call_get(&peer, id).await.unwrap().unwrap(), paid);
+    publish_media_attachment(&storage, &peer, id).await.unwrap();
+    prepare_call_block_invoice(storage.as_ref(), &sessions, &peer, &purpose, 23_000, "replacement", &wallet, &mut invoices).await.unwrap();
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn pending_media_invoice_serializes_lifecycle_and_head_reads() {
+    use konsensus_core::payloads::call as rules;
+    use konsensus_api::calls::{self as api_calls, MediaDetach};
+    let storage: Arc<dyn konsensus_storage::Storage> = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let paid = rules::CallEntry {
+        side: rules::Side::Callee, phase: rules::Phase::Live, deadline_ms: now + 30_000,
+        pending: None, paid_until_ms: Some(now + 20_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    rules::validate_block_invoice(&paid, 1, now).unwrap();
+    storage.call_put(&peer, id, &paid).await.unwrap();
+    let generation = api_calls::publish_media_attachment(&storage, &peer, id).await.unwrap();
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let sessions = session_with(&peer).await;
+    let purpose = format!("{}{id}:1", rules::CALL_BLOCK_INVOICE_PREFIX);
+    let mut invoices = ready_invoice_book().await;
+    let body = format!(r#"{{"call_id":"{id}","seq":1}}"#);
+    let transition = api_calls::prepare_incoming_block(storage.as_ref(), &peer, Some(&body), &[15;32]).await.unwrap();
+    let mut quote = Box::pin(prepare_call_block_invoice(storage.as_ref(), &sessions, &peer, &purpose, 23_000, "during-transition", &wallet, &mut invoices));
+    let early = tokio::time::timeout(Duration::from_millis(50), &mut quote).await;
+    let blocked = early.is_err();
+    let stopped = MediaDetach {
+        generation: Arc::new(tokio::sync::Mutex::new(generation)), expected_generation: generation,
+        only_unpaid: false, may_hangup_live: true,
+    };
+    api_calls::stop_media_attachment(storage.as_ref(), &peer, id, &stopped);
+    let ended = rules::CallEntry { phase: rules::Phase::Ended, end_reason: Some(rules::HangupReason::Hangup), ..paid };
+    storage.call_put(&peer, id, &ended).await.unwrap();
+    let intent = konsensus_storage::call_media::PendingMediaDetach {
+        peer, call_id: id.into(), generation, only_unpaid: false, may_hangup_live: true, has_stop_policy: true,
+    };
+    storage.call_media_record_detach(&intent, false).await.unwrap();
+    storage.call_media_record_detach(&intent, true).await.unwrap();
+    drop(transition);
+    let result = match early {
+        Ok(result) => result,
+        Err(_) => tokio::time::timeout(Duration::from_secs(2), quote).await.unwrap(),
+    };
+    assert!(blocked, "invoice validation must wait for the lifecycle transition's call lock");
+    assert_eq!(result.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 0);
+}

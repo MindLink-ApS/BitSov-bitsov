@@ -532,6 +532,7 @@ impl PostgresStorage {
     (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
     (38, "envelope deferrals", include_str!("../migrations/038_envelope_deferrals.sql")),
     (39, "envelope deferral expiry", include_str!("../migrations/039_envelope_deferral_expiry.sql")),
+    (40, "call media detach intents", include_str!("../migrations/postgres/040_call_media_detach_intents.sql")),
         ]
     }
 
@@ -1986,6 +1987,65 @@ impl Storage for PostgresStorage {
         Ok(result.rows_affected())
     }
 
+    async fn call_media_publish(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<u64, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let id: i64 = sqlx::query_scalar("INSERT INTO call_media_detach_intents(peer, call_id, event, only_unpaid, may_hangup_live) VALUES ($1, $2, 'attached', 0, 1) RETURNING id")
+            .bind(peer.to_hex()).bind(call_id).fetch_one(&mut *tx).await?;
+        sqlx::query("INSERT INTO call_media_heads(peer, call_id, generation, latest_event, completed) VALUES ($1, $2, $3, $4, 0) ON CONFLICT(peer, call_id) DO UPDATE SET generation = excluded.generation, latest_event = excluded.latest_event, completed = 0")
+            .bind(peer.to_hex()).bind(call_id).bind(id).bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        u64::try_from(id).map_err(|_| StorageError::Conversion("invalid attachment generation".into()))
+    }
+
+    async fn call_media_generation(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<u64>, StorageError> {
+        let id: Option<i64> = sqlx::query_scalar("SELECT generation FROM call_media_heads WHERE peer = $1 AND call_id = $2")
+            .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
+        id.map(|id| u64::try_from(id).map_err(|_| StorageError::Conversion("invalid attachment generation".into()))).transpose()
+    }
+
+    async fn call_media_has_pending(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<bool, StorageError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_media_heads WHERE peer = $1 AND call_id = $2 AND completed = 0")
+            .bind(peer.to_hex()).bind(call_id).fetch_one(&self.pool).await?;
+        Ok(count == 1)
+    }
+
+    async fn call_media_record_detach(&self, intent: &crate::call_media::PendingMediaDetach, completed: bool) -> Result<(), StorageError> {
+        let generation = i64::try_from(intent.generation).map_err(|_| StorageError::Conversion("attachment generation overflow".into()))?;
+        let mut tx = self.pool.begin().await?;
+        // Lock the current projection before appending; completed or superseded
+        // generations can never be reopened by a delayed callback.
+        let previous: Option<i64> = sqlx::query_scalar("UPDATE call_media_heads SET latest_event = latest_event WHERE peer = $1 AND call_id = $2 AND generation = $3 AND completed = 0 RETURNING latest_event")
+            .bind(intent.peer.to_hex()).bind(&intent.call_id).bind(generation).fetch_optional(&mut *tx).await?;
+        let previous = previous.ok_or_else(|| StorageError::Conversion("media attachment no longer pending".into()))?;
+        let policy: (String, i32, i32) = sqlx::query_as("SELECT event, only_unpaid, may_hangup_live FROM call_media_detach_intents WHERE id = $1")
+            .bind(previous).fetch_one(&mut *tx).await?;
+        if !completed && policy == ("detach".into(), i32::from(intent.only_unpaid), i32::from(intent.may_hangup_live)) {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let id: i64 = sqlx::query_scalar("INSERT INTO call_media_detach_intents(peer, call_id, generation, event, only_unpaid, may_hangup_live) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id")
+            .bind(intent.peer.to_hex()).bind(&intent.call_id).bind(generation)
+            .bind(if completed { "complete" } else { "detach" }).bind(i32::from(intent.only_unpaid)).bind(i32::from(intent.may_hangup_live))
+            .fetch_one(&mut *tx).await?;
+        sqlx::query("UPDATE call_media_heads SET latest_event = $1, completed = $2 WHERE peer = $3 AND call_id = $4 AND generation = $5")
+            .bind(id).bind(i32::from(completed)).bind(intent.peer.to_hex()).bind(&intent.call_id).bind(generation).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn call_media_pending(&self, after: u64, max: u32) -> Result<Vec<crate::call_media::PendingMediaDetach>, StorageError> {
+        let mut after = i64::try_from(after).map_err(|_| StorageError::Conversion("attachment generation overflow".into()))?;
+        loop {
+            let rows: Vec<crate::call_media::IntentRow> = sqlx::query_as("SELECT h.generation, h.peer, h.call_id, e.only_unpaid, e.may_hangup_live, CASE WHEN e.event = 'attached' THEN 0 ELSE 1 END FROM call_media_heads h JOIN call_media_detach_intents e ON e.id = h.latest_event WHERE h.completed = 0 AND h.generation > $1 ORDER BY h.generation LIMIT $2")
+                .bind(after).bind(i64::from(max)).fetch_all(&self.pool).await?;
+            let Some(last) = rows.last() else { return Ok(Vec::new()) };
+            after = last.0;
+            let decoded = crate::call_media::decode_intents(rows);
+            if !decoded.is_empty() { return Ok(decoded); }
+            // Advance through undecodable pages while retaining their pending heads.
+        }
+    }
+
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE peer = $1 AND call_id = $2")
             .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
@@ -2037,7 +2097,7 @@ impl Storage for PostgresStorage {
                 COALESCE(SUM(CASE WHEN open = 0 AND peer = $2 THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN open = 0 THEN 1 ELSE 0 END), 0) \
              FROM (SELECT peer, CASE WHEN pending_operation_id IS NOT NULL OR (phase <> 'ended' AND (CASE WHEN phase = 'live' THEN deadline_ms >= $3 ELSE deadline_ms > $3 END)) THEN 1 ELSE 0 END AS open \
-                   FROM call_state WHERE replay_until_ms > $4 OR pending_operation_id IS NOT NULL) AS rows")
+                   FROM call_state WHERE replay_until_ms > $4 OR pending_operation_id IS NOT NULL OR EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0)) AS rows")
             .bind(peer.to_hex()).bind(peer.to_hex()).bind(now).bind(now).fetch_one(&self.pool).await?;
         let n = |v: i64| u64::try_from(v).unwrap_or(0);
         Ok(konsensus_core::payloads::call::CallCounts { open_peer: n(open_peer), open_total: n(open_total), burned_peer: n(burned_peer), burned_total: n(burned_total) })
@@ -2048,7 +2108,7 @@ impl Storage for PostgresStorage {
         let done = sqlx::query(
             "DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state \
              WHERE ($1::TEXT IS NULL OR peer = $2) AND pending_operation_id IS NULL AND (phase = 'ended' OR deadline_ms <= $3) \
-             AND replay_until_ms <= $4 ORDER BY replay_until_ms LIMIT $5)")
+             AND replay_until_ms <= $4 AND NOT EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0) ORDER BY replay_until_ms LIMIT $5)")
             .bind(peer.map(|p| p.to_hex())).bind(peer.map(|p| p.to_hex()))
             .bind(ms(now_ms)?).bind(ms(replay_until_at_most)?).bind(ms(max)?)
             .execute(&self.pool).await?;
@@ -2118,7 +2178,7 @@ impl Storage for PostgresStorage {
             .execute(&self.pool).await?;
         sqlx::query("DELETE FROM call_block_invoices WHERE payment_hash IN (SELECT payment_hash FROM call_block_invoices WHERE retain_until_ms < $1 ORDER BY retain_until_ms LIMIT $2)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
-        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= $1 AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) ORDER BY replay_until_ms LIMIT $2)")
+        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= $1 AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) AND NOT EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0) ORDER BY replay_until_ms LIMIT $2)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         Ok(done.rows_affected())
     }
@@ -4275,7 +4335,7 @@ mod schema_parity_tests {
             .collect();
         assert_eq!(
             versions,
-            (1..=39).filter(|v| !matches!(v, 7..=9 | 34)).collect::<Vec<_>>()
+            (1..=40).filter(|v| !matches!(v, 7..=9 | 34)).collect::<Vec<_>>()
         );
         let sql = include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql");
         assert!(

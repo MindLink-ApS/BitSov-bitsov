@@ -1661,6 +1661,12 @@ async fn start_node_services<'a>(
         _ => None,
     };
 
+    // Resolve media left by the previous process before accepting call work.
+    // Startup refuses to continue if the durable recovery state is unreadable.
+    konsensus_api::calls::replay_media_detaches(
+        node.storage().as_ref(), chrono::Utc::now().timestamp_millis() as u64, true,
+    ).await.context("call media startup recovery failed")?;
+
     // M6 N2: node-routed call media, admitted by N1's settled-block
     // coverage and paid-until grace check.
     let call_media = call_media::CallMediaRouter::with_limits(

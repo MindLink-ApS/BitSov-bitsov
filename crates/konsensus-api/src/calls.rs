@@ -84,69 +84,38 @@ pub async fn call_media_admitted(store: Store<'_>, peer: &NodeId, call_id: &str,
     store.call_get(peer, call_id).await.ok().flatten().is_some_and(|entry| entry.media_admitted(now))
 }
 
-/// A teardown request for one local media attachment generation.
-pub struct MediaDetach {
-    /// Shared with attachment publication; held until the durable write completes.
-    pub generation: std::sync::Arc<tokio::sync::Mutex<u64>>,
-    pub expected_generation: u64,
-    /// Admission loss alone may close an Unpaid resume window, never a Live row.
-    pub only_unpaid: bool,
-    /// Whether socket teardown may end a Live call before its paid deadline.
-    pub may_hangup_live: bool,
-}
-
-/// Whether teardown completed or must wait for ordinary expiry maintenance.
-#[derive(Debug, PartialEq, Eq)]
-pub enum MediaDetachOutcome {
-    Complete,
-    PendingExpiry,
-}
-
-/// End a callee call only while its attachment generation is still current.
-/// Preserve pending evidence and replay retention for ordinary reconciliation.
-pub async fn detach_callee_media(store: Store<'_>, peer: &NodeId, call_id: &str, now: u64, detach: &MediaDetach) -> Result<MediaDetachOutcome, konsensus_storage::StorageError> {
-    let generation = detach.generation.lock().await;
-    if *generation != detach.expected_generation { return Ok(MediaDetachOutcome::Complete); }
-    let _guard = lock().lock().await;
-    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(MediaDetachOutcome::Complete) };
-    if entry.side != rules::Side::Callee { return Ok(MediaDetachOutcome::Complete); }
-    // Maintenance owns expiry and its terminal notice; socket loss only closes resume.
-    if entry.phase == rules::Phase::Live && now > entry.deadline_ms {
-        if !detach.only_unpaid && entry.paid_until_ms != Some(0) {
-            entry.paid_until_ms = Some(0);
-            store.call_put(peer, call_id, &entry).await?;
-        }
-        return Ok(MediaDetachOutcome::PendingExpiry);
-    }
-    if !((!detach.only_unpaid && detach.may_hangup_live && entry.phase == rules::Phase::Live)
-        || (entry.phase == rules::Phase::Ended && entry.end_reason == Some(rules::HangupReason::Unpaid))) { return Ok(MediaDetachOutcome::Complete); }
-    if entry.phase == rules::Phase::Ended {
-        // Zero closes resume without changing Unpaid or its replay deadline.
-        entry.paid_until_ms = Some(0);
-    } else {
-        entry.phase = rules::Phase::Ended;
-        entry.end_reason = Some(rules::HangupReason::Hangup);
-        entry.deadline_ms = entry.deadline_ms.max(now.saturating_add(rules::TOMBSTONE_MS));
-    }
-    store.call_put(peer, call_id, &entry).await?;
-    Ok(MediaDetachOutcome::Complete)
-}
+mod media_detach;
+pub use media_detach::{detach_callee_media, publish_media_attachment, replay_media_detaches, stop_media_attachment, MediaDetach, MediaDetachOutcome};
 
 /// End expired calls durably, retaining pending evidence and tombstones.
 /// Only callee entries are returned for a best-effort 403 Unpaid notification.
 pub async fn expire_calls(store: Store<'_>, now: u64) -> Result<Vec<(NodeId, String)>, konsensus_storage::StorageError> {
+    // Replay failures must not prevent ordinary unpaid expiry.
+    if let Err(error) = replay_media_detaches(store, now, false).await {
+        tracing::warn!(%error, "call media replay deferred");
+    }
     let _g = lock().lock().await;
     let mut expired = Vec::new();
     for (peer, call_id, entry) in store.call_live().await? {
         if now <= entry.deadline_ms { continue; }
         // at() may discard a very old row; keep a tombstone until the next
         // ordinary replay sweep so a notification never opens a fresh call.
-        let next = entry.clone().at(now).unwrap_or(rules::CallEntry {
+        let mut next = entry.clone().at(now).unwrap_or(rules::CallEntry {
             phase: rules::Phase::Ended,
             end_reason: Some(rules::HangupReason::Unpaid),
             deadline_ms: entry.deadline_ms.saturating_add(rules::TOMBSTONE_MS),
             ..entry
         });
+        if next.side == rules::Side::Callee {
+            match media_detach::media_attachment_stopped(store, &peer, &call_id).await {
+                Ok(true) => next.paid_until_ms = Some(0),
+                Ok(false) => {},
+                Err(error) => {
+                    tracing::warn!(%error, "call media expiry state unavailable; resume closed");
+                    next.paid_until_ms = Some(0);
+                }
+            }
+        }
         if let Err(error) = store.call_put(&peer, &call_id, &next).await {
             tracing::warn!(%error, "call expiry deferred");
             continue;
@@ -510,7 +479,11 @@ pub(crate) async fn offer_dispatch_guard(store: Store<'_>, peer: &NodeId, plaint
 }
 
 async fn current(store: Store<'_>, peer: &NodeId, call_id: &str, now: u64) -> Result<Option<CallEntry>, konsensus_storage::StorageError> {
-    Ok(store.call_get(peer, call_id).await?.and_then(|e| e.at(now)))
+    let aged = store.call_get(peer, call_id).await?.and_then(|e| e.at(now));
+    if aged.is_none() && store.call_media_has_pending(peer, call_id).await? {
+        return Err(konsensus_storage::StorageError::Conversion("call media recovery pending".into()));
+    }
+    Ok(aged)
 }
 
 async fn write(store: Store<'_>, peer: &NodeId, call_id: &str, entry: Option<&CallEntry>) -> Result<(), konsensus_storage::StorageError> {
@@ -577,6 +550,20 @@ impl IncomingBlock<'_> {
     }
 }
 
+/// Read invoice eligibility and media ownership under one lifecycle lock.
+/// Wallet operations run after this returns; callers repeat it before publishing.
+/// The result is the retention deadline for the invoice's call binding.
+pub async fn validate_call_block_invoice(store: Store<'_>, peer: &NodeId, call_id: &str, seq: u32) -> Result<u64, CallRefusal> {
+    let _guard = lock().lock().await;
+    let unavailable = |_| CallRefusal::Invalid("call state unavailable");
+    let entry = store.call_get(peer, call_id).await.map_err(unavailable)?.ok_or(CallRefusal::UnknownCall)?;
+    if media_detach::media_attachment_stopped(store, peer, call_id).await.map_err(unavailable)? {
+        return Err(CallRefusal::UnknownCall);
+    }
+    rules::validate_block_invoice(&entry, seq, now_ms())?;
+    Ok(entry.deadline_ms.saturating_add(rules::CALL_BLOCK_RESUME_MS))
+}
+
 /// Check a payment-validated block before consuming its nonce/payment proof.
 /// Retain the guard through acceptance and commit. An unserviceable settled
 /// block still consumes its proof and becomes an audited overpayment.
@@ -588,9 +575,20 @@ pub async fn prepare_incoming_block<'a>(store: Store<'a>, peer: &NodeId, plainte
     let seq = signal.seq.ok_or(CallRefusal::Invalid("missing seq"))?;
     let issued = store.has_call_block_invoice(peer, &signal.call_id, seq, payment_hash).await
         .map_err(|_| CallRefusal::Invalid("call invoice provenance unavailable"))?;
-    let next = if issued { rules::receive_block(entry, seq, now) } else {
+    let next = if !issued {
         Err(CallRefusal::Invalid("call block paid through a non-block invoice"))
-    };
+    } else if entry.as_ref().is_some_and(|e| e.side == rules::Side::Callee
+        && (e.phase == rules::Phase::Live || (e.phase == rules::Phase::Ended && e.end_reason == Some(rules::HangupReason::Unpaid)))) {
+        // A socket can stop while expiry's durable write is in flight. The
+        // final ownership snapshot orders this admission after that stop.
+        // A protected Live row keeps its paid interval but cannot renew it.
+        if media_detach::media_attachment_stopped(store, peer, &signal.call_id).await
+            .map_err(|_| CallRefusal::Invalid("call media state unavailable"))? {
+            Err(CallRefusal::UnknownCall)
+        } else {
+            rules::receive_block(entry, seq, now)
+        }
+    } else { rules::receive_block(entry, seq, now) };
     Ok(IncomingBlock { _guard: guard, store, peer: *peer, signal, next })
 }
 
