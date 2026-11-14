@@ -314,9 +314,18 @@ impl From<PairingError> for PairingRefusal {
             PairingError::OwnerChannelUnavailable => "owner_channel_off",
             PairingError::DeviceApprovalsDisabled(_) => "device_approvals_disabled",
             PairingError::Malformed(_) => "malformed",
-            PairingError::TooManyPending => "rate_limited",
+            PairingError::TooManyPending => "rate_limited_client",
             PairingError::Io(_) => "storage_error",
-            _ => "pairing_refused",
+            PairingError::Closed => "pairing_refused:Closed",
+            PairingError::UnknownPending => "pairing_refused:UnknownPending",
+            PairingError::UnknownOperation => "pairing_refused:UnknownOperation",
+            PairingError::ConfirmationMismatch => "pairing_refused:ConfirmationMismatch",
+            PairingError::WrongOwnerCode(_) => "pairing_refused:WrongOwnerCode",
+            PairingError::ConfirmationLost => "pairing_refused:ConfirmationLost",
+            PairingError::ShortCodesOff => "pairing_refused:ShortCodesOff",
+            PairingError::NotApproved => "pairing_refused:NotApproved",
+            PairingError::BindingMismatch => "pairing_refused:BindingMismatch",
+            PairingError::OwnerApprovalUnavailable => "pairing_refused:OwnerApprovalUnavailable",
         };
         Self::new(error, reason)
     }
@@ -4733,3 +4742,48 @@ mod token_challenge_tests;
 #[cfg(test)]
 #[path = "pairing/pending_tests.rs"]
 mod pending_tests;
+
+#[cfg(test)]
+mod refusal_reason_tests {
+    use super::{PairingError, PairingRefusal};
+
+    #[test]
+    fn refusal_classifications_distinguish_client_limits_and_fixed_variants() {
+        for (error, expected) in [
+            (PairingError::TooManyPending, "rate_limited_client"),
+            (PairingError::Closed, "pairing_refused:Closed"),
+            (
+                PairingError::UnknownPending,
+                "pairing_refused:UnknownPending",
+            ),
+            (
+                PairingError::UnknownOperation,
+                "pairing_refused:UnknownOperation",
+            ),
+            (
+                PairingError::ConfirmationMismatch,
+                "pairing_refused:ConfirmationMismatch",
+            ),
+            (
+                PairingError::WrongOwnerCode(3),
+                "pairing_refused:WrongOwnerCode",
+            ),
+            (
+                PairingError::ConfirmationLost,
+                "pairing_refused:ConfirmationLost",
+            ),
+            (PairingError::ShortCodesOff, "pairing_refused:ShortCodesOff"),
+            (PairingError::NotApproved, "pairing_refused:NotApproved"),
+            (
+                PairingError::BindingMismatch,
+                "pairing_refused:BindingMismatch",
+            ),
+            (
+                PairingError::OwnerApprovalUnavailable,
+                "pairing_refused:OwnerApprovalUnavailable",
+            ),
+        ] {
+            assert_eq!(PairingRefusal::from(error).reason, expected);
+        }
+    }
+}
