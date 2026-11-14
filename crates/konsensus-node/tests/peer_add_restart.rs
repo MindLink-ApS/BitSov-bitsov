@@ -24,11 +24,24 @@ struct Node {
     identity: NodeIdentity,
     log: PathBuf,
 }
+/// A free loopback address, never handed out twice in this binary.
+///
+/// The probe listener is dropped before the node binds the port, and this
+/// binary's tests run in parallel. If two nodes were given the same port, the
+/// loser's API would fail to bind while `ready` already saw the winner's
+/// `/health`, so the test would talk to the wrong node (401 on `auth/token`).
 fn address() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+    static HANDED_OUT: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    loop {
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        if HANDED_OUT.lock().unwrap().insert(addr.port()) {
+            return addr;
+        }
+    }
 }
 impl Node {
     fn new() -> Self {
@@ -93,8 +106,11 @@ impl Node {
                 .send()
                 .await
             {
+                // Our process must still be running: a node that lost its API
+                // port exits, and the answer came from another process.
                 if resp.status().is_success()
                     && (!owner || self.dir.path().join("control.sock").exists())
+                    && process.0.try_wait().unwrap().is_none()
                 {
                     return;
                 }
@@ -219,7 +235,7 @@ async fn owner_added_peer_survives_restart_and_config_still_wins() {
             "--addr",
             &b.peer.to_string(),
             "--label",
-            "Dad",
+            "Bob",
             "--yes",
             "--config",
         ])
@@ -253,7 +269,7 @@ async fn owner_added_peer_survives_restart_and_config_still_wins() {
     b.connected(&http, &token_b, &a).await;
     let peers = a.get(&http, &token_a, "peers").await;
     assert_eq!(peers[0]["addr"], b.peer.to_string());
-    assert_eq!(peers[0]["label"], "Dad");
+    assert_eq!(peers[0]["label"], "Bob");
     assert_eq!(std::fs::read(&a.config).unwrap(), unchanged);
     a.stop(pa).await;
     // Stop B too: an inbound reconnect cannot rewrite A's configured address.

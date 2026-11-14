@@ -301,6 +301,10 @@ pub enum Command {
         command: SeedCommand,
     },
 
+    /// Show the chain tip source and whether it is a public explorer this node
+    /// never explicitly accepted. Read-only: changes nothing.
+    ChainTip(crate::chain_tip_cmd::ChainTipArgs),
+
     /// Paired device keys: approve one once, list, or revoke.
     ///
     /// A device key lets the paired app open per-contact spend envelopes by

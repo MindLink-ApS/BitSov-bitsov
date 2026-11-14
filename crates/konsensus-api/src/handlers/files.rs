@@ -179,6 +179,9 @@ pub struct SendFileRequest {
 #[derive(Serialize)]
 pub struct SendFileResponse {
     pub max_routing_fee_msat: u64,
+    /// Actual aggregate LDK routing fee; omitted unless every component is known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_paid_msat: Option<u64>,
     /// The message ID of the UKM envelope.
     pub message_id: String,
     /// Whether the file was delivered to a connected peer.
@@ -490,7 +493,7 @@ async fn send_file_inner(
         .pricing
         .get_price_msat(KIND_FILE_REF)
         .await
-        .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+        .map_err(crate::error::pricing_error)?;
 
     let all_in = super::messages::caps::check_payment(&state, super::messages::caps::payable(price_msat), req.max_routing_fee_msat, req.max_total_msat)?;
     *ceiling.lock().unwrap_or_else(|e| e.into_inner()) = Some(all_in - super::messages::caps::payable(price_msat));
@@ -535,15 +538,15 @@ async fn send_file_inner(
         .await
         .map_err(|e| {
             debit.released(&peer_key);
-            ApiError::BadRequest(format!(
+            ApiError::from_encrypt_failure(e, |e| ApiError::BadRequest(format!(
                 "E2EE encryption failed (session may not be established): {e}"
-            ))
+            )))
         })?;
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
     // Create real payment proof — requests invoice from recipient (Principle 2).
     let mut admission = super::messages::FirstContactCharge::default();
-    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission, Some(KIND_FILE_REF), &mut admission).await.map_err(|error| admission.error(error));
+    let paid = create_metered_payment_proof(&state, price_msat, &peer_id, &debit, readmission, Some(KIND_FILE_REF), &mut admission, None).await.map_err(|error| admission.error(error));
     if matches!(&paid, Err(ApiError::PaymentUnresolved(_))) && admission.readmission_blocks_message {
         debit.settled(&peer_key, admission.settled_msat.saturating_sub(admission.readmission_msat));
     } else if let Err(ApiError::PaymentProofUnavailable { amount_msat, .. }) = &paid {
@@ -618,6 +621,9 @@ async fn send_file_inner(
 
     Ok(Json(SendFileResponse {
         max_routing_fee_msat: (all_in - super::messages::caps::payable(price_msat)).saturating_add(readmission.fee_ceiling_msat()),
+        fee_paid_msat: if state.lightning_backend == "ldk" {
+            debit.recorded_fee_paid_msat().and_then(|fee| readmission.fee_paid_msat().and_then(|r| fee.checked_add(r)))
+        } else { None },
         message_id: envelope.id.to_hex(),
         delivered,
         amount_msat,

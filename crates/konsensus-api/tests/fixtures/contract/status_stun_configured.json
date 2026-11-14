@@ -51,9 +51,11 @@
       "reservations": [],
       "unreadable_rows": 0
     },
+    "max_call_minutes": 60,
     "money_ready": true,
     "network": "regtest",
     "node_id": "<hex64>",
+    "node_version": "<pkg_version>",
     "offline_safety": null,
     "peer_endpoint_reason": "no_dialable_endpoint",
     "pending_deliveries": 0,

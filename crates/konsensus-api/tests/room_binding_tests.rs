@@ -211,7 +211,7 @@ async fn a_bad_binding_is_refused_before_anything_is_paid() {
         (id, true, json!({"v": 1, "room": with_us, "text": "x"}).to_string(), "room_binding_invalid"),
         // The room send's recipient is not the binding's room id.
         (&other_id, true, room_chat(&with_us, "x"), "room_binding_invalid"),
-        // Codex #155: the room id of [us, a, b] with b swapped for c, or c
+        // Review #155: the room id of [us, a, b] with b swapped for c, or c
         // added: the id commits to the roster, so both are refused, as a
         // fan-out or as a 1:1 leg to the outsider.
         (id, true, swapped(&with_us, &[f.own, a, c]), "room_binding_invalid"),
@@ -288,7 +288,7 @@ async fn store(f: &Fixture, sender: NodeId, recipient: NodeId, plaintext: &str, 
     let proof = PaymentProof::new([n; 32], [n; 32], 1_000);
     let env = UkmEnvelopeBuilder::new(0, sender, Recipient::Node(recipient), b"ct".to_vec(), proof).build();
     f.storage.store_message(&env).await.unwrap();
-    f.storage.store_message_plaintext(&env.id, &test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap()).await.unwrap();
+    f.storage.store_message_plaintext(&env.id, &test_plaintext_cipher().encrypt(&env.id.to_hex(), plaintext.as_bytes()).unwrap()).await.unwrap();
 }
 
 /// The room thread (`?room=`) lists both directions: received chats bound to
@@ -345,7 +345,7 @@ async fn the_room_thread_lists_both_directions_our_copies_once() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
-/// Codex #155 probe `review_room_thread_includes_own_sent_chat`, on SQLite:
+/// Review #155 probe `review_room_thread_includes_own_sent_chat`, on SQLite:
 /// after a fan-out the sender's room thread holds that message once, with a
 /// copy per member, and a member's reply.
 #[tokio::test]
@@ -360,7 +360,7 @@ async fn a_sent_room_message_is_in_the_thread_once_on_sqlite() {
     let proof = PaymentProof::new([9; 32], [9; 32], 1_000);
     let reply = UkmEnvelopeBuilder::new(0, others[1], Recipient::Node(f.own), b"ct".to_vec(), proof).build();
     f.state.storage.store_message(&reply).await.unwrap();
-    f.state.storage.store_message_plaintext(&reply.id, &test_plaintext_cipher().encrypt(room_chat(&r, "reply").as_bytes()).unwrap()).await.unwrap();
+    f.state.storage.store_message_plaintext(&reply.id, &test_plaintext_cipher().encrypt(&reply.id.to_hex(), room_chat(&r, "reply").as_bytes()).unwrap()).await.unwrap();
     let (status, thread) = f.call("GET", &format!("/api/v1/messages?room={}", r.id), None).await;
     assert_eq!(status, StatusCode::OK, "{thread}");
     let thread = thread.as_array().unwrap();
@@ -371,7 +371,7 @@ async fn a_sent_room_message_is_in_the_thread_once_on_sqlite() {
     assert!(thread.iter().any(|m| m["sender"] == others[1].to_hex()));
 }
 
-/// Codex #155 delta 1: the thread pages by whole messages. Our message's
+/// Review #155 delta 1: the thread pages by whole messages. Our message's
 /// copies are at 2000 and 3000 with a late resend (same `msg`) at 4000, and
 /// received chats sit at 1000, 2500 and 3500. Paging with `limit=1` and
 /// `before` = the last entry's timestamp yields each entry once: our message
@@ -390,7 +390,7 @@ async fn the_room_thread_pages_by_whole_messages() {
             let mut env = UkmEnvelopeBuilder::new(0, sender, Recipient::Node(recipient), b"ct".to_vec(), PaymentProof::new([n; 32], [n; 32], 1_000)).build();
             env.timestamp = ts;
             state.storage.store_message(&env).await.unwrap();
-            state.storage.store_message_plaintext(&env.id, &test_plaintext_cipher().encrypt(plaintext.as_bytes()).unwrap()).await.unwrap();
+            state.storage.store_message_plaintext(&env.id, &test_plaintext_cipher().encrypt(&env.id.to_hex(), plaintext.as_bytes()).unwrap()).await.unwrap();
         }
     };
     let sent = || chat_with(serde_json::to_value(&r).unwrap(), &ours, "ours");
@@ -440,7 +440,7 @@ async fn the_room_thread_pages_by_whole_messages() {
     assert!(mid.as_array().unwrap().iter().all(|m| m["sender"] != f.own.to_hex()), "{mid}");
 }
 
-/// Codex #155 probe `room_one_member_without_session_must_not_pay_first_contact`:
+/// Review #155 probe `room_one_member_without_session_must_not_pay_first_contact`:
 /// a 1:1 room chat to a connected member that advertises the binding but has
 /// no E2EE session is refused before any quote; the real (shared mock)
 /// ledger shows zero spend and no invoice is asked for. A room never pays

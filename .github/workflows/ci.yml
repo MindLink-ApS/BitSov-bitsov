@@ -105,6 +105,17 @@ jobs:
       - name: Exercise the release-signing command offline
         run: bash scripts/test-release-sign.sh
 
+  docs-consistency:
+    name: Docs Consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Dropped-link recovery steps match and name the app's buttons
+        run: bash scripts/test-known-limit-steps.sh
+
   frontend:
     name: Frontend Build
     # Always-on sentinel. Docs-only and `pm/` pulls skip the heavy jobs, and a
@@ -160,6 +171,9 @@ jobs:
       - name: Verify Rust toolchain pin
         run: bash scripts/test-rust-toolchain.sh && bash scripts/rust-toolchain-channel.sh --check
 
+      - name: Test compiler cache fallback
+        run: bash scripts/test-sccache.sh
+
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL 2>/dev/null || true
@@ -187,12 +201,12 @@ jobs:
           cache-workspace-crates: "true"
 
       - name: sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - name: Enable sccache for Cargo
-        run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Configure Cargo compiler cache
+        run: bash scripts/configure-sccache.sh '${{ steps.sccache.outcome }}'
 
       - name: Check disk space
         run: df -h /
@@ -256,11 +270,11 @@ jobs:
           shared-key: ldk-node-security-${{ hashFiles('vendor/ldk-node/Cargo.lock', 'vendor/lightning/Cargo.lock') }}
           cache-all-crates: "true"
       - name: sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-      - name: Enable sccache for Cargo
-        run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Configure Cargo compiler cache
+        run: bash scripts/configure-sccache.sh '${{ steps.sccache.outcome }}'
       # The vendor crate is excluded from --workspace and -p konsensus-*.
       # Run its private-handler regressions plus all existing local patch tests.
       - name: Test vendored ldk-node library

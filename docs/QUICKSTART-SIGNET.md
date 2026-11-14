@@ -10,7 +10,9 @@ Paid admission follows the [2026-07-01 keystone](v2/F1-CAPPED-FIRST-CONTACT.md)
 (the target re-prices and the requester pays its invoice), and **mainnet is not
 supported for the public beta**: this guide never uses it and nothing here
 funds a mainnet wallet. Signet coins have no value. There is no final signed
-release yet (only pre-release candidates); this guide builds from source. Every
+release yet, only signed pre-release binaries for signet testing; this guide
+builds from source, or installs a pre-release binary
+([step 1b](#1b-or-install-a-signed-pre-release-binary)). Every
 step below was run in the session that produced this guide, except the two
 marked **untested in CI**, and some ran under different conditions (a debug
 build on another compiler, mock Lightning instead of a live signet node); the
@@ -53,6 +55,102 @@ guide assumes it is on your `PATH`:
 ```sh
 export PATH="$PWD/target/release:$PATH"
 ```
+
+## 1b. Or install a signed pre-release binary
+
+Signed pre-release binaries are on the
+[releases page](https://github.com/MindLink-ApS/BitSov-bitsov/releases), for
+signet testing only. These steps are for macOS and Linux. Each binary is named
+for its platform, `bitsov-<os>-<arch>`: `bitsov-darwin-aarch64` (Apple silicon),
+`bitsov-darwin-x86_64` (Intel Mac), `bitsov-linux-aarch64` or
+`bitsov-linux-x86_64`. This guide and the node's own messages call it
+`konsensus`.
+
+Into an empty directory, download your platform's binary, `SHA256SUMS` and
+`SHA256SUMS.asc` from the release, and the release key from the repository at
+the same tag:
+
+```sh
+TAG=v0.3.0-rc22   # the release you downloaded
+curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/RELEASE_KEY.asc"
+```
+
+**Check the signature.** A throwaway GnuPG home keeps your own keyring
+untouched, and `--no-auto-key-retrieve` stops gpg from fetching any key from
+the network; only the downloaded `RELEASE_KEY.asc` is used:
+
+```sh
+(
+  export GNUPGHOME="$(mktemp -d)"
+  gpg --batch --quiet --import RELEASE_KEY.asc
+  gpg --batch --no-auto-key-retrieve --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null > gpg-status.txt
+  gpg_exit=$?
+  rm -rf "$GNUPGHOME"
+  if [ "$gpg_exit" -eq 0 ] &&
+     ! grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG) ' gpg-status.txt &&
+     [ "$(awk '$2 == "VALIDSIG" { print $12 }' gpg-status.txt)" = B299274C200301714DC6F51A7C2D6F8AC842EF6E ]
+  then echo "signature OK"
+  else echo "SIGNATURE CHECK FAILED: do not use these files"; exit 1
+  fi
+)
+```
+
+It prints `signature OK` and exits 0 only if gpg exits 0, no bad-signature
+status appears, and the primary-key fingerprint in the `VALIDSIG` line is
+exactly `B299274C200301714DC6F51A7C2D6F8AC842EF6E`, the release key (also in
+[`SECURITY.md`](../SECURITY.md)). Any non-zero status means stop: do not use
+the files. The parentheses keep the `exit` from closing your shell. "Good
+signature" alone is not enough: that fingerprint field is what ties the
+signature to the release key.
+
+If you download every asset of the release instead, a source checkout's
+`bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` makes the same
+check plus every checksum, and prints a sealed copy to install from. It refuses
+a directory that holds only one platform's binary.
+
+**Check the file.** `SHA256SUMS` lists every platform's files, so tell the
+check to skip the ones you didn't download:
+
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing   # macOS
+sha256sum -c --ignore-missing SHA256SUMS       # Linux
+```
+
+Look for `OK` after your binary's name. Without `--ignore-missing` the command
+fails on the files that aren't there, even when yours is fine.
+
+**Install it as `konsensus`.** The download isn't executable, and on macOS a
+browser marks it as downloaded. The macOS binary is not notarized, so
+Gatekeeper refuses to open a marked copy; after the checks above pass, remove
+the mark (`curl` and `gh` downloads have none):
+
+```sh
+mv bitsov-darwin-aarch64 konsensus   # your platform's file; or: ln -s bitsov-darwin-aarch64 konsensus
+chmod +x konsensus
+xattr -d com.apple.quarantine konsensus 2>/dev/null   # macOS only
+./konsensus --version                # konsensus 0.3.0-rc22
+export PATH="$PWD:$PATH"
+```
+
+Step 4 needs the owner-token helper. It is not a release asset, so neither
+`SHA256SUMS` nor its signature covers it. Fetch it from the same tag into this
+directory:
+
+```sh
+curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/docs/ops/owner-token.sh"
+shasum -a 256 owner-token.sh   # Linux: sha256sum owner-token.sh
+```
+
+For `v0.3.0-rc22` the hash is
+`a23f002e754f91416c5580a3ff6b82ef8447cea7cc6a125e505fef3a5ff95764`, the file at
+that tag (`docs/ops/owner-token.sh` in the tag's tree on GitHub). That value
+comes from the same site as the file, so it catches a damaged or mismatched
+download, not a changed repository. For a check tied to the release key,
+verify the tag in a source checkout (`git verify-tag`, with the fingerprint
+above) and compare the file there with `cmp`. Read the script before you
+source it.
+
+Keep this directory; step 4 comes back to it. Then continue at step 2.
 
 ## 2. Initialize a node on signet
 
@@ -151,6 +249,15 @@ In the second terminal, enter the checkout and put the binary on `PATH` again
 ```sh
 cd BitSov-bitsov
 export PATH="$PWD/target/release:$PATH"
+```
+
+With a release binary from step 1b, enter that directory instead, and source
+the helper from there in place of the `docs/ops/owner-token.sh` line below:
+
+```sh
+cd <the step 1b directory>
+export PATH="$PWD:$PATH"
+KONSENSUS_CONFIG=~/bitsov-signet/konsensus.toml source ./owner-token.sh
 ```
 
 The HTTP API is loopback only and every owner route needs a bearer token. The
@@ -278,7 +385,7 @@ api -X POST -H 'content-type: application/json' $API/messages/compose -d '{
 }' | jq .
 ```
 
-`kind: 0` is a chat message. The node encrypts it end to end (X3DH and the
+`kind: 0` is a chat message. The node encrypts it for the contact's node (X3DH and the
 Double Ratchet), pays the recipient's chat price over the channel, and sends
 it. The default chat price is 10 msat, which the node raises to its 1,000 msat
 invoice minimum; `max_total_msat` caps principal plus routing fee (6,000 msat is
@@ -297,7 +404,7 @@ api "$API/messages?peer=<your node id>" | jq .
 
 lists the message with its decrypted `plaintext`, and their `payments/balance`
 has gone up by the price. That is the whole loop: identity from keys, admission
-by payment, content end to end encrypted.
+by payment, content encrypted between the two nodes. Either node can read it.
 
 ## Stopping, restarting, troubleshooting
 

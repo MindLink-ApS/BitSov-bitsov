@@ -143,7 +143,7 @@ impl MessageResponse {
     /// Attach cached plaintext by decrypting the at-rest encrypted blob.
     pub(super) fn with_cached_plaintext(mut self, encrypted: Option<Vec<u8>>, cipher: Option<&konsensus_crypto::PlaintextCacheCipher>) -> Self {
         if let (Some(enc), Some(c)) = (encrypted, cipher) {
-            match c.decrypt(&enc) {
+            match c.decrypt(&self.id, &enc) {
                 Ok(bytes) => {
                     if let Ok(text) = String::from_utf8(bytes) {
                         if let Some(chat) = self.room_of(&text) {
@@ -215,7 +215,7 @@ pub(super) async fn get_message_plaintext(
         .ok_or_else(|| ApiError::NotFound(format!("no cached plaintext for message {id_hex}")))?;
 
     let decrypted = cipher
-        .decrypt(&encrypted)
+        .decrypt(&id.to_hex(), &encrypted)
         .map_err(|e| ApiError::Internal(format!("plaintext decryption failed: {e}")))?;
 
     // Try to parse as UTF-8 text; fall back to base64 for binary content
@@ -329,7 +329,7 @@ pub(super) async fn list_messages(
 /// is built from the newest [`MAX_SEARCH_SCAN`] chats with any node, always
 /// from the top: copies of one message can be far apart (a resend to a member
 /// that was refused), so `before` cannot be applied to single envelopes
-/// without splitting a message across pages (Codex #155 delta 1). Each entry
+/// without splitting a message across pages (review #155 delta 1). Each entry
 /// is placed at its newest copy's timestamp, ordered newest first (ties by
 /// id); `before` and `limit` then apply to entries, so a page never repeats
 /// or splits a message.
@@ -508,7 +508,7 @@ pub(super) async fn search_messages(
             Ok(Some(blob)) => blob,
             _ => continue, // no cached plaintext (undecryptable / pre-cache) — skip
         };
-        let decrypted = match cipher.decrypt(&encrypted) {
+        let decrypted = match cipher.decrypt(&env.id.to_hex(), &encrypted) {
             Ok(bytes) => bytes,
             Err(_) => continue,
         };
