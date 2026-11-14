@@ -78,9 +78,12 @@ async fn owner_first_contact_without_cap_is_refused_before_any_invoice() {
 async fn owner_first_contact_zero_cap_pays_nothing() {
     // 0 is a stated cap ("pay nothing new"): it passes the presence check and
     // is then too small for any admission, so nothing is paid.
-    let (status, body, _, spent) = owner_compose(0, "hello stranger", Some(0)).await;
+    let (status, body, requests, spent) = owner_compose(0, "hello stranger", Some(0)).await;
     assert_ne!(body["reason"], "total_cap_required", "{body}");
     assert!(!status.is_success(), "{body}");
+    // The signed quote is fetched first (one invoice request); the zero cap then
+    // refuses before any admission invoice is asked for or paid.
+    assert_eq!(requests, 1, "only the quote's invoice request, no admission request");
     assert_eq!(spent, 0, "nothing was paid");
 }
 
