@@ -143,7 +143,7 @@ impl MessageResponse {
     /// Attach cached plaintext by decrypting the at-rest encrypted blob.
     pub(super) fn with_cached_plaintext(mut self, encrypted: Option<Vec<u8>>, cipher: Option<&konsensus_crypto::PlaintextCacheCipher>) -> Self {
         if let (Some(enc), Some(c)) = (encrypted, cipher) {
-            match c.decrypt(&enc) {
+            match c.decrypt(&self.id, &enc) {
                 Ok(bytes) => {
                     if let Ok(text) = String::from_utf8(bytes) {
                         if let Some(chat) = self.room_of(&text) {
@@ -215,7 +215,7 @@ pub(super) async fn get_message_plaintext(
         .ok_or_else(|| ApiError::NotFound(format!("no cached plaintext for message {id_hex}")))?;
 
     let decrypted = cipher
-        .decrypt(&encrypted)
+        .decrypt(&id.to_hex(), &encrypted)
         .map_err(|e| ApiError::Internal(format!("plaintext decryption failed: {e}")))?;
 
     // Try to parse as UTF-8 text; fall back to base64 for binary content
@@ -508,7 +508,7 @@ pub(super) async fn search_messages(
             Ok(Some(blob)) => blob,
             _ => continue, // no cached plaintext (undecryptable / pre-cache) — skip
         };
-        let decrypted = match cipher.decrypt(&encrypted) {
+        let decrypted = match cipher.decrypt(&env.id.to_hex(), &encrypted) {
             Ok(bytes) => bytes,
             Err(_) => continue,
         };

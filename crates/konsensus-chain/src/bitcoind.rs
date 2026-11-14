@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
+use crate::network::{NetworkCheck, NetworkGate, ReportedNetwork};
+
 /// File-backed RPC authentication, shared with the embedded Lightning node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "RawConfig")]
@@ -120,6 +122,7 @@ impl BitcoindConfig {
 pub struct BitcoindProvider {
     config: BitcoindConfig,
     client: reqwest::Client,
+    network: Option<NetworkGate>,
 }
 
 #[derive(Deserialize)]
@@ -144,7 +147,59 @@ impl BitcoindProvider {
             .no_proxy()
             .build()
             .map_err(|_| ChainError::Connection("cannot build bitcoind RPC client".into()))?;
-        Ok(Self { config, client })
+        Ok(Self {
+            config,
+            client,
+            network: None,
+        })
+    }
+
+    /// Serve no chain data until Core reports this network; refuse it for
+    /// good if Core reports another one.
+    ///
+    /// Reconnect: any failed request (transport error or HTTP failure) ends
+    /// the check, and Core is asked again before the next call. Every
+    /// `getblockchaininfo` reply is also compared, at no extra cost.
+    pub fn with_network(mut self, network: bitcoin::Network) -> Self {
+        self.network = Some(NetworkGate::new(network, "bitcoind", 1));
+        self
+    }
+
+    /// Ask Core now which chain it is on. No retry here: an unreachable Core
+    /// is reported as `Unavailable`.
+    pub async fn verify_network(&self) -> NetworkCheck {
+        let Some(gate) = &self.network else {
+            return NetworkCheck::NotConfigured;
+        };
+        gate.invalidate_all();
+        let _ = self.ensure_network().await;
+        gate.check()
+    }
+
+    async fn ensure_network(&self) -> Result<(), ChainError> {
+        let Some(gate) = &self.network else {
+            return Ok(());
+        };
+        gate.refusal()?;
+        if gate.is_verified(0) {
+            return Ok(());
+        }
+        let info = self.send_checked("getblockchaininfo", json!([])).await?;
+        let info = info.map_err(|code| {
+            ChainError::Backend(format!("bitcoind getblockchaininfo failed (RPC {code})"))
+        })?;
+        Self::record_chain(gate, &info)
+    }
+
+    /// A reply without a `chain` string is not an answer: Core stays unverified.
+    fn record_chain(gate: &NetworkGate, info: &Value) -> Result<(), ChainError> {
+        match info["chain"].as_str() {
+            Some(chain) => gate.record(0, ReportedNetwork::from_core_chain(chain)),
+            None => {
+                gate.invalidate(0);
+                Err(ChainError::Backend("invalid bitcoind chain".into()))
+            }
+        }
     }
 
     pub(crate) async fn rpc(
@@ -152,6 +207,28 @@ impl BitcoindProvider {
         method: &str,
         params: Value,
     ) -> Result<Result<Value, i64>, ChainError> {
+        self.ensure_network().await?;
+        let result = self.send_checked(method, params).await?;
+        if let (Some(gate), "getblockchaininfo", Ok(info)) = (&self.network, method, &result) {
+            Self::record_chain(gate, info)?;
+        }
+        Ok(result)
+    }
+
+    /// `send`, ending the network check on any failed request.
+    async fn send_checked(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Result<Value, i64>, ChainError> {
+        let result = self.send(method, params).await;
+        if let (Some(gate), Err(_)) = (&self.network, &result) {
+            gate.invalidate(0);
+        }
+        result
+    }
+
+    async fn send(&self, method: &str, params: Value) -> Result<Result<Value, i64>, ChainError> {
         let (user, password) = self.config.credentials()?;
         let response = self
             .client
@@ -302,6 +379,9 @@ fn number(value: &Value, field: &str) -> Result<u64, ChainError> {
 
 #[async_trait]
 impl ChainProvider for BitcoindProvider {
+    fn refusal(&self) -> Result<(), ChainError> {
+        self.network.as_ref().map_or(Ok(()), |gate| gate.refusal())
+    }
     fn trust_level(&self) -> TrustLevel {
         TrustLevel::FullValidation
     }
@@ -310,6 +390,7 @@ impl ChainProvider for BitcoindProvider {
             backend: "bitcoind",
             trust_level: "own_node",
             host: Some(self.config.rpc_host.clone()),
+            explorer_default: false,
         }
     }
     async fn get_block_height(&self) -> Result<u64, ChainError> {

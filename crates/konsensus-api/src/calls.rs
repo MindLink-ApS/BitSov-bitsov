@@ -84,6 +84,54 @@ pub async fn call_media_admitted(store: Store<'_>, peer: &NodeId, call_id: &str,
     store.call_get(peer, call_id).await.ok().flatten().is_some_and(|entry| entry.media_admitted(now))
 }
 
+/// A teardown request for one local media attachment generation.
+pub struct MediaDetach {
+    /// Shared with attachment publication; held until the durable write completes.
+    pub generation: std::sync::Arc<tokio::sync::Mutex<u64>>,
+    pub expected_generation: u64,
+    /// Admission loss alone may close an Unpaid resume window, never a Live row.
+    pub only_unpaid: bool,
+    /// Whether socket teardown may end a Live call before its paid deadline.
+    pub may_hangup_live: bool,
+}
+
+/// Whether teardown completed or must wait for ordinary expiry maintenance.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MediaDetachOutcome {
+    Complete,
+    PendingExpiry,
+}
+
+/// End a callee call only while its attachment generation is still current.
+/// Preserve pending evidence and replay retention for ordinary reconciliation.
+pub async fn detach_callee_media(store: Store<'_>, peer: &NodeId, call_id: &str, now: u64, detach: &MediaDetach) -> Result<MediaDetachOutcome, konsensus_storage::StorageError> {
+    let generation = detach.generation.lock().await;
+    if *generation != detach.expected_generation { return Ok(MediaDetachOutcome::Complete); }
+    let _guard = lock().lock().await;
+    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(MediaDetachOutcome::Complete) };
+    if entry.side != rules::Side::Callee { return Ok(MediaDetachOutcome::Complete); }
+    // Maintenance owns expiry and its terminal notice; socket loss only closes resume.
+    if entry.phase == rules::Phase::Live && now > entry.deadline_ms {
+        if !detach.only_unpaid && entry.paid_until_ms != Some(0) {
+            entry.paid_until_ms = Some(0);
+            store.call_put(peer, call_id, &entry).await?;
+        }
+        return Ok(MediaDetachOutcome::PendingExpiry);
+    }
+    if !((!detach.only_unpaid && detach.may_hangup_live && entry.phase == rules::Phase::Live)
+        || (entry.phase == rules::Phase::Ended && entry.end_reason == Some(rules::HangupReason::Unpaid))) { return Ok(MediaDetachOutcome::Complete); }
+    if entry.phase == rules::Phase::Ended {
+        // Zero closes resume without changing Unpaid or its replay deadline.
+        entry.paid_until_ms = Some(0);
+    } else {
+        entry.phase = rules::Phase::Ended;
+        entry.end_reason = Some(rules::HangupReason::Hangup);
+        entry.deadline_ms = entry.deadline_ms.max(now.saturating_add(rules::TOMBSTONE_MS));
+    }
+    store.call_put(peer, call_id, &entry).await?;
+    Ok(MediaDetachOutcome::Complete)
+}
+
 /// End expired calls durably, retaining pending evidence and tombstones.
 /// Only callee entries are returned for a best-effort 403 Unpaid notification.
 pub async fn expire_calls(store: Store<'_>, now: u64) -> Result<Vec<(NodeId, String)>, konsensus_storage::StorageError> {
@@ -231,7 +279,7 @@ pub(crate) async fn owner_funded_call(state: &AppState, peer: &NodeId, call_id: 
                     None => {
                         let Some(cipher) = &state.plaintext_cipher else { return Ok(false) };
                         let Some(cached) = state.storage.get_message_plaintext(&envelope.id).await? else { return Ok(false) };
-                        let plaintext = cipher.decrypt(&cached).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+                        let plaintext = cipher.decrypt(&envelope.id.to_hex(), &cached).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
                         let signal = CallSignal::parse(kind, std::str::from_utf8(&plaintext)
                             .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?)
                             .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
@@ -889,6 +937,8 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
         )
         .with_reason("call_price_unknown")
     };
+    // No query is claimed or sent without a tip to check the answer against.
+    crate::error::chain_tip(state).await?;
     let now = Instant::now();
     // A query counts as asked only once it was sent (review N4): the slot is
     // claimed so concurrent callers share one frame, and given back if the
@@ -936,7 +986,7 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
     .await
     .map_err(|_| unknown())?
     .map_err(|()| unknown())?;
-    let height = state.chain.get_block_height().await.unwrap_or(0);
+    let height = crate::error::chain_tip(state).await?;
     // New minute invoices require the callee's current payable tariff. Its reply
     // already includes both floors. A cached table's
     // trust discount applies to ordinary delivery, not to the kind-404 quote.
@@ -951,7 +1001,7 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
 pub async fn block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher, peer: &NodeId, id: &konsensus_core::MessageId) -> Result<Option<u64>, konsensus_storage::StorageError> {
     let unavailable = || konsensus_storage::StorageError::Conversion("paid call grant metadata unavailable".into());
     let cached = store.get_message_plaintext(id).await?.ok_or_else(unavailable)?;
-    let plaintext = cipher.decrypt(&cached).map_err(|_| unavailable())?;
+    let plaintext = cipher.decrypt(&id.to_hex(), &cached).map_err(|_| unavailable())?;
     let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, std::str::from_utf8(&plaintext).map_err(|_| unavailable())?).map_err(|_| unavailable())?;
     let entry = store.call_get(peer, &signal.call_id).await?.ok_or_else(unavailable)?;
     if entry.side != rules::Side::Callee || entry.next_block_seq != signal.seq.ok_or_else(unavailable)?.saturating_add(1)
@@ -964,6 +1014,7 @@ pub async fn block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextC
 pub async fn receive_block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher, own: &NodeId, peer: &NodeId,
     id: &konsensus_core::MessageId, paid_until_ms: u64,
 ) -> Result<(), konsensus_storage::StorageError> {
+    if paid_until_ms == 0 { return Ok(()); }
     if !store.is_pending_dispatched(id, peer, own).await? { return Ok(()); }
     let Some(envelope) = store.get_message(id).await? else { return Ok(()) };
     if envelope.kind != konsensus_core::kind::KIND_CALL_BLOCK || envelope.sender != *own
@@ -1023,7 +1074,7 @@ async fn cached_call_block_binding(store: Store<'_>, cipher: &konsensus_crypto::
 ) -> Result<(String, u32), konsensus_storage::StorageError> {
     let unavailable = || konsensus_storage::StorageError::Conversion("legacy paid block binding unavailable".into());
     let cached = store.get_message_plaintext(id).await?.ok_or_else(unavailable)?;
-    let plaintext = cipher.decrypt(&cached).map_err(|_| unavailable())?;
+    let plaintext = cipher.decrypt(&id.to_hex(), &cached).map_err(|_| unavailable())?;
     let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK,
         std::str::from_utf8(&plaintext).map_err(|_| unavailable())?).map_err(|_| unavailable())?;
     Ok((signal.call_id, signal.seq.ok_or_else(unavailable)?))

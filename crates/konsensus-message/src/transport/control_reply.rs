@@ -17,10 +17,23 @@ pub(super) struct Connection {
     socket: socket2::Socket,
     closed: AtomicBool,
     pub(super) admission_paid: AtomicBool,
+    /// Only E2EE repair after a verified paid deferral on this connection.
+    session_repair: std::sync::Mutex<Option<Instant>>,
     pub(super) connected_at: Instant,
 }
 
 impl Connection {
+    pub(super) fn session_repair_active(&self) -> bool {
+        self.session_repair.lock().unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    pub(super) fn allow_session_repair_until(&self, until: Instant) -> bool {
+        if until <= Instant::now() { return false; }
+        *self.session_repair.lock().unwrap_or_else(|e| e.into_inner()) = Some(until);
+        true
+    }
+
     pub(super) fn new(
         state: PeerConnection,
         peer: NodeId,
@@ -35,6 +48,7 @@ impl Connection {
         let conn = Arc::new(Self {
             outbound,
             admission_paid: AtomicBool::new(false),
+            session_repair: std::sync::Mutex::new(None),
             connected_at,
             state: Mutex::new(state),
             replies,
