@@ -367,34 +367,7 @@ fn shred(path: &Path) -> std::io::Result<()> {
 /// no group or other permissions (0600 or 0400) is accepted. The file must be
 /// at most 4096 bytes, the same ceiling as `--password-fd`.
 pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
-    let before = std::fs::symlink_metadata(path)
-        .with_context(|| format!("cannot read the password file {}", path.display()))?;
-    if !before.is_file() {
-        anyhow::bail!("{} is not a regular file (symlinks are refused)", path.display());
-    }
-    let mut file = std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-    // Check the file actually opened, not just the name: a swap between the
-    // check and the open is refused.
-    let meta = file.metadata()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if (meta.dev(), meta.ino()) != (before.dev(), before.ino()) || !meta.is_file() {
-            anyhow::bail!("{} changed while it was being opened; refusing it", path.display());
-        }
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            anyhow::bail!(
-                "{} has mode {mode:o}; the password file must be readable by its owner only (chmod 600)",
-                path.display()
-            );
-        }
-        // SAFETY: getuid has no preconditions and cannot fail.
-        let me = unsafe { libc::getuid() };
-        if meta.uid() != me {
-            anyhow::bail!("{} is owned by another user; refusing it", path.display());
-        }
-    }
+    let mut file = open_password_file(path)?;
     // Fixed buffer, same shape as `--password-fd`: one extra byte detects an
     // over-long file without growing a copy of the secret.
     let mut bytes = Zeroizing::new([0u8; MAX_PASSWORD_FILE_BYTES + 1]);
@@ -424,6 +397,45 @@ pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
         anyhow::bail!("the password file {} is empty", path.display());
     }
     Ok(pw)
+}
+
+/// Whether the node can verify that only this OS user can read `path`. False
+/// on a platform without Unix modes: there is nothing to check there, so an
+/// owner setting that depends on it stays refused.
+pub fn password_file_is_owner_only(path: &Path) -> bool {
+    cfg!(unix) && open_password_file(path).is_ok()
+}
+
+fn open_password_file(path: &Path) -> Result<std::fs::File> {
+    let before = std::fs::symlink_metadata(path)
+        .with_context(|| format!("cannot read the password file {}", path.display()))?;
+    if !before.is_file() {
+        anyhow::bail!("{} is not a regular file (symlinks are refused)", path.display());
+    }
+    let file = std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    // Check the file actually opened, not just the name: a swap between the
+    // check and the open is refused.
+    let meta = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if (meta.dev(), meta.ino()) != (before.dev(), before.ino()) || !meta.is_file() {
+            anyhow::bail!("{} changed while it was being opened; refusing it", path.display());
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "{} has mode {mode:o}; the password file must be readable by its owner only (chmod 600)",
+                path.display()
+            );
+        }
+        // SAFETY: getuid has no preconditions and cannot fail.
+        let me = unsafe { libc::getuid() };
+        if meta.uid() != me {
+            anyhow::bail!("{} is owned by another user; refusing it", path.display());
+        }
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
