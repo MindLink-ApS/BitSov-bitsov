@@ -5,6 +5,8 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Bind device-signed relation intents to the pairing epoch (`bitsov-relation-intent-v2`; `relation_intent_v2`). v1 signatures are refused. The remote route uses the same authenticated Noise session as the other signed tunnel intents. `GET /api/v1/pair/device-keys` returns that epoch.
+
 ## [0.3.0-rc24] — 2026-11-12
 
 - A paid call now ends after the callee's app connection is lost, including a

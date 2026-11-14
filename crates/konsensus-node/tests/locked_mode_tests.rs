@@ -748,6 +748,7 @@ async fn locked_mode_tunnel_unlock_starts_normal_node_and_preserves_authority_fl
         let message = device::intent_message(
             &pairing::identity_fingerprint(&f.identity.node_id().to_hex()),
             &f.record.client_id,
+            f.record.epoch,
             &intent,
         );
         let sig = hex::encode(

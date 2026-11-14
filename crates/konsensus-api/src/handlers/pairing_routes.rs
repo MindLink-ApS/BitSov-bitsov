@@ -757,8 +757,10 @@ pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
 /// Device-key requests, status, cancellation and listing confer no authority;
 /// owner-device ticket issuance and SAS delegation require an enrolled key.
 /// Relation intents require a registered device key's signature bound to the
-/// node, client and epoch, with a fresh nonce; provisional sessions cannot use
-/// them. Console approval, key revocation and first-contact grants stay owner-local.
+/// node, client and pairing epoch, over the same authenticated Noise session
+/// as the other signed tunnel intents, with a fresh nonce. Provisional
+/// sessions cannot use them. Console approval, key revocation and
+/// first-contact grants stay owner-local.
 /// Locked mode uses its own four-route router, never this one.
 pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
     if !pairing_enabled {
@@ -830,7 +832,7 @@ pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
         )
         .route(
             "/api/v1/pair/relation-intent",
-            post(super::device_routes::relation_intent),
+            post(super::owner_device_routes::relation_intent),
         )
 }
 

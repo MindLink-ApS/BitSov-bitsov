@@ -80,6 +80,7 @@ async fn pair_status_shows_six_sat_messaging_cap_with_original_budget() {
             &sign(&device::intent_message(
                 "node-test",
                 &client.client_id,
+                client.epoch,
                 &intent,
             )),
         )

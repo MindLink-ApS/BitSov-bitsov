@@ -16,6 +16,7 @@
       "membrane_v1",
       "spend_budget_grant_v1",
       "relation_envelope_id_v1",
+      "relation_intent_v2",
       "first_contact_grant_v1",
       "introduction_v1",
       "front_door_v1",

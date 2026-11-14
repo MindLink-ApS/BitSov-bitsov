@@ -9,13 +9,17 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::device_routes::{binding, map_err, service, DelegationRequest};
+use super::device_routes::{
+    accept_relation_intent, binding, map_err, service, DelegationRequest, RelationIntentRequest,
+    RelationIntentResponse,
+};
 use crate::{
     auth::{
         scoped::{Read, ScopedAuth},
         PairingBinding,
     },
-    error::ApiError,
+    error::{refusal_response, ApiError},
+    pairing::PairingRefusal,
     rate_limit::AuthenticatedNoise,
     state::AppState,
 };
@@ -25,20 +29,37 @@ pub(super) fn tunnel<'a>(
     state: &AppState,
     noise: Option<Extension<AuthenticatedNoise>>,
 ) -> Result<&'a PairingBinding, ApiError> {
-    let binding = binding(auth)?;
+    tunnel_checked(auth, state, noise).map_err(|(error, _)| error)
+}
+
+/// Same channel check as [`tunnel`], plus the fixed refusal reason the
+/// relation-intent log records. Other tunnel handlers keep the `ApiError`.
+pub(super) fn tunnel_checked<'a>(
+    auth: &'a ScopedAuth<Read>,
+    state: &AppState,
+    noise: Option<Extension<AuthenticatedNoise>>,
+) -> Result<&'a PairingBinding, (ApiError, &'static str)> {
+    let binding = binding(auth).map_err(|error| (error, "no_pairing"))?;
     let noise = noise
         .filter(|n| n.client_id.as_ref() == binding.client_id)
         .ok_or_else(|| {
-            ApiError::Forbidden("matching authenticated Noise session required".into())
+            (
+                ApiError::Forbidden("matching authenticated Noise session required".into()),
+                "noise_required",
+            )
         })?;
-    let svc = service(state)?;
+    let svc = service(state).map_err(|error| (error, "pairing_unavailable"))?;
     svc.validate_remote_authority(
         &binding.client_id,
         binding.epoch,
         &noise.binding.client_static,
         &svc.bound_fingerprint(),
     )
-    .map_err(map_err)?;
+    .map_err(|error| {
+        let refusal = PairingRefusal::from(error);
+        let reason = refusal.reason;
+        (map_err(refusal.error), reason)
+    })?;
     Ok(binding)
 }
 
@@ -237,6 +258,21 @@ pub(crate) async fn second_reject(
         axum::http::StatusCode::NO_CONTENT,
     ))
 }
+/// Remote `POST /api/v1/pair/relation-intent`. The loopback handler does not
+/// require Noise; this one uses the same [`tunnel`] binding as the other
+/// signed tunnel intents (ticket, delegation, owner approval).
+#[allow(clippy::result_large_err)]
+pub(crate) async fn relation_intent(
+    auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    noise: Option<Extension<AuthenticatedNoise>>,
+    Json(body): Json<RelationIntentRequest>,
+) -> Result<Json<RelationIntentResponse>, axum::response::Response> {
+    let binding = tunnel_checked(&auth, &state, noise)
+        .map_err(|(error, reason)| refusal_response(error, reason))?;
+    accept_relation_intent(&state, binding, body).await
+}
+
 fn second_error(e: crate::pairing::PairingError) -> ApiError {
     match e {
         crate::pairing::PairingError::OwnerChannelUnavailable => ApiError::BoxLocked,
