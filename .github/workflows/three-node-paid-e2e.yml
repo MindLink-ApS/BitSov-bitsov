@@ -145,6 +145,12 @@ jobs:
           if [[ "$REGTEST_GHOST_AFTER_PR200" == 1 ]]; then
             grep -q '^GHOST UNFUNDED CHANNEL PASS:' regtest.log
           fi
+      - name: Seed-only recovery after force-close
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/regress/recover_regtest.sh 2>&1 | tee recover-regtest.log
+          grep -q '^test result: ok\. 1 passed;' recover-regtest.log
       - name: Retain evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -155,4 +161,5 @@ jobs:
             private-forwarding.log
             paid-call.log
             app-grant.log
+            recover-regtest.log
           if-no-files-found: ignore
