@@ -1,7 +1,9 @@
 # Owner-console recovery after disk loss
 
 `konsensus recover` is for a lost or wiped node. If its current live disk still
-works, use `move-home`. Keep the old node disabled throughout recovery.
+works, use `move-home`. Keep the old node disabled throughout recovery. Choose
+between move-home, recover, and rebind-instance in
+[restore paths](restore-paths.md).
 
 1. Run `konsensus restore --dir NEW_DIRECTORY --tier full` and enter the recovery
    words. The directory must be empty. Restore writes an open `ldk/recover.json`
