@@ -401,6 +401,7 @@ toml
 toml_datetime
 toml_edit
 toml_parser
+toml_writer
 tower
 tower-http
 tower-layer

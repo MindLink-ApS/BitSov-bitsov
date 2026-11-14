@@ -91,7 +91,7 @@ impl Fixture {
             String::from_utf8_lossy(&out.stderr)
         );
         let config = dir.path().join("konsensus.toml");
-        let mut cfg: toml::Value = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+        let mut cfg: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
         cfg["node"] = toml::Value::try_from(std::collections::BTreeMap::from([(
             "hosted_by",
             "Alice's Pi",
@@ -840,7 +840,7 @@ async fn locked_mode_forged_record_and_identity_mismatch_stay_locked() {
             let path = f.dir.path().join("pairing/clients.json");
             let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             file["clients"][0]["identity_fingerprint"] = fp.clone().into();
-            let cfg: toml::Value = std::fs::read_to_string(&f.config).unwrap().parse().unwrap();
+            let cfg: toml::Table = std::fs::read_to_string(&f.config).unwrap().parse().unwrap();
             let phrase = mnemonic_crypto::read_mnemonic(
                 Path::new(cfg["identity"]["mnemonic_file"].as_str().unwrap()),
                 Some(PASSWORD),
@@ -909,7 +909,7 @@ async fn locked_mode_forged_record_and_identity_mismatch_stay_locked() {
 #[test]
 fn locked_mode_plaintext_seed_refuses_before_serving() {
     let f = Fixture::new();
-    let mut cfg: toml::Value = std::fs::read_to_string(&f.config).unwrap().parse().unwrap();
+    let mut cfg: toml::Table = std::fs::read_to_string(&f.config).unwrap().parse().unwrap();
     let path = std::path::PathBuf::from(cfg["identity"]["mnemonic_file"].as_str().unwrap());
     let phrase = mnemonic_crypto::read_mnemonic(&path, Some(PASSWORD)).unwrap();
     let plain = path.with_extension("txt");

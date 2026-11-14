@@ -116,7 +116,7 @@ fn init_encrypts_and_start_decrypts_from_a_single_handoff_without_logging_it() {
         assert!(dir.path().join("mnemonic.enc").exists());
         assert!(!dir.path().join("mnemonic.txt").exists());
         let config_path = dir.path().join("konsensus.toml");
-        let mut config: toml::Value = std::fs::read_to_string(&config_path)
+        let mut config: toml::Table = std::fs::read_to_string(&config_path)
             .unwrap()
             .parse()
             .unwrap();
@@ -259,7 +259,7 @@ fn local_owner_unavailable_verifier_refuses_start_without_writing_files() {
             String::from_utf8_lossy(&out.stderr)
         );
         let config_path = dir.path().join("konsensus.toml");
-        let mut config: toml::Value = std::fs::read_to_string(&config_path)
+        let mut config: toml::Table = std::fs::read_to_string(&config_path)
             .unwrap()
             .parse()
             .unwrap();
