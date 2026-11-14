@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Many-node sandbox simulation, one `konsensus` process per node.
 
-The in-process harness (`konsensus-node` `sim_many_nodes.rs`) cannot send from
+The in-process simulation (`konsensus-node` `sim_many_nodes.rs`) cannot send from
 two nodes to the same recipient: compose keeps its first-contact admission
 ledger, admission locks and quote cache in process-wide statics keyed by the
 recipient only. This runner starts N real node processes instead, so any
@@ -17,7 +17,7 @@ OS scheduling is not fixed, so a failing seed reproduces the shape, usually
 but not always the same failure.
 
 Known finding this runner shows: BUG-SIM-1 (one-time prekey reuse: acked but
-unreadable messages; see the in-process harness for the focused regression).
+unreadable messages; see the in-process simulation for the focused regression).
 Some first contacts on a busy node may also return 502
 payment_settled_send_incomplete (the admission is disclosed and a retry does
 not pay it again); that cause is tracked separately.
