@@ -5,6 +5,13 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Report the node's configured Bitcoin network (`bitcoin`, `testnet`, `signet`
+  or `regtest`) as `network` in the unauthenticated `GET /api/v1/bootstrap/state`
+  response, so a client can confirm the network during remote-owner first run
+  before any identity exists. The field is absent when the lightning backend
+  does not state a network; no other field, route or authentication rule of the
+  bootstrap router changes (#443).
+
 ## [0.3.0-rc24] — 2026-11-12
 
 - A paid call now ends after the callee's app connection is lost, including a

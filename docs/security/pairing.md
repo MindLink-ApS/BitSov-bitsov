@@ -401,7 +401,13 @@ and is discarded on the next touch (`410 ceremony_expired` on finalize).
 Cancellation, shutdown and failures drop zeroizing buffers. A fresh ceremony
 always generates a fresh phrase. There is no resend or mnemonic-reveal route.
 `GET /api/v1/bootstrap/state` is unauthenticated. It exposes only `state`,
-`can_create`, `can_restore`, and `local_owner: {available, enroll_device, pending}`.
+`can_create`, `can_restore`, `local_owner: {available, enroll_device, pending}`,
+and `network`: the configured Bitcoin network name (`bitcoin`, `testnet`,
+`signet` or `regtest`), present only when the lightning backend states one.
+The field is the name alone: no node id, balances, addresses or endpoints. A
+client that requires a particular network, such as a beta app that sets up home
+nodes on signet only, reads it here (directly on the loopback API, or through
+the tunnel once paired) and must refuse setup when it is absent or differs.
 If an interrupted commit requires repair, it returns `state: "refused"` with
 `can_create: false` and `can_restore: false`, including before a restart. It
 does not expose a refusal object, reason, disk-state details, or repair text.
@@ -453,6 +459,9 @@ tunnel as usual.
 `GET /api/v1/bootstrap/state` reports `can_restore: false` and
 `local_owner: {available: true, enroll_device: true, pending,
 tunnel_password: true}`. `tunnel_password` is absent in local mode. The
+response also carries `network` as above, so the app can confirm the box runs
+on the network it expects before it commits a password or enrolls a device;
+the router, its routes and their authentication are otherwise unchanged. The
 ceremony routes change in this mode only:
 
 1. `POST /api/v1/identity/create-pending` takes
