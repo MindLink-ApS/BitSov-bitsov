@@ -1,4 +1,4 @@
-//! Calls review (#131, Codex FAIL at 34a722d): the reviewer's five probes as
+//! Calls review (#131, FAIL at 34a722d): the reviewer's five probes as
 //! regressions, asserting the fixed behaviour, plus restart, recovery, bounds
 //! and price-query rate limiting. Real SQLite call state throughout.
 
@@ -151,7 +151,7 @@ async fn burn(store: &SqliteStorage, peer: &NodeId, from: usize, n: usize) {
 
 /// Probe `unexpired_burned_id_is_readmitted_under_capacity_pressure`, still
 /// fixed: under pressure, an id burned less than `BURN_MIN_MS` ago is never
-/// dropped; the pair is refused instead. Fable N3: that refusal is per pair,
+/// dropped; the pair is refused instead. Review N3: that refusal is per pair,
 /// not node-wide, and ended calls never count against open ones.
 #[tokio::test]
 async fn young_burned_ids_are_never_dropped_and_only_block_their_own_pair() {
@@ -168,7 +168,7 @@ async fn young_burned_ids_are_never_dropped_and_only_block_their_own_pair() {
     calls::reserve_outgoing(&store, &own(), &NodeId::from_bytes([78; 32]), 400, &body(400, &id(100_002)), "op-elsewhere", "h").await.unwrap();
 }
 
-/// Fable N3: past `BURN_MIN_MS`, the oldest burned ids of a pair make room for
+/// Review N3: past `BURN_MIN_MS`, the oldest burned ids of a pair make room for
 /// a new call instead of blocking the pair for the rest of the day; younger
 /// ones stay burned.
 #[tokio::test]
@@ -192,7 +192,7 @@ async fn burned_ids_older_than_the_minimum_make_room_oldest_first() {
     assert!(calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &id(1)))).await.is_err(), "an old id not needed for room stays burned");
 }
 
-/// Fable N3: open calls have their own small bound, and ending one frees it.
+/// Review N3: open calls have their own small bound, and ending one frees it.
 #[tokio::test]
 async fn open_calls_are_bounded_per_peer_and_freed_by_hangup() {
     let store = SqliteStorage::in_memory().await.unwrap();
@@ -206,7 +206,7 @@ async fn open_calls_are_bounded_per_peer_and_freed_by_hangup() {
     calls::admit_incoming(&store, &own(), &peer, 400, Some(&body(400, &next))).await.unwrap();
 }
 
-/// Fable N2: one operation id pays for one signal of one call. Reusing it for
+/// Review N2: one operation id pays for one signal of one call. Reusing it for
 /// another call id is refused before any reservation, whether the first
 /// request is still reserved or already in the journal.
 #[tokio::test]
@@ -260,7 +260,7 @@ async fn an_unrelated_price_response_is_not_a_call_quote() {
     assert_eq!(price.unwrap(), 12_000);
 }
 
-/// Fable follow-up: concurrent quotes to one peer send one `PriceQuery`.
+/// Review follow-up: concurrent quotes to one peer send one `PriceQuery`.
 #[tokio::test]
 async fn price_queries_to_one_peer_are_rate_limited() {
     let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
@@ -280,7 +280,7 @@ async fn price_queries_to_one_peer_are_rate_limited() {
     assert_eq!(queries, 1);
 }
 
-/// Fable N4: a price query that could not be sent does not hold the peer's
+/// Review N4: a price query that could not be sent does not hold the peer's
 /// query slot: it fails at once, and the next quote sends its own query.
 #[tokio::test]
 async fn a_price_query_that_was_not_sent_does_not_hold_the_slot() {
@@ -320,7 +320,7 @@ async fn a_refused_signal_is_not_delivered_by_resync_or_counted_accepted() {
     let env = UkmEnvelopeBuilder::new(402, peer, Recipient::Node(*state.identity.node_id()), vec![], PaymentProof::new([2; 32], [3; 32], 1000)).build();
     // As the receive path leaves it: paid acceptance stored, plaintext cached.
     assert!(matches!(state.storage.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted));
-    state.storage.store_message_plaintext(&env.id, &cipher.encrypt(text.as_bytes()).unwrap()).await.unwrap();
+    state.storage.store_message_plaintext(&env.id, &cipher.encrypt(&env.id.to_hex(), text.as_bytes()).unwrap()).await.unwrap();
     assert!(calls::admit_incoming(state.storage.as_ref(), &own(), &peer, 402, Some(&text)).await.is_err());
     state.storage.reject_accepted_envelope(&env).await.unwrap();
     assert!(state.storage.get_message(&env.id).await.unwrap().is_none());
@@ -340,7 +340,7 @@ async fn a_refused_signal_is_not_delivered_by_resync_or_counted_accepted() {
     assert!(ws.try_recv().is_err(), "refused signal must not reach WS");
 }
 
-/// Codex P2: a restart keeps burned ids and live calls.
+/// Review P2: a restart keeps burned ids and live calls.
 #[tokio::test]
 async fn call_state_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -360,7 +360,7 @@ async fn call_state_survives_a_restart() {
     assert!(calls::admit_incoming(&store, &own(), &peer, 401, Some(&body(401, &mine))).await.is_ok(), "our paid offer still rings");
 }
 
-/// Codex P1/P2: recovery settles what a crash left, from the operation journal.
+/// Review P1/P2: recovery settles what a crash left, from the operation journal.
 #[tokio::test]
 async fn recovery_commits_paid_releases_unpaid_and_keeps_ambiguous() {
     let store = SqliteStorage::in_memory().await.unwrap();
@@ -385,7 +385,7 @@ async fn recovery_commits_paid_releases_unpaid_and_keeps_ambiguous() {
     let _ = CallSignal::parse(400, &body(400, &id(3))).unwrap();
 }
 
-/// Fable R1 (delta2): startup recovery commits a reservation only if the
+/// Review R1 (delta2): startup recovery commits a reservation only if the
 /// journal row under its operation id is this very request. A call reserved
 /// under an operation id whose journal row is a paid chat (app misuse plus a
 /// crash) is released, never rung unpaid.
@@ -413,7 +413,7 @@ async fn recovery_never_commits_a_call_under_another_requests_journal_row() {
     assert!(store.call_get(&peer, &id(2)).await.unwrap().is_none());
 }
 
-/// Fable R2 (delta2): a refused answer/ICE/hangup for an unknown call id never
+/// Review R2 (delta2): a refused answer/ICE/hangup for an unknown call id never
 /// makes room, so it cannot evict a burned id even past the minimum age.
 #[tokio::test]
 async fn unknown_call_signals_never_evict_burned_ids() {
@@ -438,4 +438,73 @@ async fn unknown_call_signals_never_evict_burned_ids() {
 /// This node's own id in these tests: never one of the peers.
 fn own() -> konsensus_core::types::NodeId {
     konsensus_core::types::NodeId::from_bytes([0xee; 32])
+}
+
+/// T2: a call price is checked against the local tip. Without one, nothing
+/// is asked: no price query is claimed or sent, and the quote is not ready.
+#[tokio::test]
+async fn a_call_quote_without_a_chain_tip_is_not_ready() {
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let mut state = common::test_state_with_lightning(wallet.clone());
+    let peer = NodeId::from_bytes([71; 32]);
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    let chain = Arc::new(common::TipDownChain::down());
+    {
+        let state = Arc::get_mut(&mut state).unwrap();
+        state.transport = transport.clone();
+        state.chain = chain.clone();
+    }
+    let started = std::time::Instant::now();
+    let err = calls::peer_call_price(&state, &peer).await.unwrap_err();
+    assert!(matches!(err, konsensus_api::error::ApiError::ChainNotReady), "{err:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1), "no wait for an answer");
+    assert!(transport.raw_frames.lock().unwrap().is_empty(), "no price query sent");
+    assert_eq!(chain.reads(), 1);
+    assert!(wallet.list_payments(100).await.unwrap().is_empty());
+
+    // The tip is checked again once the answer is in: lost meanwhile, refused.
+    let chain = Arc::new(common::TipDownChain::after(1));
+    let state = Arc::new(konsensus_api::state::AppState { chain: chain.clone(), ..(*state).clone() });
+    let answer = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
+    };
+    let (price, ()) = tokio::join!(calls::peer_call_price(&state, &peer), answer);
+    assert!(matches!(price.unwrap_err(), konsensus_api::error::ApiError::ChainNotReady));
+    assert_eq!(chain.reads(), 2);
+    assert_eq!(transport.raw_frames.lock().unwrap().len(), 1);
+}
+
+/// T2: the call page's signal price reads the tip again; that read failing
+/// refuses the whole answer rather than pricing signals at height 0.
+#[tokio::test]
+async fn the_call_price_route_refuses_when_the_second_tip_read_fails() {
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let mut state = common::test_state_with_lightning(wallet.clone());
+    let peer = NodeId::from_bytes([72; 32]);
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone()));
+    // Up for the offer's two reads (before the query, after the answer).
+    let chain = Arc::new(common::TipDownChain::after(2));
+    {
+        let state = Arc::get_mut(&mut state).unwrap();
+        state.transport = transport;
+        state.chain = chain.clone();
+    }
+    let request = Request::builder()
+        .uri(format!("/api/v1/pricing/peers/{}/call", peer.to_hex()))
+        .header("authorization", common::auth_header(&state))
+        .body(Body::empty())
+        .unwrap();
+    let answer = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        state.peer_prices.update_kind_price(peer, 400, 10_000, 850_000).await;
+    };
+    let (response, ()) = tokio::join!(common::test_router(state.clone()).oneshot(request), answer);
+    let response = response.unwrap();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 65_536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    common::assert_chain_not_ready(status, &body);
+    assert_eq!(chain.reads(), 3, "the offer read the tip twice, then the signal price did");
+    assert!(wallet.list_payments(100).await.unwrap().is_empty());
 }

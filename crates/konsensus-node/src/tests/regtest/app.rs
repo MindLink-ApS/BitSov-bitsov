@@ -102,17 +102,20 @@ fn paired_client(
     (service, client.client_id, token)
 }
 
-/// New Atlas fixture options; legacy tests keep their original setup.
+/// New TEST5 fixture options; legacy tests keep their original setup.
 pub struct Options {
     pub identity: Arc<NodeIdentity>,
     pub chain_url: String,
     pub calls: Option<CallOptions>,
+    pub owner_approval_key: Option<ed25519_dalek::VerifyingKey>,
 }
 
 /// Production call settings; the block clock is never shortened by the fixture.
 pub struct CallOptions {
     pub block_msat: u64,
     pub max_minutes: u16,
+    pub offer_msat: u64,
+    pub chat_msat: u64,
 }
 
 struct NoTerminal;
@@ -128,19 +131,22 @@ impl std::io::Write for NoTerminal {
 fn read_only_client(
     dir: &std::path::Path,
     node: &NodeIdentity,
+    owner_approval_key: Option<ed25519_dalek::VerifyingKey>,
 ) -> (Arc<konsensus_api::pairing::PairingService>, String, String) {
     use ed25519_dalek::Signer;
     use konsensus_api::pairing::{self, PairingService};
-    let service = Arc::new(
-        PairingService::open(
-            dir,
-            pairing::identity_fingerprint(&node.node_id().to_hex()),
-            true,
-        )
-        .unwrap()
-        .with_owner_console(Box::new(NoTerminal))
-        .without_stdout_code(),
-    );
+    let service = PairingService::open(
+        dir,
+        pairing::identity_fingerprint(&node.node_id().to_hex()),
+        true,
+    )
+    .unwrap()
+    .with_owner_console(Box::new(NoTerminal))
+    .without_stdout_code();
+    let service = Arc::new(match owner_approval_key {
+        Some(key) => service.with_owner_approval_key(key),
+        None => service,
+    });
     let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
     let pubkey = hex::encode(key.verifying_key().to_bytes());
     let clients = service.list_clients();
@@ -254,7 +260,11 @@ impl App {
         });
         sessions.restore_sessions().await;
         let pairing = if options.is_some() {
-            read_only_client(&dir.join("pairing"), identity)
+            read_only_client(
+                &dir.join("pairing"),
+                identity,
+                options.as_ref().and_then(|o| o.owner_approval_key),
+            )
         } else {
             paired_client(
                 &dir.join("pairing"),
@@ -296,11 +306,10 @@ impl App {
             ),
             pricing: Arc::new(konsensus_pricing::StaticPricingEngine::new(
                 konsensus_pricing::StaticPricingConfig {
-                    chat_msat: 2_001,
+                    chat_msat: calls.map_or(2_001, |c| c.chat_msat),
                     call_block_msat: calls.map_or(10_000, |c| c.block_msat),
-                    // The ordinary paid offer remains under the messaging
-                    // per-act ceiling; only the block bundle has call authority.
-                    call_msat: if calls.is_some() { 1_000 } else { 10_000 },
+                    // Tests choose offer and block tariffs independently.
+                    call_msat: calls.map_or(10_000, |c| c.offer_msat),
                     ..Default::default()
                 },
             )),
@@ -309,7 +318,7 @@ impl App {
             transport: Arc::clone(transport) as Arc<dyn MessageTransport>,
             session_manager: Arc::clone(sessions),
             jwt_secret: JWT_SECRET.into(),
-            auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            auth_challenges: konsensus_api::AuthChallenges::new(),
             pairing: Some(pairing.0.clone()),
             cors_enabled: false,
             operator_probes_enabled: true,
@@ -563,7 +572,7 @@ impl App {
             .unwrap();
         let status = response.status();
         // Scope extractors return text/plain; keep their exact refusal body so
-        // the Atlas scenario can assert it. JSON endpoints remain strict.
+        // the TEST5 scenario can assert it. JSON endpoints remain strict.
         let plain = response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
@@ -591,7 +600,7 @@ impl App {
         assert_eq!(
             status,
             StatusCode::OK,
-            "Atlas run 4 relaunch: remote challenge {body}"
+            "TEST5 run 4 relaunch: remote challenge {body}"
         );
         let challenge = body["challenge"].as_str().unwrap();
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
@@ -608,7 +617,7 @@ impl App {
         assert_eq!(
             status,
             StatusCode::OK,
-            "Atlas run 4 relaunch: remote token {body}"
+            "TEST5 run 4 relaunch: remote token {body}"
         );
         self.token = body["token"].as_str().unwrap().to_owned();
         body["scopes"].clone()
@@ -641,6 +650,7 @@ impl App {
             .await;
         assert_eq!(status, StatusCode::OK, "compose: {body}");
         assert_eq!(body["delivered"], true, "{body}");
+        assert_eq!(body["accepted"], true, "{body}");
         let message = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let message = receiver.received.recv().await.unwrap();

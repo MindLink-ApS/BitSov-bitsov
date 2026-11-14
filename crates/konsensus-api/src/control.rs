@@ -576,7 +576,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                         .collect::<Vec<_>>()
                         .join("+"),
                     g.client_id,
-                    g.expires_at,
+                    utc_and_unix(g.expires_at),
                     g.epoch,
                     g.budget
                         .as_ref()
@@ -601,7 +601,10 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                     "granted front_door to client {} until {} (epoch {}): it may publish or \
                      update this node's front-door card and nothing else; it moves no value. \
                      Revoke any time with: konsensus grant-revoke --client-id {}",
-                    g.client_id, g.expires_at, g.epoch, g.client_id,
+                    g.client_id,
+                    utc_and_unix(g.expires_at),
+                    g.epoch,
+                    g.client_id,
                 ),
             },
             Err(e) => error(e),
@@ -613,7 +616,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
         ) {
             Ok(grant) => ControlResponse::Ok {
                 detail: format!("approved first contact for client {client_id}, grant {grant_op_id}, recipient {}, maximum {} msat; expires at {} (single use)",
-                    grant.recipient, grant.max_total_msat, grant.expires_at),
+                    grant.recipient, grant.max_total_msat, utc_and_unix(grant.expires_at)),
             },
             Err(e) => ControlResponse::Error { message: e.to_string() },
         },
@@ -714,7 +717,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
         ControlRequest::OpenWindow { seconds } => {
             let until = service.open_pairing_window(std::time::Duration::from_secs(seconds));
             ControlResponse::Ok {
-                detail: format!("pairing window open until {until}"),
+                detail: format!("pairing window open until {}", utc_and_unix(until)),
             }
         }
     }
@@ -814,6 +817,20 @@ fn approve_and_execute_replacement(
     }
 }
 
+/// A Unix time in seconds as ISO-8601 UTC, `2026-11-09T16:01:22Z`, for console
+/// output. A value outside chrono's range prints as the plain number.
+pub fn utc_iso8601(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| secs.to_string())
+}
+
+/// `2026-11-09T16:01:22Z (unix 1794240082)`: readable first, with the number
+/// kept for anyone who copies it.
+pub fn utc_and_unix(secs: i64) -> String {
+    format!("{} (unix {secs})", utc_iso8601(secs))
+}
+
 fn error(e: PairingError) -> ControlResponse {
     ControlResponse::Error {
         message: e.to_string(),
@@ -844,7 +861,10 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
              profile, links and the prices shown on the card. It moves no value, reaches no \
              other route, and lasts until the window closes (1 h unless you pass --for, 24 h at \
              most). Revoke with konsensus grant-revoke.",
-            op.op_id, op.client_name, op.client_id, op.expires_at
+            op.op_id,
+            op.client_name,
+            op.client_id,
+            utc_and_unix(op.expires_at)
         );
         return ControlResponse::Describe {
             confirmation_label: grant_confirmation_phrase(op),
@@ -876,7 +896,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
                 .join("+"),
-            op.expires_at
+            utc_and_unix(op.expires_at)
         );
         return ControlResponse::Describe {
             confirmation_label: grant_confirmation_phrase(op),
@@ -906,7 +926,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             p.client_id,
             p.name,
             crate::pairing::device::key_fingerprint(&p.key_id),
-            p.expires_at,
+            utc_and_unix(p.expires_at),
             p.key_id
         );
         return ControlResponse::Describe {
@@ -944,7 +964,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             a.client_id,
             a.current_identity_fingerprint,
             a.replacement_identity_fingerprint,
-            a.expires_at
+            utc_and_unix(a.expires_at)
         );
         return ControlResponse::Describe {
             confirmation_label: replacement_confirmation_phrase(a),
@@ -1441,7 +1461,7 @@ mod wire_tests {
     #[test]
     fn transport_encoding_preserves_all_request_variants() {
         let fixtures = [
-            r#"{"op":"add-peer","node_id":"abababababababababababababababababababababababababababababababab","addr":"127.0.0.1:9735","label":"Dad"}"#,
+            r#"{"op":"add-peer","node_id":"abababababababababababababababababababababababababababababababab","addr":"127.0.0.1:9735","label":"Bob"}"#,
             r#"{"op":"add-peer","node_id":"abababababababababababababababababababababababababababababababab","addr":"127.0.0.1:9735","label":null}"#,
             r#"{"op":"status"}"#,
             r#"{"op":"describe","op_id":"test"}"#,
@@ -1466,5 +1486,23 @@ mod wire_tests {
             let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(actual, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::{utc_and_unix, utc_iso8601};
+
+    #[test]
+    fn unix_seconds_print_as_iso8601_utc() {
+        assert_eq!(utc_iso8601(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_iso8601(1_794_240_082), "2026-11-09T16:01:22Z");
+        assert_eq!(
+            utc_and_unix(1_794_240_082),
+            "2026-11-09T16:01:22Z (unix 1794240082)"
+        );
+        // Out of chrono's range: the number, never a panic or a wrong date.
+        assert_eq!(utc_iso8601(i64::MAX), i64::MAX.to_string());
+        assert_eq!(utc_iso8601(i64::MIN), i64::MIN.to_string());
     }
 }

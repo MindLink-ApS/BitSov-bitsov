@@ -190,7 +190,7 @@ impl SimChain {
 #[async_trait::async_trait]
 impl ChainProvider for SimChain {
     fn chain_view(&self) -> konsensus_core::traits::chain::ChainView {
-        konsensus_core::traits::chain::ChainView { backend: "mock", trust_level: "simulated", host: None }
+        konsensus_core::traits::chain::ChainView { backend: "mock", trust_level: "simulated", host: None, explorer_default: false }
     }
     fn trust_level(&self) -> TrustLevel {
         TrustLevel::ServerTrust
@@ -336,7 +336,7 @@ async fn start_node(spec: Spec<'_>) -> SimNode {
         transport: Arc::clone(&transport) as Arc<dyn MessageTransport>,
         session_manager: Arc::clone(&sessions),
         jwt_secret: JWT_SECRET.into(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -920,8 +920,8 @@ impl Net {
                 let from = *self.identities[s.from].node_id();
                 let other: Vec<String> = deliveries
                     .iter()
-                    .filter(|d| d.at == s.to && d.sender == from && d.plaintext.as_deref().map_or(true, |p| !p.starts_with("sim:")))
-                    .map(|d| format!("kind={} plaintext={:?} id={}", d.kind, d.plaintext.as_deref().map(|p| p.chars().take(40).collect::<String>()), &d.envelope_id))
+                    .filter(|d| d.at == s.to && d.sender == from && d.plaintext.as_deref().is_none_or(|p| !p.starts_with("sim:")))
+                    .map(|d| format!("kind={} plaintext={:?} id={}", d.kind, d.plaintext.as_deref().map(|p| p.chars().take(40).collect::<String>()), d.envelope_id))
                     .collect();
                 v.push(format!(
                     "I1 exactly-once: step {} n{}->n{} {:?} delivered {got} times (op {}, message_id {}); other deliveries from sender there: {other:?}",

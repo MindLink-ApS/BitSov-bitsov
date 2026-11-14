@@ -4,6 +4,9 @@
 
 mod admission_quotes;
 mod call_media;
+mod chain_tip;
+#[path = "cli/chain_tip.rs"]
+mod chain_tip_cmd;
 mod claim_code;
 mod cli;
 mod config;
@@ -15,6 +18,10 @@ mod endpoints;
 mod guarded_lightning;
 mod housekeeping;
 mod invoice_refusals;
+mod lightning_health;
+#[cfg(test)]
+#[path = "tests/fixtures/flaky_session_store.rs"]
+mod flaky_session_store;
 #[path = "cli/locked.rs"]
 mod locked_cmd;
 mod logging;
@@ -31,6 +38,7 @@ mod onboarding;
 mod owner_cmd;
 mod password;
 mod peer_exchange;
+mod peer_invoices;
 mod pending_handler;
 mod profile_handler;
 #[path = "cli/recover.rs"]
@@ -117,6 +125,10 @@ impl konsensus_crypto::SessionStore for StorageSessionAdapter {
     }
 }
 
+#[cfg(test)]
+#[path = "tests/session_save_durability.rs"]
+mod session_save_durability;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -184,6 +196,7 @@ async fn main() -> Result<()> {
         } => {
             seed_cmd::cmd_seed_encrypt(&config)?;
         }
+        Command::ChainTip(args) => chain_tip_cmd::run(args)?,
         Command::Device { command } => {
             owner_cmd::cmd_device(command).await?;
         }
@@ -570,8 +583,35 @@ fn cmd_init(
             println!("  3. Run: konsensus start -c {}", config_path.display());
         }
     }
+    print_network_notice(&config);
 
     Ok(())
+}
+
+/// Lines naming the Bitcoin network a freshly written config pays on, when that
+/// is mainnet. `init` and `restore` write `network = "bitcoin"` today, while this
+/// beta supports signet only, so the owner is told before the first start.
+fn network_notice(config: &NodeConfig) -> Vec<String> {
+    if config.lightning.bitcoin_network().as_deref() != Some("bitcoin") {
+        return Vec::new();
+    }
+    vec![
+        "NOTE: This config uses the Bitcoin mainnet ([lightning] network = \"bitcoin\").".into(),
+        "      Mainnet is not supported in this beta. Before the first start, switch".into(),
+        "      [lightning] network and the [lightning] and [chain] server URLs to signet:".into(),
+        "      see docs/QUICKSTART-SIGNET.md, step 2.".into(),
+    ]
+}
+
+fn print_network_notice(config: &NodeConfig) {
+    let lines = network_notice(config);
+    if lines.is_empty() {
+        return;
+    }
+    println!();
+    for line in lines {
+        println!("{line}");
+    }
 }
 
 /// `konsensus restore` — recover a node from an existing mnemonic.
@@ -705,6 +745,7 @@ fn cmd_restore(
     } else {
         println!("Run: konsensus start -c {}", config_path.display());
     }
+    print_network_notice(&config);
     println!();
 
     Ok(())
@@ -903,8 +944,8 @@ fn cmd_node_id(
 /// The three inputs are mutually exclusive at the CLI. Absent all three,
 /// returns `None` so the caller can prompt. The password is never logged.
 /// `--password-file` uses [`seed_cmd::read_password_file`] (chmod 600, regular
-/// file). `--password-fd` uses [`password::read_password_fd`] (one read to EOF,
-/// trailing CR/LF stripped, 4096-byte maximum).
+/// file, 4096-byte maximum). `--password-fd` uses [`password::read_password_fd`]
+/// (one read to EOF, trailing CR/LF stripped, 4096-byte maximum).
 fn supplied_seed_password(
     password: Option<Zeroizing<String>>,
     password_file: Option<&Path>,
@@ -1401,48 +1442,20 @@ async fn start_node_services<'a>(
         lock_status_socket,
     } = authority;
     // ── Lightning health check ─────────────────────────────────────
-    // Verify Lightning connectivity at startup so users get a clear
-    // error message if their wallet is misconfigured.
-    let lightning_backend = config.lightning.backend_name();
-    match node.lightning().get_balance_msat().await {
-        Ok(balance_msat) => {
-            info!(
-                backend = lightning_backend,
-                balance_msat, "lightning health check passed"
-            );
-        }
-        Err(e) => {
-            if config.lightning.is_mock() {
-                // Mock should never fail, but log just in case
-                warn!(error = %e, "mock lightning health check failed (unexpected)");
-            } else {
-                // Real backend failure — give a helpful error message per tier
-                let fix_hint = match config.tier {
-                    crate::config::NodeTier::Cloud => {
-                        "Cloud tier: check your hosted node URL and ensure the service is running."
-                    }
-                    crate::config::NodeTier::Light => {
-                        "Light tier: check your LDK or LND settings in konsensus.toml.\n  \
-                         If using hosted Lightning, ensure your configured provider is reachable.\n  \
-                         You can switch to mock Lightning for testing: set [lightning] backend = \"mock\"."
-                    }
-                    crate::config::NodeTier::Full => {
-                        "Full tier: LDK embedded Lightning is enabled by default. Your node IS its own Lightning node.\n  \
-                         Keys are derived from your mnemonic. Fund the on-chain wallet to open channels.\n  \
-                         To use your own LND instead, set [lightning] backend = \"lnd\" and configure its REST credentials."
-                    }
-                };
-                warn!(
-                    backend = lightning_backend,
-                    error = %e,
-                    "lightning health check FAILED — payments will not work"
-                );
-                warn!("Fix: {}", fix_hint);
-                // Don't abort — the node can still operate for non-payment tasks,
-                // but the payment gate will reject all messages.
-            }
-        }
-    }
+    // A wallet still syncing is normal on every start and is said at INFO;
+    // an unreachable chain service, a failure, or a sync still running after
+    // the sync window is a WARN. See `lightning_health`.
+    lightning_health::check_and_watch(
+        node.lightning(),
+        lightning_health::Context {
+            backend: config.lightning.backend_name(),
+            chain_source: config.chain.backend_name(),
+            tier: config.tier,
+            is_mock: config.lightning.is_mock(),
+        },
+        node.shutdown_rx(),
+    )
+    .await;
 
     // Replay invite-derived whitelist entries before the listener accepts
     // inbound traffic. `transport.add_to_whitelist` is dynamic in-memory
@@ -1506,7 +1519,7 @@ async fn start_node_services<'a>(
     let session_manager = Arc::new(konsensus_crypto::SessionManager::with_store(
         Arc::clone(node.identity()),
         session_store,
-    ));
+    ).with_record_policy(node.record_policy()));
 
     // Restore E2EE sessions from previous run
     let restored = session_manager.restore_sessions().await;
@@ -1650,9 +1663,10 @@ async fn start_node_services<'a>(
 
     // M6 N2: node-routed call media, admitted by N1's settled-block
     // coverage and paid-until grace check.
-    let call_media = call_media::CallMediaRouter::new(
+    let call_media = call_media::CallMediaRouter::with_limits(
         Arc::clone(node.transport()) as Arc<dyn call_media::MediaLink>,
         Arc::new(call_media::PaidCallAdmission::new(Arc::clone(node.storage()))),
+        config.calls.media_limits(),
     );
     let call_media_handle = call_media.spawn(node.shutdown_rx());
 
@@ -1671,7 +1685,7 @@ async fn start_node_services<'a>(
         session_manager,
         jwt_secret,
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         cors_enabled: config.api.cors_enabled,
         operator_probes_enabled: config
             .api
@@ -1699,8 +1713,9 @@ async fn start_node_services<'a>(
         },
         peer_prices: Arc::clone(&peer_prices),
         routing: Arc::clone(node.routing()),
-        plaintext_cipher: Some(Arc::new(konsensus_crypto::PlaintextCacheCipher::new(
+        plaintext_cipher: Some(Arc::new(konsensus_crypto::PlaintextCacheCipher::with_policy(
             node.identity().aes_key(),
+            node.record_policy(),
         ))),
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1922,8 +1937,9 @@ async fn start_node_services<'a>(
         front_door: api_state.front_door.clone(),
         routing: Arc::clone(node.routing()),
         identity: Arc::clone(node.identity()),
-        plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::new(
+        plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::with_policy(
             node.identity().aes_key(),
+            node.record_policy(),
         )),
         ws_tx,
         audit_log: Arc::clone(&audit_log),
@@ -2466,9 +2482,13 @@ async fn replay_accepted_invite_whitelist(
 
     for record in &records {
         let inviter = NodeId::from_bytes(record.inviter_pubkey);
-        let peer = match storage.get_peer(&inviter).await? {
-            Some(peer) => peer,
-            None => {
+        let peer = match storage.get_peer(&inviter).await {
+            Ok(Some(peer)) => peer,
+            // The active invitation supplies this admission decision. Leave
+            // unreadable peer metadata for the background format upgrade.
+            Err(konsensus_storage::StorageError::Encryption(_)) => konsensus_storage::Peer::new(inviter),
+            Err(error) => return Err(error.into()),
+            Ok(None) => {
                 let peer = konsensus_storage::Peer::new(inviter);
                 storage
                     .upsert_peer(&peer)
@@ -2554,6 +2574,22 @@ mod whitelist_replay_tests {
         async fn add_to_whitelist(&self, peer: &NodeId) {
             self.whitelist.lock().await.insert(*peer);
         }
+    }
+
+    #[tokio::test]
+    async fn whitelist_replay_defers_unreadable_peer_metadata() {
+        let raw = SqliteStorage::in_memory().await.unwrap();
+        let inviter = NodeId::from_bytes([2; 32]);
+        raw.upsert_peer(&konsensus_storage::Peer::new(inviter)).await.unwrap();
+        raw.add_accepted_invite(&AcceptedInviteRecord {
+            nonce: [9; 16], inviter_pubkey: [2; 32], expiry_unix: 200, accepted_at: 10,
+        }).await.unwrap();
+        let storage = konsensus_storage::EncryptedStorage::new(raw, &[7; 32]);
+        let transport = RecordingTransport::default();
+        let registry = tokio::sync::RwLock::new(konsensus_message::PeerRegistry::new());
+        assert_eq!(replay_accepted_invite_whitelist(&storage, &transport, &registry, 100).await.unwrap(), 1);
+        assert!(transport.whitelist.lock().await.contains(&inviter));
+        assert!(storage.get_peer(&inviter).await.is_err());
     }
 
     #[tokio::test]
@@ -3096,3 +3132,39 @@ mod regtest_e2e;
 #[cfg(test)]
 #[path = "tests/shutdown.rs"]
 mod shutdown_tests;
+
+#[cfg(test)]
+mod network_notice_tests {
+    use super::*;
+
+    fn fresh(tier: NodeTier) -> (tempfile::TempDir, NodeConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = NodeConfig::default_for_tier(tier, dir.path().join("mnemonic.txt"), dir.path());
+        (dir, config)
+    }
+
+    #[test]
+    fn a_fresh_full_node_is_told_it_is_on_mainnet_and_where_to_switch() {
+        let (_dir, config) = fresh(NodeTier::Full);
+        assert_eq!(config.lightning.bitcoin_network().as_deref(), Some("bitcoin"));
+        let text = network_notice(&config).join("\n");
+        assert!(text.contains("Bitcoin mainnet"), "{text}");
+        assert!(text.contains("not supported in this beta"), "{text}");
+        assert!(text.contains("docs/QUICKSTART-SIGNET.md"), "{text}");
+    }
+
+    #[test]
+    fn a_signet_or_mock_config_gets_no_notice() {
+        let (_dir, mut config) = fresh(NodeTier::Full);
+        if let LightningConfig::Ldk { network, .. } = &mut config.lightning {
+            *network = "signet".into();
+        } else {
+            panic!("full tier writes an LDK backend");
+        }
+        assert!(network_notice(&config).is_empty());
+        for tier in [NodeTier::Light, NodeTier::Cloud] {
+            let (_dir, config) = fresh(tier);
+            assert!(network_notice(&config).is_empty(), "{}", tier.description());
+        }
+    }
+}

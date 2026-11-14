@@ -241,6 +241,8 @@ pub struct EventActionResponse {
     pub message_id: Option<String>,
     pub delivered_to: Vec<String>,
     pub queued_for: Vec<String>,
+    /// Attendees whose encryption failed; no payment or delivery was attempted.
+    pub failed_for: Vec<String>,
     pub amount_msat: u64,
 }
 
@@ -540,6 +542,7 @@ async fn create_event(
     let result = async {
     let mut delivered_to = Vec::new();
     let mut queued_for = Vec::new();
+    let mut failed_for = Vec::new();
     let mut total_msat: u64 = 0;
     let mut last_message_id: Option<String> = None;
 
@@ -566,9 +569,11 @@ async fn create_event(
                 tracing::warn!(
                     peer = %peer_id,
                     error = %e,
-                    "no E2EE session for attendee, skipping"
+                    "attendee invite not encrypted, skipping"
                 );
-                queued_for.push(peer_id.to_hex());
+                // Earlier attendees keep their receipts. This attendee was not
+                // charged and has no envelope queued for delivery.
+                failed_for.push(peer_id.to_hex());
                 continue;
             }
         };
@@ -578,7 +583,7 @@ async fn create_event(
             .pricing
             .get_price_msat(KIND_CALENDAR_EVENT)
             .await
-            .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+            .map_err(crate::error::pricing_error)?;
 
         let paid = create_payment_proof_with_fee_report(&state, price_msat, peer_id).await;
         let fee_ceiling = match &paid {
@@ -639,6 +644,7 @@ async fn create_event(
             "title": req.title,
             "delivered_to": delivered_to,
             "queued_for": queued_for,
+            "failed_for": failed_for,
             "amount_msat": total_msat,
         })),
     );
@@ -649,6 +655,7 @@ async fn create_event(
         message_id: last_message_id,
         delivered_to,
         queued_for,
+        failed_for,
         amount_msat: total_msat,
     }))
     }.await;
@@ -740,6 +747,7 @@ async fn update_event(
     let result = async {
     let mut delivered_to = Vec::new();
     let mut queued_for = Vec::new();
+    let mut failed_for = Vec::new();
     let mut total_msat: u64 = 0;
     let mut last_message_id: Option<String> = None;
 
@@ -762,8 +770,11 @@ async fn update_event(
 
         let ratchet_msg = match state.session_manager.encrypt(peer_id, &payload_bytes).await {
             Ok(msg) => msg,
-            Err(_) => {
-                queued_for.push(peer_id.to_hex());
+            Err(e) => {
+                tracing::warn!(peer = %peer_id, error = %e, "attendee update not encrypted, skipping");
+                // Earlier attendees keep their receipts. This attendee was not
+                // charged and has no envelope queued for delivery.
+                failed_for.push(peer_id.to_hex());
                 continue;
             }
         };
@@ -773,7 +784,7 @@ async fn update_event(
             .pricing
             .get_price_msat(KIND_CALENDAR_UPDATE)
             .await
-            .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+            .map_err(crate::error::pricing_error)?;
         let paid = create_payment_proof_with_fee_report(&state, price_msat, peer_id).await;
         let fee_ceiling = match &paid {
             Ok((_, fee, _)) => *fee,
@@ -830,6 +841,7 @@ async fn update_event(
         message_id: last_message_id,
         delivered_to,
         queued_for,
+        failed_for,
         amount_msat: total_msat,
     }))
     }.await;
@@ -906,9 +918,9 @@ async fn create_rsvp(
         .encrypt(&organizer_id, &payload_bytes)
         .await
         .map_err(|e| {
-            ApiError::BadRequest(format!(
+            ApiError::from_encrypt_failure(e, |e| ApiError::BadRequest(format!(
                 "E2EE encryption failed (session may not be established): {e}"
-            ))
+            )))
         })?;
     let ciphertext = ratchet_message_to_bytes(&ratchet_msg);
 
@@ -916,7 +928,7 @@ async fn create_rsvp(
         .pricing
         .get_price_msat(KIND_RSVP)
         .await
-        .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+        .map_err(crate::error::pricing_error)?;
     let ((payment_hash, preimage, amount_msat), max_routing_fee_msat, settled_msat) =
         create_payment_proof_with_fee_report(&state, price_msat, &organizer_id).await?;
     let result = async {

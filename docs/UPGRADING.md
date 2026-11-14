@@ -3,14 +3,341 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
+## Installing a release binary
+
+Release binaries are named `bitsov-<os>-<arch>` (for example
+`bitsov-darwin-aarch64`); this note calls the binary `konsensus`. Verify the
+download, rename it to the path your service runs, make it executable and, on
+macOS, remove the browser's download mark, as in
+[install a signed pre-release binary](QUICKSTART-SIGNET.md#1b-or-install-a-signed-pre-release-binary),
+including its signature check (or `scripts/verify-release.sh` for a download of
+every asset). Use `shasum -a 256 -c SHA256SUMS --ignore-missing` (Linux:
+`sha256sum -c --ignore-missing SHA256SUMS`): without `--ignore-missing` the
+check fails on the other platforms' files. Stage the new binary beside the old
+one and check `./konsensus --version` before you switch.
+
+A running node does not print its release on start. Builds that include #540
+(none signed yet) report it as `node_version` in the owner's
+`GET /api/v1/status`; `version` there and in `/api/v1/health` stays the API
+version, `2`. On rc22 and earlier, check the
+binary with `--version`.
+
+## rc23 → rc24
+
+End calls and reconcile pending payments using their existing operation IDs
+before stopping BitSov. Take a consistent backup of the complete data directory
+and, when used, the PostgreSQL database. Retain config, wallet/channel, pairing,
+session and operation state together. Leave separately managed Lightning
+services running. Do not re-run `init` or rewind current state to an older copy.
+
+Verify the future signed artifact for the correct platform, stage it beside
+the retained binary, and check that `--version` reports `konsensus 0.3.0-rc24`.
+Review tier consistency, API bind settings, optional media settings and the
+configured source with `chain-tip` without changing or accepting it implicitly.
+Switch the binary and restart with the same config, data and normal owner
+controls. There are no new SQL migrations or stored-format changes since rc23;
+the forward-only migrations and encrypted record markers from rc23 still apply.
+Nodes coming from rc22 or earlier must also follow [rc22 → rc23](#rc22--rc23).
+
+Inspect migration and aggregate record-upgrade logs; retain every completion
+marker and investigate unreadable or unwritable data. Check `node_version`,
+health, identity, contacts, channels, chain source and `money_ready`. Initial
+wallet sync alone does not establish payment readiness. Resolve
+`chain_unavailable` by restoring source availability and freshness before
+priced work. Read session state on both peers and confirm a message in each
+direction on signet. Reconcile pending results before retrying.
+
+A paid call now ends after the callee's app connection is lost, including a
+brief network interruption, when the callee's node records the disconnect.
+The cutoff runs on the callee's node and requires rc24 there. With an rc23
+callee, the old behaviour remains and the caller can pay further blocks.
+Update both nodes before paid calls; do not run paid calls while versions are
+mixed. After both nodes are upgraded, wait until both report payment-ready
+(`money_ready` is true) and their channels are usable before the paid check.
+Then check a call and its closing result within the configured cap. Keep the
+upgraded data intact.
+
+If the callee's node cannot record the disconnect, either because the write
+still fails after its retries or because the node stops before the write,
+the call can stay live without media until it expires unpaid. The caller can
+keep paying for blocks meanwhile. Hang up from the caller side as soon as
+audio stops and reconcile any further paid blocks. A pending disconnect is
+not replayed after a restart; durable replay is planned for a later release.
+
+A media-drop hangup does not notify the peer; after a recorded cutoff, the
+peer's node ends the call at the next refused renewal, observed at about
+66 to 67 seconds. Keep unresolved operation IDs and reconcile results
+before further spending. Prefer rolling forward; existing
+[rollback constraints](#rollback-constraints) remain. No rc24 → rc23 retained-node
+rollback rehearsal is recorded. See the [rc24 operator checklist](releases/v0.3.0-rc24.md#4-retained-nodes-rc23--rc24)
+for the complete upgrade sequence and remaining release gates.
+
+## rc22 → rc23
+
+rc23 includes forward-only storage upgrades and session recovery changes. Stop
+BitSov after ending calls and reconciling pending operations by their existing
+IDs. Take a consistent backup of the complete data directory and, when used,
+the PostgreSQL database. Retain config, wallet/channel, pairing, session and
+operation state together. Do not re-run `init` or rewind a live node to an
+older snapshot after it has written new state.
+
+Stage the future verified signed binary beside rc22 and confirm
+`konsensus 0.3.0-rc23` before switching. Start with the retained config and data;
+leave separately managed Lightning services alone. Correct any mismatch between
+`tier` and `[network].tier`. An existing non-loopback API bind now requires
+`[api].allow_non_loopback_bind = true`; remote access still requires a loopback
+API. Review optional call-media limits and `accept_third_party_tip` before
+adding them: older binaries reject unknown keys. Use `chain-tip` to inspect the
+configured source without changing it or accepting a third-party source.
+
+First start applies migrations **033, 038 and 039** on SQLite and PostgreSQL
+and begins the [encrypted record upgrade](#location-bound-storage-records-after-rc22).
+Keep the completion markers. Inspect aggregate migration and record-upgrade
+logs and investigate unreadable or unwritable fields. Pairing storage remains
+**v8**, which does not establish compatibility with an older binary. Check
+`node_version`, health, identity, contacts, channels and `money_ready` before
+priced work. Resolve `chain_unavailable` by restoring source availability and
+freshness; initial wallet sync alone does not establish payment readiness.
+
+Recovery may hold new sends with `session_handover` and defer an unreadable paid
+envelope. Retain and retry the existing operation ID after recovery; do not
+create a new paid operation to resolve an uncertain result. Mixed rc22/rc23
+deferred messages can stall after **10 attempts**. Reconcile payment and delivery
+on both peers; upgrading neither confirms delivery nor refunds earlier payments.
+Mixed-version and retained-node rehearsals for the complete rc23 candidate
+remain outstanding.
+
+Prefer rolling forward. After rc23 first opens the retained data, do not run
+rc22 or older on it. There is no in-place downgrade for the migrations or record
+format. Crossing migrations 038/039 on SQLite requires restoring pre-upgrade
+`konsensus.db` under a separately established consistent-state recovery plan;
+a database-only rewind beneath newer wallet/channel or session state is not
+supported. PostgreSQL also has no down migration. Never delete migration rows
+or completion markers to make an older binary start. Follow the existing
+[rollback constraints](#rollback-constraints) and the
+[rc23 operator checklist](releases/v0.3.0-rc23.md), including its detailed
+[rollback and recovery steps](releases/v0.3.0-rc23.md#5-rollback-and-recovery).
+This preparation records no rc23 → rc22 rollback rehearsal.
+
+## Location-bound storage records (after rc22)
+
+The encrypted record format is **forward-only**. New writes bind encrypted
+fields in messages, peers, rooms, files, outbox operations and channel/payment
+operations to their table, column and row ID. Cached message plaintext and
+persisted sessions use the same location binding. The background pass converts
+readable fields before persisting a local completion marker. After that marker
+exists, unbound v1 records are refused, including after a restart. The cache and
+session cutoff also remains effective across storage-mode changes.
+
+Fields are converted independently. A corrupt optional message cache is cleared
+so it cannot prevent readable message content from upgrading. Invalid file data
+is retained and still rejected; readable file names and MIME types are upgraded
+so metadata reads and listings continue to work. Other unreadable fields are
+retained for recovery. The log reports table names and aggregate unreadable,
+unwritable and discarded-cache counts, without record IDs or field contents.
+
+SQLite snapshot comparisons account for TEXT/BLOB storage classes. After a
+rejected swap, including a row data or constraint rejection, the pass rereads
+that row once: an unchanged snapshot is reported
+as unwritable rather than retried forever. Such blocked rows are retained and
+may require recovery after cutoff. A changed snapshot or an operational database error
+still defers completion and retries with exponential backoff, from one minute
+to at most one hour; ongoing writes can therefore delay completion. Held call
+messages are included in maintenance while hidden from ordinary message reads.
+
+Retain the latest complete data directory, including the completion markers.
+Do not delete a marker or restore an older database beneath it to re-enable old
+records. Do not run rc22 or an older binary on this data: migration 033 is a
+separate schema fence, and the encrypted record wrapper alone is not a
+binary-version fence. On SQLite, those binaries refuse the database at start
+with `migration 33 was previously applied but is missing in the resolved
+migrations` (sqlx `VersionMissing`). Released PostgreSQL binaries (rc22 and
+older) have no such check: they skip migration versions they don't know and
+start anyway, so never run them on this data. Recover by rolling forward using consistent
+state, following the existing channel and ratchet rollback constraints.
+
+Only the encrypted fields are bound. Plain sibling columns (for example file
+associations and hashes, room creators, and operation state) are outside this
+binding, except for message-envelope fields checked through the message ID.
+Recovery shards and whitelist backups retain their separate existing formats.
+The format version is authenticated in the AAD; no trusted per-record generation
+counter is included. Replaying an older valid ciphertext at the same location
+can still succeed, so this change does not prevent same-record or whole-database
+rollback by an attacker with write access.
+
+Library defaults accept v2 only. Embedders migrating v1 data must explicitly
+supply a data-directory policy to storage, cache and session constructors, run
+the format upgrade, and retain its marker across restarts.
+
+## rc21 → rc22
+
+An E2EE send now saves its advanced send chain before the ciphertext leaves the
+session; if the save fails, nothing is sent (#519). Session setup applies
+stricter consistency checks to the keys it receives (#520). File sends report
+the routing fee actually paid (#521). There are no new SQL migrations or pairing-store or peer-store schema version changes since rc21;
+pairing storage remains **v8**, and stored session state keeps its format.
+Retain the latest data directory, config and encrypted seed; do not re-run
+`init` or restore a historical snapshot. Existing rollback constraints still
+apply. This change does not extend to a database restored from an older copy.
+
+Operators stop BitSov, switch its binary and restart with the same config and
+data. No config change or grant re-issue is needed. A node running rc20 follows
+[rc20 → rc21](#rc20--rc21) too.
+
+A send the node cannot save is now refused with `not_dispatched`, reason
+`session_save_failed`, before any payment for it. An admission already settled
+in the same call stays settled and is reported as paid, with the same reason.
+In a room or calendar fan-out, that recipient is skipped and nothing is paid to
+it. When this reason appears, check disk and database health.
+
+An rc22 node refuses a prekey bundle or session init that fails the stricter
+checks. It logs a warning and adds no reply frame, so that peer gets no new
+session from it. If a session with a contact does not form after the upgrade,
+read the node log.
+
+`POST /api/v1/files/:id/send` now returns optional `fee_paid_msat`. It is omitted
+when any component fee is unknown and on backends other than LDK; absence does
+not mean zero.
+
+The diff from rc21 changes no frame, envelope, ratchet message, prekey bundle or
+session init format. One-time prekey id values change; the field and its type do
+not. From the source, the bundles and inits an rc21 node builds pass the stricter
+checks, so rc21 and rc22 should interoperate. The source supports this
+reading, and it was also run on regtest (below); not on real hardware.
+
+Mixed rc21 and rc22 operation: tested on regtest at `9c923c98`. Upgrade in place
+in both id orders, fresh sessions and file sends to and from rc21 passed. Not run
+on real hardware.
+
+Rollback from rc22 to rc21: tested on regtest in both id orders. rc21 started on
+the candidate's data, and chat, calls and files passed. The earlier guidance that
+prefers rolling forward stands.
+
+To roll back rc22 → rc21:
+
+1. Get rc21's binary and verify it the same way, against the `SHA256SUMS` of
+   release `v0.3.0-rc21` (same release key). `--version` prints
+   `konsensus 0.3.0-rc21`.
+2. Let calls end. Stop only BitSov.
+3. Keep the data directory, config and encrypted seed as they are. rc22 adds
+   no SQL migration, config key or storage format since rc21, so rc21 reads
+   what rc22 wrote. Do not re-run `init` or restore an older snapshot.
+4. rc21 refuses a `konsensus.toml` key it does not know. If the config was
+   changed after the upgrade, for example for a later build, put back the copy
+   you kept before upgrading first.
+5. Put rc21 at the path your service runs and start it with the same config,
+   data and options.
+6. If you run two nodes that talk to each other, roll back one at a time and
+   let the first reconnect before restarting the second: two nodes that
+   reconnect at nearly the same moment can end up on different sessions (known
+   limit below).
+7. Check as after an upgrade: `/api/v1/health`, contacts and channels, and a
+   message in each direction.
+
+This applies only to data that rc22 or rc21 last ran on. Data a later build
+has used can carry migration 033 and the location-bound record format
+([above](#location-bound-storage-records-after-rc22)). On SQLite, rc22 and
+older refuse a database with migration 033 at start. Released PostgreSQL
+binaries (rc22 and older) do not: they skip migration versions they don't know
+and start anyway. Never run them on a PostgreSQL database that a later build
+has used.
+
+Not included: call cutoff is not yet verified on real hardware, and this release
+does not fix the other open reports.
+
+Known limit, also present in rc21: If a link drops during a call and both nodes reconnect at nearly the same moment,
+the two nodes can end up on different sessions. Messages and call minutes sent
+then can be paid for and not read. It can clear within about a minute; otherwise
+follow the steps below. This release does not change it, and a fix is planned.
+
+If messages stop being read after a dropped link:
+
+1. Stop sending; a send can be paid for and not read.
+2. Restart one node with its existing config and data, and allow up to about 90
+   seconds; early sends may fail with nothing paid.
+3. In any app that reports a pending result, use Check pending result.
+4. In any app that still shows the call, use End call, or Hang up while the
+   call still shows as live.
+5. Check that messages are read in both directions, then call again.
+
+Amounts already paid for messages or minutes that were not read are not refunded.
+Tested on regtest on this release and on rc21, by calling the app's host
+functions, not on real hardware.
+
+Also present in rc21 and rc22: after a reconnect, one node can be left without
+an E2EE session. If that node holds the lower id, it stays stuck until a new
+connection. The fix is on main (#514) and not in either signed release; see
+[recovering a stuck E2EE session](operations/e2ee-session-recovery.md).
+
+Follow the [rc22 signing and node checklist](releases/v0.3.0-rc22.md).
+
+## rc20 → rc21
+
+rc21 fixes app-grant call spending and closing signals (#493, #498). There
+are no new SQL migrations or pairing-store or peer-store schema version
+changes since rc20; pairing storage remains **v8**. Retain the latest data
+directory, config and encrypted seed; do not re-run `init` or restore a
+historical snapshot. Existing rollback constraints still apply.
+
+Existing app grants bind calls at their stored **6,000 msat per payment**
+until re-granted. Re-issue each app client's grant with
+`konsensus grant --op <op>`. With no `--per-call`, the client's proposed
+per-payment value is signed, capped at the budget; pass `--per-call <sats>`
+to set the limit explicitly, and review the value shown before signing.
+The owner now sees and signs the real per-payment value; paid messages,
+files, rooms and admission still use the lower of that value and 6 sats.
+Calls use the signed value and their pinned per-block ceiling, with the
+offer bounded by its own cap. Every draw re-checks the signed value.
+
+Set `[calls] max_call_minutes` so a call's hold fits typical app budgets.
+For example, use **10 minutes for a 500-sat grant at 10 sat/min**; the
+default 60-minute hold would exceed that budget even before fees. Allow
+room for routing fees, the offer and the closing allowance. The closing
+signal is paid by the call's grant, with its allowance reserved outside
+the caller's hold consent (`max_hold_msat`); it still counts against the
+grant's budget and available liquidity. A refused closing payment leaves
+the call ended without an owner debit.
+
+PostgreSQL in rc21 (and rc22) does not refuse a database whose
+`_konsensus_migrations` rows include a version the binary does not know: it
+skips that version and starts. Only SQLite refuses that case
+(`VersionMissing`). The PostgreSQL check (`FutureSchema`) came with #504, on
+main after rc22, and is not in any signed release. Do not run an older binary
+on a newer PostgreSQL schema, and do not delete migration history to make one start.
+
+Follow the [rc21 signing and beta-node checklist](releases/v0.3.0-rc21.md).
+
+## rc19 → rc20
+
+rc20 adds M6 paid calls and the onboarding/pairing work merged since rc19.
+SQL migrations **031** and **032** (starter requests and queries, signet,
+off by default) and **035**, **036** and **037** (call blocks, the Unpaid
+notice and call-block invoice provenance) run on first start. They are
+additive and have no down migration. Keep a consistent database backup
+before upgrading. Do not downgrade; roll forward on the migrated database.
+On SQLite, an older binary refuses startup when the database records a
+migration version the binary does not know (`VersionMissing`). The
+PostgreSQL backend in rc20, rc21 and rc22 has no such check and would start
+on the newer schema; the check (`FutureSchema`) came with #504, after rc22,
+and is not in any signed release.
+
+Migration **035** ends every in-flight live call;
+restart calls after the upgrade (their replay tombstones are kept and no
+unpaid media interval is granted). The two sections below cover the call
+ledger and invoice bindings in detail.
+
 ## Call-block invoice provenance (migration 037)
 
 Migration **037** adds invoice-hash bindings to `(peer, call_id, seq)` on
 SQLite and PostgreSQL. It is additive and idempotent, with no down migration.
-Keep a consistent database backup before upgrading: an older SQLite binary
-that does not know version 037 refuses the upgraded database (`VersionMissing`).
-Returning to that binary requires restoring the pre-upgrade database; do not
-delete migration history or invoice bindings to bypass the check.
+Keep a consistent database backup before upgrading. Do not downgrade; roll
+forward. On SQLite, an older binary that does not know version 037 refuses
+the upgraded database (`VersionMissing`). A released PostgreSQL binary
+(rc22 and older) does not refuse it and would start; only builds that include
+#504 (none signed yet) refuse an applied version they do not know
+(`FutureSchema`). Do not run an
+older binary on the upgraded database, and do not delete migration history
+or invoice bindings to make one start.
 
 ## Call reservations (#460)
 
@@ -234,7 +561,7 @@ There is no intermediate rc15 installation step.
 `fix/ldk-node-late-failure`. The candidate is `main` at
 `3088c53cbb3f6b609545e93844f3d1eec84cbdea` plus the reviewed release/upgrade
 docs and this security update on `docs/rc15-release-notes-security`. This
-update changes documentation only; versions remain rc14. Rasmus will select
+update changes documentation only; versions remain rc14. The release operator will select
 the final rc15 release commit and tag/sign separately. See the
 [signing checklist](releases/v0.3.0-rc15.md).
 For nodes skipping releases, apply the earlier procedures first, then
@@ -580,8 +907,14 @@ confirm `uname -m` is `aarch64`, the service uses `/usr/bin/konsensus` and the
 config is `/var/lib/bitsov/konsensus.toml`. If the Pi still uses a user unit or
 other paths, use that unit's actual account and paths; do not run both services.
 
-After downloading and independently verifying the **published** rc14 Linux
-aarch64 artifact and signed checksums, from its download directory:
+After downloading the **published** rc14 Linux aarch64 artifact, verify it
+before it runs.
+
+Do not run the block below. It makes `./bitsov-linux-aarch64` executable,
+runs that download-directory path, and installs the same path. Verify with
+`bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` and install
+`bitsov-linux-aarch64` from the seal path the script prints. The home-node
+guide shows that command. The block stays as the record of this rc14 note.
 
 ```sh
 uname -m
@@ -1486,9 +1819,10 @@ selects embedded LDK's chain source; it does not reconfigure an external LND.
 | `[chain]` Bitcoin Core | `backend = "bitcoind"`, `rpc_host`, `rpc_port`, `cookie_file`; alternatively `rpc_user` + `rpc_password_file` | Explicit opt-in; bare host + port and exactly one file-based auth mode. No inline password or credential URL. Replace the Esplora stanza rather than mixing backend keys. |
 | `[chain]` Electrum | `backend = "electrum"`, `server_url`, `operator = "own"` or `"third_party"` | Server URL required; no default/discovery. `operator` defaults to `third_party`, even on loopback/LAN. `own` is the owner's declaration, not proof of validation. |
 | `[remote_access]` | `listen_addr`, `advertised_endpoint`, `mdns` | Off unless a listener is set; `advertised_endpoint` optionally overrides the first auto-discovered endpoint. `[api] listen_addr` must stay loopback. Optional `mdns` build feature advertises only under `--home`; `mdns = false` opts out. Old apps use `pair-ticket --legacy`. Avoid API/P2P/Lightning TCP port collisions. |
+| `[api]` | `allow_non_loopback_bind` | Default false. `listen_addr` must be loopback (`127.0.0.1` or `::1`). `0.0.0.0`, `::`, and LAN addresses fail validation until `allow_non_loopback_bind = true`. The flag does not relax the `[remote_access]` loopback requirement. |
 | `[privacy]` | `peer_exchange = "off"` or `"paid"`, `shareable_peers`, `share_peer_labels` | Off and empty lists. Node-ID allowlists explicitly consent to sharing peers and, separately, their labels. Restart to apply; already issued quotes stay redeemable until expiry. |
 | `[network]` | `advertised_addr`, `stun_server` | Optional; explicit advertised address wins. Discovery uses only owner-set STUN; no default third-party server. |
-| `[calls]` | `stun_listen`, `max_call_minutes` | STUN omitted/off; outgoing paid call cap defaults to 60 minutes, bounded 1–240. |
+| `[calls]` | `stun_listen`, `max_call_minutes`, `media_max_frames_per_second`, `media_max_bytes_per_second`, `media_drop_bulk_over_share` | STUN omitted/off; outgoing paid call cap defaults to 60 minutes, bounded 1–240.; media limits default to 100 packets and 65536 bytes per second, per direction, and the socket closes past them |
 | `[pricing]` | `call_msat` | New, default `10000`, must be positive; offer kind 400 only. |
 | `[pricing]` / `[web]` | Existing `web_content_msat` / `page_price_msat` | Defaults changed from 50 to 1000 msat before rc8 (#167, #173). Retained `web_content_msat < 1000` is rejected at startup, even if web serving is disabled; raise or remove it. `page_price_msat` is legacy, not a separate charge override. Porch floors still apply to advertised and paid prices. |
 | `[identity]` | `hosted` | Default false; true or cloud tier reports hosted custody. Seed encryption does not turn a hosted node into a remote signer. |
