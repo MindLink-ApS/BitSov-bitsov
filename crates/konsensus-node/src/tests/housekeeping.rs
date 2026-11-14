@@ -650,3 +650,23 @@ async fn invoice_requests_cleanup_shuts_down_on_signal() {
         .expect("should finish within timeout")
         .expect("should not panic");
 }
+
+#[tokio::test]
+async fn nonce_cleanup_reclaims_expired_envelope_deferrals_at_startup() {
+    let storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let env = make_envelope_with_timestamp(NodeId::from_bytes([1; 32]), NodeId::from_bytes([2; 32]),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64);
+    assert!(storage.defer_unreadable_envelope(&env).await.unwrap());
+    sqlx::query("UPDATE envelope_deferrals SET expires_at_ms = 0").execute(storage.pool()).await.unwrap();
+    let (shutdown, rx) = watch::channel(false);
+    let task = tokio::spawn(run_nonce_cleanup(storage.clone(), rx));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM envelope_deferrals").fetch_one(storage.pool()).await.unwrap();
+            if count == 0 { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("startup maintenance removes expired rows");
+    shutdown.send(true).unwrap();
+    task.await.unwrap();
+}

@@ -17,7 +17,9 @@
 //! ```
 //!
 //! When chain data is unavailable, falls back to static prices — the payment
-//! gate (Principle 2) still enforces that *some* payment is required.
+//! gate (Principle 2) still enforces that *some* payment is required. A synced
+//! source whose tip height cannot be read is the exception: the price is
+//! refused (`ChainUnavailable`), never computed against a made-up height.
 //!
 //! Both fee rate and block height are cached with a configurable TTL to
 //! avoid excessive chain queries. At millions of nodes, each node queries
@@ -377,9 +379,15 @@ impl ChainAwarePricingEngine {
 
     /// Refresh the chain state cache, fetching fee rates for all configured targets.
     ///
-    /// Returns the block height if successful, or None if chain is unavailable.
-    /// After this call, per-target fee rates are cached with EMA smoothing.
-    async fn refresh_chain_state(&self, observed_height: Option<(u64, Instant)>) -> Option<u64> {
+    /// Returns the block height if successful, `Ok(None)` if the chain is not
+    /// synced or has no fee rate (static fallback), and `ChainUnavailable` if
+    /// a synced source's tip height cannot be read: no price is anchored to a
+    /// height it did not report. After a success, per-target fee rates are
+    /// cached with EMA smoothing.
+    async fn refresh_chain_state(
+        &self,
+        observed_height: Option<(u64, Instant)>,
+    ) -> Result<Option<u64>, PricingError> {
         // Verify chain provider is synced before trusting its data.
         let synced = match observed_height {
             Some((height, _)) => self.chain.is_synced_with_height(height).await,
@@ -387,7 +395,7 @@ impl ChainAwarePricingEngine {
         };
         if !synced {
             warn!("chain-aware pricing: provider not synced, falling back to static prices");
-            return None;
+            return Ok(None);
         }
 
         let unique_targets = self.config.unique_targets();
@@ -397,11 +405,24 @@ impl ChainAwarePricingEngine {
         // Fee targets are fetched sequentially (typically 1-3 targets, each
         // is a single HTTP call with sub-second latency). The cache TTL (60s)
         // ensures this runs at most once per minute, not per message.
-        let (height_result, height_read_at) = match observed_height {
-            Some((height, observed_at)) => (Ok(height), observed_at),
+        let (height, block_height_fetched_at) = match observed_height {
+            Some((height, observed_at)) => (height, observed_at),
             None => {
                 let read_at = Instant::now();
-                (self.chain.get_block_height().await, read_at)
+                match self.chain.get_block_height().await {
+                    Ok(height) => (height, read_at),
+                    // A failed read is not height 0: refuse rather than price
+                    // against a made-up tip (no halving sensitivity) or cache one.
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "chain-aware pricing: chain tip height unavailable, refusing to price"
+                        );
+                        return Err(PricingError::ChainUnavailable(
+                            "chain tip unavailable".into(),
+                        ));
+                    }
+                }
             }
         };
         let mut fee_results = Vec::with_capacity(unique_targets.len());
@@ -411,18 +432,6 @@ impl ChainAwarePricingEngine {
             fee_results.push((read_at, self.chain.estimate_fee(target).await));
         }
         let now = Instant::now();
-
-        let (height, block_height_fetched_at) = match height_result {
-            Ok(h) => (h, height_read_at),
-            Err(e) => {
-                debug!(
-                    error = %e,
-                    "chain-aware pricing: block height unavailable, using base sensitivity"
-                );
-                // A fallback, not chain data: already `cache_ttl` old.
-                (0, now.checked_sub(self.config.cache_ttl).unwrap_or(now))
-            }
-        };
 
         // Process fee results for each target.
         let prev_cache = self.cached_state.read().await;
@@ -492,7 +501,7 @@ impl ChainAwarePricingEngine {
 
         if !any_succeeded {
             warn!("chain-aware pricing: all fee rate queries failed, falling back to static");
-            return None;
+            return Ok(None);
         }
 
         let halvings = height / HALVING_INTERVAL;
@@ -513,18 +522,19 @@ impl ChainAwarePricingEngine {
             refreshed_at: now,
         });
 
-        Some(height)
+        Ok(Some(height))
     }
 
     /// Get the cached chain state for a specific category.
     ///
     /// Returns `(ema_fee_rate, block_height)` for the category's configured
-    /// confirmation target. Refreshes the cache if expired.
+    /// confirmation target. Refreshes the cache if expired. `Ok(None)` means
+    /// the static fallback; an error means no price.
     async fn get_chain_state_for_category(
         &self,
         category: KindCategory,
         observed_height: Option<(u64, Instant)>,
-    ) -> Option<(f64, u64)> {
+    ) -> Result<Option<(f64, u64)>, PricingError> {
         let target = self.config.target_for_category(category);
 
         // Check cache freshness (read lock — cheap).
@@ -534,7 +544,7 @@ impl ChainAwarePricingEngine {
                 if cached.refreshed_at.elapsed() < self.config.cache_ttl {
                     // Cache is fresh — look up this target's fee rate.
                     if let Some(state) = cached.targets.get(&target) {
-                        return Some((state.ema_sat_per_vbyte, cached.block_height));
+                        return Ok(Some((state.ema_sat_per_vbyte, cached.block_height)));
                     }
                     // Target not in cache (new target added to config after last fetch).
                     // Fall through to refresh.
@@ -543,13 +553,16 @@ impl ChainAwarePricingEngine {
         }
 
         // Cache expired or target missing — refresh all targets.
-        let height = self.refresh_chain_state(observed_height).await?;
+        let Some(height) = self.refresh_chain_state(observed_height).await? else {
+            return Ok(None);
+        };
 
         // Read the freshly populated cache.
         let cache = self.cached_state.read().await;
-        let cached = cache.as_ref()?;
-        let state = cached.targets.get(&target)?;
-        Some((state.ema_sat_per_vbyte, height))
+        Ok(cache
+            .as_ref()
+            .and_then(|cached| cached.targets.get(&target))
+            .map(|state| (state.ema_sat_per_vbyte, height)))
     }
 
     /// Get the current chain state using the default fee target.
@@ -734,12 +747,16 @@ impl ChainAwarePricingEngine {
     ) -> Result<u64, PricingError> {
         // Get base price first — propagates NotPriceable for deferred kinds.
         let base_price = self.base_engine.get_price_msat(kind).await?;
+        // Multiplying a zero base cannot make it payable; no chain data is needed.
+        if base_price == 0 {
+            return Ok(0);
+        }
 
         // Use the category-specific fee target for this kind.
         let category = KindCategory::from_kind(kind);
         match self
             .get_chain_state_for_category(category, observed_height)
-            .await
+            .await?
         {
             Some((fee_rate, height)) => {
                 let sensitivity = Self::halving_sensitivity(height);
@@ -792,7 +809,7 @@ impl PricingEngine for ChainAwarePricingEngine {
     async fn get_category_price_msat(&self, category: KindCategory) -> Result<u64, PricingError> {
         let base_price = self.base_engine.get_category_price_msat(category).await?;
 
-        match self.get_chain_state_for_category(category, None).await {
+        match self.get_chain_state_for_category(category, None).await? {
             Some((fee_rate, height)) => {
                 let sensitivity = Self::halving_sensitivity(height);
                 Ok(Self::apply_multiplier(

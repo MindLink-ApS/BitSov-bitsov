@@ -62,6 +62,7 @@ pub struct MemStorage {
     pub peer_upsert_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub peer_delete_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub call_block_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub outbox_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub call_offer_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub fail_call_get_for: Mutex<Option<String>>,
     pub fail_call_put_for: Mutex<Option<String>>,
@@ -91,6 +92,7 @@ impl MemStorage {
             peer_upsert_gate: Mutex::new(None),
             peer_delete_gate: Mutex::new(None),
             call_block_dispatch_gate: Mutex::new(None),
+            outbox_dispatch_gate: Mutex::new(None),
             call_offer_dispatch_gate: Mutex::new(None),
             fail_call_get_for: Mutex::new(None),
             fail_call_put_for: Mutex::new(None),
@@ -132,36 +134,72 @@ impl MemStorage {
 
 #[async_trait]
 impl Storage for MemStorage {
-    async fn call_get(&self, peer: &NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+    async fn call_get(
+        &self,
+        peer: &NodeId,
+        call_id: &str,
+    ) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         if self.fail_call_get_for.lock().unwrap().as_deref() == Some(call_id) {
-            return Err(StorageError::Serialization("injected call read failure".into()));
+            return Err(StorageError::Serialization(
+                "injected call read failure".into(),
+            ));
         }
-        Ok(self.calls.lock().unwrap().get(&(*peer, call_id.to_owned())).cloned())
+        Ok(self
+            .calls
+            .lock()
+            .unwrap()
+            .get(&(*peer, call_id.to_owned()))
+            .cloned())
     }
 
-    async fn call_put(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+    async fn call_put(
+        &self,
+        peer: &NodeId,
+        call_id: &str,
+        entry: &konsensus_core::payloads::call::CallEntry,
+    ) -> Result<(), StorageError> {
         if self.fail_call_put_for.lock().unwrap().as_deref() == Some(call_id) {
-            return Err(StorageError::Serialization("injected call write failure".into()));
+            return Err(StorageError::Serialization(
+                "injected call write failure".into(),
+            ));
         }
-        self.calls.lock().unwrap().insert((*peer, call_id.to_owned()), entry.clone());
+        self.calls
+            .lock()
+            .unwrap()
+            .insert((*peer, call_id.to_owned()), entry.clone());
         Ok(())
     }
 
     /// No admission holds in memory: the grant alone, with the same fault hook.
-    async fn call_commit_admitted(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry, _id: &MessageId) -> Result<(), StorageError> {
+    async fn call_commit_admitted(
+        &self,
+        peer: &NodeId,
+        call_id: &str,
+        entry: &konsensus_core::payloads::call::CallEntry,
+        _id: &MessageId,
+    ) -> Result<(), StorageError> {
         self.call_put(peer, call_id, entry).await
     }
 
     async fn call_delete(&self, peer: &NodeId, call_id: &str) -> Result<(), StorageError> {
-        self.calls.lock().unwrap().remove(&(*peer, call_id.to_owned()));
+        self.calls
+            .lock()
+            .unwrap()
+            .remove(&(*peer, call_id.to_owned()));
         Ok(())
     }
 
-    async fn call_counts(&self, peer: &NodeId, now: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+    async fn call_counts(
+        &self,
+        peer: &NodeId,
+        now: u64,
+    ) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
         use konsensus_core::payloads::call::{CallCounts, Phase};
         let mut counts = CallCounts::default();
         for ((p, _), entry) in self.calls.lock().unwrap().iter() {
-            let Some(entry) = entry.clone().at(now) else { continue };
+            let Some(entry) = entry.clone().at(now) else {
+                continue;
+            };
             if entry.pending.is_some() || entry.phase != Phase::Ended {
                 counts.open_total += 1;
                 counts.open_peer += u64::from(p == peer);
@@ -173,14 +211,32 @@ impl Storage for MemStorage {
         Ok(counts)
     }
 
-    async fn call_live(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.phase != konsensus_core::payloads::call::Phase::Ended)
-            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    async fn call_live(
+        &self,
+    ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
+    {
+        Ok(self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.phase != konsensus_core::payloads::call::Phase::Ended)
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
+            .collect())
     }
 
-    async fn call_pending(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.pending.is_some())
-            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    async fn call_pending(
+        &self,
+    ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
+    {
+        Ok(self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.pending.is_some())
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
+            .collect())
     }
 
     async fn insert_channel_open_operation(
@@ -267,6 +323,10 @@ impl Storage for MemStorage {
         &self,
         op: &konsensus_storage::OutboxOperation,
     ) -> Result<bool, StorageError> {
+        let dispatching = op.state == "paying" && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+            .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if dispatching { self.outbox_dispatch_gate.lock().unwrap().take() } else { None };
+        if let Some(gate) = gate { gate.run().await?; }
         let dispatched = op.kind == 404 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
             .is_ok_and(|data| data["dispatched"] == true);
         let gate = if dispatched { self.call_block_dispatch_gate.lock().unwrap().take() } else { None };
@@ -1116,6 +1176,125 @@ impl ChainProvider for StubChain {
     }
 }
 
+/// A chain source at height 850 000 that answers `ok_reads` tip reads and
+/// then fails every one. Counts all tip reads. Other reads work as
+/// [`StubChain`]'s.
+pub struct TipDownChain {
+    pub read_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub ok_reads: std::sync::atomic::AtomicUsize,
+    pub reads: std::sync::atomic::AtomicUsize,
+    /// When down, answer height 0 instead of an error.
+    pub zero: bool,
+}
+
+impl TipDownChain {
+    /// Down from the first read.
+    pub fn down() -> Self {
+        Self::after(0)
+    }
+    /// Up for `ok_reads` tip reads, then down.
+    pub fn after(ok_reads: usize) -> Self {
+        Self {
+            read_gate: Mutex::new(None),
+            ok_reads: std::sync::atomic::AtomicUsize::new(ok_reads),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            zero: false,
+        }
+    }
+    /// Answers height 0 from the first read: an unknown tip, not a height.
+    pub fn zero() -> Self {
+        Self {
+            zero: true,
+            ..Self::down()
+        }
+    }
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ChainProvider for TipDownChain {
+    fn trust_level(&self) -> TrustLevel {
+        TrustLevel::FullValidation
+    }
+    async fn get_block_height(&self) -> Result<u64, ChainError> {
+        use std::sync::atomic::Ordering;
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        let gate = self.read_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.run().await.map_err(|e| ChainError::Connection(e.to_string()))?;
+        }
+        // Tests read the tip from one task at a time.
+        let left = self.ok_reads.load(Ordering::SeqCst);
+        let up = left > 0;
+        if up {
+            self.ok_reads.store(left - 1, Ordering::SeqCst);
+        }
+        if up {
+            Ok(850_000)
+        } else if self.zero {
+            Ok(0)
+        } else {
+            Err(ChainError::Connection("chain source unreachable".into()))
+        }
+    }
+    async fn get_block_header(&self, height: u64) -> Result<BlockHeader, ChainError> {
+        StubChain.get_block_header(height).await
+    }
+    async fn estimate_fee(&self, target_blocks: u32) -> Result<FeeEstimate, ChainError> {
+        StubChain.estimate_fee(target_blocks).await
+    }
+    async fn is_tx_confirmed(
+        &self,
+        txid: &str,
+        min_confirmations: u32,
+    ) -> Result<bool, ChainError> {
+        StubChain.is_tx_confirmed(txid, min_confirmations).await
+    }
+    async fn is_synced(&self) -> bool {
+        true
+    }
+}
+
+/// A `not_ready` refusal because the local chain tip could not be read.
+pub fn assert_chain_not_ready(status: u16, body: &serde_json::Value) {
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "not_ready", "{body}");
+    assert_eq!(body["reason"], "chain_unavailable", "{body}");
+    assert_eq!(body["retry_allowed"], true, "{body}");
+    // About the chain source, not the wallet.
+    assert!(
+        body["error"].as_str().unwrap().contains("chain source"),
+        "{body}"
+    );
+    assert!(body.get("money_ready").is_none(), "{body}");
+}
+
+/// A pricing engine that always answers like a chain-aware engine without a
+/// usable tip.
+pub struct ChainlessPricing;
+
+#[async_trait]
+impl PricingEngine for ChainlessPricing {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get_price_msat(&self, _kind: u16) -> Result<u64, PricingError> {
+        Err(PricingError::ChainUnavailable(
+            "chain tip unavailable".into(),
+        ))
+    }
+    async fn get_category_price_msat(
+        &self,
+        _category: konsensus_core::kind::KindCategory,
+    ) -> Result<u64, PricingError> {
+        Err(PricingError::ChainUnavailable(
+            "chain tip unavailable".into(),
+        ))
+    }
+}
+
 // ─── Stub: Pricing Engine ───────────────────────────────────────────
 
 pub struct StubPricing;
@@ -1223,7 +1402,7 @@ pub fn test_state() -> Arc<AppState> {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -1292,7 +1471,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -1349,7 +1528,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -1416,7 +1595,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -1473,7 +1652,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -1758,7 +1937,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -1852,7 +2031,7 @@ pub async fn store_test_message_with_plaintext(
     state.storage.store_message(&envelope).await.unwrap();
 
     let encrypted = test_plaintext_cipher()
-        .encrypt(plaintext.as_bytes())
+        .encrypt(&msg_id, plaintext.as_bytes())
         .unwrap();
     state
         .storage
@@ -2021,7 +2200,7 @@ pub fn test_state_with_lightning_and_storage(
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -2068,7 +2247,8 @@ pub struct FlakySessionStore {
 
 impl FlakySessionStore {
     pub fn fail_all(&self, fail: bool) {
-        self.fail_all.store(fail, std::sync::atomic::Ordering::SeqCst);
+        self.fail_all
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
     pub fn fail_peer(&self, peer: Option<NodeId>) {
         *self.fail_peer.lock().unwrap() = peer;
@@ -2077,17 +2257,29 @@ impl FlakySessionStore {
 
 #[async_trait]
 impl konsensus_crypto::SessionStore for FlakySessionStore {
-    async fn save_session(&self, peer: &NodeId, state: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) || *self.fail_peer.lock().unwrap() == Some(*peer) {
+    async fn save_session(
+        &self,
+        peer: &NodeId,
+        state: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.fail_all.load(std::sync::atomic::Ordering::SeqCst)
+            || *self.fail_peer.lock().unwrap() == Some(*peer)
+        {
             return Err("test: disk full".into());
         }
         self.data.lock().unwrap().insert(*peer, state.to_vec());
         Ok(())
     }
-    async fn load_session(&self, peer: &NodeId) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn load_session(
+        &self,
+        peer: &NodeId,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.data.lock().unwrap().get(peer).cloned())
     }
-    async fn delete_session(&self, peer: &NodeId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_session(
+        &self,
+        peer: &NodeId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.data.lock().unwrap().remove(peer);
         Ok(())
     }

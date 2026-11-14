@@ -120,7 +120,7 @@ async fn start_node_with(
         session_manager: Arc::new(konsensus_crypto::SessionManager::new(Arc::clone(&identity))),
         jwt_secret: JWT_SECRET.into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: Some(service),
         cors_enabled: false,
         operator_probes_enabled: false,

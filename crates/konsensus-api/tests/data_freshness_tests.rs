@@ -714,6 +714,55 @@ async fn owner_status_reports_chain_view_without_exposing_it_on_public_health() 
     }
 }
 
+/// A chain source labelled as a public explorer the node never accepted.
+struct ExplorerDefaultChain;
+
+#[async_trait]
+impl ChainProvider for ExplorerDefaultChain {
+    fn chain_view(&self) -> konsensus_core::traits::chain::ChainView {
+        konsensus_core::traits::chain::ChainView {
+            backend: "esplora",
+            trust_level: "third_party",
+            host: Some("mempool.space".into()),
+            explorer_default: true,
+        }
+    }
+    fn trust_level(&self) -> TrustLevel {
+        TrustLevel::ServerTrust
+    }
+    async fn get_block_height(&self) -> Result<u64, ChainError> {
+        Err(ChainError::NotAvailable("test".into()))
+    }
+    async fn get_block_header(&self, height: u64) -> Result<BlockHeader, ChainError> {
+        Err(ChainError::BlockNotFound(height))
+    }
+    async fn estimate_fee(&self, _target_blocks: u32) -> Result<FeeEstimate, ChainError> {
+        Err(ChainError::NotAvailable("test".into()))
+    }
+    async fn is_tx_confirmed(&self, _txid: &str, _min: u32) -> Result<bool, ChainError> {
+        Err(ChainError::NotAvailable("test".into()))
+    }
+    async fn is_synced(&self) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn owner_status_reports_explorer_default_only_to_the_owner() {
+    let mut state = test_state();
+    let s = Arc::get_mut(&mut state).unwrap();
+    s.chain = Arc::new(ExplorerDefaultChain);
+    s.chain_backend = "esplora".into();
+    let response = get(state.clone(), "/api/v1/status", true).await;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json["chain_view"], serde_json::json!({
+        "backend":"esplora", "trust_level":"third_party", "host":"mempool.space",
+        "explorer_default":true
+    }));
+    let public = get(state, "/api/v1/health", false).await;
+    assert!(!public.json.to_string().contains("explorer_default"));
+}
+
 #[tokio::test]
 async fn stalled_chain_sync_is_owner_only_and_survives_unready_recovery_wrapper() {
     let recovering = konsensus_lightning::RecoveringLightning::new(

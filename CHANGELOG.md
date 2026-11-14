@@ -15,6 +15,101 @@ also live on the corresponding GitHub pre-release pages.
   an older version that advertises an unsigned key is refused with the fixed
   reason "contact must update"; the payment never falls back to an invoice to
   the unbound node.
+
+## [0.3.0-rc24] — 2026-11-12
+
+- A paid call now ends after the callee's app connection is lost, including a
+  brief network interruption, when the callee's node records the disconnect.
+  This protection requires the callee's node to run rc24. With an rc23 callee,
+  the old behaviour remains and further blocks can be paid. Update both nodes
+  before paid calls; do not run paid calls while versions are mixed.
+- If the callee's node cannot record the disconnect, either because the write
+  still fails after its retries or because the node stops before the write,
+  the call can stay live without media until it expires unpaid. The caller
+  can keep paying for blocks meanwhile. Hang up from the caller side as soon
+  as audio stops and reconcile any further paid blocks. A pending disconnect
+  is not replayed after a restart; durable replay is planned for a later release.
+- A media-drop hangup does not notify the peer; after a recorded cutoff, the
+  peer's node ends the call at the next refused renewal, observed at about
+  66 to 67 seconds. See the [rc24 notes and checklist](docs/releases/v0.3.0-rc24.md)
+  and [rc23 → rc24 upgrade steps](docs/UPGRADING.md#rc23--rc24).
+
+## [0.3.0-rc23] — 2026-11-09
+
+- Setup cancellation leaves the comparison-attempt budget unchanged. Setup
+  requests keep a per-source backoff that refills automatically. Cap pending
+  pairing requests per client key and in a shared pool, and refuse further
+  requests at either cap without evicting an existing ceremony.
+- Limit local sign-in challenges per source, rate-limit issuance, and apply
+  Host admission to challenge issuance. Local authentication endpoints refuse
+  cross-site and same-site browser fetches; Origin, when present, must name
+  this API's loopback origin. Clients without browser headers remain supported.
+- The node refuses to start when its chain source is on another network than
+  `[lightning] network`, naming both networks, and tries no other source. Bitcoin
+  Core is checked through `getblockchaininfo`; Electrum and Esplora through their
+  height-0 header, hashed by the node. Until a source has answered on the
+  configured network, nothing reads or syncs from it: the node starts not ready
+  and the embedded LDK node retries without starting. With `credentials_file`,
+  an unanswered primary is skipped and LDK uses the verified fallback without
+  credentials. Each Esplora endpoint is checked within its own ten seconds, so
+  a slow or silent endpoint never discards another one's answer. Sources are
+  asked again after a lost connection and at least every 60 seconds, and
+  `konsensus recover` checks its source too. A custom signet passes as
+  `signet`. With LND, LNbits or mock Lightning a real `[chain]` source is not
+  checked.
+- The owner's `GET /api/v1/status` reports the running release as
+  `node_version` (for example `0.3.0-rc23`). `version` stays the API version,
+  `2`. The public `/api/v1/health` is unchanged and does not name the release.
+- Console times for grants, pending requests and the pairing window print as
+  ISO-8601 UTC next to the Unix time, for example
+  `until 2026-11-09T16:01:22Z (unix 1794240082)`; `pair-status` keeps
+  `expires_at=<unix>` and adds the UTC time after it.
+- The console log has no colour codes when stdout is not a terminal (a launcher
+  or service writing to a file or pipe), and none when `NO_COLOR` is set. A
+  terminal keeps colour. The `node.log` file already had none.
+- Docs: installing a signed pre-release binary (rename to `konsensus`,
+  `chmod +x`, macOS download mark), checking one platform with
+  `--ignore-missing`, the signature check with the pinned fingerprint, and
+  rollback steps from rc22 to rc21.
+- **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` now fails config validation unless
+  `[api].allow_non_loopback_bind = true` is set, because the owner API is
+  plaintext HTTP (#412). The default remains loopback-only. A node that already
+  binds the API off-loopback refuses to start with an error naming the flag; add
+  it to keep that bind. `[remote_access]` still requires a loopback API, and the
+  flag does not lift that rule.
+- A node whose chain tip is a public explorer it never explicitly accepted
+  (earlier generated Full configs or omitted Esplora URLs) now logs one warning
+  at start naming the explorer hosts, and owner status reports
+  `chain_view.explorer_default: true` with `trust_level: "third_party"`. The
+  field is omitted otherwise. The node starts as before and its config is not
+  changed. `konsensus chain-tip --config <path>` shows the source and changes
+  nothing. To move to your own Bitcoin Core or Electrum server, or to keep the
+  explorer by adding `accept_third_party_tip = true` to `[chain]`, edit the
+  config by hand; see `docs/CHAIN-SOURCE.md`. A fresh explorer tip is still
+  someone else's view of the chain. Releases before this key reject configs
+  that contain it.
+- A chain tip that cannot be read is no longer treated as height 0. Paid sends
+  (single and room), admission and call quotes, the introduction card and front
+  door publishing now refuse with `503` `not_ready` (`reason: chain_unavailable`)
+  before anything is paid or signed; web manifests are not sent; peer price
+  tables are listed as stale; chain-aware pricing refuses a price instead of
+  pricing at height 0. With Bitcoin Core, Electrum or Esplora, the tip is also
+  not ready when its best block is older than 3 hours on `bitcoin` or 24 hours on
+  test networks (no limit on regtest). See `docs/CHAIN-SOURCE.md`, "Tip
+  readiness". A call quote checks the tip before it sends a price query; a send
+  begun while the wallet was not ready re-quotes any price to pay against a real
+  tip; a changed front door page price is re-signed only with a tip. These
+  refusals say the chain source has no current tip. Every payment of a peer's
+  price needs a usable tip observation, shared between quoting and payment
+  where possible for up to 30 seconds and refreshed before dispatch after a
+  longer wait. Established free conversations need no tip or wallet payment
+  and can still send when the chain source is unavailable or the wallet is
+  not money-ready. A kept tip is dropped once its source refuses its
+  network. Direct invoice and keysend payments, including those under paired
+  spend grants, remain outside this peer-price check; grant limits still apply.
+  On-chain sends, channel opens, liquidity, sponsor gifts, the dormant daily
+  hosting keysend and opt-in invite auto-channel opens are also outside it.
+  Prices are unchanged.
 - A node that lost its E2EE session with a connected peer gets it back on the
   same connection. When the lower-id node lost it, about 25 seconds: the higher-id
   peer now answers a PrekeyOffer with its own, at most once per ten seconds per
@@ -53,6 +148,25 @@ also live on the corresponding GitHub pre-release pages.
   offer the peer refuses, or a well-formed init with other keys, changes nothing.
   Two stale offers, or a late `SessionAck`, can still retire a working session
   until key confirmation lands. No frame or message format changes.
+- A normal start no longer logs `lightning health check FAILED — payments will
+  not work` and a `Fix:` hint while the wallet is still syncing. The startup
+  check reads the Lightning readiness phase: a sync is INFO ("payments start
+  when it is ready"); an unreachable chain service is one WARN naming the
+  service kind (`LIGHTNING_CHAIN_SOURCE_UNAVAILABLE`), not repeated on each
+  retry; a failed or stopped Lightning, or a backend error, still warns with
+  the `Fix:` hint, as soon as it is seen. A sync still running after ten minutes
+  warns once, and the node says at INFO when payments are on. Payments are
+  refused until Lightning is ready, as before.
+
+- Storage upgrades are forward-only: migration 033 aligns SQLite and PostgreSQL,
+  migrations 038/039 retain deferred envelopes and their expiry, and encrypted
+  records gain location binding. Preserve the complete current state and its
+  completion markers; follow [rc22 → rc23](docs/UPGRADING.md#rc22--rc23).
+- Session recovery holds new sends and durably defers unreadable paid envelopes.
+  Retry the existing operation after recovery to retain its payment. Mixed
+  rc22/rc23 deferred messages may stall after ten attempts; an upgrade does not
+  confirm delivery or refund. See the [candidate checklist](docs/releases/v0.3.0-rc23.md)
+  for scope, remaining limits and release gates.
 
 ## [0.3.0-rc22] — 2026-11-05
 

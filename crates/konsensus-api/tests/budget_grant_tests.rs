@@ -3207,3 +3207,75 @@ async fn request_ids_are_scoped_per_caller_so_clients_never_share_a_receipt() {
     assert_eq!(receipt["amount_msat"], 2000);
     assert_eq!(fx.wallet.money(), 4);
 }
+
+
+#[tokio::test]
+async fn direct_payments_without_a_tip_still_enforce_the_grant() {
+    for chain in [common::TipDownChain::down(), common::TipDownChain::zero()] {
+        let mut fx = fixture().await;
+        let chain = Arc::new(chain);
+        fx.state = Arc::new(AppState { chain: chain.clone(), ..(*fx.state).clone() });
+        let token = fx.grant(None, GrantTerms::new(2_500)).await;
+        let (status, body) = fx.call(
+            "POST", "/api/v1/payments/pay",
+            Some(json!({"request_id": rid(), "bolt11": create_test_bolt11(1_500)})), Some(&token),
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = fx.keysend(&token, OTHER_LN, 1_000).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(fx.used(), 2_500);
+        let (status, body) = fx.keysend(&token, OTHER_LN, 1_000).await;
+        assert_budget_exceeded(status, &body, "total");
+        assert_eq!(fx.wallet.money(), 2);
+        assert_eq!(chain.reads(), 0);
+    }
+}
+
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_tip_refresh_releases_the_grant_on_recovery() {
+    let mut fx = fixture().await;
+    let storage = Arc::new(common::MemStorage::new());
+    let chain = Arc::new(common::TipDownChain::after(usize::MAX));
+    fx.state = Arc::new(AppState { storage: storage.clone(), chain: chain.clone(), ..(*fx.state).clone() });
+    let token = fx.grant(None, GrantTerms::new(2_500)).await;
+    let fx = Arc::new(fx);
+    let operation = uuid::Uuid::new_v4().to_string();
+    let body = json!({"operation_id": operation, "recipient": fx.peer.to_hex(), "kind": 0,
+        "plaintext": "cancelled preparation", "wait_ack_ms": 0, "max_routing_fee_msat": 0});
+    let journal = Arc::new(common::PeerWriteGate::default());
+    *storage.outbox_dispatch_gate.lock().unwrap() = Some(journal.clone());
+    let sending = tokio::spawn({
+        let fx = fx.clone();
+        let token = token.clone();
+        let body = body.clone();
+        async move { fx.call("POST", "/api/v1/messages/compose", Some(body), Some(&token)).await }
+    });
+    journal.entered.notified().await;
+    assert_eq!(fx.used(), 1_000, "the grant is reserved before dispatch");
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    let read = Arc::new(common::PeerWriteGate::default());
+    *chain.read_gate.lock().unwrap() = Some(read.clone());
+    journal.release.notify_one();
+    read.entered.notified().await;
+    sending.abort();
+    assert!(sending.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let op = fx.state.storage.get_outbox_operation(&operation).await.unwrap().unwrap();
+            let data: Value = serde_json::from_slice(&op.recovery).unwrap();
+            if data["dispatched"] == false { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }).await.expect("cancelled preparation clears dispatch intent");
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    let (status, view) = fx.call("GET", &format!("/api/v1/messages/operations/{operation}"), None, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["state"], "prepared", "{view}");
+    assert_eq!(fx.used(), 0);
+    assert_eq!(fx.wallet.money(), 0);
+    let (status, view) = fx.call("POST", "/api/v1/messages/compose", Some(body), Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(fx.used(), 1_000);
+    assert_eq!(fx.wallet.money(), 1);
+}

@@ -31,6 +31,10 @@ pub enum ApiError {
     OperationConflict(&'static str),
     #[error("Lightning is offline or synchronizing; retry when money_ready is true")]
     NotReady,
+    /// The local chain tip could not be read, is height 0, or is older than
+    /// the network's bound. `not_ready` with reason `chain_unavailable`.
+    #[error("the chain source has no current tip (unreachable, height 0 or stale); retry when it is current")]
+    ChainNotReady,
     #[error("recipient is not ready to receive payments: {reason}")]
     PeerNotReady { reason: &'static str },
 
@@ -132,6 +136,9 @@ impl ApiError {
                 "the session state could not be saved, so this was not sent or paid for".into(),
             )
             .with_reason(SESSION_SAVE_FAILED),
+            konsensus_crypto::SessionError::HandoverPending => ApiError::NotDispatched(
+                "session recovery handover is pending; retry shortly".into(),
+            ).with_reason("session_handover"),
             other => otherwise(other),
         }
     }
@@ -170,6 +177,12 @@ impl ApiError {
         if matches!(self, Self::NotReady) {
             return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
                 "error": self.to_string(), "code": "not_ready", "money_ready": false
+            }));
+        }
+        if matches!(self, Self::ChainNotReady) {
+            return (StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                "error": self.to_string(), "code": "not_ready",
+                "reason": CHAIN_UNAVAILABLE, "retry_allowed": true
             }));
         }
         if let Self::RoutingFee { source, max_routing_fee_msat } = self {
@@ -269,6 +282,7 @@ impl ApiError {
             | ApiError::Operation { .. }
             | ApiError::OperationConflict(_)
             | ApiError::NotReady
+            | ApiError::ChainNotReady
             | ApiError::PeerNotReady { .. }
             | ApiError::RoutingFee { .. }
             | ApiError::Reasoned { .. }
@@ -309,6 +323,94 @@ impl IntoResponse for ApiError {
 /// Check before parsing payment details, consuming grants, or issuing invoices.
 pub(crate) async fn require_money_ready(state: &crate::state::AppState) -> Result<(), ApiError> {
     if state.lightning.money_ready().await { Ok(()) } else { Err(ApiError::NotReady) }
+}
+
+/// The local chain tip a price, a signed card or a payment is checked against.
+/// A failed read (or a zero tip) is refused as `not_ready` with reason
+/// `chain_unavailable`, before anything is paid or signed: no caller goes on
+/// with height 0 in its place.
+pub(crate) async fn chain_tip(state: &crate::state::AppState) -> Result<u64, ApiError> {
+    chain_tip_of(state.chain.as_ref()).await
+}
+
+/// Evidence that this send read a usable chain tip. Only [`observe_tip`]
+/// makes one, and every function that dispatches a peer payment takes one:
+/// a path that never read a usable tip cannot pay.
+/// Deliberately neither `Clone` nor `Copy`: the evidence cannot be duplicated.
+#[derive(Debug)]
+pub(crate) struct ObservedTip {
+    height: u64,
+    observed_at: tokio::time::Instant,
+}
+
+// Compile-time check that `ObservedTip` is not `Clone` (so not `Copy`): if it
+// were, both impls below would apply and the item path would be ambiguous.
+const _: () = {
+    trait AmbiguousIfClone<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    struct IsClone;
+    impl<T: Clone> AmbiguousIfClone<IsClone> for T {}
+    let _ = <ObservedTip as AmbiguousIfClone<_>>::some_item;
+};
+
+impl ObservedTip {
+    pub(crate) fn height(&self) -> u64 {
+        self.height
+    }
+
+    /// Reuse a send's observation for at most 30 seconds, including any wait
+    /// for its recipient. A longer preparation needs another usable tip.
+    pub(crate) async fn recheck(&self, state: &crate::state::AppState) -> Result<(), ApiError> {
+        if self.observed_at.elapsed() >= std::time::Duration::from_secs(30) {
+            chain_tip(state).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Read the tip for a payment about to be dispatched ([`chain_tip`]).
+pub(crate) async fn observe_tip(state: &crate::state::AppState) -> Result<ObservedTip, ApiError> {
+    let observed_at = tokio::time::Instant::now();
+    chain_tip(state).await.map(|height| ObservedTip { height, observed_at })
+}
+
+/// [`chain_tip`] for a caller holding only the chain source.
+pub(crate) async fn chain_tip_of(
+    chain: &dyn konsensus_core::traits::chain::ChainProvider,
+) -> Result<u64, ApiError> {
+    match chain.get_block_height().await {
+        Ok(height) if height > 0 => Ok(height),
+        Ok(_) => {
+            tracing::warn!("not_ready: chain tip is height zero");
+            Err(ApiError::ChainNotReady)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "not_ready: chain tip unavailable");
+            Err(ApiError::ChainNotReady)
+        }
+    }
+}
+
+/// Machine reason of [`ApiError::ChainNotReady`].
+pub(crate) const CHAIN_UNAVAILABLE: &str = "chain_unavailable";
+
+/// A pricing failure: a chain-aware engine without a usable tip is the typed
+/// chain readiness refusal; anything else is `other(error)`.
+pub(crate) fn pricing_error_or(
+    error: konsensus_core::traits::pricing::PricingError,
+    other: impl FnOnce(konsensus_core::traits::pricing::PricingError) -> ApiError,
+) -> ApiError {
+    match error {
+        konsensus_core::traits::pricing::PricingError::ChainUnavailable(_) => ApiError::ChainNotReady,
+        error => other(error),
+    }
+}
+
+/// [`pricing_error_or`] with the usual internal `pricing error: …`.
+pub(crate) fn pricing_error(error: konsensus_core::traits::pricing::PricingError) -> ApiError {
+    pricing_error_or(error, |e| ApiError::Internal(format!("pricing error: {e}")))
 }
 
 impl From<konsensus_core::traits::lightning::LightningError> for ApiError {

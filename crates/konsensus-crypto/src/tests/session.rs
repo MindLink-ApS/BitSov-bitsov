@@ -29,6 +29,44 @@ async fn prekey_bundle_generation() {
 }
 
 #[tokio::test]
+async fn queued_repair_does_not_override_initial_confirmation() {
+    let a = make_identity(TEST_MNEMONIC_A);
+    let b = make_identity(TEST_MNEMONIC_B);
+    let peer = *b.node_id();
+    let ours = SessionManager::new(a);
+    let theirs = SessionManager::new(b);
+    ours.initiate_session(&peer, &theirs.prekey_bundle().await).await.unwrap();
+    let queued = std::time::Instant::now();
+    assert!(ours.confirm_session(&peer).await);
+    assert!(!ours.mark_needs_renegotiation_before(&peer, queued).await,
+        "confirmation after a queued rejection makes that rejection stale");
+    assert!(ours.encrypt(&peer, b"confirmed").await.is_ok());
+    assert!(ours.mark_needs_renegotiation_before(&peer, std::time::Instant::now()).await,
+        "a current rejection still fences the session");
+    assert!(ours.encrypt(&peer, b"wait for repair").await.is_err());
+    let queued = std::time::Instant::now();
+    assert!(!ours.confirm_session(&peer).await, "an unexpected ACK proves no new session progress");
+    assert!(ours.mark_needs_renegotiation_before(&peer, queued).await);
+}
+
+#[tokio::test]
+async fn queued_repair_does_not_override_successful_current_decrypt() {
+    let a = make_identity(TEST_MNEMONIC_A);
+    let b = make_identity(TEST_MNEMONIC_B);
+    let (own, peer) = (*a.node_id(), *b.node_id());
+    let ours = SessionManager::new(a);
+    let theirs = SessionManager::new(b);
+    let init = theirs.initiate_session(&own, &ours.prekey_bundle().await).await.unwrap();
+    ours.accept_session(&peer, &init).await.unwrap();
+    let message = theirs.encrypt(&own, b"current chain is healthy").await.unwrap();
+    let queued = std::time::Instant::now();
+    assert_eq!(ours.decrypt(&peer, &message).await.unwrap(), b"current chain is healthy");
+    assert!(!ours.mark_needs_renegotiation_before(&peer, queued).await,
+        "successful current decryption after a queued rejection makes it stale");
+    assert!(ours.encrypt(&peer, b"readable reply").await.is_ok());
+}
+
+#[tokio::test]
 async fn full_session_establishment() {
     let id_a = make_identity(TEST_MNEMONIC_A);
     let id_b = make_identity(TEST_MNEMONIC_B);
@@ -451,7 +489,9 @@ async fn restore_migrates_plaintext_to_encrypted() {
     //   * migration build (feature on): the plaintext blob migrates to
     //     encrypted, as the legacy one-shot path intends.
     std::env::set_var("KONSENSUS_LEGACY_SESSION_MIGRATION", "1");
-    let mgr_a2 = SessionManager::with_store(Arc::clone(&id_a), store.clone());
+    let migration_dir = tempfile::tempdir().unwrap();
+    let mgr_a2 = SessionManager::with_store(Arc::clone(&id_a), store.clone())
+        .with_record_policy(crate::record_cipher::LegacyReadPolicy::in_data_dir(migration_dir.path()));
     let restored = mgr_a2.restore_sessions().await;
     std::env::remove_var("KONSENSUS_LEGACY_SESSION_MIGRATION");
 
@@ -769,6 +809,46 @@ async fn decrypt_without_session_fails() {
 
     let result = mgr_a.decrypt(&node_b, &fake_msg).await;
     assert!(matches!(result, Err(SessionError::NoSession(_))));
+}
+
+#[tokio::test]
+async fn stored_session_cannot_move_to_another_peer() {
+    let identity = make_identity(TEST_MNEMONIC_A);
+    let other = SessionManager::new(make_identity(TEST_MNEMONIC_B));
+    let store = MemorySessionStore::new();
+    let manager = SessionManager::with_store(identity.clone(), store.clone());
+    let peer = *other.identity.node_id();
+    manager.initiate_session(&peer, &other.prekey_bundle().await).await.unwrap();
+    let moved = NodeId::from_bytes([19; 32]);
+    for after_send in [false, true] {
+        if after_send {
+            manager.encrypt(&peer, b"persisted send").await.unwrap();
+        }
+        let blob = store.load_session(&peer).await.unwrap().unwrap();
+        store.save_session(&moved, &blob).await.unwrap();
+        let restarted = SessionManager::with_store(identity.clone(), store.clone());
+        assert_eq!(restarted.restore_sessions().await, 1);
+        assert!(restarted.has_session(&peer).await);
+        assert!(!restarted.has_session(&moved).await);
+    }
+}
+
+#[test]
+fn session_v1_is_readable_only_before_local_cutoff() {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
+    let identity = make_identity(TEST_MNEMONIC_A);
+    let dir = tempfile::tempdir().unwrap();
+    let policy = LegacyReadPolicy::in_data_dir(dir.path());
+    let manager = SessionManager::new(identity.clone()).with_record_policy(policy.clone());
+    let key = blake3::derive_key(SESSION_ENCRYPTION_CTX, identity.aes_key());
+    let nonce = [3u8; 12];
+    let mut blob = nonce.to_vec();
+    blob.extend(Aes256Gcm::new_from_slice(&key).unwrap().encrypt((&nonce).into(), b"legacy".as_slice()).unwrap());
+    let peer = NodeId::from_bytes([19; 32]);
+    assert_eq!(manager.decrypt_session_blob(&peer, &blob).unwrap(), b"legacy");
+    policy.complete().unwrap();
+    assert!(manager.decrypt_session_blob(&peer, &blob).is_err());
+    assert!(manager.decrypt_or_migrate_blob(&peer, b"{}", true).is_none());
 }
 
 // ── Validate before replace ─────────────────────────────────────────
@@ -1244,13 +1324,13 @@ async fn an_acceptor_that_could_not_save_the_move_repeats_no_position_after_a_re
 #[tokio::test]
 async fn a_replaced_session_only_reads_and_is_not_saved() {
     let (id_a, _, store_a, _, mgr_a, mgr_b, node_a, node_b, _) = saving_pair().await;
+    let first = mgr_b.encrypt(&node_a, b"first").await.unwrap();
+    let second = mgr_b.encrypt(&node_a, b"second").await.unwrap();
     let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
     mgr_b.reaccept_session(&node_a, &init).await.unwrap();
     assert!(mgr_a.confirm_session(&node_b).await);
     assert!(!mgr_a.take_ratchet_init_owed(&node_b).await);
 
-    let first = mgr_b.encrypt(&node_a, b"first").await.unwrap();
-    let second = mgr_b.encrypt(&node_a, b"second").await.unwrap();
     assert_eq!(mgr_a.preview_decrypt(&node_b, &first).await.unwrap(), b"first");
     assert!(!mgr_a.take_ratchet_init_owed(&node_b).await, "a preview changes nothing");
     assert_eq!(mgr_a.decrypt(&node_b, &first).await.unwrap(), b"first");
@@ -1261,7 +1341,7 @@ async fn a_replaced_session_only_reads_and_is_not_saved() {
     assert!(mgr_a.needs_renegotiation(&node_b).await, "this says nothing about the session in use");
 
     // What it sends is under the new session: the acceptor moves over on it.
-    let sent = mgr_a.encrypt(&node_b, b"under the new session").await.unwrap();
+    let sent = mgr_a.encrypt_recovery_probe(&node_b).await.unwrap();
     mgr_b.decrypt(&node_a, &sent).await.unwrap();
     assert!(mgr_a.preview_decrypt(&node_b, &mgr_b.encrypt(&node_a, b"on it").await.unwrap()).await.is_ok());
 
@@ -1276,10 +1356,10 @@ async fn a_replaced_session_only_reads_and_is_not_saved() {
 #[tokio::test]
 async fn a_replaced_session_stops_reading_after_its_time() {
     let (_, _, _, _, mgr_a, mgr_b, node_a, node_b, _) = saving_pair().await;
+    let late = mgr_b.encrypt(&node_a, b"late").await.unwrap();
     let init = mgr_a.reinitiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
     mgr_b.reaccept_session(&node_a, &init).await.unwrap();
     assert!(mgr_a.confirm_session(&node_b).await);
-    let late = mgr_b.encrypt(&node_a, b"late").await.unwrap();
     assert!(mgr_a.preview_decrypt(&node_b, &late).await.is_ok());
 
     mgr_a.expire_retired_sessions().await;
@@ -1387,4 +1467,26 @@ fn same_x25519_point_ignores_the_top_bit_only() {
     other[0] ^= 0x01;
     assert!(!same_x25519_point(&hex::encode(key), &hex::encode(other)));
     assert!(!same_x25519_point(&hex::encode(key), "not hex"));
+}
+
+#[tokio::test]
+async fn recovery_handover_holds_marked_sends_but_allows_recovery_probes() {
+    for stored in [false, true] {
+        let a_id = make_identity(TEST_MNEMONIC_A);
+        let b_id = make_identity(TEST_MNEMONIC_B);
+        let (aid, bid) = (*a_id.node_id(), *b_id.node_id());
+        let a = if stored { SessionManager::with_store(a_id, Arc::new(FlakyStore::default())) } else { SessionManager::new(a_id) };
+        let b = SessionManager::new(b_id);
+        let init = a.initiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
+        b.accept_session(&aid, &init).await.unwrap();
+        a.confirm_session(&bid).await;
+        a.mark_needs_renegotiation(&bid).await;
+        assert!(matches!(a.encrypt(&bid, b"application").await, Err(SessionError::HandoverPending)));
+        let probe = a.encrypt_recovery_probe(&bid).await.unwrap();
+        b.decrypt(&aid, &probe).await.unwrap();
+        let reply = b.encrypt(&aid, b"reply").await.unwrap();
+        a.decrypt(&bid, &reply).await.unwrap();
+        let sent = a.encrypt(&bid, b"application").await.unwrap();
+        assert_eq!(b.decrypt(&aid, &sent).await.unwrap(), b"application");
+    }
 }

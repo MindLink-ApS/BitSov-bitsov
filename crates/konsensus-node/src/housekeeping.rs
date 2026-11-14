@@ -37,6 +37,16 @@ pub(crate) async fn sweep_outstanding_web_requests(storage: &dyn konsensus_stora
     }
 }
 
+/// Reclaim a bounded batch; permission expires independently of this sweep.
+pub(crate) async fn sweep_envelope_deferrals(storage: &dyn konsensus_storage::Storage) -> u64 {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().min(i64::MAX as u128) as i64).unwrap_or(0);
+    match storage.cleanup_expired_deferrals(now, konsensus_storage::DEFERRAL_CLEANUP_BATCH).await {
+        Ok(removed) => removed,
+        Err(e) => { warn!(error = %e, "envelope deferral sweep failed"); 0 }
+    }
+}
+
 /// Spawns the nonce cleanup task — periodically removes expired replay-protection nonces.
 ///
 /// Without this, the nonces table grows unbounded as every incoming message
@@ -50,10 +60,12 @@ pub(crate) async fn run_nonce_cleanup(
     let max_nonce_age_secs: u64 = 3600; // 1 hour
     // Expired paid web requests (#129 R2): once at startup, then every tick.
     sweep_outstanding_web_requests(storage.as_ref()).await;
+    sweep_envelope_deferrals(storage.as_ref()).await;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(cleanup_interval) => {
                 sweep_outstanding_web_requests(storage.as_ref()).await;
+                sweep_envelope_deferrals(storage.as_ref()).await;
                 // Call ids whose replay protection ended (never one still pending).
                 let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 if let Err(e) = storage.call_sweep(now_ms, 10_000).await {

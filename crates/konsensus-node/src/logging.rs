@@ -142,11 +142,22 @@ pub(crate) fn init() -> FileLogging {
         .with(file_layer)
         .with(
             tracing_subscriber::fmt::layer()
+                .with_ansi(console_ansi(
+                    std::io::IsTerminal::is_terminal(&std::io::stdout()),
+                    std::env::var_os("NO_COLOR"),
+                ))
                 .with_target(true)
                 .with_filter(env_filter),
         )
         .init();
     handle
+}
+
+/// Colour the console log only on a terminal. A launcher or service that sends
+/// stdout to a file or pipe gets plain text, so the log reads and pastes cleanly.
+/// A non-empty `NO_COLOR` turns colour off on a terminal too.
+fn console_ansi(stdout_is_terminal: bool, no_color: Option<std::ffi::OsString>) -> bool {
+    stdout_is_terminal && no_color.is_none_or(|v| v.is_empty())
 }
 
 #[cfg(test)]
@@ -390,6 +401,51 @@ mod file_tests {
                 assert!(!text.contains("secret-plaintext-canary"));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ansi_tests {
+    #[test]
+    fn console_colour_only_on_a_terminal_without_no_color() {
+        use std::ffi::OsString;
+        assert!(super::console_ansi(true, None));
+        assert!(super::console_ansi(true, Some(OsString::new())));
+        assert!(!super::console_ansi(true, Some(OsString::from("1"))));
+        assert!(!super::console_ansi(false, None));
+        assert!(!super::console_ansi(false, Some(OsString::new())));
+    }
+
+    /// A launcher that redirects stdout to a file gets no escape codes.
+    #[test]
+    fn console_log_redirected_to_a_file_has_no_ansi_codes() {
+        const CHILD: &str = "BITSOV_TEST_CONSOLE_NO_ANSI";
+        if std::env::var_os(CHILD).is_some() {
+            super::init();
+            tracing::warn!("console-ansi-canary");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let console_path = dir.path().join("console.log");
+        let console = std::fs::File::create(&console_path).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "logging::ansi_tests::console_log_redirected_to_a_file_has_no_ansi_codes",
+                "--nocapture",
+            ])
+            .current_dir(dir.path())
+            .env(CHILD, "1")
+            .env("RUST_LOG", "warn")
+            .env_remove("NO_COLOR")
+            .stdout(console)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = std::fs::read_to_string(&console_path).unwrap();
+        assert!(text.contains("console-ansi-canary"), "{text}");
+        assert!(text.contains(" WARN "), "{text}");
+        assert!(!text.contains('\x1b'), "escape codes in {text:?}");
     }
 }
 

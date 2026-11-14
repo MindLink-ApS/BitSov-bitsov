@@ -45,6 +45,9 @@ enum Mask {
     /// 10^12 (so a switch to seconds fails the check instead of hiding
     /// behind the mask). Placeholder `<unix_ms>`.
     UnixMs,
+    /// The workspace release version string, exactly (it changes with every
+    /// release, so the fixture does not pin it). Placeholder `<pkg_version>`.
+    PkgVersion,
 }
 
 impl Mask {
@@ -53,6 +56,7 @@ impl Mask {
             Mask::Hex(n) => Value::String(format!("<hex{n}>")),
             Mask::Uint => Value::String("<uint>".into()),
             Mask::UnixMs => Value::String("<unix_ms>".into()),
+            Mask::PkgVersion => Value::String("<pkg_version>".into()),
         }
     }
 
@@ -71,6 +75,7 @@ impl Mask {
             {
                 Ok(())
             }
+            (Mask::PkgVersion, Value::String(s)) if s == env!("CARGO_PKG_VERSION") => Ok(()),
             _ => Err(format!("expected {self:?}, got {value}")),
         }
     }
@@ -85,6 +90,7 @@ const MASKS: &[(&str, Mask)] = &[
     ("/body/connected_peer_ids/*", Mask::Hex(64)),
     ("/body/lightning_node_pubkey", Mask::Hex(66)),
     ("/body/uptime_secs", Mask::Uint),
+    ("/body/node_version", Mask::PkgVersion),
     // POST /api/v1/messages/compose (call invite)
     ("/body/message_id", Mask::Hex(64)),
     ("/body/payment_hash", Mask::Hex(64)),
@@ -534,6 +540,8 @@ fn mask_checks_shape_before_hiding() {
         ok["body"]["lightning_node_pubkey"].is_null(),
         "null is part of the contract, not masked"
     );
+    let version = masked(json!({"body": {"node_version": env!("CARGO_PKG_VERSION")}}));
+    assert_eq!(version["body"]["node_version"], "<pkg_version>");
     let calls = masked(json!({"body": [{"created": 1_790_000_000_000_u64}, {"created": null}]}));
     assert_eq!(calls["body"][0]["created"], "<unix_ms>");
     assert!(calls["body"][1]["created"].is_null());
@@ -545,6 +553,8 @@ fn mask_checks_shape_before_hiding() {
         json!({"body": [{"created": 1.5}]}),
         json!({"body": [{"created": 1_790_000_000}]}), // seconds, not milliseconds
         json!({"body": [{"created": "1790000000000"}]}),
+        json!({"body": {"node_version": "0.0.0-other"}}),
+        json!({"body": {"node_version": 2}}),
     ] {
         let shape = std::panic::catch_unwind(|| masked(bad.clone()));
         assert!(shape.is_err(), "{bad} must be rejected, not hidden");
