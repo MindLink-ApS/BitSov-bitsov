@@ -5,6 +5,7 @@ use super::*;
 use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
 use konsensus_core::payloads::call::{CallEntry, HangupReason, Phase};
+use konsensus_core::traits::lightning::LightningError;
 use konsensus_core::NodeId;
 use konsensus_crypto::SessionManager;
 use tokio_tungstenite::{
@@ -213,6 +214,7 @@ impl Pair {
                     ),
                     chain_url: chain.api_url.clone(),
                     calls: Some(calls),
+                    readiness_gated: false,
                     owner_approval_key: approval_keys[if index == first { 0 } else { 1 }],
                 }),
             )
@@ -849,6 +851,232 @@ async fn one_minute_duration_cap() {
     scenario(1, 1, HangupReason::DurationCap).await;
 }
 
+/// Real LDK settlement, then a callee whose chain sync has lapsed: acts it has
+/// been paid for count for a bounded time, and it takes on no new money work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real Bitcoin Core + electrs; scripts/regress/two_node_paid_call_e2e.sh"]
+async fn paid_signals_count_briefly_while_callee_is_not_ready() {
+    let mut steps = Steps::new();
+    let chain = infra::Chain::start().await;
+    let fault = three_node::fault_proxy::FaultProxy::start(&chain.url).await;
+    let dirs = [(); 2].map(|_| tempfile::tempdir().unwrap());
+    let caller_config = infra::lightning_config(dirs[0].path(), &chain.url);
+    let mut callee_config = infra::lightning_config(dirs[1].path(), &fault.url);
+    // Only the callee's wallet sync goes through the fault; its chain API does not.
+    callee_config.esplora_sync_intervals.lightning_wallet_sync_interval_secs = Some(10);
+    let a = Arc::new(
+        LdkProvider::new(caller_config.clone())
+            .await
+            .unwrap()
+            .with_routing_fee_policy(three_node::direct_channel_fee_policy()),
+    );
+    let b = Arc::new(
+        LdkProvider::new(callee_config.clone())
+            .await
+            .unwrap()
+            .with_routing_fee_policy(three_node::direct_channel_fee_policy()),
+    );
+    chain.fund(a.node()).await;
+    chain.fund(b.node()).await;
+    let options = |config: &konsensus_lightning::LdkConfig, block_msat, readiness_gated| {
+        Some(app::Options {
+            identity: Arc::new(NodeIdentity::from_mnemonic(&config.mnemonic, "").unwrap()),
+            chain_url: chain.api_url.clone(),
+            calls: Some(app::CallOptions {
+                block_msat,
+                max_minutes: 5,
+                offer_msat: SIGNAL_PRICE,
+                chat_msat: 2_001,
+            }),
+            readiness_gated,
+            owner_approval_key: None,
+        })
+    };
+    let mut caller = app::App::start_with_options(
+        dirs[0].path(),
+        &chain,
+        a.clone(),
+        options(&caller_config, 7_001, false),
+    )
+    .await;
+    let mut callee = app::App::start_with_options(
+        dirs[1].path(),
+        &chain,
+        b.clone(),
+        options(&callee_config, PRICE, true),
+    )
+    .await;
+    let aid = *caller.state.identity.node_id();
+    let bid = *callee.state.identity.node_id();
+    let (status, body) = caller
+        .post(
+            "/api/v1/payments/open-channel",
+            json!({
+                "peer_pubkey": b.node().node_id().to_string(),
+                "peer_addr": callee_config.listening_address,
+                "amount_sats": 1_000_000, "announce": false,
+            }),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "owner channel open: {body}");
+    chain.confirm_channel(a.node(), b.node(), &[]).await;
+    let money = callee.state.lightning.clone();
+    wait("both wallets ready", || async {
+        a.money_ready().await && money.money_ready().await
+    })
+    .await;
+    three_node::list_contact(&caller, &callee, "owners list their call peer").await;
+    three_node::list_contact(&callee, &caller, "owners list their call peer").await;
+    three_node::connect(&caller, &callee, "Noise connection").await;
+    wait("both signaling sessions established", || async {
+        caller.state.session_manager.can_send(&bid).await
+            && callee.state.session_manager.can_send(&aid).await
+    })
+    .await;
+    three_node::elevate(&mut caller, &[bid.to_hex()]).await;
+    three_node::elevate(&mut callee, &[aid.to_hex()]).await;
+    caller.compose(&mut callee, "while ready").await;
+    // The callee's real key, as its Lightning info frame would deliver it, so
+    // these acts go by keysend: that path has no readiness check before paying.
+    caller
+        .state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(bid, b.node().node_id().to_string());
+    steps.pass("two funded nodes, direct channel, callee behind the readiness wrappers");
+
+    fault.set_limited(true);
+    wait("callee chain sync lapses", || async {
+        fault.rejected() > 0 && !money.money_ready().await
+    })
+    .await;
+    let received_before = b
+        .list_payments(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.direction == PaymentDirection::Incoming)
+        .count();
+
+    // No pre-check protects a keysend: this is settled before the gate sees it.
+    caller.compose(&mut callee, "paid while the callee cannot sync").await;
+    let received: Vec<_> = b
+        .list_payments(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.direction == PaymentDirection::Incoming)
+        .collect();
+    assert_eq!(received.len(), received_before + 1, "exactly one new settlement");
+    assert!(!money.money_ready().await, "still not ready when admitted");
+    steps.pass("settled message admitted and delivered while not ready");
+
+    // Nothing else opened: new invoices and other status readers still refuse.
+    let settled = received
+        .iter()
+        .find(|p| p.status == PaymentStatus::Settled)
+        .unwrap();
+    assert!(matches!(
+        money.get_payment_status(&settled.payment_hash).await,
+        Err(LightningError::NotReady)
+    ));
+    assert!(matches!(
+        money.create_invoice(1_000, "regtest", 60).await,
+        Err(LightningError::NotReady)
+    ));
+
+    // A paid offer rings now, not as a late resend after the caller has gone.
+    let offer = json!({"v":1, "call_id":CALL, "media":"audio", "sdp":SDP});
+    let (status, body) = compose(&caller, &bid, 400, offer, SIGNAL_PRICE).await;
+    assert_eq!(status, StatusCode::OK, "offer: {body}");
+    assert_eq!(body["delivered"], true, "offer: {body}");
+    recv_kind(&mut callee, &aid, 400).await;
+    assert_eq!(entry(&callee, &aid).await.phase, Phase::Ringing);
+    // The callee cannot pay for its answer yet. That refusal costs nothing and
+    // leaves the call ringing.
+    let (status, body) = compose(
+        &callee,
+        &aid,
+        401,
+        json!({"v":1, "call_id":CALL, "sdp":SDP}),
+        SIGNAL_PRICE,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "answer: {body}");
+    assert_eq!(body["code"], "not_ready", "answer: {body}");
+    assert_eq!(entry(&callee, &aid).await.phase, Phase::Ringing);
+    assert!(!money.money_ready().await, "still not ready after the offer");
+    // A paid hangup reaches it too, so the ring ends with the caller.
+    let (status, body) = compose(
+        &caller,
+        &bid,
+        403,
+        json!({"v":1, "call_id":CALL, "reason":"hangup"}),
+        SIGNAL_PRICE,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "hangup: {body}");
+    recv_kind(&mut callee, &aid, 403).await;
+    assert_eq!(entry(&callee, &aid).await.phase, Phase::Ended);
+    assert!(!money.money_ready().await, "still not ready after the hangup");
+    steps.pass("offer rings, unpayable answer refused, hangup ends the ring, all while not ready");
+
+    // Past the bound a fresh settlement is not confirmed: refused as it would
+    // have been, nothing burned, and the sender's normal resend delivers it.
+    let cutoff = b.gate_settlement_cutoff().expect("a good sync is on record");
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while now_ms() / 1000 <= cutoff {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("the settlement cutoff passes");
+    assert!(!money.money_ready().await, "still not ready past the cutoff");
+    assert_eq!(b.gate_settlement_cutoff(), Some(cutoff), "no sync moved the cutoff");
+    const LATE: &str = "settled past the cutoff";
+    let operation = uuid::Uuid::new_v4().to_string();
+    let (status, body) = caller
+        .post(
+            "/api/v1/messages/compose",
+            json!({"operation_id": operation, "recipient": bid.to_hex(), "kind": 0, "plaintext": LATE}),
+            false,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "late message: {body}");
+    let late_state = || async {
+        let (status, body) = caller
+            .get(&format!("/api/v1/messages/operations/{operation}"), false)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["state"].as_str().unwrap().to_owned()
+    };
+    wait("the late message is refused, retryably", || async {
+        late_state().await == "rejected_retryable"
+    })
+    .await;
+    assert!(!money.money_ready().await, "still not ready when refused");
+    steps.pass("settlement past the bound refused while not ready");
+
+    fault.set_limited(false);
+    // Failed syncs have backed off by now, so this can take a few minutes.
+    tokio::time::timeout(Duration::from_secs(360), async {
+        while !money.money_ready().await {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("callee recovers");
+    assert_ne!(late_state().await, "failed_paid", "a refusal past the bound stays retryable");
+    caller.compose(&mut callee, "after recovery").await;
+    steps.pass("recovery needs no restart; delivery continues");
+    println!("GATE WHILE NOT READY PASS");
+    caller.stop().await;
+    callee.stop().await;
+    a.shutdown().await.unwrap();
+    money.shutdown().await.unwrap();
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real Bitcoin Core + electrs; scripts/regress/two_node_paid_call_e2e.sh"]

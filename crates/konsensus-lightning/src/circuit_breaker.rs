@@ -8,7 +8,8 @@
 //! slow or unhealthy backend head-of-line-stalls the whole node, and a cheap
 //! paid-but-unsettleable flood amplifies the stall.
 //!
-//! This decorator wraps **only** `get_payment_status` with four protections,
+//! This decorator wraps **only** `get_payment_status` and the gate's
+//! `gate_payment_status` with four protections,
 //! every one **fail-closed** (a backend that is slow, down, at-capacity, or
 //! unhealthy yields an *error*, which the payment gate maps to a rejection — it
 //! never admits an unverified message):
@@ -239,6 +240,76 @@ impl CircuitBreakerLightning {
             },
         );
     }
+
+    /// Every protection in this decorator, around one settlement read.
+    async fn bounded_read(
+        &self,
+        payment_hash: &str,
+        read: impl std::future::Future<Output = Result<PaymentDetails, LightningError>> + Send,
+    ) -> Result<PaymentDetails, LightningError> {
+        // 1. Circuit open → fast-fail (fail-closed), no backend hit.
+        let generation = self.available_generation()?;
+        let now = Instant::now();
+
+        // 2. Recent non-settled result → return it without a backend hit. Gate
+        //    sees a non-settled status and rejects (fail-closed). Never serves a
+        //    `Settled` result (those are never cached).
+        if let Some(details) = self.neg_cache_get(payment_hash, now) {
+            return Ok(details);
+        }
+
+        // 3. Bounded concurrency: take a slot, but never wait longer than the
+        //    call budget (at-capacity for too long is itself a fail-closed error).
+        let _permit = match tokio::time::timeout(
+            self.cfg.call_timeout,
+            Arc::clone(&self.sem).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            _ => {
+                self.record_failure(generation, false);
+                return Err(LightningError::Backend(
+                    "settlement verification at capacity / timed out acquiring a slot — fail-closed"
+                        .into(),
+                ));
+            }
+        };
+
+        // Recheck after waiting: a previous call may have opened the circuit.
+        // Admission and the single half-open probe reservation are atomic.
+        let call = self.admit_call()?;
+
+        // 4. The actual backend call, bounded by the timeout. Keep the slot until
+        // its outcome is recorded, before waking the next queued caller.
+        let result = tokio::time::timeout(self.cfg.call_timeout, read).await;
+
+        match result {
+            Err(_elapsed) => {
+                self.record_failure(call.generation, call.probe);
+                Err(LightningError::Backend(
+                    "settlement verification timed out — fail-closed".into(),
+                ))
+            }
+            // The backend answered in time: a refusal the gate expects says
+            // nothing about its health, and must not lock out other payments.
+            Ok(Err(e @ (LightningError::NotReady | LightningError::PaymentNotFound(_)))) => {
+                self.record_success(call.generation);
+                Err(e)
+            }
+            Ok(Err(e)) => {
+                self.record_failure(call.generation, call.probe);
+                Err(e)
+            }
+            Ok(Ok(details)) => {
+                self.record_success(call.generation);
+                if details.status != PaymentStatus::Settled {
+                    self.neg_cache_put(payment_hash, &details, Instant::now());
+                }
+                Ok(details)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -288,64 +359,16 @@ impl LightningProvider for CircuitBreakerLightning {
         &self,
         payment_hash: &str,
     ) -> Result<PaymentDetails, LightningError> {
-        // 1. Circuit open → fast-fail (fail-closed), no backend hit.
-        let generation = self.available_generation()?;
-        let now = Instant::now();
+        self.bounded_read(payment_hash, self.inner.get_payment_status(payment_hash))
+            .await
+    }
 
-        // 2. Recent non-settled result → return it without a backend hit. Gate
-        //    sees a non-settled status and rejects (fail-closed). Never serves a
-        //    `Settled` result (those are never cached).
-        if let Some(details) = self.neg_cache_get(payment_hash, now) {
-            return Ok(details);
-        }
-
-        // 3. Bounded concurrency: take a slot, but never wait longer than the
-        //    call budget (at-capacity for too long is itself a fail-closed error).
-        let _permit = match tokio::time::timeout(
-            self.cfg.call_timeout,
-            Arc::clone(&self.sem).acquire_owned(),
-        )
-        .await
-        {
-            Ok(Ok(p)) => p,
-            _ => {
-                self.record_failure(generation, false);
-                return Err(LightningError::Backend(
-                    "settlement verification at capacity / timed out acquiring a slot — fail-closed"
-                        .into(),
-                ));
-            }
-        };
-
-        // Recheck after waiting: a previous call may have opened the circuit.
-        // Admission and the single half-open probe reservation are atomic.
-        let call = self.admit_call()?;
-
-        // 4. The actual backend call, bounded by the timeout. Keep the slot until
-        // its outcome is recorded, before waking the next queued caller.
-        let result =
-            tokio::time::timeout(self.cfg.call_timeout, self.inner.get_payment_status(payment_hash))
-                .await;
-
-        match result {
-            Err(_elapsed) => {
-                self.record_failure(call.generation, call.probe);
-                Err(LightningError::Backend(
-                    "settlement verification timed out — fail-closed".into(),
-                ))
-            }
-            Ok(Err(e)) => {
-                self.record_failure(call.generation, call.probe);
-                Err(e)
-            }
-            Ok(Ok(details)) => {
-                self.record_success(call.generation);
-                if details.status != PaymentStatus::Settled {
-                    self.neg_cache_put(payment_hash, &details, Instant::now());
-                }
-                Ok(details)
-            }
-        }
+    async fn gate_payment_status(
+        &self,
+        payment_hash: &str,
+    ) -> Result<PaymentDetails, LightningError> {
+        self.bounded_read(payment_hash, self.inner.gate_payment_status(payment_hash))
+            .await
     }
 
     // ── Pass-through for the rest of the trait (not instrumented) ────────────
@@ -408,6 +431,8 @@ mod tests {
         Settled,
         Pending,
         Error,
+        NotReady,
+        NotFound,
         BlockedError,
         BlockedSettled,
         /// Sleep this long, then return `Settled` (simulates a slow backend).
@@ -485,6 +510,8 @@ mod tests {
                 Behavior::Settled => Ok(settled_details()),
                 Behavior::Pending => Ok(pending_details()),
                 Behavior::Error => Err(LightningError::Backend("boom".into())),
+                Behavior::NotReady => Err(LightningError::NotReady),
+                Behavior::NotFound => Err(LightningError::PaymentNotFound("hash".into())),
                 Behavior::BlockedError => {
                     self.release.notified().await;
                     Err(LightningError::Backend("boom".into()))
@@ -839,6 +866,69 @@ mod tests {
             start.elapsed() < Duration::from_secs(3),
             "the flood must not pin the node for the full serial duration"
         );
+    }
+
+    // The gate's read gets the same protections as `get_payment_status`.
+    #[tokio::test]
+    async fn gate_read_is_bounded_and_opens_the_circuit() {
+        let fake = FakeProvider::new(Behavior::SlowSettled(Duration::from_secs(5)));
+        let cb = CircuitBreakerLightning::new(fake.clone(), fast_cfg());
+        for _ in 0..3 {
+            assert!(cb.gate_payment_status("hash").await.is_err());
+        }
+        let calls = fake.calls.load(Ordering::SeqCst);
+        assert!(matches!(
+            cb.gate_payment_status("hash").await,
+            Err(LightningError::Backend(_))
+        ));
+        assert_eq!(fake.calls.load(Ordering::SeqCst), calls, "open circuit makes no backend hit");
+    }
+
+    #[tokio::test]
+    async fn gate_read_caches_only_non_settled_answers() {
+        let fake = FakeProvider::new(Behavior::Pending);
+        let cb = CircuitBreakerLightning::new(fake.clone(), fast_cfg());
+        for _ in 0..2 {
+            assert_eq!(cb.gate_payment_status("hash").await.unwrap().status, PaymentStatus::Pending);
+        }
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1, "a repeat is served from the short cache");
+
+        let fake = FakeProvider::new(Behavior::Settled);
+        let cb = CircuitBreakerLightning::new(fake.clone(), fast_cfg());
+        for _ in 0..2 {
+            assert_eq!(cb.gate_payment_status("hash").await.unwrap().status, PaymentStatus::Settled);
+        }
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 2, "a settled answer is never cached");
+    }
+
+    // A refusal the gate expects is an answer, not a sick backend.
+    #[tokio::test]
+    async fn expected_refusals_do_not_open_the_circuit() {
+        for refusal in [Behavior::NotReady, Behavior::NotFound] {
+            let fake = FakeProvider::new(refusal);
+            let cb = CircuitBreakerLightning::new(fake.clone(), fast_cfg());
+            for _ in 0..20 {
+                assert!(cb.gate_payment_status("hash").await.is_err());
+            }
+            assert_eq!(fake.calls.load(Ordering::SeqCst), 20, "every call reached the backend");
+            *fake.behavior.lock().unwrap() = Behavior::Settled;
+            assert_eq!(cb.gate_payment_status("hash").await.unwrap().status, PaymentStatus::Settled);
+        }
+    }
+
+    // A half-open probe that gets such an answer closes the circuit.
+    #[tokio::test]
+    async fn expected_refusal_closes_a_half_open_circuit() {
+        let fake = FakeProvider::new(Behavior::Error);
+        let cb = CircuitBreakerLightning::new(fake.clone(), fast_cfg());
+        for _ in 0..3 {
+            assert!(cb.gate_payment_status("hash").await.is_err());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        *fake.behavior.lock().unwrap() = Behavior::NotReady;
+        assert!(matches!(cb.gate_payment_status("hash").await, Err(LightningError::NotReady)));
+        *fake.behavior.lock().unwrap() = Behavior::Settled;
+        assert!(cb.gate_payment_status("hash").await.is_ok(), "the probe answered, the circuit is closed");
     }
 
     // Freshness headers: the wrapper must report the inner wallet's sync
