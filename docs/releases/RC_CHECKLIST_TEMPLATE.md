@@ -21,9 +21,9 @@ Pre-release; not for production use. Copy this template for each new RC.
 - [ ] Review the tag's `scripts/release-toolchain`, `scripts/release-build.sh`,
       `scripts/release-macos-toolchain.sh`, lockfile and CI release matrix together.
       Install the pinned Rust toolchain.
-- [ ] On NOVA, install/select **Xcode 27.1 build 27A9275**, macOS SDK **27.0**,
+- [ ] On the release Mac, install/select **Xcode 27.1 build 27A9275**, macOS SDK **27.0**,
       Apple clang **21.0.0 (clang-2100.3.34.2)** using the
-      [installation steps](../ops/RELEASE_POLICY.md#pinned-macos-release-toolchain-nova).
+      [installation steps](../ops/RELEASE_POLICY.md#pinned-macos-release-toolchain-release-mac).
       From the reviewed release commit, run
       `bash scripts/release-build.sh --check-toolchain aarch64-apple-darwin`.
       A mismatch must stop before rebuilding or signing; host break-glass cannot
@@ -59,7 +59,7 @@ Pre-release; not for production use. Copy this template for each new RC.
       Retain every non-host `ACCEPT UNVERIFIED` entry and its rationale.
 - [ ] On any mismatch, inspect and archive the printed `REBUILD EVIDENCE` directory:
       rebuilt binary, hash diff, `SHA256SUMS`, `manifest.txt`, both CI Darwin
-      toolchain records and (on NOVA) `host-toolchain.txt`. It survives exit
+      toolchain records and (on the release Mac) `host-toolchain.txt`. It survives exit
       even on rejection or dry-run; later attempts create separate directories.
 - [ ] If proceeding despite an investigated host mismatch, supply
       `--accept-unverified-host "<incident-specific reason>"` explicitly. Confirm
@@ -75,10 +75,16 @@ Pre-release; not for production use. Copy this template for each new RC.
 
 ## Independently verify and publish
 
-- [ ] In a fresh download directory, verify the tag commit/signature, checksum
-      signature and all 17 source assets against `SHA256SUMS`: five binaries,
-      their five `.sha256` files, five `.sbom.spdx.json` files, and
-      `bitsov-darwin-aarch64.toolchain.txt` and `bitsov-darwin-x86_64.toolchain.txt`.
+- [ ] In a fresh download directory, run
+      `bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` with the
+      reviewed key file. Do not fetch that key from `main`. The script accepts
+      a signature only when `[GNUPG:] VALIDSIG` field 10 is the release key.
+      It requires `SHA256SUMS` to name exactly the seventeen source assets:
+      five binaries, their five `.sha256` files, five `.sbom.spdx.json` files,
+      and `bitsov-darwin-aarch64.toolchain.txt` and
+      `bitsov-darwin-x86_64.toolchain.txt`. A shorter list or any other file
+      in the directory is refused. Check the tag with `git verify-tag` against
+      the same key. A bare `gpg --verify` exit code is not this check.
 - [ ] Check SBOM, provenance and release notes. Record unverified targets as such;
       their signed checksums do not prove they were independently rebuilt.
 - [ ] Obtain operator publication sign-off. The signing script never publishes.

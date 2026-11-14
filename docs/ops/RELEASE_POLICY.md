@@ -183,7 +183,7 @@ use the reasoned host break-glass and retain its evidence.
 Do not claim cross-platform reproducibility solely from a successful native-host
 check.
 
-## Pinned macOS release toolchain (NOVA)
+## Pinned macOS release toolchain (release Mac)
 
 Both Release CLI Darwin targets use GitHub's **`xcode-27` Apple Silicon runner**
 and explicitly select `/Applications/Xcode_27.1.app` with `sudo xcode-select -s`.
@@ -211,12 +211,12 @@ The [dedicated Xcode 27 image](https://github.com/actions/runner-images/blob/mai
 27.0 for Xcode 27.1. CI selects the documented `Xcode_27.1.app` symlink; the
 `Release_Candidate` directory name does not change the exact version/build check.
 The image README lists Clang/LLVM 21.0.0 but not its full build string. The full
-Apple clang pin above comes from NOVA's reported toolchain; CI must pass that
+Apple clang pin above comes from the release Mac's reported toolchain; CI must pass that
 same exact check before building. This is a versioned runner family, **not an
 immutable VM snapshot**; GitHub still updates it. Exact compiler/SDK checks fail
 closed if the selected toolchain changes or disappears.
 
-NOVA already reports **Xcode 27.1 build 27A9275**, SDK **27.0**, and the Apple
+The release Mac already reports **Xcode 27.1 build 27A9275**, SDK **27.0**, and the Apple
 clang line pinned above; no reinstall is needed when those checks pass. Do not
 downgrade it to Xcode 27.0 or substitute a different build. If installation is
 needed, download the matching Xcode `.xip` from
@@ -258,14 +258,43 @@ build preflight check their respective toolchains. These version records aid
 diagnosis; only the H3 binary hash comparison proves
 a matching host rebuild.
 
+## Verifying a published download
+
+`scripts/verify-release.sh <download-dir> <release-public-key.asc>` checks a
+directory that already contains `SHA256SUMS`, `SHA256SUMS.asc`, and the
+published CLI files. The key file must be the reviewed `RELEASE_KEY.asc`. The
+script reads that file's primary fingerprint and refuses anything other than
+`B299274C200301714DC6F51A7C2D6F8AC842EF6E`. It does not fetch the key, the tag,
+or the binaries. It passes `--no-auto-key-retrieve` to GnuPG and imports the
+key only into a temporary GnuPG home.
+
+A signature counts only when GnuPG reports `[GNUPG:] VALIDSIG` with field 10
+equal to that fingerprint. This is the same predicate as `scripts/release-sign.sh`.
+`SHA256SUMS` must name exactly the seventeen source assets the signer publishes:
+the five CLI binaries, their `.sha256` files, their `.sbom.spdx.json` files,
+and the two Darwin `.toolchain.txt` files. Every directory entry must be exactly
+one of those names or the two sums files. The comparison is the whole filename;
+a directory entry is not a grep pattern. The script copies each of those files
+into a mode-0700 seal directory and hashes the copies.
+Copying `SHA256SUMS` does not seal the payloads. Install from the seal path
+the script prints, then remove it with `--cleanup`. Mode 0700 stops a different
+uid from writing the seal. It does not stop the same uid. The script does not
+install. A shorter list, another file, a nested path, or a symlink is refused.
+
+The script does not verify the git tag. Check `git verify-tag` separately
+against the same key. It also does not record whether a target was rebuilt on
+the signing host or accepted with `--accept-unverified-target`.
+
 ## Release-script tests
 
-Run `bash scripts/test-release-sign.sh`. It isolates `HOME`, `GNUPGHOME` and Git
-configuration, generates a disposable signing key, uses a local Git origin and
-simulates GitHub/large Rust builds. A private test copy substitutes only the
-throwaway fingerprint; the production pin stays fixed. Tests must never import,
-list or use real signing keys. Lint with `shellcheck scripts/release-sign.sh
-scripts/release-build.sh scripts/release-macos-toolchain.sh scripts/test-release-sign.sh`.
+Run `bash scripts/test-release-sign.sh` and `bash scripts/test-verify-release.sh`.
+The signer test isolates `HOME`, `GNUPGHOME` and Git configuration, generates a
+disposable signing key, uses a local Git origin and simulates GitHub/large Rust
+builds. A private test copy substitutes only the throwaway fingerprint; the
+production pin stays fixed. Tests must never import, list or use real signing
+keys. Lint with `shellcheck scripts/release-sign.sh scripts/release-build.sh
+scripts/release-macos-toolchain.sh scripts/test-release-sign.sh
+scripts/verify-release.sh scripts/test-verify-release.sh`.
 
 Use the [RC checklist template](../releases/RC_CHECKLIST_TEMPLATE.md) for each new
 release, including rebuild evidence and per-target waiver decisions.

@@ -95,6 +95,12 @@ pub const PENDING_PAIRING_TTL: Duration = Duration::from_secs(120);
 /// rest rather than letting the directory grow without limit.
 pub const MAX_PENDING_PAIRINGS: usize = 32;
 
+/// Pending pairing requests one client key may hold at once.
+///
+/// Excess requests are refused: the submitted public key is not proof of
+/// ownership, so it must never authorize eviction of an existing ceremony.
+pub const MAX_PENDING_PAIRINGS_PER_SOURCE: usize = 4;
+
 /// Paired-token lifetime: 10 minutes.
 ///
 /// Minutes, not the 24 hours a loopback token gets. The durable secret is the
@@ -502,6 +508,11 @@ pub struct PairingFile {
     pub clients: Vec<PairedClient>,
     /// Owner-written grants.
     pub grants: Vec<SpendGrant>,
+    /// `(peer:call_id) -> originating grant`. Funding provenance survives
+    /// grant revocation/replacement, so maintenance cannot fall back to owner.
+    /// Removed only after the call's durable replay tombstone disappears.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub call_spend_grants: BTreeMap<String, String>,
     /// Owner-written `front_door` grants. Separate from `grants` so that no
     /// budget path can pick one up. Absent in files written before it existed.
     #[serde(default)]
@@ -754,6 +765,9 @@ struct Inner {
     // One-time first-contact confirmations, by client id. Memory only: never
     // serialized, dropped on restart (fail closed). See `FirstContactGrant`.
     first_contact: HashMap<String, PendingFirstContact>,
+    // Call media ownership is memory only; missing bindings fail closed after restart.
+    call_media_clients: HashMap<(String, String), auth::PairingBinding>,
+    pending_call_media_clients: HashMap<(String, String), call_spend::PendingMediaClient>,
 }
 
 type ReservationJournal<'a> = Box<dyn FnOnce(&Reservation) -> Result<(), BudgetRefusal> + 'a>;
@@ -768,6 +782,12 @@ struct ReservationAuthority<'a> {
     before_persist: Option<ReservationJournal<'a>>,
     operation: Option<crate::spend_budget::OperationReservationLink>,
     call: Option<crate::spend_budget::CallSpendTerms>,
+    /// A call offer, paid under that call's existing hold: its call id and
+    /// the caller's consented all-in cap for it, if any.
+    call_offer: Option<(&'a str, Option<u64>)>,
+    /// Change the ledger in memory only: the caller persists (or rolls back)
+    /// this reservation together with others under the same lock.
+    in_memory: bool,
 }
 
 /// Consumed, single-use authorization. Its grant identity survives the handoff
@@ -934,7 +954,7 @@ impl PairingService {
             }
         }
         let file_path = dir.join("clients.json");
-        let file = if file_path.exists() {
+        let mut file = if file_path.exists() {
             let raw = std::fs::read(&file_path)?;
             let parsed: PairingFile = serde_json::from_slice(&raw).map_err(|e| {
                 // Fail closed and demand repair. Treating an unreadable pairing
@@ -965,6 +985,19 @@ impl PairingService {
                 ..PairingFile::default()
             }
         };
+
+        // Upgrade existing holds before any expired/revoked grant can lose
+        // their provenance. This is metadata only, never renewed authority.
+        let mut funding_upgraded = false;
+        for grant in &file.grants {
+            for call in grant.budget.iter().flat_map(|budget| budget.call_reservations.values()) {
+                let key = format!("{}:{}", call.terms.peer, call.terms.call_id);
+                if let std::collections::btree_map::Entry::Vacant(entry) = file.call_spend_grants.entry(key) {
+                    entry.insert(grant.op_id.clone());
+                    funding_upgraded = true;
+                }
+            }
+        }
 
         // A crash before rename can leave grant data in the temporary file,
         // even when the authoritative file has no grants to prune. Never
@@ -998,6 +1031,8 @@ impl PairingService {
                 owner_approvals: approval::OwnerApprovals::default(),
                 cancelled_ops: std::collections::HashMap::new(),
                 first_contact: HashMap::new(),
+                call_media_clients: HashMap::new(),
+                pending_call_media_clients: HashMap::new(),
             }),
             grant_changes: tokio::sync::Notify::new(),
             authority_changes,
@@ -1015,6 +1050,9 @@ impl PairingService {
         };
         // A grant that expired while the node was down, or an unmetered
         // pre-G1 grant, must not survive the restart on disk either.
+        if funding_upgraded {
+            service.persist(&mut service.lock_without_cleanup().file)?;
+        }
         service.prune_expired_grants()?;
         service.sweep_provisional_pairings()?;
         Ok(service)
@@ -1547,8 +1585,16 @@ impl PairingService {
         name: &str,
         client_pubkey_hex: &str,
     ) -> Result<PairingRequestOutcome, PairingError> {
-        let pubkey = parse_pubkey(client_pubkey_hex)?;
-        let _ = pubkey;
+        self.request_pairing_with_writer(name, client_pubkey_hex, write_protected)
+    }
+
+    fn request_pairing_with_writer(
+        &self,
+        name: &str,
+        client_pubkey_hex: &str,
+        write_challenge: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+    ) -> Result<PairingRequestOutcome, PairingError> {
+        parse_pubkey(client_pubkey_hex)?;
         let name = sanitize_name(name);
 
         let mut challenge = [0u8; CHALLENGE_LEN];
@@ -1557,11 +1603,11 @@ impl PairingService {
         rand::thread_rng().fill_bytes(&mut pair_id_bytes);
         let pair_id = hex::encode(pair_id_bytes);
 
-        let now = Instant::now();
         let expires_at_unix = chrono::Utc::now().timestamp() + PENDING_PAIRING_TTL.as_secs() as i64;
 
         {
             let mut inner = self.lock();
+            let now = Instant::now();
             if !Self::open_inner(&inner) {
                 return Err(PairingError::Closed);
             }
@@ -1572,24 +1618,42 @@ impl PairingService {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in stale {
-                inner.pending.remove(&id);
-                let _ = std::fs::remove_file(self.challenge_path(&id));
+                // A failed unlink keeps that reservation counted for a later
+                // retry; it must not block requests within the remaining quota.
+                if let Err(error) = self.remove_pending_locked(&mut inner, &id) {
+                    tracing::warn!(pair_id = %id, %error, "expired pairing challenge not removed; still reserved");
+                }
             }
-            if inner.pending.len() >= MAX_PENDING_PAIRINGS {
+            let source = client_pubkey_hex.to_ascii_lowercase();
+            let own_count = inner
+                .pending
+                .values()
+                .filter(|pending| pending.client_pubkey == source)
+                .count();
+            if inner.pending.len() >= MAX_PENDING_PAIRINGS
+                || own_count >= MAX_PENDING_PAIRINGS_PER_SOURCE
+            {
                 return Err(PairingError::TooManyPending);
             }
             inner.pending.insert(
                 pair_id.clone(),
                 PendingPairing {
-                    client_pubkey: client_pubkey_hex.to_ascii_lowercase(),
+                    client_pubkey: source,
                     name,
                     challenge,
                     expires_at: now + PENDING_PAIRING_TTL,
                 },
             );
+            // Publish under the same lock as pending removal, so expiry or
+            // confirmation cannot remove the reservation before its file exists.
+            let path = self.challenge_path(&pair_id);
+            if let Err(error) = write_challenge(&path, &challenge) {
+                // Failed deletion keeps an expired reservation for cleanup,
+                // so a partial file cannot escape the pending quota.
+                let _ = self.remove_pending_locked(&mut inner, &pair_id);
+                return Err(error.into());
+            }
         }
-
-        write_protected(&self.challenge_path(&pair_id), &challenge)?;
 
         let code = short_code(&challenge);
         if self.print_pairing_instruction {
@@ -1637,17 +1701,12 @@ impl PairingService {
 
         let pending = {
             let mut inner = self.lock();
-            let pending = inner
-                .pending
-                .remove(pair_id)
-                .ok_or(PairingError::UnknownPending)?;
+            let pending = self.remove_pending_locked(&mut inner, pair_id)?;
             if pending.expires_at <= Instant::now() {
-                let _ = std::fs::remove_file(self.challenge_path(pair_id));
                 return Err(PairingError::UnknownPending);
             }
             pending
         };
-        let _ = std::fs::remove_file(self.challenge_path(pair_id));
 
         let verifying = parse_pubkey(&pending.client_pubkey)?;
         let msg = Self::proof_message(pair_id, &pending.client_pubkey, &pending.challenge);
@@ -2528,7 +2587,12 @@ impl PairingService {
         // Nothing pending from bootstrap carries into the live node. Pending
         // ceremonies are also cleared, but that alone is not the identity
         // authority gate — see the final-lock check in `confirm_pairing`.
-        inner.pending.clear();
+        let pending_ids: Vec<_> = inner.pending.keys().cloned().collect();
+        for id in pending_ids {
+            // Failed deletions remain expired and tracked for cleanup; they
+            // cannot carry ceremony authority into the new identity.
+            let _ = self.remove_pending_locked(&mut inner, &id);
+        }
         inner.file.revoke_grants(None);
         inner.file.pending_elevations.clear();
         inner.file.replacement_approvals.clear();
@@ -3240,6 +3304,7 @@ impl PairingService {
         mut clock: impl FnMut() -> i64,
     ) -> Result<Reservation, BudgetRefusal> {
         let now = clock();
+        let in_memory = authority.in_memory;
         let fingerprint = inner.identity_fingerprint.clone();
         let current_epoch = inner
             .file
@@ -3280,6 +3345,7 @@ impl PairingService {
                 "grant does not authorize liquidity fees".into(),
             ));
         }
+        let call_binding = authority.call.as_ref().map(|terms| format!("{}:{}", terms.peer, terms.call_id));
         let before = inner.file.grants[idx].budget.clone();
         let op_id = inner.file.grants[idx].op_id.clone();
         let id = uuid::Uuid::new_v4().to_string();
@@ -3309,13 +3375,42 @@ impl PairingService {
                 "too many unresolved reservations".into(),
             ));
         }
+        // Neither a call's hold nor its offer is bounded by the messaging cap.
+        // The hold funds payments of at most its pinned per-block ceiling. An
+        // offer under a matching open hold in this grant is its own payment:
+        // bounded by the caller's consented cap for it or, without one, by
+        // that ceiling. Both stay within the owner's per-payment limit
+        // (`GrantBudget::call_per_payment_max_msat`). An offer without a
+        // matching hold keeps the messaging cap.
+        let ceiling = |terms: &crate::spend_budget::CallSpendTerms| {
+            terms.per_block_msat.saturating_add(terms.per_block_fee_msat)
+        };
+        let hold_ceiling = authority.call.as_ref().map(ceiling);
+        let offer = authority.call_offer.filter(|_| authority.call.is_none());
+        let offer_limit = offer.and_then(|(call_id, cap)| {
+            budget
+                .call_reservations
+                .values()
+                .find(|c| {
+                    !c.closed
+                        && c.terms.call_id == call_id
+                        && charges.iter().all(|charge| charge.recipient == c.terms.peer)
+                })
+                .map(|c| cap.unwrap_or_else(|| ceiling(&c.terms)))
+        });
+        let offer_msat = charges
+            .iter()
+            .fold(0u64, |total, c| total.saturating_add(c.amount_msat));
         // Purpose, not grant provenance, determines the effective ceiling.
         // Enforce it without changing stored/signed terms, so live grants are
         // covered immediately and explicit payments retain the owner's limit.
-        let purpose_limit = if authority.payment || authority.call.is_some() {
+        let purpose_limit = if let Some(terms) = &authority.call {
+            // Checked before the hold counts against any breaker.
+            budget.check_call_closing(terms)
+        } else if authority.payment {
             Ok(())
         } else {
-            let max_msat = budget.messaging_per_call_max_msat();
+            let max_msat = offer_limit.unwrap_or_else(|| budget.messaging_per_call_max_msat());
             charges
                 .iter()
                 .try_fold(0u64, |total, charge| {
@@ -3326,8 +3421,13 @@ impl PairingService {
                 })
                 .map(|_| ())
         };
-        if let Err(refusal) = purpose_limit.and_then(|()| budget.reserve_at(&charges, now)) {
-            if budget.record_breaker_refusal(&refusal, now) {
+        let reserved = purpose_limit.and_then(|()| match (hold_ceiling, offer_limit) {
+            (Some(ceiling), _) => budget.reserve_call_at(&charges, ceiling, now),
+            (None, Some(_)) => budget.reserve_call_at(&charges, offer_msat, now),
+            (None, None) => budget.reserve_at(&charges, now),
+        });
+        if let Err(refusal) = reserved {
+            if budget.record_breaker_refusal(&refusal, now) && !in_memory {
                 if let Err(e) = self.persist(&mut inner.file) {
                     if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
                         g.budget = before;
@@ -3366,7 +3466,18 @@ impl PairingService {
             inner.file.grants[idx].budget = before;
             return Err(e);
         }
+        let previous_binding = call_binding.as_ref().and_then(|key|
+            inner.file.call_spend_grants.insert(key.clone(), op_id.clone()));
+        if in_memory {
+            return Ok(reservation);
+        }
         if let Err(e) = self.persist_with_clock(&mut inner.file, &mut clock) {
+            if let Some(key) = call_binding {
+                match previous_binding {
+                    Some(previous) => { inner.file.call_spend_grants.insert(key, previous); },
+                    None => { inner.file.call_spend_grants.remove(&key); },
+                }
+            }
             if let Some(g) = inner.file.grants.iter_mut().find(|g| g.op_id == op_id) {
                 g.budget = before;
             }
@@ -3900,10 +4011,9 @@ impl PairingService {
         })
     }
 
-    /// Validate a persisted reservation and run one synchronous dispatch step
-    /// under the same lock used by debit, revoke, rotation and identity rebind.
-    /// The closure must never block or re-enter the pairing service. Async
-    /// callers poll once here and release the lock before returning Pending.
+    /// [`Self::with_call_payment_authority`] for a payment that is not a call
+    /// payment.
+    #[cfg(test)]
     pub(crate) fn with_spend_authority<T>(
         &self,
         reservation: &Reservation,
@@ -3912,31 +4022,52 @@ impl PairingService {
         self.with_spend_authority_at(reservation, || chrono::Utc::now().timestamp(), action)
     }
 
-    /// [`Self::with_spend_authority`] with an injected clock. The clock is read
-    /// **after** the pairing lock is held: a dispatch that waited behind
-    /// another writer must judge deadlines at the time it actually runs.
+    /// [`Self::with_spend_authority`] with an injected clock.
+    #[cfg(test)]
     pub(crate) fn with_spend_authority_at<T>(
         &self,
         reservation: &Reservation,
         clock: impl FnOnce() -> i64,
         action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
-        self.with_call_spend_authority_at(reservation, None, clock, action)
+        self.with_call_spend_authority_at(reservation, None, None, clock, action)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_call_spend_authority<T>(
         &self, reservation: &Reservation, call: Option<(&str, &str)>, action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
         match call {
             None => self.with_spend_authority(reservation, action),
-            Some(call) => self.with_call_spend_authority_at(reservation, Some(call), || chrono::Utc::now().timestamp(), action),
+            Some(call) => self.with_call_spend_authority_at(reservation, Some(call), None, || chrono::Utc::now().timestamp(), action),
         }
     }
 
+    /// Validate a persisted reservation and run one synchronous dispatch step
+    /// under the same lock used by debit, revoke, rotation and identity rebind.
+    /// The closure must never block or re-enter the pairing service. Async
+    /// callers poll once here and release the lock before returning Pending.
+    /// `call` is the hold the payment draws on, if any; `purpose` marks a paid
+    /// call signal, whether or not it draws on a hold.
+    pub(crate) fn with_call_payment_authority<T>(
+        &self, reservation: &Reservation, call: Option<(&str, &str)>, purpose: Option<crate::spend_budget::CallPayment>,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, BudgetRefusal> {
+        self.with_call_spend_authority_at(reservation, call, purpose, || chrono::Utc::now().timestamp(), action)
+    }
+
+    /// The clock is read **after** the pairing lock is held: a dispatch that
+    /// waited behind another writer must judge deadlines at the time it
+    /// actually runs. `call`: the hold this payment draws on, which must be
+    /// open and fit the grant. `purpose`: a paid call signal, whose whole
+    /// charge must fit the grant as it is now.
     fn with_call_spend_authority_at<T>(
         &self, reservation: &Reservation, call: Option<(&str, &str)>,
+        purpose: Option<crate::spend_budget::CallPayment>,
         clock: impl FnOnce() -> i64, action: impl FnOnce() -> T,
     ) -> Result<T, BudgetRefusal> {
+        // A payment drawing on a hold is a call payment even if unmarked.
+        let purpose = purpose.or(call.map(|_| crate::spend_budget::CallPayment::Media));
         let inner = self.lock();
         let now = clock();
         let valid = inner.file.grants.iter().any(|g| {
@@ -3950,7 +4081,13 @@ impl PairingService {
                         .get(&reservation.id)
                         .is_some_and(|recipients| b.envelopes_live(recipients.keys(), now))
                         && call.is_none_or(|(peer, id)| b.call_reservations.values().any(|hold|
-                            hold.terms.peer == peer && hold.terms.call_id == id && !hold.closed))
+                            hold.terms.peer == peer && hold.terms.call_id == id && !hold.closed
+                                // Recovery re-dispatches under the grant as it is now.
+                                && b.check_call_hold(&hold.terms).is_ok()))
+                        // On every guarded poll, a paid call signal's own
+                        // whole charge fits the grant as it is now: a renewal
+                        // may have lowered it since reservation.
+                        && purpose.is_none_or(|purpose| b.check_call_debit(&reservation.charges, purpose).is_ok())
                 })
                 && g.client_id == reservation.client_id
                 && g.identity_fingerprint == inner.identity_fingerprint
@@ -4183,6 +4320,31 @@ impl PairingService {
 
     // ── Durable persistence ────────────────────────────────────────
 
+    /// Unlink before releasing the quota slot. A failed deletion still burns
+    /// the ceremony's authority, but retains its cleanup obligation.
+    fn remove_pending_locked(
+        &self,
+        inner: &mut Inner,
+        pair_id: &str,
+    ) -> Result<PendingPairing, PairingError> {
+        let pending = inner
+            .pending
+            .get_mut(pair_id)
+            .ok_or(PairingError::UnknownPending)?;
+        match std::fs::remove_file(self.challenge_path(pair_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                pending.expires_at = Instant::now();
+                return Err(error.into());
+            }
+        }
+        inner
+            .pending
+            .remove(pair_id)
+            .ok_or(PairingError::UnknownPending)
+    }
+
     fn challenge_path(&self, pair_id: &str) -> PathBuf {
         self.dir.join(format!("challenge-{pair_id}"))
     }
@@ -4269,7 +4431,9 @@ fn grant_view(g: &SpendGrant) -> Option<GrantView> {
         budget_msat: b.budget_msat,
         used_msat: b.used_msat,
         remaining_msat: b.remaining_msat(),
-        per_call_max_msat: b.messaging_per_call_max_msat(),
+        per_call_max_msat: b.per_call_max_msat,
+        message_per_payment_max_msat: b.messaging_per_call_max_msat(),
+        call_per_payment_max_msat: b.call_per_payment_max_msat(),
         per_recipient_msat: b.per_recipient_msat.clone(),
         used_by_recipient: b.used_by_recipient.clone(),
         recipients_only: b.recipients_only,
@@ -4576,3 +4740,7 @@ mod headless_tests;
 #[cfg(test)]
 #[path = "pairing/token_challenge_tests.rs"]
 mod token_challenge_tests;
+
+#[cfg(test)]
+#[path = "pairing/pending_tests.rs"]
+mod pending_tests;

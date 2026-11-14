@@ -23,6 +23,8 @@ use super::NoiseTransport;
 pub enum Standing {
     /// We settled an admission on this connection (`admission_paid`).
     AdmissionPaid,
+    /// A verified paid envelope needs E2EE repair on this connection.
+    SessionRepair,
     /// The peer is privileged on this connection (whitelisted or promoted by its payment).
     Privileged,
 }
@@ -186,9 +188,14 @@ impl NoiseTransport {
                     "{}: connection generation replaced or gone", peer.to_hex()
                 )))?
         };
+        if standing == Standing::SessionRepair && !matches!(Frame::from_bytes(frame_bytes),
+            Ok(Frame::PrekeyOffer { .. } | Frame::SessionInit { .. } | Frame::SessionAck | Frame::RatchetInit { .. })) {
+            return Err(TransportError::Other("session repair standing permits only E2EE control frames".into()));
+        }
         let mut state = conn.lock().await;
         let holds = match standing {
             Standing::AdmissionPaid => conn.admission_paid.load(std::sync::atomic::Ordering::Acquire),
+            Standing::SessionRepair => conn.session_repair_active(),
             Standing::Privileged => state.privileged,
         };
         if conn.is_closed() || !holds {
@@ -326,8 +333,25 @@ impl NoiseTransport {
         privileged
     }
 
+    /// Permit only E2EE repair on this exact live connection until its deadline. Callers must
+    /// have durably deferred a verified paid envelope, or matched a paid
+    /// outbound delivery to an authenticated recovery refusal.
+    pub async fn allow_session_repair(&self, peer: &NodeId, since: Instant, until: Instant) -> bool {
+        let peers = self.peers.read().await;
+        let Some(conn) = peers.get(peer).filter(|conn| conn.connected_at == since && !conn.is_closed()) else {
+            return false;
+        };
+        conn.allow_session_repair_until(until)
+    }
+
+    pub async fn session_repair_on_connection(&self, peer: &NodeId) -> bool {
+        self.peers.read().await.get(peer).is_some_and(|conn|
+            !conn.is_closed() && conn.session_repair_active())
+    }
+
     /// Connected peers eligible for E2EE session setup: privileged ones, plus
-    /// a peer whose admission WE settled on this live connection
+    /// a peer with a paid deferral needing repair, or whose admission WE settled
+    /// on this live connection
     /// (`Connection::admission_paid`, BUG-PSI). Offering our prekey to the node
     /// we paid is our own choice and completes the act we bought; it is how
     /// the session forms when the payee is the X3DH initiator.
@@ -343,7 +367,9 @@ impl NoiseTransport {
         };
         let mut eligible = Vec::with_capacity(conns.len());
         for (id, conn) in conns {
-            if conn.admission_paid.load(std::sync::atomic::Ordering::Acquire) || conn.lock().await.privileged {
+            if conn.admission_paid.load(std::sync::atomic::Ordering::Acquire)
+                || conn.session_repair_active()
+                || conn.lock().await.privileged {
                 eligible.push(id);
             }
         }
@@ -393,6 +419,15 @@ pub(super) fn spawn_reader_task(
         if *shutdown.borrow() { conn.remove(&peer_id, &peers).await; return; }
         // Keep the read future alive across ping ticks: cancelling/restarting a
         // partial length-prefixed read would corrupt framing and reset its deadline.
+        // Fixed for this connection's life, and stamped on its session frames.
+        let connection = {
+            let state = conn.lock().await;
+            Arc::new(super::ConnectionContext {
+                generation: conn.connected_at,
+                hello_key: state.noise.remote_static_key().copied(),
+                capabilities: state.capabilities.clone(),
+            })
+        };
         let read_frames = async {
         loop {
             // Read the next encrypted message
@@ -503,11 +538,15 @@ pub(super) fn spawn_reader_task(
             // its session handshake, acks/rejects of our messages and its prices.
             // Every other frame (peer exchange, Lightning info, gossip, price
             // queries, invoice requests) keeps plain `privileged`.
-            let (privileged, bought, source_ip) = {
+            // A deferred paid envelope opens only the E2EE repair controls.
+            // Prices, invoices, media and other services keep their own standing.
+            let (privileged, bought, session_control, source_ip) = {
                 let mut state = conn.lock().await;
                 state.last_recv = Instant::now();
                 let paid = conn.admission_paid.load(std::sync::atomic::Ordering::Acquire);
-                (state.privileged, state.privileged || paid, state.source_ip)
+                let bought = state.privileged || paid;
+                let session_control = bought || conn.session_repair_active();
+                (state.privileged, bought, session_control, state.source_ip)
             };
 
             // Handle frame
@@ -576,7 +615,9 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::PrekeyOffer {
                             peer_id,
                             bundle,
-                            privileged: bought,
+                            privileged: session_control,
+                            connection: Arc::clone(&connection),
+                            received_at: std::time::Instant::now(),
                         })
                         .await
                     {
@@ -589,7 +630,8 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::SessionInit {
                             peer_id,
                             init_data,
-                            privileged: bought,
+                            privileged: session_control,
+                            connection: Arc::clone(&connection),
                         })
                         .await
                     {
@@ -599,7 +641,7 @@ pub(super) fn spawn_reader_task(
                 Frame::SessionAck => {
                     debug!(peer = %peer_id, "received session ack");
                     if let Err(e) = control_tx
-                        .send(ControlEvent::SessionAck { peer_id, privileged: bought })
+                        .send(ControlEvent::SessionAck { peer_id, privileged: session_control, connection: Arc::clone(&connection) })
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send SessionAck control event");
@@ -611,7 +653,8 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::RatchetInit {
                             peer_id,
                             payload,
-                            privileged: bought,
+                            privileged: session_control,
+                            connection: Arc::clone(&connection),
                         })
                         .await
                     {

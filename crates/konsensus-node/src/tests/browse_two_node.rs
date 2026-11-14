@@ -40,7 +40,7 @@ fn card(owner: &Node, seq: u64) -> FrontDoorCard {
             },
             profile: FrontDoorProfile {
                 kind: ProfileKind::Person,
-                display_name: format!("Maya v{seq}"),
+                display_name: format!("Carol v{seq}"),
                 tagline: String::new(),
                 about: String::new(),
                 avatar: None,
@@ -125,7 +125,7 @@ async fn porch_read_pays_once_and_returns_the_verified_card() {
     *net.payee.front_door.card.lock().await = Some(card(&net.payee, 1));
     std::fs::write(
         net.payee.data_dir.join("pages/index.md"),
-        "# Maya\n\nHello from the porch.",
+        "# Carol\n\nHello from the porch.",
     )
     .unwrap();
 
@@ -160,7 +160,7 @@ async fn porch_read_pays_once_and_returns_the_verified_card() {
     assert_eq!(held["cards"].as_array().map(Vec::len), Some(1), "{held}");
     assert_eq!(
         held["cards"][0]["card"]["profile"]["display_name"],
-        "Maya v1"
+        "Carol v1"
     );
 
     let (status, body) = net.payer.browse(&owner, "/index.md").await;
@@ -169,7 +169,7 @@ async fn porch_read_pays_once_and_returns_the_verified_card() {
         (body["status"].as_str(), body["content_type"].as_str()),
         (Some("Ok"), Some("text/markdown"))
     );
-    assert_eq!(body["body"], "# Maya\n\nHello from the porch.");
+    assert_eq!(body["body"], "# Carol\n\nHello from the porch.");
     assert!(body["card"].is_null());
     paid.push(PAGE_MSAT);
 
@@ -196,6 +196,10 @@ async fn porch_read_pays_once_and_returns_the_verified_card() {
         "{body}"
     );
     *net.payee.front_door.card.lock().await = Some(card(&net.payee, 1));
+    // Four service invoices have been paid. Their slots are released by the
+    // background sweep, not by a backend query on the next request. Wait for
+    // that sweep before testing card rollback semantics with a fifth invoice.
+    tokio::time::sleep(crate::peer_invoices::CLEANUP_INTERVAL + std::time::Duration::from_secs(1)).await;
     let (_, body) = net.payer.browse(&owner, PORCH_CARD_PATH).await;
     assert_eq!(
         (

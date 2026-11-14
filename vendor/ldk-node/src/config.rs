@@ -64,6 +64,13 @@ pub(crate) const RESOLVED_CHANNEL_MONITOR_ARCHIVAL_INTERVAL: u32 = 6;
 // The time in-between peer reconnection attempts.
 pub(crate) const PEER_RECONNECTION_INTERVAL: Duration = Duration::from_secs(60);
 
+// The maximum number of accepted inbound connections handled at the same time, across all
+// listening addresses. A socket accepted while this many are open is closed right away. This only
+// limits the accept loop: established connections and connections we open ourselves (including
+// reconnecting to persisted peers) are never affected. It is well above LDK's own limit of 250
+// connected peers without a channel, leaving room for channel peers and pending handshakes.
+pub(crate) const MAX_CONCURRENT_INBOUND_CONNECTIONS: usize = 512;
+
 // The time in-between RGS sync attempts.
 pub(crate) const RGS_SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 

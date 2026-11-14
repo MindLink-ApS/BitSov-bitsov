@@ -39,6 +39,7 @@ tracing.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 # Exercise the default-feature OS-randomness path used by Lightning hash tables.
 possiblyrandom = { version = "0.2", default-features = false }
 mockall.workspace = true

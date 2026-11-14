@@ -81,6 +81,203 @@ fn remote_access_requires_loopback_api_but_allows_auto_endpoints() {
     config.api.listen_addr = "0.0.0.0:18080".parse().unwrap();
     let error = config.validate().unwrap_err().to_string();
     assert!(error.contains("must be loopback"), "{error}");
+
+    // The non-loopback opt-in does not waive the remote-access loopback rule.
+    config.api.allow_non_loopback_bind = true;
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("must be loopback"), "{error}");
+    assert!(
+        error.contains("plaintext HTTP"),
+        "opt-in must not replace the remote-access refusal: {error}"
+    );
+}
+
+fn api_bind_config(listen_addr: &str, opt_in: Option<bool>) -> NodeConfig {
+    let flag = match opt_in {
+        Some(true) => "allow_non_loopback_bind = true\n",
+        Some(false) => "allow_non_loopback_bind = false\n",
+        None => "",
+    };
+    let toml = format!(
+        r#"
+[identity]
+mnemonic_file = "/dev/null"
+
+[network]
+listen_addr = "0.0.0.0:9736"
+
+[lightning]
+backend = "mock"
+
+[chain]
+backend = "mock"
+
+[storage]
+backend = "sqlite"
+
+[api]
+listen_addr = "{listen_addr}"
+{flag}"#
+    );
+    toml::from_str(&toml).unwrap_or_else(|error| panic!("parse {listen_addr}: {error}"))
+}
+
+fn assert_api_bind_rejected(listen_addr: &str) {
+    for opt_in in [None, Some(false)] {
+        let config = api_bind_config(listen_addr, opt_in);
+        assert!(
+            !config.api.allow_non_loopback_bind,
+            "{listen_addr} opt_in={opt_in:?} must stay opted out"
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("must be loopback")
+                && error.contains("allow_non_loopback_bind = true")
+                && error.contains("[api]"),
+            "{listen_addr} opt_in={opt_in:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_unspecified_ipv4_api_bind_without_opt_in() {
+    assert_api_bind_rejected("0.0.0.0:3141");
+}
+
+#[test]
+fn validate_rejects_lan_api_bind_without_opt_in() {
+    assert_api_bind_rejected("192.168.1.20:3141");
+}
+
+#[test]
+fn validate_rejects_unspecified_ipv6_api_bind_without_opt_in() {
+    assert_api_bind_rejected("[::]:3141");
+}
+
+#[test]
+fn validate_accepts_non_loopback_api_bind_with_opt_in() {
+    for listen_addr in ["0.0.0.0:3141", "192.168.1.20:3141", "[::]:3141"] {
+        let config = api_bind_config(listen_addr, Some(true));
+        assert!(config.api.allow_non_loopback_bind);
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("{listen_addr} with opt-in must validate: {error}"));
+    }
+}
+
+#[test]
+fn validate_accepts_default_loopback_api_bind() {
+    let mut config = NodeConfig::default_for_tier(
+        NodeTier::Light,
+        PathBuf::from("/dev/null"),
+        Path::new("/tmp"),
+    );
+    assert_eq!(
+        config.api.listen_addr,
+        "127.0.0.1:3141".parse().unwrap(),
+        "the owner API default stays loopback"
+    );
+    assert!(!config.api.allow_non_loopback_bind);
+    config
+        .validate()
+        .expect("default loopback API must validate without the opt-in");
+
+    // Remote access already requires loopback and must not need the new flag.
+    config.remote_access.listen_addr = Some("127.0.0.1:18443".parse().unwrap());
+    config
+        .validate()
+        .expect("remote access on a loopback API needs no extra flag");
+
+    let ipv6_loopback = api_bind_config("[::1]:3141", None);
+    assert!(!ipv6_loopback.api.allow_non_loopback_bind);
+    ipv6_loopback
+        .validate()
+        .expect("IPv6 loopback must validate without the opt-in");
+}
+
+#[test]
+fn init_output_validates_with_loopback_api() {
+    let dir = tempfile::tempdir().unwrap();
+    let mnemonic_path = dir.path().join("mnemonic.txt");
+    std::fs::write(&mnemonic_path, "test-mnemonic").unwrap();
+
+    for tier in [NodeTier::Cloud, NodeTier::Light, NodeTier::Full] {
+        let config = NodeConfig::default_for_tier(tier, mnemonic_path.clone(), dir.path());
+        assert!(
+            config.api.listen_addr.ip().is_loopback(),
+            "{tier:?} init must keep the API on loopback"
+        );
+        assert!(!config.api.allow_non_loopback_bind);
+
+        let path = dir.path().join(format!("{tier:?}.toml"));
+        config.save(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("allow_non_loopback_bind = false"),
+            "{tier:?} init output must document the default opt-in: {raw}"
+        );
+        let loaded = NodeConfig::load(&path)
+            .unwrap_or_else(|error| panic!("{tier:?} init output must validate: {error}"));
+        assert!(loaded.api.listen_addr.ip().is_loopback());
+        assert!(!loaded.api.allow_non_loopback_bind);
+    }
+}
+
+#[test]
+fn network_tier_must_match_node_tier() {
+    for tier in [NodeTier::Cloud, NodeTier::Light, NodeTier::Full] {
+        let mut config =
+            NodeConfig::default_for_tier(tier, PathBuf::from("/dev/null"), Path::new("/tmp"));
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("fresh {tier} config should validate: {error}"));
+
+        config.network.tier = match tier.to_sovereignty_tier() {
+            SovereigntyTier::T1 => SovereigntyTier::T2,
+            _ => SovereigntyTier::T1,
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("[network].tier") && error.contains(&format!("tier = \"{tier}\"")),
+            "{tier}: {error}"
+        );
+    }
+}
+
+#[test]
+fn mismatched_tier_fixture_is_rejected() {
+    let fixture = r#"
+tier = "full"
+
+[identity]
+mnemonic_file = "/dev/null"
+
+[network]
+listen_addr = "0.0.0.0:9736"
+tier = "T1"
+
+[lightning]
+backend = "lnbits"
+api_url = "http://localhost:5000"
+admin_key = "test-key"
+
+[chain]
+backend = "esplora"
+
+[storage]
+backend = "sqlite"
+"#;
+    let config: NodeConfig = toml::from_str(fixture).unwrap();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("disagrees") && error.contains("set [network].tier = \"T2\""),
+        "{error}"
+    );
+
+    // An omitted [network].tier defaults to T1, which a full node contradicts.
+    let config: NodeConfig = toml::from_str(&fixture.replace("tier = \"T1\"\n", "")).unwrap();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("disagrees"), "{error}");
 }
 
 #[test]
@@ -92,7 +289,7 @@ fn hosted_by_is_bounded_trimmed_and_printable() {
     );
     for label in [
         None,
-        Some("Rasmus's Pi".to_string()),
+        Some("Alice's Pi".to_string()),
         Some("Øresund-boks 🟠".to_string()),
         Some("𝔅".repeat(64)),
     ] {
@@ -106,8 +303,8 @@ fn hosted_by_is_bounded_trimmed_and_printable() {
         ("   ", "empty"),
         (" Pi", "whitespace"),
         ("Pi\n", "whitespace"),
-        ("Rasmus\u{7}Pi", "printable"),
-        ("Rasmus\u{1b}[31mPi", "printable"),
+        ("Alice\u{7}Pi", "printable"),
+        ("Alice\u{1b}[31mPi", "printable"),
         ("Pi\u{202E}kcab", "printable"),
         ("Pi\u{200B}", "printable"),
         ("Pi\u{2066}x\u{2069}", "printable"),
@@ -476,7 +673,7 @@ backend = "sqlite"
 
 #[test]
 fn admission_mode_unknown_token_errors_not_silent_whitelist() {
-    // Doctrine (CODEX.md §Renames fail loud, never silent-default): `NodeConfig`
+    // Doctrine (renames fail loud, never silent-default): `NodeConfig`
     // carries `deny_unknown_fields` and `admission_mode` carries `#[serde(default)]`.
     // `#[serde(default)]` only fills an ABSENT field — a PRESENT-but-unknown token
     // must FAIL the whole parse, never fall back to the Whitelist default, which
@@ -1536,9 +1733,11 @@ fn validate_same_port_different_specific_ips_ok() {
         Path::new("/tmp"),
     );
     config.peers.clear();
-    // Two distinct specific IPs on same port should not collide
+    // Two distinct specific IPs on same port should not collide. The LAN API
+    // address is legal only with the explicit non-loopback opt-in.
     config.network.listen_addr = "10.0.0.1:3141".parse().unwrap();
     config.api.listen_addr = "10.0.0.2:3141".parse().unwrap();
+    config.api.allow_non_loopback_bind = true;
     assert!(config.validate().is_ok());
 }
 
@@ -2171,7 +2370,7 @@ esplora_url_fallback = "https://fallback.example.com"
     }
 }
 
-/// genome #66 round 2 (Codex R2): an EXISTING config that omits the primary URL
+/// genome #66 round 2 (review R2): an EXISTING config that omits the primary URL
 /// must keep resolving to the provider it resolved to before. The first attempt
 /// at #66 changed the `#[serde(default = ...)]` helpers, which would have moved
 /// every such config from mempool.space to Blockstream on upgrade — the same
@@ -2387,7 +2586,7 @@ fn validate_allows_settlement_off_on_mock_backend() {
     );
 }
 
-// 2d (Codex #3): relay/price-open admission is settlement-gated, so it must fail
+// 2d (review #3): relay/price-open admission is settlement-gated, so it must fail
 // closed on a Mock backend (settlement resolves off by default) unless the
 // operator explicitly opts in. A Mock relay/price-open node that silently ran
 // would admit unsettled/forged proofs.
@@ -2677,6 +2876,44 @@ backend = "sqlite"
         "{base}\n[calls]\nstun_listen = \"not-an-addr\"\n"
     ))
     .is_err());
+}
+
+#[test]
+fn call_media_limits_default_to_the_fixed_limits_and_stay_in_bounds() {
+    let base = r#"
+[identity]
+mnemonic_file = "/tmp/m.txt"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+"#;
+    let unset: NodeConfig = toml::from_str(base).unwrap();
+    assert_eq!(unset.calls.media_limits(), konsensus_api::call_media::MediaLimits::default());
+    assert_eq!(unset.calls.media_max_frames_per_second, 100);
+    assert_eq!(unset.calls.media_max_bytes_per_second, 65536);
+    assert!(!unset.calls.media_drop_bulk_over_share);
+    assert_eq!(crate::config::CallsConfig::default().media_limits(), unset.calls.media_limits());
+
+    let tier: NodeConfig = toml::from_str(&format!(
+        "{base}\n[calls]\nmedia_max_frames_per_second = 160\nmedia_max_bytes_per_second = 262144\nmedia_drop_bulk_over_share = true\n"
+    ))
+    .unwrap();
+    assert!(tier.calls.media_limits().drop_bulk_over_share);
+    assert_eq!(tier.calls.media_limits().max_frames_per_second, 160);
+    assert_eq!(tier.calls.media_limits().max_bytes_per_second, 262_144);
+
+    for bad in [
+        "media_max_frames_per_second = 99",
+        "media_max_frames_per_second = 1001",
+        "media_max_bytes_per_second = 65535",
+        "media_max_bytes_per_second = 1048577",
+    ] {
+        assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\n{bad}\n")).is_err(), "{bad} must be refused");
+    }
 }
 
 #[test]
@@ -3441,6 +3678,7 @@ fn endpoint_debug_redacts_url_credentials() {
             api_url: url.into(),
             esplora_url_fallback: Some(url.into()),
             credentials_file: None,
+            accept_third_party_tip: false,
         };
         assert_debug_redacted(
             &config,
@@ -3669,7 +3907,8 @@ fn privacy_node_ids_still_deserialize_from_toml() {
     let id = "ab".repeat(32);
     let config: crate::config::PrivacyConfig = toml::from_str(&format!(
         "shareable_peers = [\"{id}\"]\nshare_peer_labels = [\"{id}\"]\n"
-    )).unwrap();
+    ))
+    .unwrap();
     assert_eq!(config.shareable_peers[0].to_hex(), id);
     assert_eq!(config.share_peer_labels[0].to_hex(), id);
 }

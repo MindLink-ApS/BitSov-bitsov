@@ -19,6 +19,9 @@ mod three_node;
 #[cfg(unix)]
 #[path = "regtest/paid_call.rs"]
 mod paid_call;
+#[cfg(unix)]
+#[path = "regtest/app_grant.rs"]
+mod app_grant;
 
 async fn wait<F, Fut>(label: &str, mut check: F)
 where
@@ -897,7 +900,7 @@ async fn real_ldk_regtest_calls() {
     );
     steps.pass("msat reconciliation: channels and budgets");
 
-    // Codex P2 (#131): a call after a reconnect must not be stuck behind the
+    // Review P2 (#131): a call after a reconnect must not be stuck behind the
     // call price query. Observed on real LDK: the uncapped (owner) call asks
     // B's call price, re-admits the new connection through the existing flow
     // (reported separately as readmission_msat), then pays the call once.

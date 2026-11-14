@@ -1,8 +1,7 @@
 //! EncryptedStorage wrapper — adds AES-256-GCM at-rest encryption.
 //!
-//! Wraps any `Storage` implementation and encrypts/decrypts sensitive fields
-//! before/after storage. This ensures that even if the database is compromised,
-//! message payloads and metadata remain encrypted.
+//! Wraps any `Storage` implementation and encrypts sensitive fields with
+//! associated data identifying their table, column, and record key.
 //!
 //! ## What is encrypted
 //!
@@ -13,14 +12,10 @@
 //!
 //! Principle 4: Data lives only on sender & receiver — no plaintext at any layer.
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce as AesNonce,
-};
+use konsensus_crypto::record_cipher::{LegacyReadPolicy, RecordCipher};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rand::RngCore;
 use tokio::sync::Mutex as TokioMutex;
 
 use hex;
@@ -41,11 +36,12 @@ use crate::traits::Storage;
 
 /// AES-256-GCM at-rest encryption wrapper over any `Storage` backend.
 ///
-/// Encrypts the ciphertext field before storing; decrypts after loading.
-/// All other operations (rooms, peers, nonces) pass through unchanged.
+/// Sensitive message, peer, room, file, and operation fields use v2 records.
+/// Legacy encrypted records require an explicit local upgrade policy.
+/// The default constructor accepts only location-bound v2 records.
 pub struct EncryptedStorage<S: Storage> {
     inner: S,
-    cipher: Aes256Gcm,
+    cipher: RecordCipher,
     read_health: std::sync::Mutex<crate::StorageReadHealth>,
     /// Per-peer locks serialising `upsert_peer`'s read-decrypt-merge-encrypt-write
     /// sequence. The merge that preserves `invite_ref` / `whitelist_source` cannot
@@ -57,11 +53,15 @@ pub struct EncryptedStorage<S: Storage> {
 }
 
 impl<S: Storage> EncryptedStorage<S> {
-    /// Create a new encrypted storage wrapper.
+    /// Create a v2-only encrypted storage wrapper. Use with_policy for a local v1 upgrade.
     ///
     /// The `key` should be the 32-byte AES key from `NodeIdentity::aes_key()`.
     pub fn new(inner: S, key: &[u8; 32]) -> Self {
-        let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256 key is always 32 bytes");
+        Self::with_policy(inner, key, LegacyReadPolicy::default())
+    }
+
+    pub fn with_policy(inner: S, key: &[u8; 32], policy: LegacyReadPolicy) -> Self {
+        let cipher = RecordCipher::new(key, policy);
         Self {
             inner,
             cipher,
@@ -79,44 +79,17 @@ impl<S: Storage> EncryptedStorage<S> {
         locks.entry(*node_id).or_default().clone()
     }
 
-    /// Encrypt data with a random 12-byte nonce.
-    /// Returns nonce || ciphertext.
-    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, StorageError> {
-        let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
-        let nonce = AesNonce::from_slice(&nonce_bytes);
-
-        let encrypted = self
-            .cipher
-            .encrypt(nonce, plaintext)
-            .map_err(|e| StorageError::Encryption(format!("encrypt: {e}")))?;
-
-        // Prepend nonce to ciphertext
-        let mut result = Vec::with_capacity(12 + encrypted.len());
-        result.extend_from_slice(&nonce_bytes);
-        result.extend_from_slice(&encrypted);
-        Ok(result)
+    fn encrypt(&self, table: &str, column: &str, row: &str, plaintext: &[u8]) -> Result<Vec<u8>, StorageError> {
+        self.cipher.encrypt(table, column, row, plaintext).map_err(StorageError::Encryption)
     }
 
-    /// Decrypt data. Expects nonce (12 bytes) || ciphertext.
-    fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, StorageError> {
-        if data.len() < 12 {
-            return Err(StorageError::Encryption(
-                "encrypted data too short for nonce".into(),
-            ));
-        }
-
-        let (nonce_bytes, ciphertext) = data.split_at(12);
-        let nonce = AesNonce::from_slice(nonce_bytes);
-
-        self.cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| StorageError::Encryption(format!("decrypt: {e}")))
+    fn decrypt(&self, table: &str, column: &str, row: &str, data: &[u8]) -> Result<Vec<u8>, StorageError> {
+        self.cipher.decrypt(table, column, row, data).map_err(StorageError::Encryption)
     }
 
     /// Encrypt the ciphertext field of an envelope for storage.
     fn encrypt_envelope(&self, envelope: &UkmEnvelope) -> Result<UkmEnvelope, StorageError> {
-        let encrypted_ct = self.encrypt(&envelope.ciphertext)?;
+        let encrypted_ct = self.encrypt("messages", "ciphertext", &envelope.id.to_hex(), &envelope.ciphertext)?;
 
         // Rebuild envelope with encrypted ciphertext but same nonce/id
         // We need to set the ID manually since the ciphertext changed
@@ -127,7 +100,7 @@ impl<S: Storage> EncryptedStorage<S> {
 
     /// Decrypt the ciphertext field of an envelope after loading.
     fn decrypt_envelope(&self, envelope: &UkmEnvelope) -> Result<UkmEnvelope, StorageError> {
-        let decrypted_ct = self.decrypt(&envelope.ciphertext)?;
+        let decrypted_ct = self.decrypt("messages", "ciphertext", &envelope.id.to_hex(), &envelope.ciphertext)?;
 
         // Rebuild with original plaintext ciphertext and recompute ID
         let rebuilt = UkmEnvelopeBuilder::new(
@@ -143,6 +116,9 @@ impl<S: Storage> EncryptedStorage<S> {
         .references(envelope.references.clone())
         .build();
 
+        if rebuilt.id != envelope.id {
+            return Err(StorageError::Conversion("envelope id does not match stored row".into()));
+        }
         Ok(rebuilt)
     }
 
@@ -150,16 +126,16 @@ impl<S: Storage> EncryptedStorage<S> {
     ///
     /// Returns the encrypted bytes as a hex-encoded string, suitable for
     /// TEXT columns in SQLite/PostgreSQL.
-    fn encrypt_string(&self, plaintext: &str) -> Result<String, StorageError> {
-        let encrypted = self.encrypt(plaintext.as_bytes())?;
+    fn encrypt_string(&self, table: &str, column: &str, row: &str, plaintext: &str) -> Result<String, StorageError> {
+        let encrypted = self.encrypt(table, column, row, plaintext.as_bytes())?;
         Ok(hex::encode(encrypted))
     }
 
     /// Decrypt a hex-encoded encrypted string field.
-    fn decrypt_string(&self, hex_ciphertext: &str) -> Result<String, StorageError> {
+    fn decrypt_string(&self, table: &str, column: &str, row: &str, hex_ciphertext: &str) -> Result<String, StorageError> {
         let encrypted = hex::decode(hex_ciphertext)
             .map_err(|e| StorageError::Encryption(format!("hex decode: {e}")))?;
-        let decrypted = self.decrypt(&encrypted)?;
+        let decrypted = self.decrypt(table, column, row, &encrypted)?;
         String::from_utf8(decrypted)
             .map_err(|e| StorageError::Encryption(format!("utf8 decode: {e}")))
     }
@@ -167,10 +143,10 @@ impl<S: Storage> EncryptedStorage<S> {
     /// Encrypt an optional string field.
     fn encrypt_opt_string(
         &self,
-        opt: &Option<String>,
+        table: &str, column: &str, row: &str, opt: &Option<String>,
     ) -> Result<Option<String>, StorageError> {
         match opt {
-            Some(s) => Ok(Some(self.encrypt_string(s)?)),
+            Some(s) => Ok(Some(self.encrypt_string(table, column, row, s)?)),
             None => Ok(None),
         }
     }
@@ -178,34 +154,31 @@ impl<S: Storage> EncryptedStorage<S> {
     /// Decrypt an optional hex-encoded encrypted string field.
     fn decrypt_opt_string(
         &self,
-        opt: &Option<String>,
+        table: &str, column: &str, row: &str, opt: &Option<String>,
     ) -> Result<Option<String>, StorageError> {
         match opt {
-            Some(s) => Ok(Some(self.decrypt_string(s)?)),
+            Some(s) => Ok(Some(self.decrypt_string(table, column, row, s)?)),
             None => Ok(None),
         }
     }
 
     /// Encrypt a serde_json::Value field (serialized to JSON string, then encrypted).
-    fn encrypt_json(&self, value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
+    fn encrypt_json(&self, table: &str, column: &str, row: &str, value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
         let json_str = serde_json::to_string(value)
             .map_err(|e| StorageError::Encryption(format!("json serialize: {e}")))?;
-        let encrypted = self.encrypt_string(&json_str)?;
+        let encrypted = self.encrypt_string(table, column, row, &json_str)?;
         Ok(serde_json::Value::String(encrypted))
     }
 
     /// Decrypt a serde_json::Value field (hex string → decrypt → parse JSON).
-    fn decrypt_json(&self, value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
+    fn decrypt_json(&self, table: &str, column: &str, row: &str, value: &serde_json::Value) -> Result<serde_json::Value, StorageError> {
         match value.as_str() {
             Some(hex_str) => {
-                let json_str = self.decrypt_string(hex_str)?;
+                let json_str = self.decrypt_string(table, column, row, hex_str)?;
                 serde_json::from_str(&json_str)
                     .map_err(|e| StorageError::Encryption(format!("json parse: {e}")))
             }
-            None => {
-                // Not encrypted (e.g., legacy data) — return as-is
-                Ok(value.clone())
-            }
+            None => Err(StorageError::Encryption("encrypted JSON field is required".into())),
         }
     }
 
@@ -213,10 +186,10 @@ impl<S: Storage> EncryptedStorage<S> {
     fn encrypt_peer(&self, peer: &Peer) -> Result<Peer, StorageError> {
         Ok(Peer {
             node_id: peer.node_id,
-            address: self.encrypt_opt_string(&peer.address)?,
+            address: self.encrypt_opt_string("peers", "address", &peer.node_id.to_hex(), &peer.address)?,
             last_seen: peer.last_seen.clone(),
-            display_name: self.encrypt_opt_string(&peer.display_name)?,
-            metadata: self.encrypt_json(&peer.metadata)?,
+            display_name: self.encrypt_opt_string("peers", "display_name", &peer.node_id.to_hex(), &peer.display_name)?,
+            metadata: self.encrypt_json("peers", "metadata_json", &peer.node_id.to_hex(), &peer.metadata)?,
         })
     }
 
@@ -224,10 +197,10 @@ impl<S: Storage> EncryptedStorage<S> {
     fn decrypt_peer(&self, peer: &Peer) -> Result<Peer, StorageError> {
         Ok(Peer {
             node_id: peer.node_id,
-            address: self.decrypt_opt_string(&peer.address)?,
+            address: self.decrypt_opt_string("peers", "address", &peer.node_id.to_hex(), &peer.address)?,
             last_seen: peer.last_seen.clone(),
-            display_name: self.decrypt_opt_string(&peer.display_name)?,
-            metadata: self.decrypt_json(&peer.metadata)?,
+            display_name: self.decrypt_opt_string("peers", "display_name", &peer.node_id.to_hex(), &peer.display_name)?,
+            metadata: self.decrypt_json("peers", "metadata_json", &peer.node_id.to_hex(), &peer.metadata)?,
         })
     }
 
@@ -235,10 +208,10 @@ impl<S: Storage> EncryptedStorage<S> {
     fn encrypt_room(&self, room: &Room) -> Result<Room, StorageError> {
         Ok(Room {
             id: room.id,
-            name: self.encrypt_string(&room.name)?,
+            name: self.encrypt_string("rooms", "name", &room.id.to_string(), &room.name)?,
             created_by: room.created_by,
             created_at: room.created_at.clone(),
-            metadata: self.encrypt_json(&room.metadata)?,
+            metadata: self.encrypt_json("rooms", "metadata_json", &room.id.to_string(), &room.metadata)?,
         })
     }
 
@@ -246,10 +219,10 @@ impl<S: Storage> EncryptedStorage<S> {
     fn decrypt_room(&self, room: &Room) -> Result<Room, StorageError> {
         Ok(Room {
             id: room.id,
-            name: self.decrypt_string(&room.name)?,
+            name: self.decrypt_string("rooms", "name", &room.id.to_string(), &room.name)?,
             created_by: room.created_by,
             created_at: room.created_at.clone(),
-            metadata: self.decrypt_json(&room.metadata)?,
+            metadata: self.decrypt_json("rooms", "metadata_json", &room.id.to_string(), &room.metadata)?,
         })
     }
 
@@ -257,13 +230,13 @@ impl<S: Storage> EncryptedStorage<S> {
     fn encrypt_file_record(&self, file: &FileRecord) -> Result<FileRecord, StorageError> {
         Ok(FileRecord {
             id: file.id.clone(),
-            filename: self.encrypt_string(&file.filename)?,
-            mime_type: self.encrypt_string(&file.mime_type)?,
+            filename: self.encrypt_string("files", "filename", &file.id, &file.filename)?,
+            mime_type: self.encrypt_string("files", "mime_type", &file.id, &file.mime_type)?,
             size_bytes: file.size_bytes,
             blake3_hash: file.blake3_hash.clone(),
             sender: file.sender.clone(),
             message_id: file.message_id.clone(),
-            data: self.encrypt(&file.data)?,
+            data: self.encrypt("files", "data", &file.id, &file.data)?,
             created_at: file.created_at.clone(),
         })
     }
@@ -272,13 +245,13 @@ impl<S: Storage> EncryptedStorage<S> {
     fn decrypt_file_record(&self, file: &FileRecord) -> Result<FileRecord, StorageError> {
         Ok(FileRecord {
             id: file.id.clone(),
-            filename: self.decrypt_string(&file.filename)?,
-            mime_type: self.decrypt_string(&file.mime_type)?,
+            filename: self.decrypt_string("files", "filename", &file.id, &file.filename)?,
+            mime_type: self.decrypt_string("files", "mime_type", &file.id, &file.mime_type)?,
             size_bytes: file.size_bytes,
             blake3_hash: file.blake3_hash.clone(),
             sender: file.sender.clone(),
             message_id: file.message_id.clone(),
-            data: self.decrypt(&file.data)?,
+            data: self.decrypt("files", "data", &file.id, &file.data)?,
             created_at: file.created_at.clone(),
         })
     }
@@ -287,8 +260,8 @@ impl<S: Storage> EncryptedStorage<S> {
     fn decrypt_file_metadata(&self, meta: &FileMetadata) -> Result<FileMetadata, StorageError> {
         Ok(FileMetadata {
             id: meta.id.clone(),
-            filename: self.decrypt_string(&meta.filename)?,
-            mime_type: self.decrypt_string(&meta.mime_type)?,
+            filename: self.decrypt_string("files", "filename", &meta.id, &meta.filename)?,
+            mime_type: self.decrypt_string("files", "mime_type", &meta.id, &meta.mime_type)?,
             size_bytes: meta.size_bytes,
             blake3_hash: meta.blake3_hash.clone(),
             sender: meta.sender.clone(),
@@ -329,6 +302,7 @@ impl<S: Storage> EncryptedStorage<S> {
                 "decrypted peer metadata is not a JSON object".into(),
             ));
         };
+        obj.remove("storage_legacy_untrusted");
         obj.insert(
             "invite_ref".to_string(),
             serde_json::Value::String(invite_id.to_string()),
@@ -338,7 +312,7 @@ impl<S: Storage> EncryptedStorage<S> {
             serde_json::Value::String("invite".to_string()),
         );
 
-        let encrypted = self.encrypt_json(&metadata)?;
+        let encrypted = self.encrypt_json("peers", "metadata_json", &node_id.to_hex(), &metadata)?;
         serde_json::to_string(&encrypted).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
@@ -428,7 +402,7 @@ impl<S: Storage> EncryptedStorage<S> {
         let mut op = op.clone();
         // Empty recovery is valid for existing compacted tombstones.
         if !op.recovery.is_empty() {
-            op.recovery = self.decrypt(&op.recovery)?;
+            op.recovery = self.decrypt("outbox_operations", "recovery", &op.operation_id, &op.recovery)?;
         }
         Ok(op)
     }
@@ -441,6 +415,20 @@ impl<S: Storage> EncryptedStorage<S> {
 
 #[async_trait]
 impl<S: Storage> Storage for EncryptedStorage<S> {
+    async fn record_upgrade_envelope(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
+        self.inner.record_upgrade_envelope(id).await
+    }
+
+    async fn record_upgrade_rows(&self, table: crate::record_upgrade::RecordTable, after: Option<&str>, limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
+        self.inner.record_upgrade_rows(table, after, limit).await
+    }
+    async fn record_upgrade_row(&self, table: crate::record_upgrade::RecordTable, id: &str) -> Result<Option<crate::record_upgrade::RecordRow>, StorageError> {
+        self.inner.record_upgrade_row(table, id).await
+    }
+    async fn record_upgrade_replace(&self, table: crate::record_upgrade::RecordTable, old: &crate::record_upgrade::RecordRow, new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
+        self.inner.record_upgrade_replace(table, old, new).await
+    }
+
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         self.inner.starter_request_get(id).await
     }
@@ -479,18 +467,40 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
 
     async fn commit_outbox_envelope(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
-        let mut encrypted = op.clone(); encrypted.recovery = self.encrypt(&op.recovery)?;
+        let mut encrypted = op.clone(); encrypted.recovery = self.encrypt("outbox_operations", "recovery", &op.operation_id, &op.recovery)?;
         self.inner.commit_outbox_envelope(&encrypted, &self.encrypt_envelope(envelope)?).await
+    }
+
+    async fn replace_outbox_envelope(&self, op: &crate::OutboxOperation, previous: &MessageId, envelope: &UkmEnvelope, plaintext_enc: Option<&[u8]>) -> Result<bool, StorageError> {
+        let mut encrypted = op.clone();
+        encrypted.recovery = self.encrypt("outbox_operations", "recovery", &op.operation_id, &op.recovery)?;
+        self.inner.replace_outbox_envelope(&encrypted, previous, &self.encrypt_envelope(envelope)?, plaintext_enc).await
+    }
+
+    async fn defer_unreadable_envelope(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        self.inner.defer_unreadable_envelope(envelope).await
+    }
+
+    async fn is_envelope_deferred(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        self.inner.is_envelope_deferred(envelope).await
+    }
+
+    async fn session_repair_expires_at(&self, own: &NodeId, peer: &NodeId) -> Result<Option<i64>, StorageError> {
+        self.inner.session_repair_expires_at(own, peer).await
+    }
+
+    async fn cleanup_expired_deferrals(&self, now_ms: i64, max: u32) -> Result<u64, StorageError> {
+        self.inner.cleanup_expired_deferrals(now_ms, max).await
     }
 
     async fn insert_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
         let mut encrypted = op.clone();
-        encrypted.recovery = self.encrypt(&op.recovery)?;
+        encrypted.recovery = self.encrypt("outbox_operations", "recovery", &op.operation_id, &op.recovery)?;
         self.inner.insert_outbox_operation(&encrypted).await
     }
     async fn update_outbox_operation(&self, op: &crate::OutboxOperation) -> Result<bool, StorageError> {
         let mut encrypted = op.clone();
-        encrypted.recovery = self.encrypt(&op.recovery)?;
+        encrypted.recovery = self.encrypt("outbox_operations", "recovery", &op.operation_id, &op.recovery)?;
         self.inner.update_outbox_operation(&encrypted).await
     }
     async fn starter_update(
@@ -501,7 +511,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         // Indexed grant identifiers follow the peer/invite metadata policy. Operation
         // payloads retain the same at-rest encryption as ordinary channel opens.
         if let crate::starter::StarterUpdate::Claim { operation, .. } = &mut update {
-            operation.request = self.encrypt(&operation.request)?;
+            operation.request = self.encrypt("channel_open_operations", "request", &operation.operation_id, &operation.request)?;
         }
         self.inner.starter_update(update, now).await
     }
@@ -522,23 +532,23 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
     async fn insert_channel_open_operation(&self, op: &crate::ChannelOpenOperation) -> Result<bool, StorageError> {
         let mut encrypted = op.clone();
-        encrypted.request = self.encrypt(&op.request)?;
-        encrypted.result = op.result.as_deref().map(|r| self.encrypt(r)).transpose()?;
+        encrypted.request = self.encrypt("channel_open_operations", "request", &op.operation_id, &op.request)?;
+        encrypted.result = op.result.as_deref().map(|r| self.encrypt("channel_open_operations", "result", &op.operation_id, r)).transpose()?;
         self.inner.insert_channel_open_operation(&encrypted).await
     }
     async fn get_channel_open_operation(&self, id: &str) -> Result<Option<crate::ChannelOpenOperation>, StorageError> {
         let Some(mut op) = self.inner.get_channel_open_operation(id).await? else { return Ok(None) };
-        op.request = self.decrypt(&op.request)?;
-        op.result = op.result.as_deref().map(|r| self.decrypt(r)).transpose()?;
+        op.request = self.decrypt("channel_open_operations", "request", &op.operation_id, &op.request)?;
+        op.result = op.result.as_deref().map(|r| self.decrypt("channel_open_operations", "result", &op.operation_id, r)).transpose()?;
         Ok(Some(op))
     }
     async fn resolve_channel_open_operation(&self, id: &str, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
-        let result = result.map(|r| self.encrypt(r)).transpose()?;
+        let result = result.map(|r| self.encrypt("channel_open_operations", "result", id, r)).transpose()?;
         self.inner.resolve_channel_open_operation(id, state, result.as_deref(), last_error).await
     }
     async fn record_channel_open_outcome(&self, expected: &crate::ChannelOpenOperation, state: &str, result: Option<&[u8]>, last_error: Option<&str>) -> Result<bool, StorageError> {
         // The fence reads only unencrypted columns (id, request hash, time, state).
-        let result = result.map(|r| self.encrypt(r)).transpose()?;
+        let result = result.map(|r| self.encrypt("channel_open_operations", "result", &expected.operation_id, r)).transpose()?;
         self.inner.record_channel_open_outcome(expected, state, result.as_deref(), last_error).await
     }
     async fn delete_pending_channel_open_operation(&self, id: &str) -> Result<bool, StorageError> {
@@ -546,12 +556,12 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
     }
     async fn get_outbox_operation(&self, id: &str) -> Result<Option<crate::OutboxOperation>, StorageError> {
         let mut op = self.inner.get_outbox_operation(id).await?;
-        if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt("outbox_operations", "recovery", &op.operation_id, &op.recovery)?; } }
         Ok(op)
     }
     async fn get_outbox_operation_by_message(&self, id: &MessageId) -> Result<Option<crate::OutboxOperation>, StorageError> {
         let mut op = self.inner.get_outbox_operation_by_message(id).await?;
-        if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt(&op.recovery)?; } }
+        if let Some(op) = &mut op { if !op.recovery.is_empty() { op.recovery = self.decrypt("outbox_operations", "recovery", &op.operation_id, &op.recovery)?; } }
         Ok(op)
     }
     async fn list_recoverable_operations(&self) -> Result<Vec<crate::OutboxOperation>, StorageError> {
@@ -603,6 +613,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.is_paid_envelope_accepted(envelope).await
     }
 
+    async fn paid_envelope_status(&self, envelope: &UkmEnvelope) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+        self.inner.paid_envelope_status(&self.encrypt_envelope(envelope)?).await
+    }
+
     async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
         self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
     }
@@ -617,6 +631,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
         self.inner.is_pending_dispatched(id, peer, sender).await
+    }
+
+    async fn pending_was_undecryptable(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        self.inner.pending_was_undecryptable(id, peer, sender).await
     }
 
     async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {
@@ -868,6 +886,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_put(peer, call_id, entry).await
     }
 
+    async fn call_commit_admitted(&self, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry, id: &MessageId) -> Result<(), StorageError> {
+        self.inner.call_commit_admitted(peer, call_id, entry, id).await
+    }
+
     async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
         self.inner.call_delete(peer, call_id).await
     }
@@ -886,6 +908,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         self.inner.call_live().await
+    }
+
+    async fn call_block_invoice_count(&self, peer: &NodeId, call_id: &str, seq: u32) -> Result<u32, StorageError> {
+        self.inner.call_block_invoice_count(peer, call_id, seq).await
     }
 
     async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
@@ -1202,7 +1228,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.get_onboarding_state().await
     }
 
-    // ── Calendar (pass-through — calendar metadata queried plaintext for indexing) ─
+    // ── Calendar and fiat (pass-through — queried in SQL, stored plaintext) ─
 
     async fn store_calendar_event(&self, record: &CalendarEventRecord) -> Result<(), StorageError> {
         self.inner.store_calendar_event(record).await
@@ -1251,6 +1277,23 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn store_rsvp(&self, record: &RsvpRecord) -> Result<(), StorageError> {
         self.inner.store_rsvp(record).await
+    }
+
+    async fn store_fiat_rate_snapshot(
+        &self,
+        snapshot: &crate::fiat_snapshots::FiatRateSnapshot,
+    ) -> Result<(), StorageError> {
+        self.inner.store_fiat_rate_snapshot(snapshot).await
+    }
+
+    async fn list_fiat_rate_snapshots(
+        &self,
+        from_date: &str,
+        to_date: &str,
+    ) -> Result<Vec<crate::fiat_snapshots::FiatRateSnapshot>, StorageError> {
+        self.inner
+            .list_fiat_rate_snapshots(from_date, to_date)
+            .await
     }
 
     // ── Operator hosting (pass-through — contract state contains no message plaintext) ─

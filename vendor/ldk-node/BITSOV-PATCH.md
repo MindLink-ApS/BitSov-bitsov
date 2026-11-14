@@ -148,7 +148,7 @@ The candidate remains an estimate, not proof of replacement funding confirmation
 
 ## Chain-sync retry resilience (2026-10-03)
 
-Investigation of test #5 (Atlas run 2 item 13, and the repeat around 04:14 on
+Investigation of test #5 (review run 2 item 13, and the repeat around 04:14 on
 3 October), against ldk-node 0.7.0, esplora-client 0.12.3 and
 lightning-transaction-sync 0.2.1:
 
@@ -261,8 +261,8 @@ incident-resolution claims remain explicitly unverified. Lines 3 and 4 unchanged
 
 ## Shared Esplora rate limiting and rebroadcast eligibility (2026-10-03)
 
-Incident evidence: `TEST5-SANITY-LOG.md`, Atlas run 4 step 1, and the supplied
-redacted `beta-ldk-sync-0403.txt`. The 1,385-line excerpt contains 252 broadcast
+Incident evidence: a test #5 sanity log, review run 4 step 1, and a supplied
+redacted sync excerpt. The 1,385-line excerpt contains 252 broadcast
 failures, 254 Lightning wallet sync timeouts, 96 on-chain failures, and 350 lines
 mentioning 429. Broadcast errors recur about every 30 seconds. The excerpt does
 **not** identify the transaction: the ghost commitment is a plausible driver,
@@ -668,7 +668,7 @@ TODO(W2b). No production acknowledgements are generated in W2a.
 Enabling after earlier channel use cannot recover historical commitments missed
 while disabled. Quarantining corruption can leave historical states unguarded;
 this recovery policy avoids a permanent startup loop and does not claim repair of
-lost tower data. Fable + Grok PASS on the same SHA remains the money-path merge gate.
+lost tower data. A passing review on the same SHA remains the money-path merge gate.
 
 ## Offline safety diagnostics (2026-10-07)
 
@@ -822,3 +822,47 @@ real channel messages and production admission/accounting without bitcoind.
 Validation:
 
     cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib
+
+## Inbound connection task lifecycle (2026-11-09)
+
+- `runtime.rs`: cancellable tasks are tracked with `tokio_util::task::TaskTracker`
+  and stopped through a `CancellationToken`, instead of a `JoinSet` that was only
+  drained at shutdown. A finished task is released when it ends. This follows
+  upstream ldk-node's "Release completed cancellable tasks" (lightningdevkit/ldk-node#997,
+  on `main` after 0.7.1). Stop closes the tracker, cancels every task in it and
+  waits until each has been dropped; dropping the runtime also cancels them.
+  Also as upstream, a closed tracker refuses new cancellable tasks: a task
+  spawned while a stop is in progress, or after it, is dropped without being
+  polled. Before, such a task went into a fresh set and could outlive the stop.
+  `Node::start` opens a fresh set, so restart still works. The debug assertion
+  that the set is non-empty at stop is dropped: finished tasks no longer count.
+  This covers tasks spawned through the runtime only; a task that one of them
+  hands to Tokio directly (such as the socket task inside
+  `lightning_net_tokio::setup_inbound`) is not tracked, as before, and ends when
+  `Node::stop` disconnects all peers.
+- `inbound.rs` (new): the inbound accept loop moved out of `Node::start`. At most
+  `MAX_CONCURRENT_INBOUND_CONNECTIONS` (512, `config.rs`) accepted connections
+  are handled at a time across all listening addresses; a socket accepted beyond
+  that is closed at once. The limit only applies to newly accepted sockets:
+  established connections and outbound connections (including reconnects to
+  persisted peers) are unaffected. 512 is above LDK's 250 connected peers
+  without a channel, but the extra slots are headroom, not reserved: the peer is
+  not known when a socket is accepted, so while 512 accepted connections are
+  open, a new inbound connection from a channel peer is refused too. A channel
+  peer with a stored address is still reached by the outbound reconnect; one
+  without has to retry until a slot frees. A failed `accept` is logged and retried after 100 ms
+  instead of ending the listener; a failed socket conversion ends only that
+  connection.
+- `Cargo.toml`: adds `tokio-util` (`rt` feature), already in the root lock at
+  0.7.18; the vendor lock pins the same version.
+
+Tests: `inbound::tests` run 200 short loopback connections on an ephemeral port
+and check that only the accept loop remains tracked, that sockets beyond the
+limit are closed while held ones stay open and freed slots are reused, and that
+stop closes open connections; the fixture stops its tasks before it drops the
+runtime. `runtime::tests` cover release of finished tasks, cancellation on stop
+and on drop, refusing tasks spawned after a stop and accepting them again after
+a restart, and a task that spawns a child while a stop is in progress: the child
+is never polled and nothing stays tracked after the stop.
+
+    cargo test --offline --locked --manifest-path vendor/ldk-node/Cargo.toml --lib -- inbound:: runtime::
