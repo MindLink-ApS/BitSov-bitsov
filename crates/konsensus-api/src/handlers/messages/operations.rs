@@ -605,6 +605,18 @@ pub(super) async fn compose_call(
     if let Some(op) = journal.as_ref().filter(|op| op.request_hash != request_hash) {
         return Err(mismatch(op));
     }
+    // A paired client acts only on a call it holds: a block for a call held
+    // under another client's grant is refused before anything is reserved or
+    // recorded for this operation.
+    if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+        if let (Some(binding), Some(service), Ok(signal)) = (auth.user.pairing.as_ref(), state.pairing.as_ref(),
+            konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)) {
+            if service.call_spend_status(&peer.to_hex(), &signal.call_id).is_some()
+                && !service.owns_call_spend(binding, &peer.to_hex(), &signal.call_id) {
+                return Err(ApiError::Forbidden("call belongs to another caller".into()));
+            }
+        }
+    }
     if let Some(op) = journal.as_mut().filter(|op| recovery(op).is_ok_and(|data| data.call_price_changed)) {
         if caller(&auth).is_some() && caller(&auth) != recovery(op)?.caller {
             return Err(ApiError::Forbidden("operation belongs to another caller".into()));
