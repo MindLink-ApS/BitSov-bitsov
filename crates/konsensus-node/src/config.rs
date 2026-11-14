@@ -8,6 +8,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use konsensus_message::wire::SovereigntyTier;
 use serde::{Deserialize, Serialize};
 
@@ -894,6 +895,20 @@ impl LightningConfig {
         }
     }
 
+    /// Network the chain source must be on: `[lightning] network` for the
+    /// backends that set one. Mock, LND and LNbits state none.
+    pub fn chain_source_network(&self) -> Option<bitcoin::Network> {
+        match self {
+            Self::Ldk { network, .. } | Self::Cln { network, .. } => {
+                konsensus_chain::network::parse_configured_network(network)
+            }
+            Self::Lnbits { .. }
+            | Self::Lnd { .. }
+            | Self::Mock { .. }
+            | Self::SharedMock { .. } => None,
+        }
+    }
+
     /// Both addresses can be advertised to peers, so reject values they cannot decode.
     fn validate_address_lengths(&self) -> anyhow::Result<()> {
         if let Self::Ldk {
@@ -906,10 +921,9 @@ impl LightningConfig {
                 ("advertised_address", advertised_address),
                 ("listening_address", listening_address),
             ] {
-                if address
-                    .as_ref()
-                    .is_some_and(|address| address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES)
-                {
+                if address.as_ref().is_some_and(|address| {
+                    address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES
+                }) {
                     anyhow::bail!(
                         "Lightning address lightning.{field} exceeds the wire limit of {} UTF-8 bytes",
                         konsensus_message::wire::MAX_LN_ADDR_BYTES
@@ -969,6 +983,12 @@ pub enum ChainConfig {
         /// Owner-only OAuth client credentials for the primary Esplora source.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credentials_file: Option<PathBuf>,
+        /// The owner accepted a public explorer as this node's tip by adding
+        /// `accept_third_party_tip = true` to `[chain]` by hand. Only silences
+        /// the start-time warning; the source stays `third_party`. Defaults to
+        /// false, is never written by the node, and is omitted when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accept_third_party_tip: bool,
     },
     /// Mock provider — static block data, no network calls.
     /// For testnet, development, and offline operation.
@@ -990,6 +1010,7 @@ impl std::fmt::Debug for ChainConfig {
                 api_url,
                 esplora_url_fallback,
                 credentials_file,
+                accept_third_party_tip,
             } => f
                 .debug_struct("Esplora")
                 .field(
@@ -1003,6 +1024,7 @@ impl std::fmt::Debug for ChainConfig {
                         .map(konsensus_core::logging::redact_url_for_debug),
                 )
                 .field("credentials_file", credentials_file)
+                .field("accept_third_party_tip", accept_third_party_tip)
                 .finish(),
             Self::Mock => f.write_str("Mock"),
             Self::Bitcoind(config) => f.debug_tuple("Bitcoind").field(config).finish(),
@@ -1053,6 +1075,7 @@ impl Default for ChainConfig {
             api_url: FRESH_CHAIN_PRIMARY.to_string(),
             esplora_url_fallback: Some(FRESH_CHAIN_FALLBACK.to_string()),
             credentials_file: None,
+            accept_third_party_tip: false,
         }
     }
 }
@@ -1142,11 +1165,14 @@ pub struct PricingConfig {
     /// Price for real-time signaling messages (kinds 400-499) in millisatoshis.
     #[serde(default = "default_realtime_signal_msat")]
     pub realtime_signal_msat: u64,
-    /// Per-call admission: what a call offer (kind 400) to this node costs,
-    /// in millisatoshis. Paid once per call; answers, ICE and hangups keep
+    /// Call setup: what a call offer (kind 400) to this node costs,
+    /// in millisatoshis. Paid for ringing; answers, ICE and hangups keep
     /// `realtime_signal_msat`.
     #[serde(default = "default_call_msat")]
     pub call_msat: u64,
+    /// Receiver-owned price of each 60-second CALL_BLOCK (404), in msat.
+    #[serde(default = "default_call_msat")]
+    pub call_block_msat: u64,
     /// Price for application extension messages (kinds 1000+) in millisatoshis.
     #[serde(default = "default_app_ext_msat")]
     pub app_ext_msat: u64,
@@ -1173,6 +1199,7 @@ impl Default for PricingConfig {
             collaboration_msat: default_collab_msat(),
             realtime_signal_msat: default_realtime_signal_msat(),
             call_msat: default_call_msat(),
+            call_block_msat: default_call_msat(),
             app_ext_msat: default_app_ext_msat(),
             web_content_msat: default_web_content_msat(),
         }
@@ -1314,13 +1341,85 @@ pub struct RelayConfig {
 /// request/response only: no TURN, no relay, no auth, no per-caller state). It
 /// tells a caller the public address its request came from, which is all an
 /// app needs to connect directly across a router. Off unless `stun_listen` is set.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CallsConfig {
     /// UDP address for the STUN responder, for example `0.0.0.0:3478`.
     /// `None` (default): no UDP socket is opened.
     #[serde(default)]
     pub stun_listen: Option<SocketAddr>,
+    /// Outgoing paid minutes reserved per call; one minute per block.
+    #[serde(default = "default_max_call_minutes", deserialize_with = "deserialize_max_call_minutes")]
+    pub max_call_minutes: u16,
+    /// Media packets per second one direction of one routed call may carry,
+    /// from 100 (the default) to 1000. Both nodes of a call must allow a rate
+    /// for a call to reach it. No effect on price or admission.
+    #[serde(default = "default_media_max_frames_per_second", deserialize_with = "deserialize_media_max_frames_per_second")]
+    pub media_max_frames_per_second: u32,
+    /// Media payload bytes per second one direction of one routed call may
+    /// carry, from 65536 (the default) to 1048576. Both nodes of a call must
+    /// allow a rate for a call to reach it. No effect on price or admission.
+    #[serde(default = "default_media_max_bytes_per_second", deserialize_with = "deserialize_media_max_bytes_per_second")]
+    pub media_max_bytes_per_second: u64,
+    /// At the owner's socket, count packets larger than audio against their own
+    /// share and drop them past it, so neither a burst of them nor audio catching
+    /// up beside them closes the socket. Off by default: every packet counts
+    /// against one budget and the socket closes past it, as it always has.
+    #[serde(default)]
+    pub media_drop_bulk_over_share: bool,
+}
+
+fn default_media_max_frames_per_second() -> u32 { konsensus_api::call_media::DEFAULT_MAX_FRAMES_PER_SECOND }
+
+fn default_media_max_bytes_per_second() -> u64 { konsensus_api::call_media::DEFAULT_MAX_BYTES_PER_SECOND }
+
+fn deserialize_media_max_frames_per_second<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
+    let value = u32::deserialize(deserializer)?;
+    if !(default_media_max_frames_per_second()..=1000).contains(&value) {
+        return Err(serde::de::Error::custom("calls.media_max_frames_per_second must be between 100 and 1000"));
+    }
+    Ok(value)
+}
+
+fn deserialize_media_max_bytes_per_second<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if !(default_media_max_bytes_per_second()..=1_048_576).contains(&value) {
+        return Err(serde::de::Error::custom("calls.media_max_bytes_per_second must be between 65536 and 1048576"));
+    }
+    Ok(value)
+}
+
+impl CallsConfig {
+    /// What each direction of each routed call may carry.
+    pub fn media_limits(&self) -> konsensus_api::call_media::MediaLimits {
+        konsensus_api::call_media::MediaLimits {
+            max_frames_per_second: self.media_max_frames_per_second,
+            max_bytes_per_second: self.media_max_bytes_per_second,
+            drop_bulk_over_share: self.media_drop_bulk_over_share,
+        }
+    }
+}
+
+fn default_max_call_minutes() -> u16 { 60 }
+
+fn deserialize_max_call_minutes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u16, D::Error> {
+    let value = u16::deserialize(deserializer)?;
+    if !(1..=240).contains(&value) {
+        return Err(serde::de::Error::custom("calls.max_call_minutes must be between 1 and 240"));
+    }
+    Ok(value)
+}
+
+impl Default for CallsConfig {
+    fn default() -> Self {
+        Self {
+            stun_listen: None,
+            max_call_minutes: default_max_call_minutes(),
+            media_max_frames_per_second: default_media_max_frames_per_second(),
+            media_max_bytes_per_second: default_media_max_bytes_per_second(),
+            media_drop_bulk_over_share: false,
+        }
+    }
 }
 
 /// Storage backend selection.
@@ -1440,8 +1539,22 @@ impl Default for BackupConfig {
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     /// Address to listen on for API connections.
+    ///
+    /// Defaults to loopback `127.0.0.1:3141`. `0.0.0.0`, `::`, and any other
+    /// non-loopback address fail validation unless
+    /// [`Self::allow_non_loopback_bind`] is set.
     #[serde(default = "default_api_addr")]
     pub listen_addr: SocketAddr,
+
+    /// Opt in to binding the owner API outside loopback.
+    ///
+    /// Default `false`. Leave this unset so the owner API stays on `127.0.0.1`
+    /// or `::1`. Set `allow_non_loopback_bind = true` only to accept `0.0.0.0`,
+    /// `::`, or a LAN address in `listen_addr`. This does not relax remote
+    /// access: with `[remote_access]` enabled, `listen_addr` must still be
+    /// loopback.
+    #[serde(default)]
+    pub allow_non_loopback_bind: bool,
 
     /// JWT secret for API authentication. If not set, a random secret
     /// is generated at startup (tokens won't survive restarts).
@@ -1472,6 +1585,7 @@ impl std::fmt::Debug for ApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiConfig")
             .field("listen_addr", &self.listen_addr)
+            .field("allow_non_loopback_bind", &self.allow_non_loopback_bind)
             .field("jwt_secret", &"<redacted>")
             .field("rate_limit_rps", &self.rate_limit_rps)
             .field("cors_enabled", &self.cors_enabled)
@@ -1485,6 +1599,7 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             listen_addr: default_api_addr(),
+            allow_non_loopback_bind: false,
             jwt_secret: None,
             rate_limit_rps: default_rate_limit(),
             cors_enabled: true,
@@ -1630,7 +1745,12 @@ impl NodeConfig {
 
     /// Bootstrap must inspect configured paths before requiring an identity.
     pub(crate) fn load_before_identity_validation(path: &Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read_to_string(path).with_context(|| {
+            let shown = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+            format!(
+                "could not read config file {shown:?} (--config defaults to konsensus.toml in the current directory)"
+            )
+        })?;
         // TOML errors include the source line, which may contain a rejected
         // inline password. Never attach the raw parser error to startup logs.
         let mut config: Self = toml::from_str(&content).map_err(|_| {
@@ -1682,11 +1802,16 @@ impl NodeConfig {
         Ok(())
     }
 
-    pub(crate) fn starter_settings(&self) -> konsensus_api::handlers::starter_channel::StarterSettings {
+    pub(crate) fn starter_settings(
+        &self,
+    ) -> konsensus_api::handlers::starter_channel::StarterSettings {
         let mut settings = konsensus_api::handlers::starter_channel::StarterSettings {
             config: self.starter.clone(),
             network: self.lightning.bitcoin_network().unwrap_or_default(),
-            hub_whitelisted: self.peers.iter().any(|p| p.node_id == self.starter.hub_node_id),
+            hub_whitelisted: self
+                .peers
+                .iter()
+                .any(|p| p.node_id == self.starter.hub_node_id),
             ..Default::default()
         };
         if let LightningConfig::Ldk { liquidity, .. } = &self.lightning {
@@ -1702,12 +1827,46 @@ impl NodeConfig {
     pub(crate) fn validate_starter_hub(&self, lockable: bool) -> anyhow::Result<()> {
         let network = self.lightning.bitcoin_network();
         self.starter
-            .validate(network.as_deref(), matches!(self.lightning, LightningConfig::Ldk { .. }))
+            .validate(
+                network.as_deref(),
+                matches!(self.lightning, LightningConfig::Ldk { .. }),
+            )
             .map_err(anyhow::Error::msg)?;
-        self.starter_hub.validate(network.as_deref(), self.lightning.channel_capacity_limits().map(|l| l.max_channel_capacity_sats), lockable)
+        self.starter_hub.validate(
+            network.as_deref(),
+            self.lightning
+                .channel_capacity_limits()
+                .map(|l| l.max_channel_capacity_sats),
+            lockable,
+        )
+    }
+
+    /// Refuse `0.0.0.0`, `::`, and every other non-loopback owner API bind
+    /// unless `[api].allow_non_loopback_bind` is explicitly true.
+    fn reject_non_loopback_api_bind(&self) -> anyhow::Result<()> {
+        if self.api.listen_addr.ip().is_loopback() || self.api.allow_non_loopback_bind {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "[api].listen_addr ({}) must be loopback (127.0.0.1 or ::1). \
+             Binding 0.0.0.0, ::, or a LAN address exposes the owner API. \
+             To opt in, set allow_non_loopback_bind = true in the [api] section",
+            self.api.listen_addr
+        );
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        // `[network].tier` is what peers see; it must not contradict `tier`.
+        let expected_tier = self.tier.to_sovereignty_tier();
+        if self.network.tier != expected_tier {
+            anyhow::bail!(
+                "[network].tier = \"{:?}\" disagrees with tier = \"{}\", which advertises \
+                 {expected_tier:?}; set [network].tier = \"{expected_tier:?}\"",
+                self.network.tier,
+                self.tier
+            );
+        }
+        anyhow::ensure!((1..=240).contains(&self.calls.max_call_minutes), "calls.max_call_minutes must be between 1 and 240");
         self.lightning.validate_address_lengths()?;
         self.validate_starter_hub(false)?;
         self.tower.validate()?;
@@ -1783,6 +1942,12 @@ impl NodeConfig {
                  remote access closed"
             );
         }
+
+        // Owner HTTP stays on loopback unless the operator opts in. Remote
+        // access already refused a non-loopback API above, and that refusal
+        // stands even when the opt-in is set: plaintext HTTP must not be the
+        // remote listener.
+        self.reject_non_loopback_api_bind()?;
 
         // Check P2P and Lightning (LDK) ports don't collide.
         //
@@ -1870,6 +2035,7 @@ impl NodeConfig {
             || self.pricing.collaboration_msat == 0
             || self.pricing.realtime_signal_msat == 0
             || self.pricing.call_msat == 0
+            || self.pricing.call_block_msat == 0
             || self.pricing.app_ext_msat == 0
         {
             anyhow::bail!(
@@ -1909,7 +2075,7 @@ impl NodeConfig {
             );
         }
 
-        // 2d (Codex #3): the ciphertext relay and price-open admission are
+        // 2d (review #3): the ciphertext relay and price-open admission are
         // SETTLEMENT-GATED — they admit strangers (price_open) or hold paid
         // deposits (relay) on the strength of a settled, recipient-bound payment.
         // With settlement verification resolving OFF (the default for a Mock

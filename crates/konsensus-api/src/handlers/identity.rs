@@ -1,8 +1,7 @@
 //! Identity endpoints — node identity information and recovery.
 
-use crate::auth::scoped::{ScopedAuth, Identity, Read};
+use crate::auth::scoped::{Identity, Read, ScopedAuth};
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::extract::State;
 use axum::routing::{get, post};
@@ -176,15 +175,7 @@ fn read_plaintext_mnemonic_zeroizing(
 /// already used, or expired. Mirrors the consumption semantics of
 /// `POST /api/v1/auth/token` so the reveal re-auth is exactly as strong.
 async fn consume_challenge(state: &AppState, challenge: &str) -> Result<(), ApiError> {
-    let now = Instant::now();
-    let mut challenges = state.auth_challenges.lock().await;
-    let expires_at = challenges.remove(challenge).ok_or_else(|| {
-        ApiError::Unauthorized("auth challenge is unknown or already used".into())
-    })?;
-    if expires_at <= now {
-        return Err(ApiError::Unauthorized("auth challenge expired".into()));
-    }
-    Ok(())
+    state.auth_challenges.consume(challenge).await
 }
 
 /// `POST /api/v1/identity/mnemonic` — reveal the node's mnemonic for backup.
@@ -414,7 +405,7 @@ mod tests {
     /// through the zeroizing helper and must NOT contain a raw
     /// `read_to_string(&plain_path)` on the reveal seam. This is a code-shape
     /// assertion that survives even if the runtime behaviour looks identical —
-    /// the exact regression Codex flagged on PR #238.
+    /// the exact regression a review flagged on PR #238.
     #[test]
     fn reveal_seam_uses_zeroizing_read_not_raw_string() {
         let src = include_str!("identity.rs");

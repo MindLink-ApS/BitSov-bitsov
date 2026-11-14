@@ -569,6 +569,8 @@ async fn realtime_signaling_kind_uses_payment_gate() {
         (402, 1_000, true),
         (400, 1_000, false),
         (400, 10_000, true),
+        (404, 9_999, false),
+        (404, 10_000, true),
     ] {
         let preimage = rand::random::<[u8; 32]>();
         let payment_hash: [u8; 32] = Sha256::digest(preimage).into();
@@ -600,6 +602,9 @@ async fn realtime_signaling_kind_uses_payment_gate() {
             admitted,
             "kind {kind} paying {paid} msat: {result:?}"
         );
+        if kind == 404 && !admitted {
+            assert!(matches!(result, Err(GateRejection::InsufficientPayment { required_msat: 10_000, paid_msat: 9_999 })));
+        }
     }
 }
 

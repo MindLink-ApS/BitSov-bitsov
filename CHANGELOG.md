@@ -11,6 +11,238 @@ also live on the corresponding GitHub pre-release pages.
   before any identity exists. The field is absent when the lightning backend
   does not state a network; no other field, route or authentication rule of the
   bootstrap router changes (#443).
+
+## [0.3.0-rc24] — 2026-11-12
+
+- A paid call now ends after the callee's app connection is lost, including a
+  brief network interruption, when the callee's node records the disconnect.
+  This protection requires the callee's node to run rc24. With an rc23 callee,
+  the old behaviour remains and further blocks can be paid. Update both nodes
+  before paid calls; do not run paid calls while versions are mixed.
+- If the callee's node cannot record the disconnect, either because the write
+  still fails after its retries or because the node stops before the write,
+  the call can stay live without media until it expires unpaid. The caller
+  can keep paying for blocks meanwhile. Hang up from the caller side as soon
+  as audio stops and reconcile any further paid blocks. A pending disconnect
+  is not replayed after a restart; durable replay is planned for a later release.
+- A media-drop hangup does not notify the peer; after a recorded cutoff, the
+  peer's node ends the call at the next refused renewal, observed at about
+  66 to 67 seconds. See the [rc24 notes and checklist](docs/releases/v0.3.0-rc24.md)
+  and [rc23 → rc24 upgrade steps](docs/UPGRADING.md#rc23--rc24).
+
+## [0.3.0-rc23] — 2026-11-09
+
+- Setup cancellation leaves the comparison-attempt budget unchanged. Setup
+  requests keep a per-source backoff that refills automatically. Cap pending
+  pairing requests per client key and in a shared pool, and refuse further
+  requests at either cap without evicting an existing ceremony.
+- Limit local sign-in challenges per source, rate-limit issuance, and apply
+  Host admission to challenge issuance. Local authentication endpoints refuse
+  cross-site and same-site browser fetches; Origin, when present, must name
+  this API's loopback origin. Clients without browser headers remain supported.
+- The node refuses to start when its chain source is on another network than
+  `[lightning] network`, naming both networks, and tries no other source. Bitcoin
+  Core is checked through `getblockchaininfo`; Electrum and Esplora through their
+  height-0 header, hashed by the node. Until a source has answered on the
+  configured network, nothing reads or syncs from it: the node starts not ready
+  and the embedded LDK node retries without starting. With `credentials_file`,
+  an unanswered primary is skipped and LDK uses the verified fallback without
+  credentials. Each Esplora endpoint is checked within its own ten seconds, so
+  a slow or silent endpoint never discards another one's answer. Sources are
+  asked again after a lost connection and at least every 60 seconds, and
+  `konsensus recover` checks its source too. A custom signet passes as
+  `signet`. With LND, LNbits or mock Lightning a real `[chain]` source is not
+  checked.
+- The owner's `GET /api/v1/status` reports the running release as
+  `node_version` (for example `0.3.0-rc23`). `version` stays the API version,
+  `2`. The public `/api/v1/health` is unchanged and does not name the release.
+- Console times for grants, pending requests and the pairing window print as
+  ISO-8601 UTC next to the Unix time, for example
+  `until 2026-11-09T16:01:22Z (unix 1794240082)`; `pair-status` keeps
+  `expires_at=<unix>` and adds the UTC time after it.
+- The console log has no colour codes when stdout is not a terminal (a launcher
+  or service writing to a file or pipe), and none when `NO_COLOR` is set. A
+  terminal keeps colour. The `node.log` file already had none.
+- Docs: installing a signed pre-release binary (rename to `konsensus`,
+  `chmod +x`, macOS download mark), checking one platform with
+  `--ignore-missing`, the signature check with the pinned fingerprint, and
+  rollback steps from rc22 to rc21.
+- **Breaking for exposed APIs:** a non-loopback `[api].listen_addr` now fails config validation unless
+  `[api].allow_non_loopback_bind = true` is set, because the owner API is
+  plaintext HTTP (#412). The default remains loopback-only. A node that already
+  binds the API off-loopback refuses to start with an error naming the flag; add
+  it to keep that bind. `[remote_access]` still requires a loopback API, and the
+  flag does not lift that rule.
+- A node whose chain tip is a public explorer it never explicitly accepted
+  (earlier generated Full configs or omitted Esplora URLs) now logs one warning
+  at start naming the explorer hosts, and owner status reports
+  `chain_view.explorer_default: true` with `trust_level: "third_party"`. The
+  field is omitted otherwise. The node starts as before and its config is not
+  changed. `konsensus chain-tip --config <path>` shows the source and changes
+  nothing. To move to your own Bitcoin Core or Electrum server, or to keep the
+  explorer by adding `accept_third_party_tip = true` to `[chain]`, edit the
+  config by hand; see `docs/CHAIN-SOURCE.md`. A fresh explorer tip is still
+  someone else's view of the chain. Releases before this key reject configs
+  that contain it.
+- A chain tip that cannot be read is no longer treated as height 0. Paid sends
+  (single and room), admission and call quotes, the introduction card and front
+  door publishing now refuse with `503` `not_ready` (`reason: chain_unavailable`)
+  before anything is paid or signed; web manifests are not sent; peer price
+  tables are listed as stale; chain-aware pricing refuses a price instead of
+  pricing at height 0. With Bitcoin Core, Electrum or Esplora, the tip is also
+  not ready when its best block is older than 3 hours on `bitcoin` or 24 hours on
+  test networks (no limit on regtest). See `docs/CHAIN-SOURCE.md`, "Tip
+  readiness". A call quote checks the tip before it sends a price query; a send
+  begun while the wallet was not ready re-quotes any price to pay against a real
+  tip; a changed front door page price is re-signed only with a tip. These
+  refusals say the chain source has no current tip. Every payment of a peer's
+  price needs a usable tip observation, shared between quoting and payment
+  where possible for up to 30 seconds and refreshed before dispatch after a
+  longer wait. Established free conversations need no tip or wallet payment
+  and can still send when the chain source is unavailable or the wallet is
+  not money-ready. A kept tip is dropped once its source refuses its
+  network. Direct invoice and keysend payments, including those under paired
+  spend grants, remain outside this peer-price check; grant limits still apply.
+  On-chain sends, channel opens, liquidity, sponsor gifts, the dormant daily
+  hosting keysend and opt-in invite auto-channel opens are also outside it.
+  Prices are unchanged.
+- A node that lost its E2EE session with a connected peer gets it back on the
+  same connection. When the lower-id node lost it, about 25 seconds: the higher-id
+  peer now answers a PrekeyOffer with its own, at most once per ten seconds per
+  peer. When the higher-id node lost it, up to about a minute.
+- A reconnect no longer replaces a healthy E2EE session. The lower-id node acts on
+  a PrekeyOffer only with no session, one marked for renegotiation or not yet
+  confirmed, or on a second offer on the same connection a self-heal tick or more
+  after the first. Two stale offers can still start a replacement; closing that
+  needs key confirmation, which is separate work.
+- A reconnect now shows whether two E2EE sessions still agree, with nothing
+  paid. The lower-id node sends a `RatchetInit` under the session in use on each
+  new connection, and both nodes send one on a self-heal tick once the
+  connection and any negotiation are ten seconds old. Each takes its own send
+  chain position, saved first. A peer still on the session before moves over on
+  it, which also recovers a `RatchetInit` lost with its connection; a peer that
+  cannot read it asks for a new session. Peers on earlier versions read it like
+  any `RatchetInit`, and drop their session if they cannot. No frame or message
+  format changes.
+- A replaced E2EE session keeps reading for up to an hour, in memory only, so a paid
+  envelope encrypted under it just before the switch, or resent later, is still read
+  rather than refused.
+- A callee with no readable E2EE session with the caller refuses a call block
+  invoice (`call_block_unpayable`, nothing paid), so no minute is paid for a
+  session that cannot read it. Messages and other call signals have no such step
+  before payment.
+- A call block from the higher-id side that its recipient cannot read is now
+  refused for good (`undecryptable:`), rather than retried for up to an hour. The
+  legacy `invalid call signal: undecryptable` stays retryable.
+- One envelope or control frame can no longer cost a working E2EE session. A paid
+  envelope that cannot be decrypted is refused as before and the session stays;
+  from after the session settled it also starts a new negotiation, repeated on the
+  self-heal tick until it completes or a readable message clears it. A new session
+  retires the current one only on an answer from the peer: for the initiator a
+  `SessionAck`, which names no session and so does not show the keys match; for
+  the acceptor a message that decrypts under the new session. A stale prekey
+  offer the peer refuses, or a well-formed init with other keys, changes nothing.
+  Two stale offers, or a late `SessionAck`, can still retire a working session
+  until key confirmation lands. No frame or message format changes.
+- A normal start no longer logs `lightning health check FAILED — payments will
+  not work` and a `Fix:` hint while the wallet is still syncing. The startup
+  check reads the Lightning readiness phase: a sync is INFO ("payments start
+  when it is ready"); an unreachable chain service is one WARN naming the
+  service kind (`LIGHTNING_CHAIN_SOURCE_UNAVAILABLE`), not repeated on each
+  retry; a failed or stopped Lightning, or a backend error, still warns with
+  the `Fix:` hint, as soon as it is seen. A sync still running after ten minutes
+  warns once, and the node says at INFO when payments are on. Payments are
+  refused until Lightning is ready, as before.
+
+- Storage upgrades are forward-only: migration 033 aligns SQLite and PostgreSQL,
+  migrations 038/039 retain deferred envelopes and their expiry, and encrypted
+  records gain location binding. Preserve the complete current state and its
+  completion markers; follow [rc22 → rc23](docs/UPGRADING.md#rc22--rc23).
+- Session recovery holds new sends and durably defers unreadable paid envelopes.
+  Retry the existing operation after recovery to retain its payment. Mixed
+  rc22/rc23 deferred messages may stall after ten attempts; an upgrade does not
+  confirm delivery or refund. See the [candidate checklist](docs/releases/v0.3.0-rc23.md)
+  for scope, remaining limits and release gates.
+
+## [0.3.0-rc22] — 2026-11-05
+
+- An E2EE send now saves its advanced send chain before the ciphertext leaves
+  the session; if the save fails, nothing is sent. The send is refused with
+  `not_dispatched`, reason `session_save_failed`, before any payment for it. An
+  admission already settled in the same call stays settled and is reported as
+  paid, with the same reason. Saves and deletes of session state now run to
+  completion under the session lock even if the request that started them goes
+  away (#519).
+- Session setup applies stricter consistency checks to the keys it receives. A
+  prekey bundle or session init that fails them is refused before anything
+  changes (#520).
+- File sends report the routing fee actually paid: `POST /api/v1/files/:id/send`
+  now returns optional `fee_paid_msat`, as compose does. It is omitted when any
+  component fee is unknown and on backends other than LDK; absence does not mean
+  zero (#521).
+- Docs now say what encryption covers today: message content and call audio are
+  encrypted between nodes, and either node can read them. Encryption that
+  reaches the app is planned (#512).
+- RUSTSEC-2026-0429 is waived in the audit, deny and OSV configs for the
+  test-only `zip` 0.6.6, which is absent from the shipped binary (#505).
+- Not included: call cutoff is not yet verified on real hardware, and this
+  release does not fix the other open reports.
+- Known limit, also present in rc21: If a link drops during a call and both nodes reconnect at nearly the same moment,
+  the two nodes can end up on different sessions. Messages and call minutes sent
+  then can be paid for and not read. It can clear within about a minute; otherwise
+  follow the steps in [rc21 → rc22](docs/UPGRADING.md#rc21--rc22). This release
+  does not change it, and a fix is planned.
+
+## [0.3.0-rc21] — 2026-11-01
+
+- App spend grants now show, sign and store the owner's real per-payment
+  value. Paid messages, files, rooms and admission remain capped at 6 sats
+  (or the signed value when lower). Calls are bounded by the signed value
+  and the call's pinned per-block ceiling; the offer has its own cap. A
+  direct-channel contact is paid with no routing fee when the channel can
+  carry the payments; a failed direct payment never falls back to a route
+  with a fee. A call's hold and offer are reserved together, and every draw
+  from a hold re-checks the signed value. Existing grants stored at 6,000
+  msat per payment bind calls at that value until re-granted (#493).
+- A grant-funded call's closing signal is paid by its grant. Its closing
+  allowance is reserved from the grant outside the caller's hold consent;
+  a refused closing payment leaves the call ended without an owner debit
+  (#498).
+- Grant-funded calls: every paid call signal (offer, block, answer, ICE,
+  hangup and the closing signal) is checked again at wallet dispatch against
+  the grant's current per-payment limit, so a relation envelope renewed lower
+  never pays the earlier amount. Answers, ICE candidates and hangups,
+  including the closing signal, stay within the 6 sat message cap. A call
+  whose quoted closing signal cannot fit is refused before any hold or payment
+  (`budget_exceeded`, reason `call_closing_above_limit`) (#500).
+
+## [0.3.0-rc20] — 2026-10-31
+
+- Payment truth on the owner API: `POST /payments/pay` and `/payments/keysend`
+  answer `202 Accepted` with `status: in_flight` (payment hash and operation id,
+  no preimage or fee) until the backend reports a final state, and `200` with
+  `status: settled`, the preimage and the actual fee only once settled; a
+  failure is its proper error. Both routes now require a client `request_id`
+  (`400` without it), recorded in the encrypted operation ledger before any
+  debit or dispatch: a repeat with the same id answers from the record and
+  never pays again, the same id with other parameters is `409
+  operation_mismatch`. Nodes advertise `direct_payment_operations_v1`. A paid
+  web request (kinds 500/510) now commits its outstanding-reply row in the same
+  transaction as its envelope, and every resend restores the row. See
+  [docs/v2/API_PAYMENTS.md](docs/v2/API_PAYMENTS.md) for the status codes and
+  the compatibility notes.
+- Call-block settlement policy: **stop early + honour** (owner decision,
+  26 October 2026). The callee refuses new invoices inside a 15-second deadline
+  margin; expected late blocks resume an Unpaid call within 60 seconds and buy
+  a fresh 60-second interval. The callee confirms its paid boundary to the caller.
+  Unserviceable settlements retain payment receipts and synced overpayment
+  audits for reconciliation. Block invoices expire after 5 seconds; LDK's
+  inbound expiry buffer and in-flight HTLC residual are documented in
+  `docs/v2/CALLS-PROTOTYPE.md`.
+- Deployment note: migration 035 ends every in-flight live call when upgrading
+  to paid call blocks. Existing calls must be restarted after the upgrade;
+  their replay tombstones are retained and no unpaid media interval is granted.
+
 - Add owner-authenticated claim-code display for app onboarding:
   `GET /api/v1/owner/claim-code` on the owner-local API only (loopback source,
   local console session or enrolled owner device), rate limited, `no-store`,
@@ -18,6 +250,30 @@ also live on the corresponding GitHub pre-release pages.
   pending and a clear `claimed`/`closed`/`unavailable` state otherwise. The LAN
   box page no longer publishes the SAS digest (the finalize proof derived from
   the claim code); `/setup/approve` now takes the four compared words.
+- Validate a peer's `PrekeyOffer` or `SessionInit` in full (key formats, the
+  node id the bundle names, the signed pre-key signature, a one-time pre-key
+  this node holds) before touching the session it replaces; the working
+  session stays usable until a new one is fully derived, and the swap is one
+  atomic write. A malformed or forged offer no longer erases a good session.
+- Never acknowledge a paid message as delivered when its plaintext cannot be
+  produced and kept: an undecryptable chat (no session, not a ratchet message,
+  or a failed decryption), a plaintext or file that could not be stored, and a
+  file that fails its integrity check are withdrawn and refused with a typed
+  `MessageReject` (`undecryptable:`, `not_persisted:`, `file_corrupted:`),
+  which the sender records as terminal `failed_paid`. A damaged file is never
+  listed, stored or shown to the app as received. Every paid envelope is now
+  held, like calls and chats were, until its plaintext is kept (a file until
+  stored), so a refusal whose withdrawal fails stays hidden and unacknowledged
+  until the sweep. A resend of any withdrawn envelope is answered
+  `message withdrawn` (terminal), never the reused-proof reply, so a lost
+  refusal cannot become a delivery on retry.
+- A paid call block's grant and the release of its admission hold are now one
+  storage transaction (SQLite and PostgreSQL). A committed block can no longer
+  be left held after its grant, where a restart or the sweep would withdraw it
+  and mark its payment rejected while the callee kept the interval and the
+  caller never got the grant ACK. If the release fails, the grant rolls back
+  with it and the block is refused with a reconciliation record. A committed
+  grant is acknowledged with the boundary it committed, and a retry replays it.
 - Bound seed-only recovery chain reads: after a pass discovers hub close
   outputs, the 30-second unconfirmed-close polls read only those outputs'
   scripts instead of all 2000 derived scripts. Before each focused sweep preview,

@@ -1,6 +1,9 @@
-use super::*;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+
+use super::*;
+use tracing_subscriber::layer::SubscriberExt;
 
 use konsensus_core::identity::NodeIdentity;
 use konsensus_core::types::{MessageId, NodeId, Nonce, Recipient, Signature};
@@ -29,6 +32,10 @@ impl TestStorage {
 
     fn file_count(&self) -> usize {
         self.files.lock().unwrap().len()
+    }
+
+    fn only_file_size(&self) -> Option<u64> {
+        self.files.lock().unwrap().values().next().map(|file| file.size_bytes)
     }
 
     fn has_plaintext(&self, id: &MessageId) -> bool {
@@ -348,11 +355,47 @@ async fn process_file_valid_stores_file() {
 
     let result = process_file_message(&bytes, &sender, &envelope, &storage, &audit).await;
 
-    assert_eq!(result, Some("[file: test.txt]".to_string()));
+    assert_eq!(result, Ok("[file: test.txt]".to_string()));
 }
 
 #[tokio::test]
-async fn process_file_hash_mismatch_discards_data() {
+async fn process_file_records_decoded_length_not_the_claimed_size() {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let storage = Arc::new(TestStorage::new());
+    let audit = make_audit_log();
+
+    let file_data = b"hi";
+    let hash = blake3::hash(file_data).to_hex().to_string();
+    let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, file_data);
+    let payload = serde_json::json!({
+        "filename": "short.bin",
+        "mime_type": "application/octet-stream",
+        "size_bytes": u64::MAX,
+        "blake3_hash": hash,
+        "data_b64": data_b64,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap();
+    let envelope = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_FILE_REF,
+        b"encrypted".to_vec(),
+    );
+    let stored = process_file_message(
+        &bytes,
+        alice.node_id(),
+        &envelope,
+        &(Arc::clone(&storage) as Arc<dyn Storage>),
+        &audit,
+    )
+    .await;
+    assert_eq!(stored, Ok("[file: short.bin]".to_string()));
+    assert_eq!(storage.only_file_size(), Some(u64::try_from(file_data.len()).unwrap()));
+}
+
+#[tokio::test]
+async fn process_file_hash_mismatch_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
@@ -380,12 +423,18 @@ async fn process_file_hash_mismatch_discards_data() {
 
     let result = process_file_message(&bytes, &sender, &envelope, &storage, &audit).await;
 
-    // Returns filename (for display) but does NOT store the file (hash mismatch)
-    assert_eq!(result, Some("[file: corrupt.txt]".to_string()));
+    // A hash mismatch is a damaged file: refused, never stored, never shown.
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::FileCorrupted(
+            "the file data does not match its hash"
+        ))
+    );
+    assert!(storage.list_files(10).await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn process_file_invalid_json_returns_none() {
+async fn process_file_invalid_json_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
@@ -401,11 +450,14 @@ async fn process_file_invalid_json_returns_none() {
     let sender = *alice.node_id();
 
     let result = process_file_message(bytes, &sender, &envelope, &storage, &audit).await;
-    assert_eq!(result, None);
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::FileCorrupted("the payload is not a file"))
+    );
 }
 
 #[tokio::test]
-async fn process_file_invalid_base64_returns_filename() {
+async fn process_file_invalid_base64_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
@@ -430,14 +482,17 @@ async fn process_file_invalid_base64_returns_filename() {
 
     let result = process_file_message(&bytes, &sender, &envelope, &storage, &audit).await;
 
-    // Invalid base64 returns filename (graceful degradation)
-    assert_eq!(result, Some("[file: broken.bin]".to_string()));
+    // Undecodable data is a damaged file: refused, not reported as arrived.
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::FileCorrupted("the file data is not base64"))
+    );
 }
 
 // ── decrypt_and_process tests ───────────────────────────────────────
 
 #[tokio::test]
-async fn decrypt_no_session_returns_none() {
+async fn decrypt_no_session_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let session_mgr = SessionManager::new(Arc::clone(&bob));
@@ -471,14 +526,22 @@ async fn decrypt_no_session_returns_none() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
+        None,
     )
     .await;
 
-    assert!(result.is_none(), "no session should return None");
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::Undecryptable(
+            "no E2EE session with the sender"
+        )),
+        "a paid message with no session to read it is refused, not acknowledged"
+    );
 }
 
 #[tokio::test]
-async fn decrypt_invalid_ratchet_message_returns_none() {
+async fn decrypt_invalid_ratchet_message_is_refused() {
     let alice = alice_identity();
     let bob = bob_identity();
     let bob_mgr = SessionManager::new(Arc::clone(&bob));
@@ -517,12 +580,17 @@ async fn decrypt_invalid_ratchet_message_returns_none() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
+        None,
     )
     .await;
 
-    assert!(
-        result.is_none(),
-        "invalid ratchet message should return None"
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::Undecryptable(
+            "ciphertext is not a ratchet message"
+        )),
+        "a paid message that is not a ratchet message is refused, not acknowledged"
     );
 }
 
@@ -572,10 +640,12 @@ async fn decrypt_valid_message_returns_plaintext_and_caches() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
+        None,
     )
     .await;
 
-    assert_eq!(result, Some("Hello from Alice!".to_string()));
+    assert_eq!(result, Ok(Some("Hello from Alice!".to_string())));
     // Verify plaintext was cached in storage
     assert!(storage.has_plaintext(&envelope.id));
 }
@@ -638,10 +708,12 @@ async fn decrypt_file_ref_stores_and_returns_label() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
+        None,
     )
     .await;
 
-    assert_eq!(result, Some("[file: report.pdf]".to_string()));
+    assert_eq!(result, Ok(Some("[file: report.pdf]".to_string())));
     assert_eq!(storage.file_count(), 1);
 }
 
@@ -800,6 +872,7 @@ async fn page_request_invalid_json_returns_none() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -845,6 +918,7 @@ async fn page_request_no_content_server_returns_label() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -902,6 +976,7 @@ async fn page_request_with_content_server_serves_page() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -958,6 +1033,7 @@ async fn page_request_nonexistent_path_returns_label() {
         &transport,
         &audit,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
     )
     .await;
 
@@ -967,7 +1043,7 @@ async fn page_request_nonexistent_path_returns_label() {
 // ── decrypt_and_process with stale session ──────────────────────────
 
 #[tokio::test]
-async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
+async fn decrypt_failure_keeps_the_session_and_asks_to_renegotiate() {
     let alice = alice_identity();
     let bob = bob_identity();
     let bob_mgr = SessionManager::new(Arc::clone(&bob));
@@ -992,12 +1068,14 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
         .unwrap();
     let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
 
-    let envelope = make_envelope(
+    let mut envelope = make_envelope(
         alice.as_ref(),
         *bob.node_id(),
         konsensus_core::kind::KIND_CHAT,
         ciphertext,
     );
+    // Stamped past Bob's session settling, so the failure counts against it.
+    envelope.timestamp += 11_000;
     let sender = *alice.node_id();
 
     // Before: session exists
@@ -1020,13 +1098,74 @@ async fn decrypt_stale_session_removes_and_triggers_renegotiation() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
+        None,
     )
     .await;
 
-    // Decryption failed → returns None
-    assert!(result.is_none());
-    // Session should be removed for re-negotiation
-    assert!(!bob_mgr.has_session(alice.node_id()).await);
+    // Decryption failed → refused, never acknowledged as delivered
+    assert_eq!(
+        result,
+        Err(ReceiptRefusal::Undecryptable(
+            "the session could not decrypt the ciphertext"
+        ))
+    );
+    // The session stays, and the node asks for a replacement
+    assert!(bob_mgr.has_session(alice.node_id()).await);
+    assert!(bob_mgr.needs_renegotiation(alice.node_id()).await);
+}
+
+/// A second envelope that still cannot be read does not ask again. The first
+/// request stands, and the session stays usable.
+#[tokio::test(flavor = "current_thread")]
+async fn a_second_undecryptable_envelope_asks_only_once() {
+    struct Asks(Arc<AtomicUsize>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Asks {
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            let mut message = String::new();
+            struct Take<'a>(&'a mut String);
+            impl tracing::field::Visit for Take<'_> {
+                fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+            }
+            event.record(&mut Take(&mut message));
+            if message.contains("asking to renegotiate") {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let bob_mgr = SessionManager::new(Arc::clone(&bob));
+    let alice_mgr = SessionManager::new(Arc::clone(&alice));
+    let transport = make_transport(&bob);
+    establish_sessions(&alice_mgr, &bob_mgr, &alice, &bob).await;
+
+    let alice_mgr2 = SessionManager::new(Arc::clone(&alice));
+    let bob_bundle = bob_mgr.prekey_bundle().await;
+    let init = alice_mgr2.initiate_session(bob.node_id(), &bob_bundle).await.unwrap();
+    drop(init);
+    let foreign = alice_mgr2.encrypt(bob.node_id(), b"not this session").await.unwrap();
+    let mut envelope = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_CHAT,
+        konsensus_crypto::ratchet_message_to_bytes(&foreign),
+    );
+    envelope.timestamp += 11_000;
+
+    let asks = Arc::new(AtomicUsize::new(0));
+    let subscriber = tracing_subscriber::registry().with(Asks(Arc::clone(&asks)));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    note_unreadable_envelope(&envelope, alice.node_id(), &bob_mgr, &transport).await;
+    note_unreadable_envelope(&envelope, alice.node_id(), &bob_mgr, &transport).await;
+    assert_eq!(asks.load(Ordering::SeqCst), 1, "the second envelope does not ask again");
+    assert!(bob_mgr.needs_renegotiation(alice.node_id()).await);
+    assert!(bob_mgr.has_session(alice.node_id()).await);
 }
 
 // ── Non-UTF8 plaintext ──────────────────────────────────────────────
@@ -1077,16 +1216,22 @@ async fn decrypt_non_utf8_returns_none() {
         &audit,
         &PaymentGate::new(),
         0.0,
+        true,
+        None,
     )
     .await;
 
     // Non-UTF8 for a chat message returns None
-    assert!(result.is_none());
+    assert_eq!(
+        result,
+        Ok(None),
+        "kept, but not text: nothing to show, still delivered"
+    );
 }
 
 // ── HARD-11: registry read guard released before the gate await ──────
 //
-// Codex objection on #230: the code shape scopes the read guard before
+// Review objection on #230: the code shape scopes the read guard before
 // `PaymentGate::verify().await`, but no test proved the REAL seam — that a peer
 // add/remove (a registry writer) can acquire the write lock while verification
 // is pending. These tests drive the extracted `whitelist_then_verify` helper
@@ -2797,6 +2942,23 @@ async fn kind_offer_publication_serializes_discount_and_fails_closed() {
     target.shutdown();
 }
 
+/// The caller's journal of a settled, dispatched paid block, as compose
+/// leaves it before the callee's grant ACK arrives.
+async fn journal_dispatched_block(store: &konsensus_storage::SqliteStorage, env: &konsensus_core::UkmEnvelope, call_id: &str, seq: u32) {
+    let Recipient::Node(peer) = env.recipient else { panic!("a block goes to one node") };
+    store.store_message(env).await.unwrap();
+    let mut op = konsensus_storage::OutboxOperation::prepared(format!("block-{call_id}-{seq}"), peer.to_hex(), 404, format!("request-{seq}"));
+    op.state = "sent".into();
+    op.message_id = Some(env.id.to_hex());
+    op.recovery = serde_json::to_vec(&serde_json::json!({
+        "call_block": [call_id, seq], "dispatched": true, "expected_msat": env.payment_proof.amount_msat,
+        "fee_ceiling_msat": 0, "admission_msat": 0,
+    })).unwrap();
+    store.insert_outbox_operation(&op).await.unwrap();
+    store.queue_pending_delivery(&env.id, &peer).await.unwrap();
+    store.mark_pending_sent(&env.id, &peer).await.unwrap();
+}
+
 /// 1:1 call signalling (kinds 400-403) end to end over Noise, through the
 /// real receive loop: the offer is admitted only when paid at the recipient's
 /// `call_msat`, once per call id; answer/ICE/hangup reach the app only for a
@@ -2814,6 +2976,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
             id,
             TransportConfig {
                 listen_addr: "127.0.0.1:0".parse().unwrap(),
+                capabilities: crate::node::default_advertised_capabilities(false),
                 admission_mode: ReachabilityMode::PriceOpen,
                 ..Default::default()
             },
@@ -2837,12 +3000,12 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let sessions_b = Arc::new(SessionManager::new(bob.clone()));
     establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
     let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
-    let (shutdown, shutdown_rx) = watch::channel(false);
     let (ws_tx, mut ws_rx) = broadcast::channel(16);
     let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
         konsensus_pricing::StaticPricingEngine::new(Default::default()),
     );
-    let worker = tokio::spawn(run(MsgHandlerDeps {
+    // The receive loop over Bob's durable store; started again for a restart.
+    let start = |shutdown_rx| tokio::spawn(run(MsgHandlerDeps {
         transport: target.clone(),
         transport_ack: target.clone(),
         storage: storage.clone(),
@@ -2850,30 +3013,45 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
             verify_lightning_settlement: true,
             ..Default::default()
         })),
-        pricing,
+        pricing: pricing.clone(),
         lightning: wallet.clone(),
         chain: Arc::new(konsensus_chain::MockChainProvider::new()),
         peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
-        session_manager: sessions_b,
-        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        session_manager: sessions_b.clone(),
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage.clone())),
         content_server: None,
         front_door: Default::default(),
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
-        ws_tx,
-        audit_log: audit,
+        ws_tx: ws_tx.clone(),
+        audit_log: audit.clone(),
         admission_mode: ReachabilityMode::PriceOpen,
         relay_engine: None,
         shutdown_rx,
     }));
+    let (mut shutdown, shutdown_rx) = watch::channel(false);
+    let mut worker = start(shutdown_rx);
 
     // Alice pays `msat` to Bob and sends one signal of `kind`.
     let signal = |kind: u16, msat: u64, body: String| {
-        let (wallet, sessions_a, alice, bob) =
-            (wallet.clone(), &sessions_a, alice.clone(), bob.clone());
+        let (wallet, sessions_a, alice, bob, db) =
+            (wallet.clone(), &sessions_a, alice.clone(), bob.clone(), db.clone());
         async move {
-            let hash = wallet.inject_inbound_keysend(msat, None).await;
+            let hash = if kind == 404 {
+                // Issue and bind a real invoice before paying it. These fixtures
+                // model issuance before the delayed settlement/delivery below.
+                let invoice = wallet.create_invoice(msat, "call block",
+                    konsensus_core::payloads::call::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.unwrap();
+                let block = konsensus_core::payloads::call::CallSignal::parse(404, &body).unwrap();
+                db.record_call_block_invoice(alice.node_id(), &block.call_id, block.seq.unwrap(),
+                    &hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
+                    chrono::Utc::now().timestamp_millis() as u64 + 120_000).await.unwrap();
+                wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+                invoice.payment_hash
+            } else {
+                wallet.inject_inbound_keysend(msat, None).await
+            };
             let payment = wallet.get_payment_status(&hash).await.unwrap();
             let proof = PaymentProof::new(
                 hex::decode(&hash).unwrap().try_into().unwrap(),
@@ -2962,7 +3140,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         .unwrap_err()
         .contains("replayed"));
     assert!(ws_rx.try_recv().is_err());
-    // Codex P1: the refused signal is withdrawn (no history/resync), and a
+    // Review P1: the refused signal is withdrawn (no history/resync), and a
     // resend of the very same paid envelope is refused, not duplicate-ACKed.
     assert!(db.get_message(&env.id).await.unwrap().is_none());
     assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
@@ -3026,6 +3204,513 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     source.send(bob.node_id(), &env).await.unwrap();
     assert!(outcome(source.clone()).await.is_err());
     assert!(ws_rx.try_recv().is_err());
+
+    // Block zero may take longer than ten seconds to reach the callee.
+    // The paid interval stays anchored to answer, and the gate remains single-use.
+    use konsensus_core::payloads::call::{self as calls, HangupReason, Phase};
+    let block_id = format!("{:032x}", rand::random::<u128>());
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now - 20_000;
+    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
+    let entry = calls::commit(pending, "answer", answered_at).unwrap();
+    db.call_put(alice.node_id(), &block_id, &entry).await.unwrap();
+    let block = |seq| format!(r#"{{"v":1,"call_id":"{block_id}","seq":{seq}}}"#);
+    // A generic 3600-second invoice cannot buy call media, even for a valid seq.
+    let invoice = wallet.create_invoice(10_000, "generic", 3600).await.unwrap();
+    let payment = wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+    let mut generic = signal(404, 10_000, block(0)).await;
+    generic.payment_proof = PaymentProof::new(
+        hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
+        hex::decode(payment.preimage.unwrap()).unwrap().try_into().unwrap(), 10_000);
+    generic.signature = Signature::from_ed25519(&alice.sign(&generic.signable_bytes()));
+    source.send(bob.node_id(), &generic).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(entry.clone()));
+    assert!(ws_rx.try_recv().is_err());
+    assert!(db.is_paid_envelope_rejected(&generic).await.unwrap());
+    source.send(bob.node_id(), &generic).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(log.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|event| event["event"] == "call.block_overpayment" && event["detail"]["message_id"] == generic.id.to_hex()));
+
+    let env = signal(404, 10_000, block(0)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let paid = db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap();
+    assert_eq!(paid.paid_until_ms, Some(answered_at + 60_000));
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(true));
+    assert!(ws_rx.try_recv().is_err());
+
+    // A block paid before local media detaches is retained for reconciliation.
+    let cut_id = "10000000000000000000000000000004";
+    let cut_now = chrono::Utc::now().timestamp_millis() as u64;
+    let cut_paid = calls::CallEntry {
+        paid_until_ms: Some(cut_now + 20_000), deadline_ms: cut_now + 30_000,
+        ..paid.clone()
+    };
+    db.call_put(alice.node_id(), cut_id, &cut_paid).await.unwrap();
+    let in_flight = signal(404, 10_000,
+        format!(r#"{{"call_id":"{cut_id}","seq":1}}"#)).await;
+    let media = crate::call_media::CallMediaRouter::new(target.clone(),
+        Arc::new(crate::call_media::PaidCallAdmission::new(db.clone())));
+    use konsensus_api::call_media::CallMediaPort;
+    drop(media.attach(alice.node_id(), cut_id, None).await.unwrap());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if db.call_get(alice.node_id(), cut_id).await.unwrap().unwrap().phase == Phase::Ended { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("detachment ends the callee call");
+    source.send(bob.node_id(), &in_flight).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(db.is_paid_envelope_rejected(&in_flight).await.unwrap());
+    assert!(db.has_nonce(&in_flight.nonce).await.unwrap());
+    assert!(ws_rx.try_recv().is_err());
+    let after_cut = db.call_get(alice.node_id(), cut_id).await.unwrap().unwrap();
+    assert_eq!(after_cut.phase, Phase::Ended);
+    assert_eq!(after_cut.end_reason, Some(HangupReason::Hangup));
+    assert_eq!(after_cut.next_block_seq, 1);
+    assert_eq!(after_cut.paid_until_ms, cut_paid.paid_until_ms);
+    source.send(bob.node_id(), &in_flight).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    let records: Vec<serde_json::Value> = log.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| event["event"] == "call.block_overpayment"
+            && event["detail"]["message_id"] == in_flight.id.to_hex()).collect();
+    assert_eq!(records.len(), 1, "one reconciliation record on replay");
+    assert_eq!(records[0]["detail"]["payment_hash"], hex::encode(in_flight.payment_proof.payment_hash));
+    assert_eq!(records[0]["detail"]["amount_msat"], 10_000);
+    assert_eq!(records[0]["detail"]["reconciliation_required"], true);
+
+    // An overdue socket cut retains expiry ownership while reconciling a settled renewal.
+    let overdue_id = format!("{:032x}", rand::random::<u128>());
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let live = calls::CallEntry {
+        deadline_ms: now + 30_000, paid_until_ms: Some(now + 20_000), ..paid.clone()
+    };
+    db.call_put(alice.node_id(), &overdue_id, &live).await.unwrap();
+    let settled = signal(404, 10_000, format!(r#"{{"call_id":"{overdue_id}","seq":1}}"#)).await;
+    let media = crate::call_media::CallMediaRouter::new(target.clone(),
+        Arc::new(crate::call_media::PaidCallAdmission::new(db.clone())));
+    let attachment = media.attach(alice.node_id(), &overdue_id, None).await.unwrap();
+    let overdue = calls::CallEntry {
+        deadline_ms: now - 1, paid_until_ms: Some(now - 10_001), ..live
+    };
+    db.call_put(alice.node_id(), &overdue_id, &overdue).await.unwrap();
+    drop(attachment);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if db.call_get(alice.node_id(), &overdue_id).await.unwrap().unwrap().paid_until_ms == Some(0) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("overdue socket cut closes resume before maintenance");
+    let closed = calls::CallEntry { paid_until_ms: Some(0), ..overdue };
+    assert_eq!(db.call_get(alice.node_id(), &overdue_id).await.unwrap(), Some(closed.clone()));
+    source.send(bob.node_id(), &settled).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(db.is_paid_envelope_rejected(&settled).await.unwrap());
+    assert!(db.has_nonce(&settled.nonce).await.unwrap());
+    assert!(!db.is_paid_envelope_accepted(&settled).await.unwrap());
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &overdue_id).await.unwrap(), Some(closed));
+    assert_eq!(media.attach(alice.node_id(), &overdue_id, None).await.err(), Some(konsensus_api::call_media::AttachRefusal::NotAdmitted));
+    source.send(bob.node_id(), &settled).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    let records: Vec<serde_json::Value> = log.lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| event["event"] == "call.block_overpayment"
+            && event["detail"]["message_id"] == settled.id.to_hex()).collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["detail"]["payment_hash"], hex::encode(settled.payment_proof.payment_hash));
+    assert_eq!(records[0]["detail"]["amount_msat"], 10_000);
+    assert_eq!(records[0]["detail"]["reconciliation_required"], true);
+
+    // Media cut after Unpaid expiry retains the reason and audits a settled renewal.
+    for socket_drop in [false, true] {
+        let unpaid_id = format!("{:032x}", rand::random::<u128>());
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let live = calls::CallEntry {
+            deadline_ms: now + 30_000, paid_until_ms: Some(now + 20_000), ..paid.clone()
+        };
+        db.call_put(alice.node_id(), &unpaid_id, &live).await.unwrap();
+        let settled = signal(404, 10_000, format!(r#"{{"call_id":"{unpaid_id}","seq":1}}"#)).await;
+        let media = crate::call_media::CallMediaRouter::new(target.clone(),
+            Arc::new(crate::call_media::PaidCallAdmission::new(db.clone())));
+        use konsensus_api::call_media::CallMediaPort as _;
+        let mut attachment = Some(media.attach(alice.node_id(), &unpaid_id, None).await.unwrap());
+        let expired = calls::CallEntry {
+            phase: Phase::Ended, end_reason: Some(HangupReason::Unpaid),
+            deadline_ms: now - 1 + calls::TOMBSTONE_MS, paid_until_ms: Some(now - 10_001), ..live
+        };
+        assert!(calls::receive_block(Some(expired.clone()), 1, now).is_ok());
+        db.call_put(alice.node_id(), &unpaid_id, &expired).await.unwrap();
+        if socket_drop { drop(attachment.take()); }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let ended = db.call_get(alice.node_id(), &unpaid_id).await.unwrap().unwrap();
+                if calls::receive_block(Some(ended), 1, chrono::Utc::now().timestamp_millis() as u64).is_err() { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("Unpaid media cut must close the resume window");
+        let ended = db.call_get(alice.node_id(), &unpaid_id).await.unwrap().unwrap();
+        assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
+        assert_eq!(ended.paid_until_ms, Some(0));
+        assert_eq!(ended.deadline_ms, expired.deadline_ms);
+        assert_eq!(ended.next_block_seq, expired.next_block_seq);
+        source.send(bob.node_id(), &settled).await.unwrap();
+        assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+        assert!(db.is_paid_envelope_rejected(&settled).await.unwrap());
+        assert!(db.has_nonce(&settled.nonce).await.unwrap());
+        assert!(!db.is_paid_envelope_accepted(&settled).await.unwrap());
+        assert!(db.get_message(&settled.id).await.unwrap().is_none());
+        assert!(ws_rx.try_recv().is_err());
+        assert_eq!(db.call_get(alice.node_id(), &unpaid_id).await.unwrap(), Some(ended.clone()));
+        source.send(bob.node_id(), &settled).await.unwrap();
+        assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+        assert_eq!(db.call_get(alice.node_id(), &unpaid_id).await.unwrap(), Some(ended));
+        let log = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+        let records: Vec<serde_json::Value> = log.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &serde_json::Value| event["event"] == "call.block_overpayment"
+                && event["detail"]["message_id"] == settled.id.to_hex()).collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["detail"]["reconciliation_required"], true);
+        assert_eq!(records[0]["detail"]["payment_hash"], hex::encode(settled.payment_proof.payment_hash));
+        drop(attachment);
+    }
+
+    // Outside the resume window the settled block is a durable, terminal
+    // overpayment. Its proof is single-use; the audit survives reopening.
+    let late_id = format!("{:032x}", rand::random::<u128>());
+    let late_initial = calls::CallEntry { deadline_ms: now - calls::CALL_BLOCK_RESUME_MS - 1, ..entry };
+    db.call_put(alice.node_id(), &late_id, &late_initial).await.unwrap();
+    let env = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{late_id}","seq":0}}"#)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(db.has_nonce(&env.nonce).await.unwrap());
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    assert!(db.get_message_plaintext(&env.id).await.unwrap().is_none());
+    assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(!db.store_payment_receipt(&env.payment_proof.payment_hash, alice.node_id(), &env.id).await.unwrap());
+    assert!(ws_rx.try_recv().is_err());
+    assert!(!konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &late_id, now).await);
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    let events: Vec<serde_json::Value> = audit_entries.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let overpayment = events.iter().find(|event| event["event"] == "call.block_overpayment"
+        && event["detail"]["message_id"] == env.id.to_hex()).expect("durable overpayment audit");
+    assert_eq!(overpayment["detail"]["call_id"], late_id);
+    assert_eq!(overpayment["detail"]["seq"], 0);
+    assert_eq!(overpayment["detail"]["amount_msat"], 10_000);
+    assert_eq!(overpayment["detail"]["payment_hash"], hex::encode(env.payment_proof.payment_hash));
+    assert_eq!(overpayment["detail"]["reconciliation_required"], true);
+    assert_eq!(events.iter().filter(|event| event["event"] == "call.block_overpayment"
+        && event["detail"]["message_id"] == env.id.to_hex()).count(), 1);
+
+    // An incorrect sequence is also an audited overpayment, never a grant.
+    let wrong_id = format!("{:032x}", rand::random::<u128>());
+    let wrong_entry = calls::CallEntry { deadline_ms: now + 30_000, ..late_initial.clone() };
+    db.call_put(alice.node_id(), &wrong_id, &wrong_entry).await.unwrap();
+    let wrong = signal(404, 10_000, format!(r#"{{"call_id":"{wrong_id}","seq":1}}"#)).await;
+    source.send(bob.node_id(), &wrong).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
+    assert!(db.is_paid_envelope_rejected(&wrong).await.unwrap());
+    assert_eq!(db.call_get(alice.node_id(), &wrong_id).await.unwrap(), Some(wrong_entry));
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|event| event["event"] == "call.block_overpayment" && event["detail"]["call_id"] == wrong_id
+            && event["detail"]["seq"] == 1 && event["detail"]["reconciliation_required"] == true));
+
+    // A paid block whose call-state write fails leaves explicit evidence for
+    // reconciliation, bound to its retained payment receipt, without media.
+    let failed_id = format!("{:032x}", rand::random::<u128>());
+    let failed_entry = calls::CallEntry { deadline_ms: now + 30_000, ..late_initial.clone() };
+    db.call_put(alice.node_id(), &failed_id, &failed_entry).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_call_commit BEFORE UPDATE ON call_state BEGIN SELECT RAISE(ABORT, 'injected call commit failure'); END")
+        .execute(db.pool()).await.unwrap();
+    let failed = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{failed_id}","seq":0}}"#)).await;
+    source.send(bob.node_id(), &failed).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    sqlx::query("DROP TRIGGER fail_call_commit").execute(db.pool()).await.unwrap();
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &failed_id).await.unwrap(), Some(failed_entry));
+    assert!(db.get_message(&failed.id).await.unwrap().is_none());
+    assert!(db.get_message_plaintext(&failed.id).await.unwrap().is_none());
+    let receipt: (String, i64, i32) = sqlx::query_as("SELECT message_id, amount_msat, accepted FROM payment_receipts WHERE payment_hash = ?")
+        .bind(hex::encode(failed.payment_proof.payment_hash)).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(receipt, (failed.id.to_hex(), 10_000, -1));
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    let reconciliation = audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["event"] == "call.block_commit_failed" && event["detail"]["message_id"] == failed.id.to_hex())
+        .expect("failed paid block needs a reconciliation record");
+    assert_eq!(reconciliation["detail"]["call_id"], failed_id);
+    assert_eq!(reconciliation["detail"]["seq"], 0);
+    assert_eq!(reconciliation["detail"]["amount_msat"], 10_000);
+    assert_eq!(reconciliation["detail"]["reconciliation_required"], true);
+
+    // A settled next renewal within the window resumes even after the
+    // callee already emitted its single-use Unpaid notice, and tells the caller.
+    let expired = calls::CallEntry { deadline_ms: now - 1, ..paid };
+    let ended = calls::CallEntry { unpaid_notice_used: true, ..expired.clone().at(now).unwrap() };
+    db.call_put(alice.node_id(), &block_id, &ended).await.unwrap();
+    let env = signal(404, 10_000, block(1)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    let grant = tokio::time::timeout(Duration::from_secs(5), source.recv_control()).await.unwrap().unwrap();
+    let granted_until = match grant {
+        ControlEvent::MessageAcked { message_id, paid_until_ms: Some(paid_until_ms), duplicate: false, .. } => {
+            assert_eq!(message_id, env.id);
+            assert!(paid_until_ms >= now + 60_000);
+            paid_until_ms
+        },
+        other => panic!("expected paid interval confirmation, got {other:?}"),
+    };
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let resumed = db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap();
+    assert_eq!(resumed.phase, Phase::Live);
+    assert_eq!(resumed.next_block_seq, 2);
+    assert_eq!(resumed.paid_until_ms, Some(granted_until));
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(matches!(source.recv_control().await.unwrap(), ControlEvent::MessageAcked { paid_until_ms: Some(paid_until_ms), duplicate: true, .. } if paid_until_ms == granted_until));
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(resumed));
+
+    // The peer can observe the callee's unpaid termination even after its
+    // own timer expired. Replaying that envelope never notifies the app twice.
+    let ended = calls::CallEntry { side: calls::Side::Caller, ..expired.at(now).unwrap() };
+    assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
+    db.call_put(alice.node_id(), &block_id, &ended).await.unwrap();
+    let env = signal(403, 1_000, format!(r#"{{"v":1,"call_id":"{block_id}","reason":"unpaid"}}"#)).await;
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    let notification = ws_rx.recv().await.unwrap();
+    assert_eq!(notification.plaintext.as_deref(), Some(format!(r#"{{"v":1,"call_id":"{block_id}","reason":"unpaid"}}"#).as_str()));
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap(), Some(calls::CallEntry { unpaid_notice_used: true, ..ended }));
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(true));
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &block_id).await.unwrap().unwrap().phase, Phase::Ended);
+    let second = signal(403, 1_000, format!(r#"{{"v":1,"call_id":"{block_id}","reason":"unpaid"}}"#)).await;
+    assert_ne!(second.id, env.id);
+    source.send(bob.node_id(), &second).await.unwrap();
+    assert!(outcome(source.clone()).await.is_err());
+    assert!(ws_rx.try_recv().is_err(), "a distinct paid notice must not reach the app twice");
+
+    // A committed block is never withdrawn by a failure of the generic
+    // (second) plaintext write: its interval is granted, so the sender gets
+    // the normal grant ACK and the caller reconciles to paid. The fault hits
+    // ONLY that write: the metadata write before commit finds the fresh row's
+    // cache empty, any later write would find it set and abort.
+    sqlx::query("CREATE TRIGGER fail_second_plaintext BEFORE UPDATE OF plaintext_enc ON messages WHEN OLD.plaintext_enc IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected second plaintext write failure'); END")
+        .execute(db.pool()).await.unwrap();
+    let grant_outcome = |source: Arc<NoiseTransport>, id: MessageId| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match source.recv_control().await.unwrap() {
+                    ControlEvent::MessageAcked { message_id, duplicate, paid_until_ms, .. } if message_id == id => break Ok((duplicate, paid_until_ms)),
+                    ControlEvent::MessageRejected { message_id, reason, .. } if message_id == id => break Err(reason),
+                    _ => {}
+                }
+            }
+        }).await.unwrap()
+    };
+    let caller_db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let caller_cipher = PlaintextCacheCipher::new(alice.aes_key());
+    let fault_id = format!("{:032x}", rand::random::<u128>());
+    let fault_block = |seq: u32| format!(r#"{{"v":1,"call_id":"{fault_id}","seq":{seq}}}"#);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now - 20_000;
+    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
+    let fault_entry = calls::commit(pending, "answer", answered_at).unwrap();
+    db.call_put(alice.node_id(), &fault_id, &fault_entry).await.unwrap();
+
+    // Delayed block zero. The caller advanced its sequence when it settled.
+    let caller_entry = calls::CallEntry { side: calls::Side::Caller, next_block_seq: 1, ..fault_entry.clone() };
+    caller_db.call_put(bob.node_id(), &fault_id, &caller_entry).await.unwrap();
+    assert!(!konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, now).await);
+    let env0 = signal(404, 10_000, fault_block(0)).await;
+    journal_dispatched_block(&caller_db, &env0, &fault_id, 0).await;
+    source.send(bob.node_id(), &env0).await.unwrap();
+    let granted0 = match grant_outcome(source.clone(), env0.id).await {
+        Ok((false, Some(until))) => until,
+        other => panic!("a committed block must be granted, not withdrawn: {other:?}"),
+    };
+    assert_eq!(granted0, answered_at + 60_000);
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let callee0 = db.call_get(alice.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((callee0.phase, callee0.next_block_seq, callee0.paid_until_ms), (Phase::Live, 1, Some(granted0)));
+    assert!(db.get_message(&env0.id).await.unwrap().is_some(), "not withdrawn");
+    assert!(db.is_paid_envelope_accepted(&env0).await.unwrap());
+    assert!(!db.is_paid_envelope_rejected(&env0).await.unwrap());
+    // Duplicate: the same durable grant is replayed, never extended.
+    source.send(bob.node_id(), &env0).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), env0.id).await, Ok((true, Some(granted0))));
+    assert_eq!(db.call_get(alice.node_id(), &fault_id).await.unwrap(), Some(callee0.clone()));
+    assert!(ws_rx.try_recv().is_err());
+    // The caller applies the ACK (and its duplicate) and is paid to the same boundary.
+    for _ in 0..2 {
+        konsensus_api::calls::receive_block_grant(&caller_db, &caller_cipher, alice.node_id(), bob.node_id(), &env0.id, granted0).await.unwrap();
+    }
+    let caller0 = caller_db.call_get(bob.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((caller0.phase, caller0.next_block_seq, caller0.paid_until_ms), (Phase::Live, 1, Some(granted0)));
+    let at = chrono::Utc::now().timestamp_millis() as u64;
+    assert!(konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &fault_id, at).await);
+    assert!(konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, at).await);
+
+    // Resumed renewal after both timers expired: only the grant ACK reopens
+    // the caller, so it must survive the same second-write failure.
+    let expired = calls::CallEntry { deadline_ms: now - 1, ..callee0 };
+    let callee_ended = calls::CallEntry { unpaid_notice_used: true, ..expired.clone().at(now).unwrap() };
+    db.call_put(alice.node_id(), &fault_id, &callee_ended).await.unwrap();
+    let caller_ended = calls::CallEntry { side: calls::Side::Caller, next_block_seq: 2, ..expired }.at(now).unwrap();
+    assert_eq!((caller_ended.phase, caller_ended.end_reason), (Phase::Ended, Some(HangupReason::Unpaid)));
+    caller_db.call_put(bob.node_id(), &fault_id, &caller_ended).await.unwrap();
+    let env1 = signal(404, 10_000, fault_block(1)).await;
+    journal_dispatched_block(&caller_db, &env1, &fault_id, 1).await;
+    source.send(bob.node_id(), &env1).await.unwrap();
+    let granted1 = match grant_outcome(source.clone(), env1.id).await {
+        Ok((false, Some(until))) => until,
+        other => panic!("a committed resume must be granted, not withdrawn: {other:?}"),
+    };
+    assert!(granted1 >= now + 60_000);
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    let callee1 = db.call_get(alice.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((callee1.phase, callee1.next_block_seq, callee1.paid_until_ms), (Phase::Live, 2, Some(granted1)));
+    assert!(db.get_message(&env1.id).await.unwrap().is_some(), "not withdrawn");
+    assert!(!db.is_paid_envelope_rejected(&env1).await.unwrap());
+    source.send(bob.node_id(), &env1).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), env1.id).await, Ok((true, Some(granted1))));
+    assert_eq!(db.call_get(alice.node_id(), &fault_id).await.unwrap(), Some(callee1));
+    assert!(ws_rx.try_recv().is_err());
+    assert!(!konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, now).await);
+    for _ in 0..2 {
+        konsensus_api::calls::receive_block_grant(&caller_db, &caller_cipher, alice.node_id(), bob.node_id(), &env1.id, granted1).await.unwrap();
+    }
+    let caller1 = caller_db.call_get(bob.node_id(), &fault_id).await.unwrap().unwrap();
+    assert_eq!((caller1.phase, caller1.next_block_seq, caller1.paid_until_ms), (Phase::Live, 2, Some(granted1)));
+    let at = chrono::Utc::now().timestamp_millis() as u64;
+    assert!(konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &fault_id, at).await);
+    assert!(konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &fault_id, at).await);
+
+    // One payment each, kept accepted; no withdrawal and no reconciliation event.
+    for env in [&env0, &env1] {
+        let receipts: Vec<(String, i32)> = sqlx::query_as("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
+            .bind(hex::encode(env.payment_proof.payment_hash)).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(receipts, vec![(env.id.to_hex(), 1)]);
+    }
+    let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
+    assert!(!audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .any(|event| (event["event"] == "message.rejected" || event["event"] == "call.block_commit_failed"
+            || event["event"] == "call.block_overpayment")
+            && (event["detail"]["message_id"] == env0.id.to_hex() || event["detail"]["message_id"] == env1.id.to_hex())));
+    sqlx::query("DROP TRIGGER fail_second_plaintext").execute(db.pool()).await.unwrap();
+
+    // Review P1 (#441): a failing hold release can no longer strand a committed
+    // grant behind a hold that recovery withdraws. The grant and the release
+    // are one transaction: under the fault the grant rolls back with the
+    // release (no interval, a refusal, a reconciliation record), and a block
+    // that did commit has no hold left, so neither restart recovery nor a
+    // retry under the same fault can withdraw it; a retry re-ACKs the same
+    // boundary and never grants twice.
+    let receipts = |env: &konsensus_core::UkmEnvelope| {
+        let (pool, hash) = (db.pool().clone(), hex::encode(env.payment_proof.payment_hash));
+        async move {
+            sqlx::query_as::<_, (String, i32)>("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
+                .bind(hash).fetch_all(&pool).await.unwrap()
+        }
+    };
+    let audited = |id: MessageId| -> Vec<String> {
+        std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap().lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["detail"]["message_id"] == id.to_hex())
+            .map(|event| event["event"].as_str().unwrap().to_owned()).collect()
+    };
+    let fail_release = "CREATE TRIGGER fail_release BEFORE DELETE ON call_admission_hold BEGIN SELECT RAISE(ABORT, 'injected hold release failure'); END";
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let answered_at = now - 20_000;
+    let answered = || calls::commit(calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()),
+        401, "answer", "hash", answered_at).unwrap(), "answer", answered_at).unwrap();
+
+    // The release fails: the grant rolls back with it and the block is refused.
+    let stranded_id = format!("{:032x}", rand::random::<u128>());
+    let stranded_entry = answered();
+    db.call_put(alice.node_id(), &stranded_id, &stranded_entry).await.unwrap();
+    sqlx::query(fail_release).execute(db.pool()).await.unwrap();
+    let stranded = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{stranded_id}","seq":0}}"#)).await;
+    source.send(bob.node_id(), &stranded).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), stranded.id).await, Err("storage error".into()));
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &stranded_id).await.unwrap(), Some(stranded_entry.clone()),
+        "a grant must never be committed without the release of its hold");
+    assert!(!konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &stranded_id, now).await);
+    assert!(db.call_admission_held(&stranded.id).await.unwrap(), "its withdrawal failed too: it stays hidden");
+    // Still held: a retry is refused, never acknowledged or granted.
+    source.send(bob.node_id(), &stranded).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), stranded.id).await, Err("call signal withdrawn".into()));
+    assert_eq!(db.call_get(alice.node_id(), &stranded_id).await.unwrap(), Some(stranded_entry.clone()));
+    sqlx::query("DROP TRIGGER fail_release").execute(db.pool()).await.unwrap();
+
+    // A block that commits is admitted in the same transaction: no hold remains.
+    let kept_id = format!("{:032x}", rand::random::<u128>());
+    db.call_put(alice.node_id(), &kept_id, &answered()).await.unwrap();
+    let caller_entry = calls::CallEntry { side: calls::Side::Caller, next_block_seq: 1, ..answered() };
+    caller_db.call_put(bob.node_id(), &kept_id, &caller_entry).await.unwrap();
+    let kept = signal(404, 10_000, format!(r#"{{"v":1,"call_id":"{kept_id}","seq":0}}"#)).await;
+    journal_dispatched_block(&caller_db, &kept, &kept_id, 0).await;
+    source.send(bob.node_id(), &kept).await.unwrap();
+    let kept_until = match grant_outcome(source.clone(), kept.id).await {
+        Ok((false, Some(until))) => until,
+        other => panic!("a committed block must be granted: {other:?}"),
+    };
+    assert_eq!(kept_until, answered_at + 60_000);
+    assert_eq!(ws_rx.recv().await.unwrap().envelope.kind, 404);
+    assert!(!db.call_admission_held(&kept.id).await.unwrap());
+    let callee_kept = db.call_get(alice.node_id(), &kept_id).await.unwrap().unwrap();
+    assert_eq!((callee_kept.phase, callee_kept.next_block_seq, callee_kept.paid_until_ms), (Phase::Live, 1, Some(kept_until)));
+
+    // That ACK is lost and Bob restarts: startup recovery withdraws only the
+    // stranded block. The release fault is back for everything that follows.
+    shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    assert_eq!(konsensus_api::calls::withdraw_held(db.as_ref(), true).await.unwrap(), 1);
+    sqlx::query(fail_release).execute(db.pool()).await.unwrap();
+    let (restarted, shutdown_rx) = watch::channel(false);
+    shutdown = restarted;
+    worker = start(shutdown_rx);
+
+    // The stranded block: withdrawn, never granted, refused on retry, and its
+    // settled payment is on record for reconciliation.
+    assert_eq!(receipts(&stranded).await, vec![(stranded.id.to_hex(), -1)]);
+    assert!(db.get_message(&stranded.id).await.unwrap().is_none());
+    source.send(bob.node_id(), &stranded).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), stranded.id).await, Err("call_block_overpayment".into()));
+    assert_eq!(db.call_get(alice.node_id(), &stranded_id).await.unwrap(), Some(stranded_entry));
+    assert!(audited(stranded.id).contains(&"call.block_commit_failed".to_owned()));
+
+    // The committed block survived recovery; the retry re-ACKs the same
+    // boundary without a second grant, and the caller's media gate opens.
+    assert!(db.get_message(&kept.id).await.unwrap().is_some(), "not withdrawn");
+    assert_eq!(receipts(&kept).await, vec![(kept.id.to_hex(), 1)]);
+    assert!(!konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &kept_id, now).await);
+    source.send(bob.node_id(), &kept).await.unwrap();
+    assert_eq!(grant_outcome(source.clone(), kept.id).await, Ok((true, Some(kept_until))));
+    assert!(ws_rx.try_recv().is_err());
+    assert_eq!(db.call_get(alice.node_id(), &kept_id).await.unwrap(), Some(callee_kept));
+    for _ in 0..2 {
+        konsensus_api::calls::receive_block_grant(&caller_db, &caller_cipher, alice.node_id(), bob.node_id(), &kept.id, kept_until).await.unwrap();
+    }
+    let caller_kept = caller_db.call_get(bob.node_id(), &kept_id).await.unwrap().unwrap();
+    assert_eq!((caller_kept.phase, caller_kept.next_block_seq, caller_kept.paid_until_ms), (Phase::Live, 1, Some(kept_until)));
+    let at = chrono::Utc::now().timestamp_millis() as u64;
+    assert!(konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &kept_id, at).await);
+    assert!(konsensus_api::calls::call_media_admitted(&caller_db, bob.node_id(), &kept_id, at).await);
+    assert_eq!(receipts(&kept).await, vec![(kept.id.to_hex(), 1)]);
+    assert!(audited(kept.id).is_empty(), "no withdrawal, overpayment or reconciliation for a kept grant");
+    sqlx::query("DROP TRIGGER fail_release").execute(db.pool()).await.unwrap();
     shutdown.send(true).unwrap();
     worker.await.unwrap();
     source.shutdown();
@@ -3333,6 +4018,7 @@ async fn porch_card_repricing_failure_returns_correlated_error() {
         &bob,
         &pricing,
         &PaymentGate::new(),
+        &konsensus_chain::MockChainProvider::new(),
         1001,
     )
     .await;
@@ -3346,4 +4032,2373 @@ async fn porch_card_repricing_failure_returns_correlated_error() {
         !response.body.contains("page_msat"),
         "never serve the stale price"
     );
+}
+
+// ── Honest receipts: refuse what cannot be read or kept ─────────────
+
+/// Bob's live receive loop (`run`) behind a PriceOpen Noise transport, an
+/// in-memory SQLite store and a mock wallet, with Alice connected and holding
+/// an E2EE session with Bob (`sessions_a` with Bob's manager).
+struct ReceiveLoop {
+    alice: Arc<NodeIdentity>,
+    bob: Arc<NodeIdentity>,
+    source: Arc<NoiseTransport>,
+    target: Arc<NoiseTransport>,
+    db: Arc<konsensus_storage::SqliteStorage>,
+    wallet: Arc<konsensus_lightning::MockLightningProvider>,
+    sessions_a: SessionManager,
+    sessions_b: Arc<SessionManager>,
+    audit_path: std::path::PathBuf,
+    ws_rx: broadcast::Receiver<Arc<WsMessage>>,
+    shutdown: watch::Sender<bool>,
+    worker: tokio::task::JoinHandle<()>,
+    _dir: tempfile::TempDir,
+}
+
+async fn receive_loop() -> ReceiveLoop {
+    receive_loop_ordered(false).await
+}
+
+async fn receive_loop_ordered(lower_sender: bool) -> ReceiveLoop {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let (alice, bob) = if lower_sender && alice.node_id().as_bytes() > bob.node_id().as_bytes() { (bob, alice) } else { (alice, bob) };
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    assert!(matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ));
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let sessions_b = Arc::new(SessionManager::new(bob.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, ws_rx) = broadcast::channel(8);
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing: Arc::new(MutableDeliveryPrice(std::sync::atomic::AtomicU64::new(
+            1_000,
+        ))),
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b.clone(),
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: audit,
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+    ReceiveLoop {
+        alice,
+        bob,
+        source,
+        target,
+        db,
+        wallet,
+        sessions_a,
+        sessions_b,
+        audit_path,
+        ws_rx,
+        shutdown,
+        worker,
+        _dir: dir,
+    }
+}
+
+impl ReceiveLoop {
+    /// A signed envelope from Alice to Bob paid with a fresh settled keysend.
+    async fn paid_envelope(&self, kind: u16, ciphertext: Vec<u8>) -> konsensus_core::UkmEnvelope {
+        let hash = self.wallet.inject_inbound_keysend(1_000, None).await;
+        let payment = self.wallet.get_payment_status(&hash).await.unwrap();
+        let proof = PaymentProof::new(
+            hex::decode(&hash).unwrap().try_into().unwrap(),
+            hex::decode(payment.preimage.unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            1_000,
+        );
+        let mut env = UkmEnvelopeBuilder::new(
+            kind,
+            *self.alice.node_id(),
+            Recipient::Node(*self.bob.node_id()),
+            ciphertext,
+            proof,
+        )
+        .build();
+        env.signature = Signature::from_ed25519(&self.alice.sign(&env.signable_bytes()));
+        env
+    }
+
+    /// Alice's ciphertext for Bob under their session.
+    async fn ciphertext(&self, plaintext: &[u8]) -> Vec<u8> {
+        konsensus_crypto::ratchet_message_to_bytes(
+            &self
+                .sessions_a
+                .encrypt(self.bob.node_id(), plaintext)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// Send `env` and return Bob's delivery verdict: an ACK or a reject.
+    async fn verdict(&self, env: &konsensus_core::UkmEnvelope) -> konsensus_message::ControlEvent {
+        use konsensus_message::ControlEvent;
+        self.source.send(self.bob.node_id(), env).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                // Prekey offers and the like are not delivery verdicts.
+                if let event @ (ControlEvent::MessageAcked { .. }
+                | ControlEvent::MessageRejected { .. }) =
+                    self.source.recv_control().await.unwrap()
+                {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("Bob answers every paid envelope")
+    }
+
+    /// The receipt state Bob keeps for `env`'s payment: 1 accepted, -1
+    /// application-rejected (the payment stays burned), None unknown.
+    async fn receipt_state(&self, env: &konsensus_core::UkmEnvelope) -> Option<i32> {
+        sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = ?")
+            .bind(env.id.to_hex())
+            .fetch_optional(self.db.pool())
+            .await
+            .unwrap()
+    }
+
+    fn audit_log(&self) -> String {
+        std::fs::read_to_string(&self.audit_path).unwrap_or_default()
+    }
+
+    async fn stop(self) {
+        self.shutdown.send(true).unwrap();
+        self.worker.await.unwrap();
+        self.source.shutdown();
+        self.target.shutdown();
+    }
+}
+
+fn file_payload(filename: &str, sent: &[u8], received: &[u8]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "filename": filename,
+        "mime_type": "application/octet-stream",
+        "size_bytes": received.len(),
+        "blake3_hash": blake3::hash(sent).to_hex().to_string(),
+        "data_b64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, received),
+    }))
+    .unwrap()
+}
+
+/// Alice's paid chat under a session Bob does not hold, stamped `offset_ms` from now.
+async fn unreadable_chat_stamped(net: &ReceiveLoop, offset_ms: i64) -> konsensus_core::UkmEnvelope {
+    let stale_a = SessionManager::new(net.alice.clone());
+    let stale_b = SessionManager::new(net.bob.clone());
+    establish_sessions(&stale_a, &stale_b, &net.alice, &net.bob).await;
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &stale_a.encrypt(net.bob.node_id(), b"unreadable").await.unwrap(),
+    );
+    let mut env = net.paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext).await;
+    env.timestamp = env.timestamp.saturating_add_signed(offset_ms);
+    env.signature = Signature::from_ed25519(&net.alice.sign(&env.signable_bytes()));
+    env
+}
+
+/// An envelope from before Bob's session, or stamped just after it (still in
+/// flight when Alice took the new session, or her clock ahead), was encrypted
+/// under an earlier one. It is refused like any unreadable one and Bob's working
+/// session stays: no duplicate of either envelope reaches the decrypt, and the
+/// next message reads fine.
+#[tokio::test]
+async fn envelope_from_before_the_session_settled_does_not_remove_it() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    for offset_ms in [-60_000, 0, 5_000] {
+        let env = unreadable_chat_stamped(&net, offset_ms).await;
+        let verdict = net.verdict(&env).await;
+        assert!(
+            matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+                if *message_id == env.id && reason.starts_with("session_handover:")),
+            "{offset_ms}: got {verdict:?}"
+        );
+        assert!(net.sessions_b.has_session(net.alice.node_id()).await, "{offset_ms}: the session stays");
+        assert!(!net.sessions_b.needs_renegotiation(net.alice.node_id()).await, "{offset_ms}: and no renegotiation");
+        // The same bytes again retain their durable recovery deferral.
+        let again = net.verdict(&env).await;
+        assert!(matches!(&again, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")), "got {again:?}");
+        assert!(net.sessions_b.has_session(net.alice.node_id()).await);
+    }
+
+    let ciphertext = net.ciphertext(b"still readable").await;
+    let next = net.paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext).await;
+    let verdict = net.verdict(&next).await;
+    assert!(matches!(verdict, ControlEvent::MessageAcked { message_id, .. } if message_id == next.id), "got {verdict:?}");
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(delivered.plaintext.as_deref(), Some("still readable"));
+    // A duplicate of a read envelope is acknowledged again without a decrypt; its
+    // message key is spent, so reaching the decrypt would fail.
+    let verdict = net.verdict(&next).await;
+    assert!(matches!(verdict, ControlEvent::MessageAcked { message_id, duplicate: true, .. } if message_id == next.id), "got {verdict:?}");
+    assert!(net.sessions_b.has_session(net.alice.node_id()).await, "a duplicate costs no session");
+    net.stop().await;
+}
+
+/// An envelope stamped well after the session was derived and still unreadable
+/// may mean the two sides disagree. Bob asks for a replacement and keeps the session
+/// in use until one is confirmed: Alice's next message still reads.
+#[tokio::test]
+async fn unreadable_envelope_after_the_session_settled_keeps_it_and_offers() {
+    use konsensus_message::ControlEvent;
+    let net = receive_loop().await;
+    let env = unreadable_chat_stamped(&net, 11_000).await;
+
+    net.source.send(net.bob.node_id(), &env).await.unwrap();
+    let mut offered = false;
+    let rejected = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match net.source.recv_control().await.unwrap() {
+                ControlEvent::PrekeyOffer { .. } => offered = true,
+                ControlEvent::MessageRejected { .. } => break true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(rejected && offered, "refused, after offering");
+    assert!(net.sessions_b.has_session(net.alice.node_id()).await, "the session stays");
+    assert!(net.sessions_b.needs_renegotiation(net.alice.node_id()).await);
+
+    let ciphertext = net.ciphertext(b"still readable").await;
+    let next = net.paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext).await;
+    let verdict = net.verdict(&next).await;
+    assert!(matches!(verdict, ControlEvent::MessageAcked { message_id, .. } if message_id == next.id), "got {verdict:?}");
+    net.stop().await;
+}
+
+/// A session restored from storage has no known age. An unreadable envelope still
+/// does not cost it, and the peer's next message reads under it.
+#[tokio::test]
+async fn restored_session_survives_an_unreadable_envelope() {
+    #[derive(Default)]
+    struct Memory(std::sync::Mutex<std::collections::HashMap<NodeId, Vec<u8>>>);
+    #[async_trait::async_trait]
+    impl konsensus_crypto::SessionStore for Memory {
+        async fn save_session(&self, peer: &NodeId, state: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().insert(*peer, state.to_vec());
+            Ok(())
+        }
+        async fn load_session(&self, peer: &NodeId) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.lock().unwrap().get(peer).cloned())
+        }
+        async fn delete_session(&self, peer: &NodeId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            self.0.lock().unwrap().remove(peer);
+            Ok(())
+        }
+        async fn list_sessions(&self) -> Result<Vec<NodeId>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.0.lock().unwrap().keys().copied().collect())
+        }
+    }
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let store = Arc::new(Memory::default());
+    let alice_mgr = SessionManager::new(Arc::clone(&alice));
+    let live = SessionManager::with_store(Arc::clone(&bob), store.clone());
+    establish_sessions(&alice_mgr, &live, &alice, &bob).await;
+    let bob_mgr = SessionManager::with_store(Arc::clone(&bob), store.clone());
+    assert_eq!(bob_mgr.restore_sessions().await, 1);
+
+    let foreign_a = SessionManager::new(Arc::clone(&alice));
+    let foreign_b = SessionManager::new(Arc::clone(&bob));
+    establish_sessions(&foreign_a, &foreign_b, &alice, &bob).await;
+    let unreadable = foreign_a.encrypt(bob.node_id(), b"unreadable").await.unwrap();
+    let mut envelope = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_CHAT,
+        konsensus_crypto::ratchet_message_to_bytes(&unreadable),
+    );
+    envelope.timestamp = 1;
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
+    let result = decrypt_and_process(
+        &envelope,
+        alice.node_id(),
+        &bob_mgr,
+        &PlaintextCacheCipher::new(bob.aes_key()),
+        &storage,
+        &None,
+        &Default::default(),
+        &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
+        &(Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            Default::default(),
+        )) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
+        &bob,
+        &make_transport(&bob),
+        &make_audit_log(),
+        &PaymentGate::new(),
+        0.0,
+        true,
+        None,
+    )
+    .await;
+    assert!(matches!(result, Err(ReceiptRefusal::Undecryptable(_))));
+    assert!(bob_mgr.has_session(alice.node_id()).await, "the restored session stays");
+    assert!(store.0.lock().unwrap().contains_key(alice.node_id()), "and stays on disk");
+    let readable = alice_mgr.encrypt(bob.node_id(), b"still readable").await.unwrap();
+    assert_eq!(bob_mgr.decrypt(alice.node_id(), &readable).await.unwrap(), b"still readable");
+}
+
+/// A restart's sequence for a block already in flight. The block passes its preview
+/// under the old session, a re-key completes, and the real decrypt then fails. The
+/// grant stands in the caller of this function; here the new session must survive.
+#[tokio::test]
+async fn block_stale_at_its_real_decrypt_does_not_cost_the_new_session() {
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let alice_mgr = SessionManager::new(Arc::clone(&alice));
+    let bob_mgr = SessionManager::new(Arc::clone(&bob));
+    // Bob initiates and Alice accepts, the shape where Bob could not recover alone.
+    establish_sessions(&bob_mgr, &alice_mgr, &bob, &alice).await;
+    assert!(bob_mgr.confirm_session(alice.node_id()).await);
+    let first = bob_mgr.encrypt(alice.node_id(), b"ratchet-init").await.unwrap();
+    alice_mgr.decrypt(bob.node_id(), &first).await.unwrap();
+
+    let block = alice_mgr.encrypt(bob.node_id(), b"{}").await.unwrap();
+    let envelope = make_envelope(
+        alice.as_ref(),
+        *bob.node_id(),
+        konsensus_core::kind::KIND_CALL_BLOCK,
+        konsensus_crypto::ratchet_message_to_bytes(&block),
+    );
+    assert_eq!(bob_mgr.preview_decrypt(alice.node_id(), &block).await.unwrap(), b"{}");
+
+    // The session before is gone, so nothing Bob holds can read the block.
+    assert!(bob_mgr.remove_session(alice.node_id()).await);
+    let init = bob_mgr.reinitiate_session(alice.node_id(), &alice_mgr.prekey_bundle().await).await.unwrap();
+    alice_mgr.reaccept_session(bob.node_id(), &init).await.unwrap();
+    assert!(bob_mgr.confirm_session(alice.node_id()).await);
+    let again = bob_mgr.encrypt(alice.node_id(), b"ratchet-init").await.unwrap();
+    alice_mgr.decrypt(bob.node_id(), &again).await.unwrap();
+
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::new());
+    for preview in [None, Some(b"{}".to_vec())] {
+    let verified = preview.is_some();
+    let result = decrypt_and_process(
+        &envelope,
+        alice.node_id(),
+        &bob_mgr,
+        &PlaintextCacheCipher::new(bob.aes_key()),
+        &storage,
+        &None,
+        &Default::default(),
+        &(Arc::new(konsensus_chain::MockChainProvider::new()) as Arc<dyn ChainProvider>),
+        &(Arc::new(konsensus_pricing::StaticPricingEngine::new(
+            Default::default(),
+        )) as Arc<dyn konsensus_core::traits::pricing::PricingEngine>),
+        &bob,
+        &make_transport(&bob),
+        &make_audit_log(),
+        &PaymentGate::new(),
+        0.0,
+        false,
+        preview,
+    )
+    .await;
+    if verified { assert_eq!(result.unwrap(), Some("{}".into())); }
+    else { assert!(matches!(result, Err(ReceiptRefusal::Undecryptable(_)))); }
+    }
+    assert!(!bob_mgr.needs_renegotiation(alice.node_id()).await, "stale, so no renegotiation");
+    let next = alice_mgr.encrypt(bob.node_id(), b"next block").await.unwrap();
+    assert_eq!(bob_mgr.decrypt(alice.node_id(), &next).await.unwrap(), b"next block");
+}
+
+/// A paid block Bob cannot read is refused before it consumes its proof. Unreadable
+/// under the session he holds, he also asks for a replacement; past the skip limit,
+/// which a later delivery can cure, he does not. Neither touches the session.
+#[tokio::test]
+async fn unreadable_block_asks_to_renegotiate_and_keeps_the_session() {
+    use konsensus_message::ControlEvent;
+    let net = receive_loop().await;
+    let refused = |verdict: &ControlEvent, id| {
+        matches!(verdict, ControlEvent::MessageRejected { message_id, .. } if *message_id == id)
+    };
+
+    // Past the ratchet's skip limit on the session Bob does hold.
+    for _ in 0..1_001 {
+        net.ciphertext(b"not delivered").await;
+    }
+    let ahead = net.ciphertext(b"{}").await;
+    let env = net.paid_envelope(konsensus_core::kind::KIND_CALL_BLOCK, ahead).await;
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")),
+        "the retryable reason: {verdict:?}"
+    );
+    assert!(!net.sessions_b.needs_renegotiation(net.alice.node_id()).await);
+
+    let stale_a = SessionManager::new(net.alice.clone());
+    let stale_b = SessionManager::new(net.bob.clone());
+    establish_sessions(&stale_a, &stale_b, &net.alice, &net.bob).await;
+    let stale = konsensus_crypto::ratchet_message_to_bytes(
+        &stale_a.encrypt(net.bob.node_id(), b"{}").await.unwrap(),
+    );
+    let mut env = net.paid_envelope(konsensus_core::kind::KIND_CALL_BLOCK, stale).await;
+    env.timestamp += 11_000;
+    env.signature = Signature::from_ed25519(&net.alice.sign(&env.signable_bytes()));
+    let verdict = net.verdict(&env).await;
+    assert!(refused(&verdict, env.id), "got {verdict:?}");
+    assert!(net.sessions_b.needs_renegotiation(net.alice.node_id()).await);
+    assert!(net.sessions_b.has_session(net.alice.node_id()).await, "preview refusals touch no session");
+    net.stop().await;
+}
+
+/// Readability refusals leave the proof available for a recovery retry. The app
+/// sees no message until the ciphertext can be read.
+#[tokio::test]
+async fn undecryptable_paid_chat_is_refused_not_acknowledged() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+
+    // Alice's ciphertext comes from a session Bob never had.
+    let stale_a = SessionManager::new(net.alice.clone());
+    let stale_b = SessionManager::new(net.bob.clone());
+    establish_sessions(&stale_a, &stale_b, &net.alice, &net.bob).await;
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(
+        &stale_a
+            .encrypt(net.bob.node_id(), b"unreadable")
+            .await
+            .unwrap(),
+    );
+    let mut env = net
+        .paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext)
+        .await;
+    // Stamped past Bob's session settling, so the failure counts against it.
+    env.timestamp += 11_000;
+    env.signature = Signature::from_ed25519(&net.alice.sign(&env.signable_bytes()));
+
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason.starts_with("session_handover:")),
+        "expected a typed reject, got {verdict:?}"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "withdrawn from history"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        net.receipt_state(&env).await,
+        None,
+        "unreadable ciphertext must not consume the proof"
+    );
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+    assert!(
+        net.audit_log().contains("message.rejected"),
+        "{}",
+        net.audit_log()
+    );
+    assert!(
+        net.sessions_b.has_session(net.alice.node_id()).await,
+        "one unreadable envelope does not cost the session"
+    );
+
+    // A repeated attempt keeps the same retryable classification.
+    let again = net.verdict(&env).await;
+    assert!(
+        matches!(&again, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")),
+        "a resend remains retryable: {again:?}"
+    );
+    assert!(net.ws_rx.try_recv().is_err());
+    assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    net.stop().await;
+}
+
+/// A received file that fails its integrity check is reported failed to the
+/// app (never listed, never stored, audited) and to the sender (a typed
+/// reject, never a delivered ACK); the session stays usable for the next file.
+#[tokio::test]
+async fn corrupted_file_is_failed_to_the_app_and_the_sender() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+
+    let damaged = net
+        .ciphertext(&file_payload(
+            "damaged.bin",
+            b"the bytes that were sent",
+            b"the bytes that arrived",
+        ))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, damaged)
+        .await;
+
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "file_corrupted: the file data does not match its hash"),
+        "expected a typed reject, got {verdict:?}"
+    );
+    assert!(
+        net.db.list_files(10).await.unwrap().is_empty(),
+        "never stored"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "never listed as received"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        net.receipt_state(&env).await,
+        Some(-1),
+        "the integrity refusal retains its receipt"
+    );
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+    let audit = net.audit_log();
+    assert!(
+        audit.contains("file.integrity_failed") && audit.contains("message.rejected"),
+        "{audit}"
+    );
+
+    // An intact file after it is received as usual: the session was not harmed.
+    let intact = net
+        .ciphertext(&file_payload("intact.bin", b"intact", b"intact"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, intact)
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(net.db.list_files(10).await.unwrap().len(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(1));
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("[file: intact.bin]"));
+    net.stop().await;
+}
+
+/// The admission-proof carve-out is the compose handler's exact shape: a
+/// `KIND_CHAT` carrying the marker is acknowledged as received; the marker
+/// under any other kind is an ordinary paid envelope and is refused like one,
+/// never acknowledged, never published.
+#[tokio::test]
+async fn admission_proof_is_acknowledged_but_the_marker_under_another_kind_is_refused() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+
+    let proof = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            ADMISSION_ENVELOPE_MARKER.to_vec(),
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&proof).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert_eq!(net.receipt_state(&proof).await, Some(1));
+    let published = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.envelope.id, proof.id);
+    assert!(
+        published.plaintext.is_none(),
+        "a proof carries nothing to read"
+    );
+
+    let file = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_FILE_REF,
+            ADMISSION_ENVELOPE_MARKER.to_vec(),
+        )
+        .await;
+    let verdict = net.verdict(&file).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == file.id && reason.starts_with("session_handover:")),
+        "the marker under another kind is no proof: {verdict:?}"
+    );
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(
+        net.db.get_message(&file.id).await.unwrap().is_none(),
+        "withdrawn"
+    );
+    assert_eq!(net.receipt_state(&file).await, None);
+    assert!(net.ws_rx.try_recv().is_err(), "never published");
+    net.stop().await;
+}
+
+/// A chat whose plaintext cannot be stored is refused, not acknowledged: the
+/// envelope is withdrawn, the receipt stays burned as application-rejected,
+/// the app sees nothing, and the session is unharmed for the next chat.
+#[tokio::test]
+async fn plaintext_store_failure_is_refused_not_acknowledged() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_plaintext BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            net.ciphertext(b"cannot be kept").await,
+        )
+        .await;
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "not_persisted: the plaintext could not be stored"),
+        "{verdict:?}"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "withdrawn"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+    // The replay keys stay consumed: the same bytes are refused, not acknowledged.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    sqlx::query("DROP TRIGGER fail_plaintext")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            net.ciphertext(b"kept").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("kept"));
+    net.stop().await;
+}
+
+/// A file that cannot be stored is refused, not acknowledged, and never
+/// surfaced as received.
+#[tokio::test]
+async fn file_store_failure_is_refused_not_acknowledged() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_file BEFORE INSERT ON files BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let intact = net
+        .ciphertext(&file_payload("intact.bin", b"intact", b"intact"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, intact)
+        .await;
+    let verdict = net.verdict(&env).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+            if *message_id == env.id && reason == "not_persisted: the file could not be stored"),
+        "{verdict:?}"
+    );
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "withdrawn"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+    net.stop().await;
+}
+
+/// When even the withdrawal fails, the refused chat is still never
+/// acknowledged or published: its admission hold keeps it hidden, a resend is
+/// refused as withdrawn, and the sweep withdraws it later.
+#[tokio::test]
+async fn withdrawal_failure_still_refuses_and_keeps_the_chat_hidden() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_plaintext BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            net.ciphertext(b"cannot be kept").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "not_persisted: the plaintext could not be stored"
+    ));
+    // The withdrawal rolled back whole: the row is still there, still held,
+    // and the hold hides it from history.
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+        .bind(env.id.to_hex())
+        .fetch_one(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the delete was rolled back");
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "hidden from history"
+    );
+    assert_eq!(net.receipt_state(&env).await, Some(1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+
+    // A resend is refused as withdrawn, never acknowledged as a duplicate.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    // The sweep finishes the withdrawal once the store recovers.
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    net.stop().await;
+}
+
+/// A file is held until it is stored. When the file store and then the
+/// withdrawal both fail, the hold keeps the envelope out of history and off
+/// the duplicate-ACK path: a resend is refused as withdrawn, nothing is
+/// published, and the sweep finishes the withdrawal.
+#[tokio::test]
+async fn file_withdrawal_failure_keeps_the_file_hidden_and_refuses_a_resend() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_file BEFORE INSERT ON files BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let intact = net
+        .ciphertext(&file_payload("intact.bin", b"intact", b"intact"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, intact)
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "not_persisted: the file could not be stored"
+    ));
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+        .bind(env.id.to_hex())
+        .fetch_one(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the delete was rolled back");
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "hidden from history"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+
+    // A resend is refused as withdrawn, never acknowledged as a duplicate.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+    net.stop().await;
+}
+
+/// Every paid envelope is held until it is kept, whatever its kind. A
+/// long-form message whose plaintext store and withdrawal both fail stays
+/// hidden and unacknowledged; a resend is refused as withdrawn, the sweep
+/// finishes the withdrawal, and a sound message of the same kind is received
+/// and released as usual.
+#[tokio::test]
+async fn any_kind_withdrawal_failure_keeps_the_message_hidden_and_refuses_a_resend() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_plaintext BEFORE UPDATE OF plaintext_enc ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_LONGFORM,
+            net.ciphertext(b"a long one").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "not_persisted: the plaintext could not be stored"
+    ));
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+        .bind(env.id.to_hex())
+        .fetch_one(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the delete was rolled back");
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(
+        net.db.get_message(&env.id).await.unwrap().is_none(),
+        "hidden from history"
+    );
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(net.receipt_state(&env).await, Some(1));
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it");
+
+    // A resend is refused as withdrawn, never acknowledged as a duplicate.
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    // The sweep finishes the withdrawal once the store recovers; the resend
+    // is still refused, now from the rejected receipt.
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER fail_plaintext")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+
+    // A sound message of the same kind is received, released and published.
+    let env = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_LONGFORM,
+            net.ciphertext(b"another long one").await,
+        )
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: false,
+            ..
+        }
+    ));
+    assert!(
+        !net.db.call_admission_held(&env.id).await.unwrap(),
+        "released once kept"
+    );
+    assert_eq!(
+        net.db.get_message(&env.id).await.unwrap().map(|m| m.id),
+        Some(env.id)
+    );
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("another long one"));
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageAcked {
+            duplicate: true,
+            ..
+        }
+    ));
+    net.stop().await;
+}
+
+/// A corrupted file whose withdrawal also fails stays hidden and
+/// unacknowledged; a resend is refused as withdrawn.
+#[tokio::test]
+async fn corrupted_file_with_failed_withdrawal_stays_hidden() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop().await;
+    sqlx::query("CREATE TRIGGER fail_withdraw BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+
+    let damaged = net
+        .ciphertext(&file_payload("damaged.bin", b"sent", b"arrived"))
+        .await;
+    let env = net
+        .paid_envelope(konsensus_core::kind::KIND_FILE_REF, damaged)
+        .await;
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "file_corrupted: the file data does not match its hash"
+    ));
+    assert!(
+        net.db.call_admission_held(&env.id).await.unwrap(),
+        "the hold keeps it hidden"
+    );
+    assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    assert!(net
+        .db
+        .get_message_plaintext(&env.id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(net.db.list_files(10).await.unwrap().is_empty());
+    assert!(net.ws_rx.try_recv().is_err(), "the app never saw it arrive");
+    assert!(matches!(
+        net.verdict(&env).await,
+        ControlEvent::MessageRejected { reason, .. } if reason == "message withdrawn"
+    ));
+    assert!(net.ws_rx.try_recv().is_err());
+    sqlx::query("DROP TRIGGER fail_withdraw")
+        .execute(net.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(net.db.call_admission_withdraw(u64::MAX).await.unwrap(), 1);
+    assert_eq!(net.receipt_state(&env).await, Some(-1));
+    net.stop().await;
+}
+
+/// A hold inherited from an earlier attempt (its paid acceptance rolled back
+/// and its hold cleanup failed) is released before the successful retry is
+/// published and acknowledged, so the acknowledged message is never hidden
+/// and the sweep leaves it alone. Checked for a chat and for a long-form
+/// message, the two release paths.
+#[tokio::test]
+async fn inherited_hold_is_released_before_a_retry_is_acknowledged() {
+    use konsensus_message::ControlEvent;
+    for kind in [
+        konsensus_core::kind::KIND_CHAT,
+        konsensus_core::kind::KIND_LONGFORM,
+    ] {
+        let mut net = receive_loop().await;
+        sqlx::query("CREATE TRIGGER fail_message BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER fail_release BEFORE DELETE ON call_admission_hold BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+
+        let env = net
+            .paid_envelope(kind, net.ciphertext(b"retried").await)
+            .await;
+        assert!(matches!(
+            net.verdict(&env).await,
+            ControlEvent::MessageRejected { reason, .. } if reason == "storage error"
+        ));
+        assert!(
+            net.db.call_admission_held(&env.id).await.unwrap(),
+            "the hold outlived the failed attempt"
+        );
+        assert!(net.ws_rx.try_recv().is_err());
+
+        // The store recovers; the sender retries the same bytes.
+        sqlx::query("DROP TRIGGER fail_message")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP TRIGGER fail_release")
+            .execute(net.db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            net.verdict(&env).await,
+            ControlEvent::MessageAcked {
+                duplicate: false,
+                ..
+            }
+        ));
+        assert!(
+            !net.db.call_admission_held(&env.id).await.unwrap(),
+            "kind {kind}: released before the ACK"
+        );
+        let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shown.plaintext.as_deref(), Some("retried"));
+        assert_eq!(
+            net.db.get_message(&env.id).await.unwrap().map(|m| m.id),
+            Some(env.id),
+            "visible in history"
+        );
+        assert_eq!(
+            net.db.call_admission_withdraw(u64::MAX).await.unwrap(),
+            0,
+            "nothing for the sweep"
+        );
+        assert_eq!(net.receipt_state(&env).await, Some(1));
+        assert!(
+            net.db.get_message(&env.id).await.unwrap().is_some(),
+            "kept after the sweep"
+        );
+        assert!(matches!(
+            net.verdict(&env).await,
+            ControlEvent::MessageAcked {
+                duplicate: true,
+                ..
+            }
+        ));
+        net.stop().await;
+    }
+}
+
+/// A web reply whose send chain could not be saved does not leave. It costs no
+/// session, and the next reply reads at the requester with no gap.
+#[tokio::test]
+async fn reply_is_not_sent_when_its_save_fails() {
+    use crate::flaky_session_store::FlakySessionStore;
+    use konsensus_core::traits::transport::MessageTransport;
+    let net = receive_loop().await;
+    let store = Arc::new(FlakySessionStore::default());
+    let replier = SessionManager::with_store(net.bob.clone(), store.clone());
+    let requester = SessionManager::new(net.alice.clone());
+    establish_sessions(&replier, &requester, &net.bob, &net.alice).await;
+    let request = net.paid_envelope(konsensus_core::kind::KIND_PAGE_REQUEST, vec![1]).await;
+    let reply = |text: &'static str| {
+        let (replier, target, bob, alice, request) = (&replier, &net.target, &net.bob, &net.alice, &request);
+        async move {
+            send_encrypted_response(alice.node_id(), request, &text, konsensus_core::kind::KIND_PAGE_RESPONSE, bob, replier, target).await;
+        }
+    };
+
+    store.fail(true);
+    reply("withheld").await;
+    let nothing = tokio::time::timeout(std::time::Duration::from_millis(500), net.source.recv()).await;
+    assert!(nothing.is_err(), "nothing left for a failed save");
+    assert!(replier.has_session(net.alice.node_id()).await);
+
+    store.fail(false);
+    reply("sent").await;
+    let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), net.source.recv()).await.unwrap().unwrap();
+    let message = konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext).unwrap();
+    assert_eq!(message.header.message_number, 0, "the withheld reply left no gap");
+    assert_eq!(requester.decrypt(net.bob.node_id(), &message).await.unwrap(), b"\"sent\"");
+    net.stop().await;
+}
+
+/// A chain source whose tip cannot be read.
+struct TipDown;
+
+#[async_trait::async_trait]
+impl ChainProvider for TipDown {
+    fn trust_level(&self) -> konsensus_core::traits::chain::TrustLevel {
+        konsensus_core::traits::chain::TrustLevel::FullValidation
+    }
+    async fn get_block_height(&self) -> Result<u64, konsensus_core::traits::chain::ChainError> {
+        Err(konsensus_core::traits::chain::ChainError::Connection("down".into()))
+    }
+    async fn get_block_header(
+        &self,
+        _height: u64,
+    ) -> Result<konsensus_core::traits::chain::BlockHeader, konsensus_core::traits::chain::ChainError>
+    {
+        Err(konsensus_core::traits::chain::ChainError::Connection("down".into()))
+    }
+    async fn estimate_fee(
+        &self,
+        _target_blocks: u32,
+    ) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError>
+    {
+        Err(konsensus_core::traits::chain::ChainError::Connection("down".into()))
+    }
+    async fn is_tx_confirmed(
+        &self,
+        _txid: &str,
+        _min_confirmations: u32,
+    ) -> Result<bool, konsensus_core::traits::chain::ChainError> {
+        Err(konsensus_core::traits::chain::ChainError::Connection("down".into()))
+    }
+    async fn is_synced(&self) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn web_manifest_is_not_sent_without_a_chain_tip() {
+    let net = receive_loop().await;
+    let site = tempfile::tempdir().unwrap();
+    std::fs::write(site.path().join("index.md"), "# Home\n").unwrap();
+    let content = Some(Arc::new(
+        ContentServer::new(crate::content_server::ContentServerConfig {
+            content_dir: site.path().to_path_buf(),
+            max_file_size: 4 * 1024 * 1024,
+            cache_seconds: 3600,
+            site_name: "Test Node".to_string(),
+        })
+        .unwrap(),
+    ));
+    let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
+        konsensus_pricing::StaticPricingEngine::new(Default::default()),
+    );
+    let request = net
+        .paid_envelope(konsensus_core::kind::KIND_WEB_MANIFEST, vec![1])
+        .await;
+    // A session the replier can send on (it initiated it).
+    let replier = SessionManager::new(net.bob.clone());
+    let requester = SessionManager::new(net.alice.clone());
+    establish_sessions(&replier, &requester, &net.bob, &net.alice).await;
+
+    let down: Arc<dyn ChainProvider> = Arc::new(TipDown);
+    let served = process_web_manifest(
+        net.alice.node_id(), &request, &content, &down, &pricing, &net.bob,
+        &replier, &net.target, &PaymentGate::new(), 0.0,
+    )
+    .await;
+    assert_eq!(served, None);
+    let nothing = tokio::time::timeout(std::time::Duration::from_millis(500), net.source.recv()).await;
+    assert!(nothing.is_err(), "no manifest anchored to a made-up height");
+
+    let up: Arc<dyn ChainProvider> = Arc::new(konsensus_chain::MockChainProvider::new());
+    let served = process_web_manifest(
+        net.alice.node_id(), &request, &content, &up, &pricing, &net.bob,
+        &replier, &net.target, &PaymentGate::new(), 0.0,
+    )
+    .await;
+    assert_eq!(served, Some("[web manifest request]".to_string()));
+    let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), net.source.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let message = konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext).unwrap();
+    let plaintext = requester.decrypt(net.bob.node_id(), &message).await.unwrap();
+    let manifest: konsensus_core::payloads::content::WebManifest =
+        serde_json::from_slice(&plaintext).unwrap();
+    assert_eq!(manifest.block_height, 886_000);
+    assert_eq!(manifest.pages.len(), 1);
+    net.stop().await;
+}
+
+/// A paid envelope may arrive before its SessionInit. Its proof remains available
+/// and a retry is delivered once the responder receives the handover.
+#[tokio::test]
+async fn recovery_handover_paid_chat_retries_after_session_init() {
+    use konsensus_message::ControlEvent;
+    let net = receive_loop().await;
+    let fresh = SessionManager::new(net.alice.clone());
+    let init = fresh.initiate_session(net.bob.node_id(), &net.sessions_b.prekey_bundle().await).await.unwrap();
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&fresh.encrypt(net.bob.node_id(), b"handover retry").await.unwrap());
+    let env = net.paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext).await;
+    for _ in 0..2 {
+        let verdict = net.verdict(&env).await;
+        assert!(matches!(&verdict, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")), "{verdict:?}");
+        assert_eq!(net.receipt_state(&env).await, None);
+        assert!(net.db.get_message(&env.id).await.unwrap().is_none());
+    }
+    net.sessions_b.reaccept_session(net.alice.node_id(), &init).await.unwrap();
+    let again = net.verdict(&env).await;
+    assert!(matches!(&again, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")), "{again:?}");
+    let mut replacement = env.clone();
+    replacement.ciphertext = konsensus_crypto::ratchet_message_to_bytes(&fresh.encrypt(net.bob.node_id(), b"handover retry").await.unwrap());
+    replacement.id = konsensus_core::MessageId::compute(&replacement.ciphertext, &replacement.nonce);
+    replacement.signature = Signature::from_ed25519(&net.alice.sign(&replacement.signable_bytes()));
+    let verdict = net.verdict(&replacement).await;
+    assert!(matches!(verdict, ControlEvent::MessageAcked { .. }), "{verdict:?}");
+    assert_eq!(net.receipt_state(&replacement).await, Some(1));
+    assert!(net.db.get_message_plaintext(&replacement.id).await.unwrap().is_some());
+    net.stop().await;
+}
+
+/// Omit the optional one-time prekey only so the test can reconstruct this
+/// exact receiver session later. Real X3DH, encryption and the receive loop run.
+async fn recovery_handover_session(net: &ReceiveLoop) -> konsensus_crypto::SerializableSessionInit {
+    let mut bundle = net.sessions_b.prekey_bundle().await;
+    bundle.one_time_prekey = None;
+    bundle.one_time_prekey_id = None;
+    let init = if net.sessions_a.has_session(net.bob.node_id()).await {
+        net.sessions_a
+            .reinitiate_session(net.bob.node_id(), &bundle)
+            .await
+            .unwrap()
+    } else {
+        net.sessions_a
+            .initiate_session(net.bob.node_id(), &bundle)
+            .await
+            .unwrap()
+    };
+    net.sessions_b
+        .reaccept_session(net.alice.node_id(), &init)
+        .await
+        .unwrap();
+    assert!(net.sessions_a.confirm_session(net.bob.node_id()).await);
+    init
+}
+
+fn recovery_handover_replacement(
+    net: &ReceiveLoop,
+    old: &konsensus_core::UkmEnvelope,
+    ciphertext: Vec<u8>,
+) -> konsensus_core::UkmEnvelope {
+    let mut replacement = old.clone();
+    replacement.ciphertext = ciphertext;
+    replacement.id = MessageId::compute(&replacement.ciphertext, &replacement.nonce);
+    replacement.timestamp = chrono::Utc::now().timestamp_millis() as u64;
+    replacement.signature = Signature::from_ed25519(&net.alice.sign(&replacement.signable_bytes()));
+    assert_ne!(replacement.id, old.id);
+    assert_eq!(replacement.payment_proof, old.payment_proof);
+    assert_eq!(replacement.nonce, old.nonce);
+    replacement
+}
+
+async fn recovery_handover_expect_deferred(net: &ReceiveLoop, old: &konsensus_core::UkmEnvelope) {
+    use konsensus_message::ControlEvent;
+    let verdict = net.verdict(old).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageRejected { message_id, reason, .. }
+        if *message_id == old.id && reason.starts_with("session_handover:")),
+        "{verdict:?}"
+    );
+    assert_eq!(
+        net.receipt_state(old).await,
+        None,
+        "a deferral consumes no proof"
+    );
+    assert!(
+        !net.db.has_nonce(&old.nonce).await.unwrap(),
+        "a deferral consumes no nonce"
+    );
+    assert!(net.db.get_message(&old.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn recovery_handover_stale_high_counter_chat_reencrypts_without_repaying() {
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop_ordered(true).await;
+    let old_init = recovery_handover_session(&net).await;
+    let mut earlier = Vec::new();
+    for _ in 0..1_001 {
+        earlier.push(
+            net.sessions_a
+                .encrypt(net.bob.node_id(), b"earlier frame")
+                .await
+                .unwrap(),
+        );
+    }
+    let text = b"paid chat survives a stale high counter";
+    let old_message = net
+        .sessions_a
+        .encrypt(net.bob.node_id(), text)
+        .await
+        .unwrap();
+    assert!(old_message.header.message_number > 1_000);
+    let old = net
+        .paid_envelope(
+            konsensus_core::kind::KIND_CHAT,
+            konsensus_crypto::ratchet_message_to_bytes(&old_message),
+        )
+        .await;
+
+    // The receiver loses the old root and finishes recovery. A stale high
+    // counter fails the skip bound before AEAD; earlier fresh-session frames
+    // can never repair it.
+    assert!(net.sessions_b.remove_session(net.alice.node_id()).await);
+    let new_init = recovery_handover_session(&net).await;
+    let ratchet_init = net
+        .sessions_a
+        .encrypt(net.bob.node_id(), b"ratchet-init")
+        .await
+        .unwrap();
+    net.sessions_b
+        .decrypt(net.alice.node_id(), &ratchet_init)
+        .await
+        .unwrap();
+    assert!(matches!(
+        net.sessions_b
+            .preview_decrypt(net.alice.node_id(), &old_message)
+            .await,
+        Err(konsensus_crypto::SessionError::Ratchet(
+            konsensus_crypto::RatchetError::TooManySkipped(..)
+        ))
+    ));
+    recovery_handover_expect_deferred(&net, &old).await;
+    assert!(net.ws_rx.try_recv().is_err());
+
+    // Reconstruct the original root and deliver its missing prefix. Although
+    // the old envelope is now readable, the durable deferral forbids it from
+    // winning admission while its replacement is being prepared.
+    assert!(net.sessions_b.remove_session(net.alice.node_id()).await);
+    net.sessions_b
+        .reaccept_session(net.alice.node_id(), &old_init)
+        .await
+        .unwrap();
+    for frame in &earlier {
+        net.sessions_b
+            .decrypt(net.alice.node_id(), frame)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        net.sessions_b
+            .preview_decrypt(net.alice.node_id(), &old_message)
+            .await
+            .unwrap(),
+        text
+    );
+    recovery_handover_expect_deferred(&net, &old).await;
+    assert!(net.ws_rx.try_recv().is_err());
+
+    assert!(net.sessions_b.remove_session(net.alice.node_id()).await);
+    net.sessions_b
+        .reaccept_session(net.alice.node_id(), &new_init)
+        .await
+        .unwrap();
+    net.sessions_b
+        .decrypt(net.alice.node_id(), &ratchet_init)
+        .await
+        .unwrap();
+    let replacement = recovery_handover_replacement(&net, &old, net.ciphertext(text).await);
+    let verdict = net.verdict(&replacement).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageAcked { message_id, duplicate: false, .. }
+        if *message_id == replacement.id),
+        "{verdict:?}"
+    );
+    let delivered = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivered.envelope.id, replacement.id);
+    assert_eq!(
+        delivered.plaintext.as_deref(),
+        Some(std::str::from_utf8(text).unwrap())
+    );
+    let verdict = net.verdict(&replacement).await;
+    assert!(
+        matches!(&verdict, ControlEvent::MessageAcked { message_id, duplicate: true, .. }
+        if *message_id == replacement.id),
+        "{verdict:?}"
+    );
+    assert!(
+        matches!(net.verdict(&old).await,
+        ControlEvent::MessageRejected { message_id, .. }
+        if message_id == old.id),
+        "the old identity remains deferred after the proof is accepted for its replacement"
+    );
+    assert!(net.ws_rx.try_recv().is_err(), "exactly one delivery");
+    let receipts: Vec<(String, i32)> =
+        sqlx::query_as("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
+            .bind(hex::encode(old.payment_proof.payment_hash))
+            .fetch_all(net.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(receipts, vec![(replacement.id.to_hex(), 1)]);
+    assert!(net.db.has_nonce(&old.nonce).await.unwrap());
+    net.stop().await;
+}
+
+#[tokio::test]
+async fn recovery_handover_lower_id_block_keeps_one_grant_after_reencryption() {
+    use konsensus_core::payloads::call as calls;
+    use konsensus_message::ControlEvent;
+    let mut net = receive_loop_ordered(true).await;
+    assert!(net.alice.node_id().as_bytes() < net.bob.node_id().as_bytes());
+    let old_init = recovery_handover_session(&net).await;
+    let call_id = "9876543210abcdef9876543210abcdef";
+    let text = serde_json::json!({"call_id":call_id,"seq":0}).to_string();
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let ringing = calls::receive(None, 400, None, now).unwrap();
+    let initial = calls::commit(
+        calls::reserve(Some(ringing), 401, "answer", "request", now).unwrap(),
+        "answer",
+        now,
+    )
+    .unwrap();
+    net.db
+        .call_put(net.alice.node_id(), call_id, &initial)
+        .await
+        .unwrap();
+    let invoice = net
+        .wallet
+        .create_invoice(
+            1_000,
+            "recovery block",
+            calls::CALL_BLOCK_INVOICE_EXPIRY_SECS,
+        )
+        .await
+        .unwrap();
+    net.db
+        .record_call_block_invoice(
+            net.alice.node_id(),
+            call_id,
+            0,
+            &hex::decode(&invoice.payment_hash)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            now + 120_000,
+        )
+        .await
+        .unwrap();
+    let payment = net.wallet.pay_invoice(&invoice.bolt11).await.unwrap();
+    let proof = PaymentProof::new(
+        hex::decode(&invoice.payment_hash)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        hex::decode(payment.preimage.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        1_000,
+    );
+    let old_message = net
+        .sessions_a
+        .encrypt(net.bob.node_id(), text.as_bytes())
+        .await
+        .unwrap();
+    let mut old = UkmEnvelopeBuilder::new(
+        404,
+        *net.alice.node_id(),
+        Recipient::Node(*net.bob.node_id()),
+        konsensus_crypto::ratchet_message_to_bytes(&old_message),
+        proof,
+    )
+    .build();
+    old.signature = Signature::from_ed25519(&net.alice.sign(&old.signable_bytes()));
+
+    assert!(net.sessions_b.remove_session(net.alice.node_id()).await);
+    let new_init = recovery_handover_session(&net).await;
+    let ratchet_init = net
+        .sessions_a
+        .encrypt(net.bob.node_id(), b"ratchet-init")
+        .await
+        .unwrap();
+    net.sessions_b
+        .decrypt(net.alice.node_id(), &ratchet_init)
+        .await
+        .unwrap();
+    assert!(net
+        .sessions_b
+        .preview_decrypt(net.alice.node_id(), &old_message)
+        .await
+        .is_err());
+    recovery_handover_expect_deferred(&net, &old).await;
+    assert_eq!(
+        net.db.call_get(net.alice.node_id(), call_id).await.unwrap(),
+        Some(initial.clone())
+    );
+
+    // The lower-ID block could also have merely overtaken an earlier frame.
+    // Restoring readability cannot undo the refusal's durable fence.
+    assert!(net.sessions_b.remove_session(net.alice.node_id()).await);
+    net.sessions_b
+        .reaccept_session(net.alice.node_id(), &old_init)
+        .await
+        .unwrap();
+    assert_eq!(
+        net.sessions_b
+            .preview_decrypt(net.alice.node_id(), &old_message)
+            .await
+            .unwrap(),
+        text.as_bytes()
+    );
+    recovery_handover_expect_deferred(&net, &old).await;
+    assert_eq!(
+        net.db.call_get(net.alice.node_id(), call_id).await.unwrap(),
+        Some(initial.clone())
+    );
+
+    assert!(net.sessions_b.remove_session(net.alice.node_id()).await);
+    net.sessions_b
+        .reaccept_session(net.alice.node_id(), &new_init)
+        .await
+        .unwrap();
+    net.sessions_b
+        .decrypt(net.alice.node_id(), &ratchet_init)
+        .await
+        .unwrap();
+    let replacement =
+        recovery_handover_replacement(&net, &old, net.ciphertext(text.as_bytes()).await);
+    let until = match net.verdict(&replacement).await {
+        ControlEvent::MessageAcked {
+            message_id,
+            duplicate: false,
+            paid_until_ms: Some(until),
+            ..
+        } => {
+            assert_eq!(message_id, replacement.id);
+            until
+        }
+        other => panic!("replacement must return its grant: {other:?}"),
+    };
+    let granted = net
+        .db
+        .call_get(net.alice.node_id(), call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (granted.next_block_seq, granted.paid_until_ms),
+        (1, Some(until))
+    );
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .envelope
+            .id,
+        replacement.id
+    );
+    assert!(matches!(net.verdict(&replacement).await,
+        ControlEvent::MessageAcked { message_id, duplicate: true, paid_until_ms: Some(repeated), .. }
+        if message_id == replacement.id && repeated == until));
+    assert_eq!(
+        net.db.call_get(net.alice.node_id(), call_id).await.unwrap(),
+        Some(granted)
+    );
+    assert!(
+        matches!(net.verdict(&old).await,
+        ControlEvent::MessageRejected { message_id, .. }
+        if message_id == old.id),
+        "the old identity cannot acquire or replay a grant after replacement acceptance"
+    );
+    assert!(
+        net.ws_rx.try_recv().is_err(),
+        "one application delivery and one interval"
+    );
+
+    // The sender can bind this new-ID grant to the original call operation;
+    // repeating the grant never advances the caller by another sequence.
+    let caller = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    caller
+        .call_put(
+            net.bob.node_id(),
+            call_id,
+            &calls::CallEntry {
+                side: calls::Side::Caller,
+                next_block_seq: 1,
+                ..initial
+            },
+        )
+        .await
+        .unwrap();
+    journal_dispatched_block(&caller, &replacement, call_id, 0).await;
+    let cipher = PlaintextCacheCipher::new(net.alice.aes_key());
+    for _ in 0..2 {
+        konsensus_api::calls::receive_block_grant(
+            &caller,
+            &cipher,
+            net.alice.node_id(),
+            net.bob.node_id(),
+            &replacement.id,
+            until,
+        )
+        .await
+        .unwrap();
+    }
+    let caller_granted = caller
+        .call_get(net.bob.node_id(), call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (caller_granted.next_block_seq, caller_granted.paid_until_ms),
+        (1, Some(until))
+    );
+    let receipts: Vec<(String, i32)> =
+        sqlx::query_as("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
+            .bind(hex::encode(old.payment_proof.payment_hash))
+            .fetch_all(net.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(receipts, vec![(replacement.id.to_hex(), 1)]);
+    assert!(net.db.get_message(&old.id).await.unwrap().is_none());
+    assert!(!net.audit_log().contains("call.block_overpayment"));
+    net.stop().await;
+}
+
+async fn recovery_reconnect_receive_loop(pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine>, sender_higher: bool) -> ReceiveLoop {
+    use konsensus_message::{ControlEvent, ReachabilityMode, TransportConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let alice = alice_identity();
+    let bob = bob_identity();
+    let (alice, bob) = if (alice.node_id().as_bytes() > bob.node_id().as_bytes()) != sender_higher { (bob, alice) } else { (alice, bob) };
+    let transport = |id| {
+        Arc::new(NoiseTransport::new(
+            id,
+            TransportConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                admission_mode: ReachabilityMode::PriceOpen,
+                ..Default::default()
+            },
+        ))
+    };
+    let source = transport(alice.clone());
+    let target = transport(bob.clone());
+    target.start_listener().await.unwrap();
+    let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let storage: Arc<dyn Storage> = db.clone();
+    source
+        .connect(bob.node_id(), &target.listen_addr().unwrap().to_string())
+        .await
+        .unwrap();
+    assert!(matches!(
+        source.recv_control().await.unwrap(),
+        ControlEvent::PeerConnected { .. }
+    ));
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let sessions_a = SessionManager::new(alice.clone());
+    let sessions_b = Arc::new(SessionManager::new(bob.clone()));
+    establish_sessions(&sessions_a, &sessions_b, &alice, &bob).await;
+    let audit_path = dir.path().join("audit.jsonl");
+    let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let (ws_tx, ws_rx) = broadcast::channel(8);
+    let worker = tokio::spawn(run(MsgHandlerDeps {
+        transport: target.clone(),
+        transport_ack: target.clone(),
+        storage: storage.clone(),
+        gate: Arc::new(PaymentGate::with_config(konsensus_core::gate::GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        })),
+        pricing,
+        lightning: wallet.clone(),
+        chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        session_manager: sessions_b.clone(),
+        nonce_adapter: Arc::new(konsensus_storage::StorageNonceAdapter::new(storage)),
+        content_server: None,
+        front_door: Default::default(),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        identity: bob.clone(),
+        plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        ws_tx,
+        audit_log: audit,
+        admission_mode: ReachabilityMode::PriceOpen,
+        relay_engine: None,
+        shutdown_rx,
+    }));
+    ReceiveLoop {
+        alice,
+        bob,
+        source,
+        target,
+        db,
+        wallet,
+        sessions_a,
+        sessions_b,
+        audit_path,
+        ws_rx,
+        shutdown,
+        worker,
+        _dir: dir,
+    }
+}
+
+fn recovery_reconnect_pricing() -> Arc<dyn konsensus_core::traits::pricing::PricingEngine> {
+    Arc::new(MutableDeliveryPrice(std::sync::atomic::AtomicU64::new(1_000)))
+}
+
+async fn recovery_reconnect_next_control(transport: &NoiseTransport) -> konsensus_message::ControlEvent {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = transport.recv_control().await.unwrap();
+            if !matches!(event, konsensus_message::ControlEvent::PeerConnected { .. }) { return event; }
+        }
+    }).await.expect("control frame arrives")
+}
+
+async fn recovery_reconnect_next_stamp(transport: &NoiseTransport) -> bool {
+    use konsensus_message::ControlEvent::*;
+    match recovery_reconnect_next_control(transport).await {
+        PrekeyOffer { privileged, .. } | SessionInit { privileged, .. }
+        | SessionAck { privileged, .. } | RatchetInit { privileged, .. }
+        | MessageAcked { privileged, .. } | MessageRejected { privileged, .. }
+        | PriceTableReceived { privileged, .. } | PriceQueryReceived { privileged, .. }
+        | PriceResponseReceived { privileged, .. } | InvoiceRequested { privileged, .. }
+        | PeerExchangeRequested { privileged, .. } | PeerExchangeReceived { privileged, .. }
+        | LightningInfoReceived { privileged, .. } | GossipReceived { privileged, .. } => privileged,
+        other => panic!("unexpected event {other:?}"),
+    }
+}
+
+async fn recovery_reconnect_lost_session_envelope(net: &ReceiveLoop) -> konsensus_core::UkmEnvelope {
+    let ciphertext = net.ciphertext(b"paid cached-keysend recovery").await;
+    assert!(net.sessions_b.remove_session(net.alice.node_id()).await);
+    net.paid_envelope(konsensus_core::kind::KIND_CHAT, ciphertext).await
+}
+
+async fn recovery_reconnect_reconnect(net: &ReceiveLoop) {
+    let previous = net.target.connected_since(net.alice.node_id()).await.unwrap();
+    net.source.disconnect(net.bob.node_id()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while net.target.is_connected(net.alice.node_id()).await { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    net.source.connect(net.bob.node_id(), &net.target.listen_addr().unwrap().to_string()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while net.target.connected_since(net.alice.node_id()).await.is_none_or(|now| now == previous) {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_reconnect_verified_keysend_deferral_opens_only_session_controls_and_resets() {
+    use konsensus_message::{ControlEvent, Frame};
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let env = recovery_reconnect_lost_session_envelope(&net).await;
+    assert!(matches!(net.verdict(&env).await, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")));
+    assert_eq!(net.target.connected_session_peers().await, vec![*net.alice.node_id()],
+        "a verified deferred keysend must permit session recovery on this connection");
+    assert!(net.target.connected_privileged_peers().await.is_empty());
+    assert!(!net.target.admission_paid_on_connection(net.alice.node_id()).await);
+    assert_eq!(net.receipt_state(&env).await, None);
+    assert!(!net.db.has_nonce(&env.nonce).await.unwrap());
+
+    let frames = vec![
+        (Frame::PrekeyOffer { bundle: serde_json::json!({}) }, true),
+        (Frame::SessionInit { init_data: serde_json::json!({}) }, true),
+        (Frame::SessionAck, true),
+        (Frame::RatchetInit { payload: vec![1, 2, 3] }, true),
+        (Frame::MessageAck { id: env.id, duplicate: false, paid_until_ms: None }, false),
+        (Frame::MessageReject { id: env.id, reason: "storage error".into() }, false),
+        (Frame::PriceQuery { kind: 0 }, false),
+        (Frame::PriceResponse { kind: 0, price_msat: 1000, block_height: 1 }, false),
+        (Frame::PriceTable { prices: HashMap::from([("chat".into(), 1000)]), block_height: 1, valid_blocks: 10, trust_discount: 0.0 }, false),
+        (Frame::RequestInvoice { request_id: "service".into(), amount_msat: 1000, purpose: "konsensus message".into() }, false),
+        (Frame::PeerExchangeRequest, false),
+        (Frame::PeerExchangeResponse { peers: vec![] }, false),
+        (Frame::LightningInfo { ln_pubkey: "02".repeat(33), ln_addr: None }, false),
+        (Frame::Gossip(Box::new(env.clone())), false),
+    ];
+    for (frame, allowed) in frames {
+        net.source.send_frame(net.bob.node_id(), &frame).await.unwrap();
+        assert_eq!(recovery_reconnect_next_stamp(&net.target).await, allowed, "{frame:?}");
+    }
+    net.source.send_frame(net.bob.node_id(), &Frame::CallMedia {
+        call_id: "0123456789abcdef0123456789abcdef".into(), seq: 0, data: vec![1],
+    }).await.unwrap();
+    net.source.send_frame(net.bob.node_id(), &Frame::PriceQuery { kind: 1 }).await.unwrap();
+    assert!(!recovery_reconnect_next_stamp(&net.target).await, "reader passed the media frame");
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(100), net.target.recv_call_media()).await.is_err());
+
+    recovery_reconnect_reconnect(&net).await;
+    assert!(net.target.connected_session_peers().await.is_empty(), "repair standing resets on reconnect");
+    assert!(net.source.connected_session_peers().await.is_empty());
+    net.source.send_frame(net.bob.node_id(), &Frame::SessionAck).await.unwrap();
+    assert!(!recovery_reconnect_next_stamp(&net.target).await);
+    // The same durable, still-unspent proof can open repair on the new connection.
+    assert!(matches!(net.verdict(&env).await, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")));
+    assert_eq!(net.target.connected_session_peers().await, vec![*net.alice.node_id()]);
+    assert!(net.target.connected_privileged_peers().await.is_empty());
+    assert_eq!(net.wallet.list_payments(100).await.unwrap().len(), 1);
+    net.stop().await;
+}
+
+#[tokio::test]
+async fn recovery_reconnect_failed_durable_deferral_grants_no_repair() {
+    use konsensus_message::ControlEvent;
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let env = recovery_reconnect_lost_session_envelope(&net).await;
+    sqlx::query("CREATE TRIGGER no_repair_fence BEFORE INSERT ON envelope_deferrals BEGIN SELECT RAISE(ABORT, 'disk fault'); END")
+        .execute(net.db.pool()).await.unwrap();
+    assert!(matches!(net.verdict(&env).await, ControlEvent::MessageRejected { reason, .. } if reason == "storage error"));
+    assert!(net.target.connected_session_peers().await.is_empty());
+    assert!(net.target.connected_privileged_peers().await.is_empty());
+    assert!(!net.target.admission_paid_on_connection(net.alice.node_id()).await);
+    assert!(!net.db.is_envelope_deferred(&env).await.unwrap());
+    assert_eq!(net.receipt_state(&env).await, None);
+    assert!(!net.db.has_nonce(&env.nonce).await.unwrap());
+    net.stop().await;
+}
+
+#[tokio::test]
+async fn recovery_reconnect_verification_on_replaced_connection_cannot_grant_repair() {
+    use konsensus_message::ControlEvent;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let net = recovery_reconnect_receive_loop(Arc::new(BlockingPricing { entered: entered.clone(), release: release.clone() }), true).await;
+    let env = recovery_reconnect_lost_session_envelope(&net).await;
+    net.source.send(net.bob.node_id(), &env).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified()).await.unwrap();
+    recovery_reconnect_reconnect(&net).await;
+    release.add_permits(1);
+    let event = recovery_reconnect_next_control(&net.source).await;
+    assert!(matches!(event, ControlEvent::MessageRejected { reason, .. } if reason == "storage error"),
+        "verification from the old generation authorizes no new connection");
+    assert!(net.target.connected_session_peers().await.is_empty());
+    assert!(net.target.connected_privileged_peers().await.is_empty());
+    assert!(!net.target.admission_paid_on_connection(net.alice.node_id()).await);
+    assert!(net.db.is_envelope_deferred(&env).await.unwrap(), "only the ciphertext deferral survives");
+    assert!(matches!(net.verdict(&env).await, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")));
+    assert_eq!(net.target.connected_session_peers().await, vec![*net.alice.node_id()]);
+    net.stop().await;
+}
+
+async fn recovery_reconnect_start_session_handler(
+    id: Arc<NodeIdentity>, sessions: Arc<SessionManager>, transport: Arc<NoiseTransport>,
+    storage: Arc<dyn Storage>, wallet: Arc<dyn konsensus_core::traits::lightning::LightningProvider>,
+    audit_path: std::path::PathBuf, shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let (pending_tx, pending_rx) = tokio::sync::mpsc::channel(8);
+    let (auto_channel_tx, auto_rx) = tokio::sync::mpsc::channel(8);
+    let deps = crate::session_handler::SessionHandlerDeps {
+        content_server: None, front_door: Default::default(), privacy: Default::default(), peer_exchange_floor: 0,
+        transport, session_manager: sessions, storage, our_node_id: *id.node_id(), identity: id,
+        audit_log: Arc::new(AuditLog::open(audit_path).unwrap()), min_admission_cost_msat: 1000,
+        pricing: recovery_reconnect_pricing(), chain: Arc::new(konsensus_chain::MockChainProvider::new()),
+        peer_prices: Arc::new(konsensus_pricing::PeerPriceCache::new()),
+        peer_registry: Arc::new(tokio::sync::RwLock::new(PeerRegistry::new())),
+        routing: Arc::new(RoutingTable::new(Default::default())),
+        gossip_validator: Arc::new(konsensus_gossip::GossipValidator::new(Default::default())),
+        send_timestamps: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        lightning: wallet, lightning_addr: None, mock_lightning: false,
+        invoice_requests: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        ws_broadcast: broadcast::channel(8).0, ws_delivery_tx: broadcast::channel(8).0,
+        pending_tx, auto_channel_tx, starter_newcomer_tx: None, starter_hub_tx: None, shutdown_rx,
+    };
+    tokio::spawn(async move {
+        let _receivers = (pending_rx, auto_rx);
+        crate::session_handler::run(deps).await;
+    })
+}
+
+/// An unpaid connection must not serialize the dispatcher behind storage.
+#[tokio::test]
+async fn recovery_reconnect_storage_wait_does_not_stall_unpaid_controls() {
+    unpaid_repair_wait_keeps_control_loop_live(false).await;
+}
+
+#[tokio::test]
+async fn recovery_reconnect_connection_lock_does_not_stall_unpaid_controls() {
+    unpaid_repair_wait_keeps_control_loop_live(true).await;
+}
+
+async fn unpaid_repair_wait_keeps_control_loop_live(hold_connection: bool) {
+    use konsensus_message::{ControlEvent, Frame, NoiseTransport, ReachabilityMode, TransportConfig};
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let pending = if hold_connection { None } else {
+        let env = konsensus_core::UkmEnvelopeBuilder::new(0, *net.bob.node_id(), Recipient::Node(*net.alice.node_id()),
+            b"paid ciphertext".to_vec(), konsensus_core::PaymentProof::new([19; 32], [20; 32], 1000)).build();
+        let operation = recovery_reconnect_journal_paid(&net.db, &env).await;
+        Some((env, operation))
+    };
+    // Hold the selected resource until after the response and shutdown.
+    let held = if hold_connection { None } else { Some(net.db.pool().acquire().await.unwrap()) };
+    let blocked = if hold_connection {
+        let locked = Arc::new(tokio::sync::Notify::new());
+        let (target, peer, ready) = (net.target.clone(), *net.alice.node_id(), locked.clone());
+        let task = tokio::spawn(async move {
+            let frame = Frame::PriceTable { prices: Default::default(), block_height: 0, valid_blocks: 1, trust_discount: 0.0 };
+            target.send_price_frame_with(&peer, &frame, &frame, |_, _| async {
+                ready.notify_one();
+                std::future::pending().await
+            }).await
+        });
+        locked.notified().await;
+        Some(task)
+    } else { None };
+    let worker = recovery_reconnect_start_session_handler(
+        net.bob.clone(), net.sessions_b.clone(), net.target.clone(), net.db.clone(),
+        net.wallet.clone(), net._dir.path().join("control-session.jsonl"), net.shutdown.subscribe(),
+    ).await;
+    // A fabricated confirmation is not bought authority. Fill the bounded
+    // confirmation queue while its first durable lookup cannot complete.
+    for n in 0..if hold_connection { 0 } else { 256u16 } {
+        let mut bytes = [0; 32];
+        bytes[..2].copy_from_slice(&n.to_le_bytes());
+        let id = konsensus_core::MessageId::from_bytes(bytes);
+        let frame = if n % 2 == 0 {
+            Frame::MessageReject { id, reason: "session_handover: unbound".into() }
+        } else {
+            Frame::MessageAck { id, duplicate: false, paid_until_ms: None }
+        };
+        net.source.send_frame(net.bob.node_id(), &frame).await.unwrap();
+    }
+    if let Some((env, _)) = &pending {
+        net.source.send_frame(net.bob.node_id(), &Frame::MessageAck {
+            id: env.id, duplicate: false, paid_until_ms: None,
+        }).await.unwrap();
+    }
+    let healthy = Arc::new(NoiseTransport::new(
+        Arc::new(NodeIdentity::generate().unwrap().1),
+        TransportConfig { admission_mode: ReachabilityMode::PriceOpen, ..Default::default() },
+    ));
+    healthy.connect(net.bob.node_id(), &net.target.listen_addr().unwrap().to_string()).await.unwrap();
+    healthy.send_frame(net.bob.node_id(), &Frame::RequestInvoice {
+        request_id: "other-peer".into(), amount_msat: 1000, purpose: "konsensus message".into(),
+    }).await.unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(ControlEvent::InvoiceErrorReceived { request_id, reason, .. }) = healthy.recv_control().await {
+                assert_eq!(request_id, "other-peer");
+                assert_eq!(reason, konsensus_api::invoice_refusal::ADMISSION_REQUIRED);
+                break;
+            }
+        }
+    }).await;
+    // Shutdown must also finish with the reconnect query still blocked.
+    net.shutdown.send(true).unwrap();
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(1), worker).await;
+    drop(held);
+    if let Some(task) = blocked { task.abort(); let _ = task.await; }
+    healthy.shutdown();
+    net.worker.await.unwrap();
+    if response.is_err() { net.source.shutdown(); net.target.shutdown(); }
+    assert!(response.is_ok(), "unpaid reconnect resource wait stalled another peer (connection lock: {hold_connection})");
+    stopped.expect("blocked repair prevented shutdown").unwrap();
+    if let Some((env, operation)) = pending {
+        let before = net.db.get_outbox_operation(&operation).await.unwrap().unwrap();
+        assert_eq!(before.state, "paid", "lost/queued ACK cannot complete a blocked durable match");
+        assert_eq!(before.settled_msat, 1000);
+        let (stop, shutdown_rx) = watch::channel(false);
+        let retry = recovery_reconnect_start_session_handler(net.bob.clone(), net.sessions_b.clone(),
+            net.target.clone(), net.db.clone(), net.wallet.clone(), net._dir.path().join("retry-session.jsonl"), shutdown_rx).await;
+        net.source.send_frame(net.bob.node_id(), &Frame::MessageAck {
+            id: env.id, duplicate: true, paid_until_ms: None,
+        }).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let after = net.db.get_outbox_operation(&operation).await.unwrap().unwrap();
+                if after.state == "acked" {
+                    assert_eq!(after.settled_msat, 1000);
+                    assert_eq!(after.payment_hash, before.payment_hash);
+                    assert_eq!(after.message_id, before.message_id);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("authentic ACK retry completes the original paid operation after queue/shutdown loss");
+        assert_eq!(net.db.count_pending_deliveries().await.unwrap(), 0);
+        assert!(net.wallet.list_payments(100).await.unwrap().is_empty(), "confirmation retries never issue another payment");
+        stop.send(true).unwrap();
+        retry.await.unwrap();
+    }
+    net.source.shutdown();
+    net.target.shutdown();
+}
+
+#[tokio::test]
+async fn recovery_reconnect_queued_rejection_keeps_a_newer_session_usable() {
+    use konsensus_message::{ControlEvent, Frame};
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let env = konsensus_core::UkmEnvelopeBuilder::new(0, *net.bob.node_id(), Recipient::Node(*net.alice.node_id()),
+        b"old paid ciphertext".to_vec(), konsensus_core::PaymentProof::new([29; 32], [30; 32], 1000)).build();
+    let operation = recovery_reconnect_journal_paid(&net.db, &env).await;
+    let held = net.db.pool().acquire().await.unwrap();
+    let worker = recovery_reconnect_start_session_handler(net.bob.clone(), net.sessions_b.clone(),
+        net.target.clone(), net.db.clone(), net.wallet.clone(), net._dir.path().join("queued-session.jsonl"), net.shutdown.subscribe()).await;
+    net.source.send_frame(net.bob.node_id(), &Frame::MessageReject {
+        id: env.id, reason: "session_handover: old ciphertext".into(),
+    }).await.unwrap();
+    // Same-source wire order makes this response a dispatch barrier: the
+    // rejection is queued, but its storage match is still held above.
+    net.source.send_frame(net.bob.node_id(), &Frame::RequestInvoice {
+        request_id: "queued-barrier".into(), amount_msat: 1000, purpose: "konsensus message".into(),
+    }).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(ControlEvent::InvoiceErrorReceived { request_id, .. }) = net.source.recv_control().await {
+                assert_eq!(request_id, "queued-barrier"); break;
+            }
+        }
+    }).await.expect("rejection storage does not block later controls");
+    let replacement = SessionManager::new(net.alice.clone());
+    let init = replacement.initiate_session(net.bob.node_id(), &net.sessions_b.prekey_bundle().await).await.unwrap();
+    assert!(net.sessions_b.remove_session(net.alice.node_id()).await);
+    net.sessions_b.accept_session(net.alice.node_id(), &init).await.unwrap();
+    assert!(replacement.confirm_session(net.bob.node_id()).await);
+    let ratchet_init = replacement.encrypt(net.bob.node_id(), b"replacement ready").await.unwrap();
+    assert_eq!(net.sessions_b.decrypt(net.alice.node_id(), &ratchet_init).await.unwrap(), b"replacement ready");
+    assert!(net.sessions_b.can_send(net.alice.node_id()).await);
+    drop(held);
+    // A following authentic ACK is a FIFO completion barrier for the delayed
+    // rejection and still completes the original paid operation without repay.
+    net.source.send_frame(net.bob.node_id(), &Frame::MessageAck {
+        id: env.id, duplicate: false, paid_until_ms: None,
+    }).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while net.db.get_outbox_operation(&operation).await.unwrap().unwrap().state != "acked" { tokio::task::yield_now().await; }
+    }).await.expect("following ACK completes after the queued rejection");
+    let marked = net.sessions_b.needs_renegotiation(net.alice.node_id()).await;
+    net.shutdown.send(true).unwrap();
+    worker.await.unwrap();
+    net.worker.await.unwrap();
+    net.source.shutdown();
+    net.target.shutdown();
+    assert!(!marked, "a queued rejection must not invalidate a newer healthy session");
+    assert!(net.sessions_b.encrypt(net.alice.node_id(), b"still usable").await.is_ok());
+}
+
+#[tokio::test]
+async fn recovery_reconnect_both_unprivileged_sides_recover_a_paid_keysend_without_readmission() {
+    let mut net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let env = recovery_reconnect_lost_session_envelope(&net).await;
+    let sessions_a = Arc::new(std::mem::replace(&mut net.sessions_a, SessionManager::new(net.alice.clone())));
+    let source_db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    source_db.store_message(&env).await.unwrap();
+    source_db.prepare_delivery(&env.id, net.bob.node_id()).await.unwrap();
+    let source_worker = recovery_reconnect_start_session_handler(net.alice.clone(), sessions_a.clone(), net.source.clone(),
+        source_db, Arc::new(konsensus_lightning::MockLightningProvider::new()),
+        net._dir.path().join("source-session.jsonl"), net.shutdown.subscribe()).await;
+    let target_worker = recovery_reconnect_start_session_handler(net.bob.clone(), net.sessions_b.clone(), net.target.clone(),
+        net.db.clone(), net.wallet.clone(), net._dir.path().join("target-session.jsonl"), net.shutdown.subscribe()).await;
+    net.source.send(net.bob.node_id(), &env).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if net.source.connected_session_peers().await.contains(net.bob.node_id())
+                && net.target.connected_session_peers().await.contains(net.alice.node_id()) { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("both ends admit repair on the matched paid proof");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if sessions_a.can_send(net.bob.node_id()).await && net.sessions_b.can_send(net.alice.node_id()).await
+                && !sessions_a.needs_renegotiation(net.bob.node_id()).await
+                && !sessions_a.replacement_pending(net.bob.node_id()).await
+                && !net.sessions_b.awaiting_confirmation(net.alice.node_id()).await { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("the real control handlers complete X3DH and ratchet initialization");
+    assert!(net.source.connected_privileged_peers().await.is_empty());
+    assert!(net.target.connected_privileged_peers().await.is_empty());
+    assert!(!net.source.admission_paid_on_connection(net.bob.node_id()).await);
+    assert!(!net.target.admission_paid_on_connection(net.alice.node_id()).await);
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&sessions_a.encrypt(net.bob.node_id(), b"paid cached-keysend recovery").await.unwrap());
+    let replacement = recovery_handover_replacement(&net, &env, ciphertext);
+    net.source.send(net.bob.node_id(), &replacement).await.unwrap();
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("paid cached-keysend recovery"));
+    assert_eq!(net.receipt_state(&replacement).await, Some(1));
+    assert_eq!(net.wallet.list_payments(100).await.unwrap().len(), 1, "no second payment or readmission");
+    net.stop().await;
+    source_worker.await.unwrap();
+    target_worker.await.unwrap();
+}
+
+async fn recovery_reconnect_journal_paid(
+    db: &konsensus_storage::SqliteStorage,
+    env: &konsensus_core::UkmEnvelope,
+) -> String {
+    let Recipient::Node(peer) = env.recipient else { panic!("direct message") };
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut op = konsensus_storage::OutboxOperation::prepared(id.clone(), peer.to_hex(), env.kind, "same request".into());
+    op.state = "paid".into();
+    op.message_id = Some(env.id.to_hex());
+    op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
+    op.settled_msat = i64::try_from(env.payment_proof.amount_msat).unwrap();
+    op.accounting_pending = false;
+    assert!(db.insert_outbox_operation(&op).await.unwrap());
+    assert!(db.commit_outbox_envelope(&op, env).await.unwrap());
+    db.mark_pending_sent(&env.id, &peer).await.unwrap();
+    id
+}
+
+#[tokio::test]
+async fn recovery_reconnect_pending_paid_act_reauthorizes_repair_after_drop_before_x3dh() {
+    use konsensus_message::ControlEvent;
+    let mut net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let env = recovery_reconnect_lost_session_envelope(&net).await;
+    let source_db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let operation = recovery_reconnect_journal_paid(&source_db, &env).await;
+    let verdict = net.verdict(&env).await;
+    let ControlEvent::MessageRejected { reason, .. } = verdict else { panic!("expected paid deferral") };
+    assert!(reason.starts_with("session_handover:"));
+    // These are the same durable match and mark as the sender's control loop.
+    // The loop is held here so the drop deterministically precedes X3DH.
+    assert!(source_db.reject_pending(&env.id, net.bob.node_id(), net.alice.node_id(), &reason, false).await.unwrap());
+    let old_source = net.source.connected_since(net.bob.node_id()).await.unwrap();
+    assert!(net.source.allow_session_repair(net.bob.node_id(), old_source, std::time::Instant::now() + std::time::Duration::from_secs(60)).await);
+    net.sessions_a.mark_needs_renegotiation(net.bob.node_id()).await;
+    assert!(source_db.session_repair_pending(net.alice.node_id(), net.bob.node_id()).await.unwrap());
+    assert!(net.db.session_repair_pending(net.bob.node_id(), net.alice.node_id()).await.unwrap());
+
+    recovery_reconnect_reconnect(&net).await;
+    assert!(net.source.connected_session_peers().await.is_empty(), "connection-local source flag reset");
+    assert!(net.target.connected_session_peers().await.is_empty(), "connection-local recipient flag reset");
+    let sessions_a = Arc::new(std::mem::replace(&mut net.sessions_a, SessionManager::new(net.alice.clone())));
+    let target_worker = recovery_reconnect_start_session_handler(net.bob.clone(), net.sessions_b.clone(), net.target.clone(),
+        net.db.clone(), net.wallet.clone(), net._dir.path().join("target-obligation.jsonl"), net.shutdown.subscribe()).await;
+    // Start the sender loop after the recipient revalidates. This fixes the
+    // schedule without sleeps; its offer then reaches a repair-eligible reader.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !net.target.connected_session_peers().await.contains(net.alice.node_id()) {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("recipient revalidates its durable deferral");
+    let source_worker = recovery_reconnect_start_session_handler(net.alice.clone(), sessions_a.clone(), net.source.clone(),
+        source_db.clone(), Arc::new(konsensus_lightning::MockLightningProvider::new()),
+        net._dir.path().join("source-obligation.jsonl"), net.shutdown.subscribe()).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if net.source.connected_session_peers().await.contains(net.bob.node_id())
+                && net.target.connected_session_peers().await.contains(net.alice.node_id()) { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("PeerConnected revalidates both unfinished paid obligations");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if sessions_a.can_send(net.bob.node_id()).await && net.sessions_b.can_send(net.alice.node_id()).await
+                && !sessions_a.needs_renegotiation(net.bob.node_id()).await
+                && !sessions_a.replacement_pending(net.bob.node_id()).await
+                && !net.sessions_b.awaiting_confirmation(net.alice.node_id()).await { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("new connection repairs without replaying fenced application bytes");
+    assert!(net.source.connected_privileged_peers().await.is_empty());
+    assert!(net.target.connected_privileged_peers().await.is_empty());
+    assert!(!net.source.admission_paid_on_connection(net.bob.node_id()).await);
+    assert!(!net.target.admission_paid_on_connection(net.alice.node_id()).await);
+    assert_eq!(net.receipt_state(&env).await, None);
+    assert!(!net.db.has_nonce(&env.nonce).await.unwrap());
+
+    let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&sessions_a.encrypt(net.bob.node_id(), b"paid cached-keysend recovery").await.unwrap());
+    let replacement = recovery_handover_replacement(&net, &env, ciphertext);
+    let mut next = source_db.get_outbox_operation(&operation).await.unwrap().unwrap();
+    next.state = "paid".into();
+    next.message_id = Some(replacement.id.to_hex());
+    next.last_error = None;
+    next.last_sent_at = None;
+    assert!(source_db.replace_outbox_envelope(&next, &env.id, &replacement, None).await.unwrap());
+    source_db.mark_pending_sent(&replacement.id, net.bob.node_id()).await.unwrap();
+    net.source.send(net.bob.node_id(), &replacement).await.unwrap();
+    let shown = tokio::time::timeout(std::time::Duration::from_secs(5), net.ws_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(shown.plaintext.as_deref(), Some("paid cached-keysend recovery"));
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while source_db.get_outbox_operation(&operation).await.unwrap().unwrap().state != "acked" {
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("replacement ACK completes the one paid operation");
+    assert!(!source_db.session_repair_pending(net.alice.node_id(), net.bob.node_id()).await.unwrap());
+    assert!(!net.db.session_repair_pending(net.bob.node_id(), net.alice.node_id()).await.unwrap());
+    assert_eq!(net.wallet.list_payments(100).await.unwrap().len(), 1);
+    assert_eq!(net.receipt_state(&replacement).await, Some(1));
+    assert_eq!(source_db.count_pending_deliveries().await.unwrap(), 0);
+
+    recovery_reconnect_reconnect(&net).await;
+    assert!(net.source.connected_session_peers().await.is_empty(), "fulfilled act grants no future repair standing");
+    assert!(net.target.connected_session_peers().await.is_empty(), "durable receipt retired the deferral");
+    net.stop().await;
+    source_worker.await.unwrap();
+    target_worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn recovery_reconnect_non_direct_failure_grants_no_fence_or_repair() {
+    use konsensus_message::ControlEvent;
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let mut env = recovery_reconnect_lost_session_envelope(&net).await;
+    env.recipient = Recipient::Room(konsensus_core::RoomId::new());
+    env.signature = Signature::from_ed25519(&net.alice.sign(&env.signable_bytes()));
+    assert!(matches!(net.verdict(&env).await, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_pending:")));
+    assert!(!net.db.is_envelope_deferred(&env).await.unwrap());
+    assert!(!net.db.session_repair_pending(net.bob.node_id(), net.alice.node_id()).await.unwrap());
+    assert!(net.target.connected_session_peers().await.is_empty());
+    assert!(net.target.connected_privileged_peers().await.is_empty());
+    assert_eq!(net.receipt_state(&env).await, None);
+    assert!(!net.db.has_nonce(&env.nonce).await.unwrap());
+    net.stop().await;
+}
+
+#[tokio::test]
+async fn recovery_reconnect_zero_price_bound_reply_grants_no_fence_or_repair() {
+    use konsensus_message::ControlEvent;
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    // A legitimate zero-price reply is bound to our outgoing settled request.
+    // It is gate-valid, and cannot confer the sender's admission authority.
+    // The deferred mock path stores the raw hash used by settlement lookup.
+    net.wallet.defer_next_keysend_settlement(0).await;
+    let sent = net.wallet.keysend(&"02".repeat(33), 1000, None).await.unwrap();
+    let paid = net.wallet.get_payment_status(&sent.payment_hash).await.unwrap();
+    let hash: [u8; 32] = hex::decode(&paid.payment_hash).unwrap().try_into().unwrap();
+    let preimage: [u8; 32] = hex::decode(paid.preimage.unwrap()).unwrap().try_into().unwrap();
+    let request = MessageId::from_bytes([47; 32]);
+    net.db.record_outgoing_web_request(&hash, konsensus_core::OutstandingWebRequest {
+        request_id: request, peer: *net.alice.node_id(), expected_reply_kind: konsensus_core::kind::KIND_PAGE_RESPONSE,
+        expires_at_ms: chrono::Utc::now().timestamp_millis() as u64 + konsensus_core::OUTSTANDING_TTL_MS,
+    }).await.unwrap();
+    let mut env = UkmEnvelopeBuilder::new(konsensus_core::kind::KIND_PAGE_RESPONSE,
+        *net.alice.node_id(), Recipient::Node(*net.bob.node_id()), b"not a ratchet message".to_vec(),
+        PaymentProof::new(hash, preimage, 0)).references(vec![request]).build();
+    env.signature = Signature::from_ed25519(&net.alice.sign(&env.signable_bytes()));
+    assert!(konsensus_core::is_web_service_reply(&env));
+    assert!(matches!(net.verdict(&env).await, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_pending:")));
+    assert!(!net.db.is_envelope_deferred(&env).await.unwrap());
+    assert!(!net.db.session_repair_pending(net.bob.node_id(), net.alice.node_id()).await.unwrap());
+    assert!(net.target.connected_session_peers().await.is_empty());
+    assert!(net.target.connected_privileged_peers().await.is_empty());
+    assert_eq!(net.receipt_state(&env).await, None);
+    assert!(!net.db.has_nonce(&env.nonce).await.unwrap());
+    net.stop().await;
+}
+
+#[tokio::test]
+async fn recovery_reconnect_outgoing_repair_standing_checks_generation_and_frame_kind() {
+    use konsensus_message::{Frame, Standing};
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let env = recovery_reconnect_lost_session_envelope(&net).await;
+    let since = net.target.connected_since(net.alice.node_id()).await.unwrap();
+    let control = Frame::SessionAck.to_bytes().unwrap();
+    assert!(net.target.send_raw_frame_on(net.alice.node_id(), since, Standing::SessionRepair, &control).await.is_err());
+    assert!(matches!(net.verdict(&env).await, konsensus_message::ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")));
+    net.target.send_raw_frame_on(net.alice.node_id(), since, Standing::SessionRepair, &control).await.unwrap();
+    let metadata = Frame::PriceQuery { kind: 1 }.to_bytes().unwrap();
+    assert!(net.target.send_raw_frame_on(net.alice.node_id(), since, Standing::SessionRepair, &metadata).await.is_err());
+    recovery_reconnect_reconnect(&net).await;
+    assert!(!net.target.allow_session_repair(net.alice.node_id(), since, std::time::Instant::now() + std::time::Duration::from_secs(60)).await);
+    assert!(net.target.send_raw_frame_on(net.alice.node_id(), since, Standing::SessionRepair, &control).await.is_err());
+    net.stop().await;
+}
+
+#[tokio::test]
+async fn recovery_reconnect_deferral_expiry_ends_live_and_reconnected_standing() {
+    use konsensus_message::{ControlEvent, Frame, Standing};
+    let net = recovery_reconnect_receive_loop(recovery_reconnect_pricing(), true).await;
+    let env = recovery_reconnect_lost_session_envelope(&net).await;
+    assert!(matches!(net.verdict(&env).await, ControlEvent::MessageRejected { reason, .. } if reason.starts_with("session_handover:")));
+    let since = net.target.connected_since(net.alice.node_id()).await.unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    sqlx::query("UPDATE envelope_deferrals SET expires_at_ms = ?")
+        .bind(now + 500).execute(net.db.pool()).await.unwrap();
+    assert!(crate::session_handler::allow_paid_session_repair(net.db.as_ref(), net.bob.node_id(), net.alice.node_id(), &net.target, since).await);
+    assert!(net.target.session_repair_on_connection(net.alice.node_id()).await);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(!net.db.session_repair_pending(net.bob.node_id(), net.alice.node_id()).await.unwrap());
+    assert!(!net.target.session_repair_on_connection(net.alice.node_id()).await, "live connection must lose expired permission");
+    assert!(net.target.connected_session_peers().await.is_empty());
+    let control = Frame::SessionAck.to_bytes().unwrap();
+    assert!(net.target.send_raw_frame_on(net.alice.node_id(), since, Standing::SessionRepair, &control).await.is_err());
+    net.source.send_frame(net.bob.node_id(), &Frame::SessionAck).await.unwrap();
+    assert!(!recovery_reconnect_next_stamp(&net.target).await, "expired repair cannot authorize incoming controls");
+    recovery_reconnect_reconnect(&net).await;
+    let since = net.target.connected_since(net.alice.node_id()).await.unwrap();
+    assert!(!crate::session_handler::allow_paid_session_repair(net.db.as_ref(), net.bob.node_id(), net.alice.node_id(), &net.target, since).await);
+    assert!(net.target.connected_session_peers().await.is_empty());
+    assert!(!net.db.has_nonce(&env.nonce).await.unwrap());
+    net.stop().await;
 }

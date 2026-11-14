@@ -9,6 +9,7 @@ on:
         type: boolean
         default: false
   schedule:
+    # Nightly paid-call coverage includes live-connection session recovery.
     - cron: '23 2 * * *'
 
 permissions:
@@ -21,7 +22,7 @@ concurrency:
 jobs:
   paid-regtest:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 70
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_PROFILE_DEV_DEBUG: '0'
@@ -53,11 +54,11 @@ jobs:
           cache-all-crates: "true"
           cache-workspace-crates: "true"
       - name: sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-      - name: Enable sccache for Cargo
-        run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Configure Cargo compiler cache
+        run: bash scripts/configure-sccache.sh '${{ steps.sccache.outcome }}'
       - name: Provision hash-pinned regtest fixtures
         shell: bash
         run: |
@@ -87,6 +88,36 @@ jobs:
         run: cargo fetch --locked
       - name: Runner lifecycle tests
         run: python3 scripts/regress/test_regtest_e2e_runner.py -v
+      - name: Session recovery handover
+        run: |
+          cargo test --offline --locked -p konsensus-api --test recovery_handover
+          cargo test --offline --locked -p konsensus-node --features regtest-e2e --bin konsensus recovery_handover
+      - name: Two-node paid calls and live-connection session recovery
+        shell: bash
+        env:
+          REGTEST_TIMEOUT_SECONDS: '1200'
+        run: |
+          set -euo pipefail
+          # Exit 77 is a failure here: a compiled/skipped call is not proof.
+          {
+            git log -1 --format='M6 NODE SHA %H'
+            scripts/regress/two_node_paid_call_e2e.sh
+          } 2>&1 | tee paid-call.log
+          grep -q '^SESSION RECOVERED after ' paid-call.log
+          grep -q '^RECOVERY HANDOVER FIRST SEND deferred' paid-call.log
+          grep -q '^M6 CALL PASS reason=unpaid paid_blocks=3 ' paid-call.log
+          grep -q '^M6 CALL PASS reason=duration_cap paid_blocks=1 ' paid-call.log
+      - name: Two-node approved app grants (messages and real call blocks)
+        shell: bash
+        env:
+          REGTEST_TIMEOUT_SECONDS: '1200'
+        run: |
+          set -euo pipefail
+          scripts/regress/two_node_app_grant_e2e.sh 2>&1 | tee app-grant.log
+          grep -q '^APP GRANT PASS message_reply ' app-grant.log
+          grep -q '^APP GRANT PASS paid_call paid_blocks=2 ' app-grant.log
+          grep -q '^APP GRANT PASS refusal_total ' app-grant.log
+          grep -q '^APP GRANT PASS refusal_per_call ' app-grant.log
       - name: Production private hub forwarding (#225)
         shell: bash
         env:
@@ -122,4 +153,6 @@ jobs:
           path: |
             regtest.log
             private-forwarding.log
+            paid-call.log
+            app-grant.log
           if-no-files-found: ignore

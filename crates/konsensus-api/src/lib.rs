@@ -33,12 +33,14 @@
 //!   peer IDs, wallet balance, and LN pubkey are owner-only at `/api/v1/status`.
 //! - `GET  /api/v1/status` — owner-only full node status (behind `AuthUser`).
 //! - `GET  /api/v1/owner/claim-code` — authenticated, and additionally bound to
-//!   a loopback source and an owner actor; absent from the remote router.
+//!   a loopback source, the local Host/Origin allowlist, and an owner actor;
+//!   absent from the remote router.
 //! - `GET  /api/v1/preflight` and `GET /livez` — cheap operator liveness
 //!   probes mounted only when `AppState::operator_probes_enabled` is true.
 //!   They do not query Lightning, chain, storage, peers, or user state.
 //! - `GET  /api/v1/auth/challenge` — emits a short-lived single-use
-//!   Ed25519 challenge. Cannot require a JWT to issue one.
+//!   Ed25519 challenge. Cannot require a JWT to issue one. On the local
+//!   listener, Host and Origin use the same admission as local token minting.
 //! - `POST /api/v1/auth/token` — JWT bootstrap via Ed25519 signature over
 //!   that challenge. Cannot require a JWT to issue one.
 //! - `POST /api/v1/auth/local` — JWT bootstrap restricted to loopback
@@ -54,10 +56,16 @@
 //!   from the `?token=<jwt>` query parameter inside `ws_handler`
 //!   (browsers cannot set `Authorization` on the WS handshake).
 //!   Functionally gated; see `ws.rs`.
+//! - `GET  /api/v1/calls/:call_id/media` — binary media WebSocket (M6 N2).
+//!   Validates the JWT inline like `/ws`, then requires a live pairing
+//!   binding, the `spend` scope, the owner subject and an admitted call.
+//!   Functionally gated; see `call_media.rs`.
 
 pub mod audit;
 pub mod auth;
+pub mod auth_challenge;
 pub mod bootstrap;
+pub mod call_media;
 pub mod calls;
 pub mod control;
 pub mod custody;
@@ -83,6 +91,7 @@ mod local_request;
 pub mod membrane;
 
 pub use audit::AuditLog;
+pub use auth_challenge::AuthChallenges;
 pub use rate_limit::RateLimiter;
 pub use state::{AppState, InvoiceResponseData, WsMessage};
 
@@ -240,7 +249,8 @@ fn build_router_with_options(
         .merge(handlers::starter_channel::routes())
         .merge(handlers::organism::routes())
         .merge(handlers::gossip::routes())
-        .merge(ws::routes());
+        .merge(ws::routes())
+        .merge(call_media::routes());
     let router = if remote {
         router.layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -256,7 +266,8 @@ fn build_router_with_options(
                 Router::new()
                     .route(
                         "/api/v1/owner/claim-code",
-                        get(handlers::owner_claim_code::show),
+                        get(handlers::owner_claim_code::show)
+                            .layer(middleware::from_fn(local_request::guard)),
                     )
                     .layer(middleware::map_response(
                         |mut response: axum::response::Response| async move {
@@ -364,6 +375,24 @@ pub async fn serve(
             tokio::select! {
                 _ = tick.tick() => staging_state.file_staging.lock().unwrap_or_else(|e| e.into_inner()).sweep(&staging_state),
                 _ = staging_shutdown.changed() => break,
+            }
+        }
+    });
+    // Paid call deadlines are enforced independently of connected apps.
+    let call_state = state.clone();
+    let mut call_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64).unwrap_or(0);
+                    if let Err(error) = calls::maintain_calls(&call_state, now).await {
+                        tracing::warn!(%error, "call expiry maintenance failed");
+                    }
+                },
+                _ = call_shutdown.changed() => break,
             }
         }
     });

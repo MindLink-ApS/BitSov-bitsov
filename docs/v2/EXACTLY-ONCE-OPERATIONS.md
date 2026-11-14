@@ -26,7 +26,7 @@ Accounting recovery in every operation state resolves the original paired caller
 
 Offline paid operations skip transport sends and persist an exponential retry schedule: 15, 30, 60, 120, 240, then 300 seconds (capped). Restart preserves the deadline. Once a due check finds the peer connected, recovery resets the backoff and resends the stored envelope. Offline checks do not increment send attempts. Explicit client retries retain their existing behavior and rejection backoff; the independent pending-delivery flusher is unchanged.
 
-Slice 3 follow-up (Fable #113 finding 1): generate the keysend preimage locally and persist its hash before dispatch. Slice 2 still receives keysend identity from the backend, so a crash after dispatch but before the hash is recorded leaves the operation `payment_unknown` indefinitely. Time passing is never evidence that repayment is safe.
+Slice 3 follow-up (review #113 finding 1): generate the keysend preimage locally and persist its hash before dispatch. Slice 2 still receives keysend identity from the backend, so a crash after dispatch but before the hash is recorded leaves the operation `payment_unknown` indefinitely. Time passing is never evidence that repayment is safe.
 
 Existing pending deliveries receive `legacy:<message_id>:<recipient_id>` status IDs. Their original plaintext request binding is unavailable, so these are GET receipts rather than compose retry IDs. Existing legacy recipient acceptance and ACK behavior is unchanged.
 
@@ -101,6 +101,27 @@ After 30 days without a terminal/accounting update, at most 100 `acked`/`failed_
 Coordination with #103: compaction does not touch `payment_receipts`, its migration-022 immutable envelope bindings, nonces, pending deliveries or message content. Recipient duplicate ACK and proof-reuse decisions remain valid after sender recovery compaction and independent message-content retention. Paid-message retention continues to follow `PAID-DELIVERY-SLICE-1.md`.
 
 Tests measure actual SQLite VM steps before/after 20,000 additional terminal rows, verify excluded encrypted blobs are never decrypted, exercise every state with/without accounting, upgrade a migration-024 database without checksum changes, and verify bounded encrypted retention, duplicate POST responses and #103 receipt binding after compaction/restart. Late unattached links are covered after fencing, a newer execution, and compaction; existing dispatch, settlement, budget-write failure and ACK crash-injection tests remain required.
+
+## Direct payments
+
+`POST /api/v1/payments/pay` and `/payments/keysend` require a client
+`request_id`, recorded in the same ledger as channel opens and on-chain sends
+(`pay:<caller>:<id>` / `keysend:<caller>:<id>`) before the budget debit and the backend call. A
+repeat answers from the record and never dispatches again; the outcome is
+reported as `202 in_flight` until the backend says settled (`200 settled`) or
+failed. Status codes, replay rules and the compatibility notes are in
+[API_PAYMENTS.md](API_PAYMENTS.md).
+
+## Paid web requests (kinds 500/510)
+
+The outstanding-reply row that binds a paid page or manifest request to its
+reply (`outstanding_web_requests`, migration 026) is written by
+`commit_outbox_envelope` in the same transaction as the paid envelope, the
+pending queue row and the `paid` transition. A crash after that commit cannot
+leave an envelope whose reply is unbindable. Every resend of the envelope (an
+operation retry, the recovery loop, or the reconnect flusher) upserts the row
+again, restoring it if the reply window consumed it and extending the window
+from the resend.
 
 ## Channel opens (#331)
 

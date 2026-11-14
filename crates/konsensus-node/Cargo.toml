@@ -79,6 +79,8 @@ sqlx.workspace = true
 lightning-invoice.workspace = true
 
 [dev-dependencies]
+syn = { version = "2", features = ["full"] }
+esplora-client = { version = "0.12", default-features = false, features = ["async-https-rustls", "tokio"] }
 mockito = "1"
 # Decode terminal output in the P1 regression; no image stack.
 quircs = "=0.10.3"
@@ -91,3 +93,6 @@ ldk-node.workspace = true
 tower = { workspace = true, features = ["util"] }
 lightning-invoice.workspace = true
 secp256k1 = "0.29"
+# WebSocket client for the in-process two-node call media test; the server
+# side is axum's own (same tungstenite already in the tree).
+tokio-tungstenite = "0.24"

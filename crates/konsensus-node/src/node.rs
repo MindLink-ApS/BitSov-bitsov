@@ -29,6 +29,70 @@ use konsensus_storage::Storage;
 
 use crate::config::{ChainConfig, LightningConfig, NodeConfig, PricingMode, StorageConfig};
 
+/// Bound on the start-time network check. A slow source counts as unreachable.
+const CHAIN_NETWORK_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Refuse to start when the chain source is on another network than the
+/// configured one. An unreachable source starts as before: the provider
+/// serves no chain data, so the node is not ready, until the source answers
+/// on the configured network.
+pub(crate) async fn verify_chain_network(
+    check: impl std::future::Future<Output = konsensus_chain::NetworkCheck>,
+) -> Result<()> {
+    use konsensus_chain::NetworkCheck;
+    match tokio::time::timeout(CHAIN_NETWORK_CHECK_TIMEOUT, check).await {
+        Ok(NetworkCheck::Mismatch(mismatch)) => Err(anyhow::Error::new(mismatch)),
+        Ok(NetworkCheck::Verified) => {
+            info!("chain source network verified");
+            Ok(())
+        }
+        Ok(NetworkCheck::Unavailable | NetworkCheck::NotConfigured) | Err(_) => {
+            warn!(
+                "chain source network not verified yet: source unreachable; \
+                 chain data stays unavailable until it answers on the configured network"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// LDK's own Esplora URLs can differ from `[chain]`. Refuse one on another
+/// network here too, before any node file exists. No answer is left to LDK's
+/// own start, which then stays offline until the source answers.
+async fn verify_ldk_esplora_network(config: &NodeConfig, network: bitcoin::Network) -> Result<()> {
+    let LightningConfig::Ldk {
+        esplora_url,
+        esplora_url_fallback,
+        credentials_file,
+        ..
+    } = &config.lightning
+    else {
+        return Ok(());
+    };
+    if matches!(
+        config.chain,
+        ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_)
+    ) {
+        // LDK then uses the [chain] source, checked above.
+        return Ok(());
+    }
+    let primary = credentials_file
+        .as_deref()
+        .map(konsensus_chain::bearer::BearerAuth::from_file)
+        .transpose()?
+        .map(|auth| konsensus_chain::bearer::BearerFailover::new(auth, esplora_url, Vec::new()))
+        .transpose()?;
+    let mut urls = vec![esplora_url.as_str()];
+    urls.extend(esplora_url_fallback.as_deref());
+    // Bounded per endpoint inside the check.
+    let result =
+        konsensus_chain::network::verify_esplora_api_urls(network, &urls, primary.as_deref()).await;
+    if let konsensus_chain::NetworkCheck::Mismatch(mismatch) = result.check {
+        return Err(anyhow::Error::new(mismatch));
+    }
+    Ok(())
+}
+
 /// A running BitSov v2 node.
 ///
 /// Owns all components and manages their lifecycle. Created via
@@ -44,6 +108,8 @@ pub struct KonsensusNode {
 
     /// Storage backend (type-erased).
     storage: Arc<dyn Storage>,
+
+    record_policy: konsensus_crypto::record_cipher::LegacyReadPolicy,
 
     /// Lightning provider (type-erased).
     lightning: Arc<dyn LightningProvider>,
@@ -94,6 +160,9 @@ impl KonsensusNode {
     ) -> Result<Self> {
         config.validate_starter_hub(false)?;
         config.validate_routing_fee_backend()?;
+        // A public explorer tip the owner never accepted: warn and label only.
+        // The config is never changed: the owner edits it by hand.
+        let explorer_default = crate::chain_tip::warn_at_start(&config);
         // Fail closed before starting LDK or opening node state on insecure credentials.
         let chain_auth = match &config.chain {
             ChainConfig::Esplora {
@@ -102,6 +171,64 @@ impl KonsensusNode {
             } => Some(konsensus_chain::bearer::BearerAuth::from_file(path)?),
             _ => None,
         };
+        // ── 1. Initialize Chain provider ────────────────────────────────
+        // Before any node state or Lightning: a source on another network
+        // refuses startup.
+        let network = config.lightning.chain_source_network();
+        if network.is_none() && !matches!(config.chain, ChainConfig::Mock) {
+            // [chain] has no network of its own; only the Lightning backend sets one.
+            warn!("chain source network not checked: the Lightning backend sets no network");
+        }
+        let chain: Arc<dyn ChainProvider> = match &config.chain {
+            ChainConfig::Esplora { api_url, .. } => {
+                let esplora_config = EsploraConfig::custom(
+                    api_url.clone(),
+                    konsensus_core::traits::chain::TrustLevel::ServerTrust,
+                );
+                info!(backend = "esplora", "chain provider");
+                let provider = EsploraProvider::with_fallbacks(
+                    esplora_config,
+                    config.chain.esplora_fallbacks(&config.lightning),
+                )?;
+                let mut provider = match chain_auth {
+                    Some(auth) => provider.with_bearer(auth)?,
+                    None => provider,
+                };
+                if let Some(network) = network {
+                    provider = provider.with_network(network);
+                    verify_chain_network(provider.verify_network()).await?;
+                }
+                Arc::new(provider)
+            }
+            ChainConfig::Bitcoind(rpc) => {
+                info!(backend = "bitcoind", "chain provider (own node)");
+                let mut provider = konsensus_chain::BitcoindProvider::new(rpc.clone())?;
+                if let Some(network) = network {
+                    provider = provider.with_network(network);
+                    verify_chain_network(provider.verify_network()).await?;
+                }
+                Arc::new(provider)
+            }
+            ChainConfig::Electrum(server) => {
+                info!(backend = "electrum", "chain provider (server-trusting)");
+                let mut provider = konsensus_chain::ElectrumProvider::new(server.clone())?;
+                if let Some(network) = network {
+                    provider = provider.with_network(network);
+                    verify_chain_network(provider.verify_network()).await?;
+                }
+                Arc::new(provider)
+            }
+            ChainConfig::Mock => {
+                info!(backend = "mock", "chain provider (testnet)");
+                Arc::new(MockChainProvider::new())
+            }
+        };
+
+        info!("chain provider initialized");
+        if let Some(network) = network {
+            verify_ldk_esplora_network(&config, network).await?;
+        }
+
         // Same directory as the embedded LDK state. Check before opening either store.
         let data_dir = config
             .identity
@@ -119,7 +246,7 @@ impl KonsensusNode {
             data_dir.to_path_buf(),
             config.disk_free_floor_bytes,
         ));
-        // ── 1. Load identity ────────────────────────────────────────────
+        // ── 2. Load identity ────────────────────────────────────────────
         let mnemonic = crate::mnemonic_crypto::read_mnemonic(
             &config.identity.mnemonic_file,
             mnemonic_password,
@@ -139,7 +266,11 @@ impl KonsensusNode {
 
         info!(node_id = %identity.node_id(), "identity loaded");
 
-        // ── 2. Initialize storage ───────────────────────────────────────
+        // ── 3. Initialize storage ───────────────────────────────────────
+        let encrypted_storage = match &config.storage {
+            StorageConfig::Sqlite { encrypted, .. } | StorageConfig::Postgres { encrypted, .. } => *encrypted,
+        };
+        let record_policy = konsensus_crypto::record_cipher::LegacyReadPolicy::for_storage(data_dir, encrypted_storage);
         let storage: Arc<dyn Storage> = match &config.storage {
             StorageConfig::Sqlite {
                 path, encrypted, ..
@@ -148,9 +279,10 @@ impl KonsensusNode {
                     .await
                     .with_context(|| format!("failed to open SQLite at {path}"))?;
                 if *encrypted {
-                    Arc::new(konsensus_storage::EncryptedStorage::new(
+                    Arc::new(konsensus_storage::EncryptedStorage::with_policy(
                         sqlite,
                         identity.aes_key(),
+                        record_policy.clone(),
                     ))
                 } else {
                     Arc::new(sqlite)
@@ -161,9 +293,10 @@ impl KonsensusNode {
                     .await
                     .with_context(|| "failed to connect to PostgreSQL")?;
                 if *encrypted {
-                    Arc::new(konsensus_storage::EncryptedStorage::new(
+                    Arc::new(konsensus_storage::EncryptedStorage::with_policy(
                         pg,
                         identity.aes_key(),
+                        record_policy.clone(),
                     ))
                 } else {
                     Arc::new(pg)
@@ -173,7 +306,7 @@ impl KonsensusNode {
 
         info!("storage initialized");
 
-        // ── 3. Initialize Lightning provider ────────────────────────────
+        // ── 4. Initialize Lightning provider ────────────────────────────
         let lightning: Arc<dyn LightningProvider> = match &config.lightning {
             LightningConfig::Lnbits { .. } => {
                 anyhow::bail!("not_supported: LNbits routing fee ceilings")
@@ -359,39 +492,6 @@ impl KonsensusNode {
             });
         info!("lightning provider initialized");
 
-        // ── 4. Initialize Chain provider ────────────────────────────────
-        let chain: Arc<dyn ChainProvider> = match &config.chain {
-            ChainConfig::Esplora { api_url, .. } => {
-                let esplora_config = EsploraConfig::custom(
-                    api_url.clone(),
-                    konsensus_core::traits::chain::TrustLevel::ServerTrust,
-                );
-                info!(backend = "esplora", "chain provider");
-                let provider = EsploraProvider::with_fallbacks(
-                    esplora_config,
-                    config.chain.esplora_fallbacks(&config.lightning),
-                )?;
-                Arc::new(match chain_auth {
-                    Some(auth) => provider.with_bearer(auth)?,
-                    None => provider,
-                })
-            }
-            ChainConfig::Bitcoind(rpc) => {
-                info!(backend = "bitcoind", "chain provider (own node)");
-                Arc::new(konsensus_chain::BitcoindProvider::new(rpc.clone())?)
-            }
-            ChainConfig::Electrum(server) => {
-                info!(backend = "electrum", "chain provider (server-trusting)");
-                Arc::new(konsensus_chain::ElectrumProvider::new(server.clone())?)
-            }
-            ChainConfig::Mock => {
-                info!(backend = "mock", "chain provider (testnet)");
-                Arc::new(MockChainProvider::new())
-            }
-        };
-
-        info!("chain provider initialized");
-
         // ── 5. Initialize Pricing engine ────────────────────────────────
         let base_pricing_config = konsensus_pricing::StaticPricingConfig {
             chat_msat: config.pricing.chat_msat,
@@ -402,12 +502,16 @@ impl KonsensusNode {
             collaboration_msat: config.pricing.collaboration_msat,
             realtime_signal_msat: config.pricing.realtime_signal_msat,
             call_msat: config.pricing.call_msat,
+            call_block_msat: config.pricing.call_block_msat,
             app_ext_msat: config.pricing.app_ext_msat,
             web_content_msat: config.pricing.web_content_msat,
             // T2R3: relay storage uses the pricing-engine default until the node
             // config exposes it (relay is dormant/default-off — ADR-034).
             ..Default::default()
         };
+        // From here on the chain tip is a recent best block or an error, for
+        // pricing, admission, price tables and paid sends alike.
+        let chain = bounded_tip(chain, &config);
         let pricing: Arc<dyn PricingEngine> = match config.pricing.mode {
             PricingMode::Static => {
                 info!(mode = "static", "pricing engine");
@@ -499,6 +603,7 @@ impl KonsensusNode {
         info!("routing table initialized");
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let chain = crate::chain_tip::label(chain, explorer_default.as_ref());
 
         Ok(Self {
             _state_guard: state_guard,
@@ -506,6 +611,7 @@ impl KonsensusNode {
             identity,
             config,
             storage,
+            record_policy,
             lightning,
             chain,
             pricing,
@@ -551,6 +657,43 @@ impl KonsensusNode {
 
         tokio::spawn(self.disk.clone().monitor(self.shutdown_rx()));
 
+        let storage = self.storage.clone();
+        let encrypted_storage = match &self.config.storage {
+            StorageConfig::Sqlite { encrypted, .. }
+            | StorageConfig::Postgres { encrypted, .. } => *encrypted,
+        };
+        let upgrade = konsensus_storage::record_upgrade::RecordUpgrade::new(
+            self.identity.aes_key(),
+            self.record_policy.clone(),
+            encrypted_storage,
+        );
+        let mut shutdown = self.shutdown_rx();
+        tokio::spawn(async move {
+            let mut retry_attempt = 0u32;
+            loop {
+                let retry_delay =
+                    konsensus_storage::record_upgrade::RecordUpgrade::retry_delay(retry_attempt);
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    result = upgrade.run(storage.as_ref()) => match result {
+                        Ok(changed) => {
+                            info!(changed, "storage record format cutoff is active");
+                            return;
+                        }
+                        Err(_) => tracing::warn!(
+                            retry_after_seconds = retry_delay.as_secs(),
+                            "storage record format upgrade deferred; will retry",
+                        ),
+                    }
+                }
+                tokio::select! {
+                    _ = shutdown.changed() => return,
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+                retry_attempt = retry_attempt.saturating_add(1);
+            }
+        });
+
         // Start routing table maintenance (periodic decay + pruning)
         self.routing.spawn_maintenance();
         info!("routing table maintenance tasks started");
@@ -583,6 +726,8 @@ impl KonsensusNode {
     }
 
     /// The storage backend.
+    pub fn record_policy(&self) -> konsensus_crypto::record_cipher::LegacyReadPolicy { self.record_policy.clone() }
+
     pub fn storage(&self) -> &Arc<dyn Storage> {
         &self.storage
     }
@@ -706,11 +851,29 @@ impl KonsensusNode {
 /// invitee connects inbound) is admitted by `node_id` with a non-routable
 /// sentinel address and `auto_connect = false` — it is accepted inbound, never
 /// dialed.
+/// A real chain source's tip, bounded by the configured network's age limit
+/// (`[lightning] network`; see `konsensus_chain::tip::max_tip_age`). Mock
+/// chain data is synthetic and stays as it is.
+pub(crate) fn bounded_tip(
+    chain: Arc<dyn ChainProvider>,
+    config: &NodeConfig,
+) -> Arc<dyn ChainProvider> {
+    match config.chain {
+        ChainConfig::Mock => chain,
+        ChainConfig::Esplora { .. } | ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_) => {
+            konsensus_chain::FreshTip::wrap(chain, config.lightning.bitcoin_network().as_deref())
+        }
+    }
+}
+
 pub(crate) fn merge_persisted_peers(
     registry: &mut PeerRegistry,
     peers: Vec<konsensus_storage::Peer>,
 ) {
     for peer in peers {
+        if peer.metadata.get("storage_legacy_untrusted").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
         if registry.get(&peer.node_id).is_some() {
             continue;
         }
@@ -759,6 +922,7 @@ pub(crate) fn default_advertised_capabilities(relay_enabled: bool) -> Vec<Capabi
     let mut caps = vec![
         Capability::X3dh,
         Capability::Custom(konsensus_core::payloads::call::MEETING_CAPABILITY.to_string()),
+        Capability::Custom(konsensus_message::wire::CALL_MEDIA_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::content::PORCH_READ_CAPABILITY.to_string()),
         Capability::Custom(konsensus_core::payloads::content::PORCH_QUOTE_CAPABILITY.to_string()),
@@ -799,6 +963,14 @@ mod relay_capability_tests {
             serde_json::from_str::<Vec<Capability>>(&wire).unwrap(),
             caps
         );
+    }
+
+    #[test]
+    fn call_media_capability_is_advertised_in_the_form_peers_list_shows() {
+        // M6 N2: a node forwards call media only to a peer that lists this.
+        let media = Capability::Custom("call_media_v1".into());
+        assert!(default_advertised_capabilities(false).contains(&media));
+        assert_eq!(format!("{media:?}"), r#"Custom("call_media_v1")"#);
     }
 
     #[test]
@@ -885,4 +1057,20 @@ mod p3_2_whitelist_tests {
             Some("198.51.100.7:9735".parse().unwrap())
         );
     }
+}
+
+#[tokio::test]
+async fn plaintext_peer_does_not_enter_registry_before_or_after_upgrade() {
+    use konsensus_storage::{EncryptedStorage, Peer, SqliteStorage, Storage};
+    let dir = tempfile::tempdir().unwrap();
+    let policy = konsensus_crypto::record_cipher::LegacyReadPolicy::in_data_dir(dir.path());
+    let storage = EncryptedStorage::with_policy(SqliteStorage::in_memory().await.unwrap(), &[7; 32], policy.clone());
+    let peer = Peer::new(konsensus_core::NodeId::from_bytes([1; 32]));
+    storage.inner().upsert_peer(&peer).await.unwrap();
+    let mut registry = PeerRegistry::new();
+    merge_persisted_peers(&mut registry, storage.list_peers().await.unwrap());
+    assert!(registry.get(&peer.node_id).is_none());
+    konsensus_storage::record_upgrade::RecordUpgrade::new(&[7; 32], policy, true).run(&storage).await.unwrap();
+    merge_persisted_peers(&mut registry, storage.list_peers().await.unwrap());
+    assert!(registry.get(&peer.node_id).is_none());
 }

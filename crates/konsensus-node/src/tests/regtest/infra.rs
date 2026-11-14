@@ -10,6 +10,34 @@ impl Drop for Process {
     }
 }
 
+/// Forward one request to `url` and relay the upstream status and body.
+/// A failed upstream request or body read is answered with 503, a status the
+/// Esplora client retries, so the caller's own retry handles it; it must never
+/// panic the proxy task.
+pub async fn forward(
+    client: &reqwest::Client,
+    method: axum::http::Method,
+    url: String,
+    body: axum::body::Bytes,
+) -> (axum::http::StatusCode, axum::body::Bytes) {
+    let bad_gateway = || {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::body::Bytes::new(),
+        )
+    };
+    match client.request(method, url).body(body).send().await {
+        Ok(response) => {
+            let status = response.status();
+            match response.bytes().await {
+                Ok(bytes) => (status, bytes),
+                Err(_) => bad_gateway(),
+            }
+        }
+        Err(_) => bad_gateway(),
+    }
+}
+
 pub struct Chain {
     _electrs: Process,
     pub bitcoin: corepc_node::Node,
@@ -110,12 +138,13 @@ impl Chain {
                     let upstream = upstream.clone();
                     let client = client.clone();
                     async move {
-                        let response = client
-                            .get(format!("{upstream}/{path}"))
-                            .send()
-                            .await
-                            .unwrap();
-                        (response.status(), response.bytes().await.unwrap())
+                        forward(
+                            &client,
+                            axum::http::Method::GET,
+                            format!("{upstream}/{path}"),
+                            axum::body::Bytes::new(),
+                        )
+                        .await
                     }
                 },
             ),
@@ -333,4 +362,97 @@ pub async fn router(dir: &std::path::Path, chain: &Chain) -> (Arc<ldk_node::Node
         }
     });
     (node, addr)
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::forward;
+    use axum::http::{Method, StatusCode};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // The first connection is accepted and dropped before any response, so the
+    // client sees a transport error; later requests are served normally.
+    async fn flaky_upstream() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let failed = Arc::new(AtomicBool::new(false));
+        let app = axum::Router::new().route("/ok", axum::routing::get(|| async { "fine" }));
+        tokio::spawn(async move {
+            if !failed.swap(true, Ordering::SeqCst) {
+                drop(listener.accept().await);
+            }
+            axum::serve(listener, app).await.unwrap();
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn upstream_failing_once_gives_503_then_recovers() {
+        let upstream = flaky_upstream().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("{upstream}/ok");
+
+        let (status, body) = forward(&client, Method::GET, url.clone(), Default::default()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.is_empty());
+
+        let (status, body) = forward(&client, Method::GET, url, Default::default()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"fine");
+    }
+
+    // Drive the vendored Esplora client through a proxy built on `forward`:
+    // one dropped upstream connection must be retried transparently.
+    #[tokio::test]
+    async fn esplora_client_recovers_from_one_dropped_upstream_connection() {
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("http://{}", listener.local_addr().unwrap());
+        let app =
+            axum::Router::new().route("/blocks/tip/height", axum::routing::get(|| async { "123" }));
+        tokio::spawn(async move {
+            drop(listener.accept().await);
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let router = axum::Router::new().route(
+            "/api/*path",
+            axum::routing::get(
+                move |axum::extract::Path(path): axum::extract::Path<String>| {
+                    let (upstream, client, counter) =
+                        (upstream.clone(), client.clone(), counter.clone());
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        forward(
+                            &client,
+                            Method::GET,
+                            format!("{upstream}/{path}"),
+                            Default::default(),
+                        )
+                        .await
+                    }
+                },
+            ),
+        );
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_url = format!("http://{}/api", proxy.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(proxy, router).await.unwrap();
+        });
+
+        let esplora = esplora_client::Builder::new(&api_url)
+            .build_async()
+            .unwrap();
+        let height = tokio::time::timeout(std::time::Duration::from_secs(30), esplora.get_height())
+            .await
+            .expect("get_height timed out")
+            .expect("get_height failed");
+        assert_eq!(height, 123);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
 }

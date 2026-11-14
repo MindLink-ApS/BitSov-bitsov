@@ -1804,7 +1804,7 @@ async fn sas_remote_round_trip_binds_device_and_never_returns_claim_material() {
 }
 
 #[tokio::test]
-async fn sas_three_mismatches_or_cancels_close_setup_including_legacy_downgrade() {
+async fn sas_mismatches_limit_attempts_while_cancels_leave_setup_open() {
     for cancel in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let (code, _) = konsensus_api::sas::initialize(dir.path()).unwrap();
@@ -1866,6 +1866,21 @@ async fn sas_three_mismatches_or_cancels_close_setup_including_legacy_downgrade(
                 );
             }
             assert!(!r.state.is_committed());
+        }
+        if cancel {
+            assert_eq!(
+                call_via(
+                    &r.state,
+                    &r.token,
+                    "/api/v1/identity/create-pending",
+                    sas_create(&key),
+                    Some(TUNNEL_PEER),
+                )
+                .await
+                .0,
+                StatusCode::OK,
+            );
+            continue;
         }
         for request in [sas_create(&key), commitment(REMOTE_PASSWORD)] {
             let (status, body) = call_via(

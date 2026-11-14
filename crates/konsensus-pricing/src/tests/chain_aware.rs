@@ -124,7 +124,7 @@ async fn realtime_signaling_uses_payment_gate_price() {
     assert_eq!(engine.get_price_msat(KIND_ICE_CANDIDATE).await.unwrap(), 59);
     // The call offer's own base (call_msat 10 000) takes the same multiplier.
     assert!(engine.get_price_msat(KIND_CALL_INVITE).await.unwrap() > 10_000);
-    assert_eq!(engine.category_price_overrides(), Some(vec![konsensus_core::kind::KIND_LONGFORM, KIND_CALL_INVITE]));
+    assert_eq!(engine.category_price_overrides(), Some(vec![konsensus_core::kind::KIND_LONGFORM, KIND_CALL_INVITE, konsensus_core::kind::KIND_CALL_BLOCK]));
 }
 
 #[tokio::test]
@@ -251,7 +251,7 @@ fn volatility_cap_limits_extreme_prices() {
     );
 
     // Non-finite/negative cap config is not a valid "disable cap" signal.
-    // It falls back to the default bounded-plasticity cap (5x).
+    // It falls back to the default bounded-adaptation cap (5x).
     assert_eq!(
         ChainAwarePricingEngine::apply_multiplier(10, 1000.0, 4.0, f64::NAN),
         50
@@ -1099,7 +1099,7 @@ async fn seeded_chain_state_reports_an_expired_fetch_time() {
     );
 }
 
-// ── Freshness of reused values (Codex P2 on #78) ───────────────────
+// ── Freshness of reused values (review P2 on #78) ───────────────────
 
 /// Synced provider whose `estimate_fee` fails for the targets in `failing`.
 struct FlakyFeeChain {
@@ -1369,4 +1369,108 @@ async fn admission_height_observation_preserves_price_and_original_freshness() {
     let cached = cache.as_ref().unwrap();
     assert_eq!(cached.block_height, 886_000);
     assert_eq!(cached.block_height_fetched_at, observed_at);
+}
+
+// ── A synced source whose tip height cannot be read ─────────────────
+
+/// Synced, with fee estimates, but its height read fails while `down`.
+struct HeightDownChain {
+    down: std::sync::atomic::AtomicBool,
+    fee_reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl ChainProvider for HeightDownChain {
+    fn trust_level(&self) -> konsensus_core::traits::chain::TrustLevel {
+        konsensus_core::traits::chain::TrustLevel::FullValidation
+    }
+    async fn get_block_height(&self) -> Result<u64, konsensus_core::traits::chain::ChainError> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(konsensus_core::traits::chain::ChainError::Connection("down".into()));
+        }
+        Ok(886_000)
+    }
+    async fn get_block_header(
+        &self,
+        _height: u64,
+    ) -> Result<konsensus_core::traits::chain::BlockHeader, konsensus_core::traits::chain::ChainError>
+    {
+        Err(konsensus_core::traits::chain::ChainError::NotAvailable("unused".into()))
+    }
+    async fn estimate_fee(
+        &self,
+        target_blocks: u32,
+    ) -> Result<konsensus_core::traits::chain::FeeEstimate, konsensus_core::traits::chain::ChainError>
+    {
+        self.fee_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(konsensus_core::traits::chain::FeeEstimate {
+            target_blocks,
+            sat_per_vbyte: 50.0,
+        })
+    }
+    async fn is_tx_confirmed(
+        &self,
+        _txid: &str,
+        _min_confirmations: u32,
+    ) -> Result<bool, konsensus_core::traits::chain::ChainError> {
+        Ok(false)
+    }
+    async fn is_synced(&self) -> bool {
+        true
+    }
+}
+
+fn height_down_engine() -> (Arc<HeightDownChain>, ChainAwarePricingEngine) {
+    let chain = Arc::new(HeightDownChain {
+        down: std::sync::atomic::AtomicBool::new(true),
+        fee_reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let config = ChainAwarePricingConfig {
+        base: StaticPricingConfig::default(),
+        fee_target_blocks: 144,
+        cache_ttl: Duration::from_secs(60),
+        max_price_multiplier: 0.0,
+        fee_rate_ema_alpha: 1.0,
+        category_fee_targets: HashMap::new(),
+    };
+    let engine = ChainAwarePricingEngine::new(config, chain.clone());
+    (chain, engine)
+}
+
+#[tokio::test]
+async fn failed_tip_read_refuses_instead_of_pricing_at_height_zero() {
+    let (chain, engine) = height_down_engine();
+    // Height 0 would price chat at 10 + ceil(10 * 50 * 1.0 / 100) = 15.
+    assert!(matches!(
+        engine.get_price_msat(KIND_CHAT).await,
+        Err(PricingError::ChainUnavailable(_))
+    ));
+    assert!(matches!(
+        engine
+            .get_category_price_msat(KindCategory::Communication)
+            .await,
+        Err(PricingError::ChainUnavailable(_))
+    ));
+    // Nothing was cached as chain data, and no fee was read for the refusal.
+    assert_eq!(engine.current_block_height().await, None);
+    assert!(engine.fee_rate_state().await.is_none());
+    assert!(engine.snapshot().await.is_none());
+    assert_eq!(chain.fee_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // The next read asks the chain again: a real height prices as before
+    // (halving 4, sensitivity 1.8: 10 + ceil(10 * 50 * 1.8 / 100) = 19).
+    chain.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(engine.get_price_msat(KIND_CHAT).await.unwrap(), 19);
+    assert_eq!(engine.current_block_height().await, Some(886_000));
+}
+
+#[tokio::test]
+async fn observed_height_still_prices_while_the_tip_read_is_down() {
+    // Admission passes the height it already read; no second read is made.
+    let (_chain, engine) = height_down_engine();
+    let price = engine
+        .get_price_msat_with_chain_height(KIND_CHAT, 886_000, Instant::now())
+        .await
+        .unwrap();
+    assert_eq!(price, 19);
 }

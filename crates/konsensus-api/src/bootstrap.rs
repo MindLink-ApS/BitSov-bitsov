@@ -1813,9 +1813,6 @@ async fn cancel_pending(
             return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
         }
     }
-    if slot.as_ref().is_some_and(|p| p.sas.is_some()) {
-        state.sas_failures.fetch_add(1, Ordering::SeqCst);
-    }
     *slot = None;
     Ok(StatusCode::NO_CONTENT)
 }

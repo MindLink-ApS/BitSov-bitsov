@@ -37,9 +37,7 @@ find_binary() {
     # shellcheck disable=SC2086
     compgen -G "/tmp/bitsov-target-*/debug/build/*/out/bitcoin/bitcoin-*/bin/${name}" || true
     compgen -G "/tmp/bitsov-target-*/debug/build/*/out/electrs/*/${name}" || true
-    compgen -G "/tmp/claude-501/*/scratchpad/bin/${name}" || true
-    compgen -G "/tmp/claude-501/*/*/scratchpad/bin/${name}" || true
-    compgen -G "/tmp/claude-501/*/*/*/scratchpad/bin/${name}" || true
+    compgen -G "${BITSOV_DEMO_BIN_DIR:-${TMPDIR:-/tmp}/bitsov-demo/bin}/${name}" || true
   )
   echo "Missing $name: set BITCOIND_EXE / ELECTRS_EXE to a local cached executable (no downloads)." >&2
   return 1

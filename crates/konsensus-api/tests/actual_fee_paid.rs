@@ -20,7 +20,22 @@ fn fixture(backend: &str, fee: u64) -> (Arc<AppState>, Arc<MockLightningProvider
     (state, wallet)
 }
 
+fn rid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 async fn call(state: &Arc<AppState>, method: &str, path: &str, body: Value) -> Value {
+    let (status, value) = call_status(state, method, path, body).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    value
+}
+
+async fn call_status(
+    state: &Arc<AppState>,
+    method: &str,
+    path: &str,
+    body: Value,
+) -> (StatusCode, Value) {
     let response = test_router(state.clone())
         .oneshot(
             Request::builder()
@@ -43,8 +58,7 @@ async fn call(state: &Arc<AppState>, method: &str, path: &str, body: Value) -> V
             String::from_utf8_lossy(&bytes)
         )
     });
-    assert_eq!(status, StatusCode::OK, "{value}");
-    value
+    (status, value)
 }
 
 #[tokio::test]
@@ -59,13 +73,13 @@ async fn pay_and_keysend_report_actual_ldk_fee_including_zero() {
             &state,
             "POST",
             "/api/v1/payments/pay",
-            json!({"bolt11":invoice.bolt11,"max_routing_fee_msat":1000}),
+            json!({"request_id":rid(),"bolt11":invoice.bolt11,"max_routing_fee_msat":1000}),
         )
         .await;
         assert_eq!(paid["fee_paid_msat"], fee);
         assert_eq!(paid["max_routing_fee_msat"], 1000);
         assert_eq!(paid["amount_msat"], 1000);
-        let sent = call(&state, "POST", "/api/v1/payments/keysend", json!({"dest_pubkey":format!("02{}", "aa".repeat(32)),"amount_msat":1000,"max_routing_fee_msat":1000})).await;
+        let sent = call(&state, "POST", "/api/v1/payments/keysend", json!({"request_id":rid(),"dest_pubkey":format!("02{}", "aa".repeat(32)),"amount_msat":1000,"max_routing_fee_msat":1000})).await;
         assert_eq!(sent["fee_paid_msat"], fee);
         assert_eq!(sent["max_routing_fee_msat"], 1000);
         assert_eq!(sent["amount_msat"], 1000);
@@ -90,13 +104,22 @@ async fn pending_and_other_backends_omit_actual_fee() {
         if backend == "ldk" {
             wallet.defer_next_keysend_settlement(100).await;
         }
-        let sent = call(
+        let (status, sent) = call_status(
             &state,
             "POST",
             "/api/v1/payments/keysend",
-            json!({"dest_pubkey":format!("02{}", "aa".repeat(32)),"amount_msat":1000}),
+            json!({"request_id":rid(),"dest_pubkey":format!("02{}", "aa".repeat(32)),"amount_msat":1000}),
         )
         .await;
+        if backend == "ldk" {
+            // Deferred settlement: the route reports in flight, never paid.
+            assert_eq!(status, StatusCode::ACCEPTED, "{backend}: {sent}");
+            assert_eq!(sent["status"], "in_flight");
+            assert_eq!(sent["preimage"], "");
+        } else {
+            assert_eq!(status, StatusCode::OK, "{backend}: {sent}");
+            assert_eq!(sent["status"], "settled");
+        }
         assert!(sent.get("fee_paid_msat").is_none(), "{backend}: {sent}");
         let status = call(
             &state,
@@ -119,7 +142,7 @@ async fn pending_and_other_backends_omit_actual_fee() {
                 &state,
                 "POST",
                 "/api/v1/payments/pay",
-                json!({"bolt11":invoice.bolt11}),
+                json!({"request_id":rid(),"bolt11":invoice.bolt11}),
             )
             .await;
             assert!(paid.get("fee_paid_msat").is_none(), "{backend}: {paid}");
@@ -173,6 +196,52 @@ async fn compose_and_operation_replay_report_fee_without_repaying() {
             }
         }
         assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
+    }
+}
+
+#[tokio::test]
+async fn file_send_reports_the_actual_ldk_fee_and_omits_an_unknown_one() {
+    for (backend, fee) in [
+        ("ldk", 0),
+        ("ldk", 400),
+        ("mock", 400),
+        ("lnd", 400),
+        ("lnbits", 400),
+    ] {
+        let (mut state, wallet) = fixture(backend, fee);
+        let peer = setup_e2ee_session(&state.session_manager).await;
+        Arc::get_mut(&mut state).unwrap().transport = Arc::new(ConnectedStubTransport::new(
+            vec![peer],
+            state.invoice_requests.clone(),
+        ));
+        state
+            .peer_ln_pubkeys
+            .lock()
+            .await
+            .insert(peer, format!("02{}", "aa".repeat(32)));
+        let file = call(
+            &state,
+            "POST",
+            "/api/v1/files",
+            json!({"filename":"fee.txt","mime_type":"text/plain","data_b64":"aGk="}),
+        )
+        .await;
+        let before = wallet.get_balance_msat().await.unwrap();
+        let sent = call(
+            &state,
+            "POST",
+            &format!("/api/v1/files/{}/send", file["file_id"].as_str().unwrap()),
+            json!({"recipient":peer.to_hex(),"max_total_msat":2000,"max_routing_fee_msat":1000}),
+        )
+        .await;
+        assert_eq!(sent["amount_msat"], 1000, "{sent}");
+        assert_eq!(sent["max_routing_fee_msat"], 1000, "{sent}");
+        assert_eq!(before - wallet.get_balance_msat().await.unwrap(), 1000 + fee);
+        if backend == "ldk" {
+            assert_eq!(sent["fee_paid_msat"], fee, "{sent}");
+        } else {
+            assert!(sent.get("fee_paid_msat").is_none(), "{sent}");
+        }
     }
 }
 

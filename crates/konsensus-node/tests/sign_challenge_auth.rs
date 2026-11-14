@@ -44,7 +44,7 @@ async fn owner_router(identity: Arc<NodeIdentity>) -> axum::Router {
         transport: Arc::clone(&transport) as Arc<dyn MessageTransport>,
         session_manager: sessions,
         jwt_secret: "sign-challenge-e2e-jwt-secret".into(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -74,8 +74,10 @@ async fn owner_router(identity: Arc<NodeIdentity>) -> axum::Router {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -121,6 +123,7 @@ async fn cli_sign_challenge_accepted_by_auth_token_wrong_nonce_refused() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/auth/challenge")
+                .header("host", "localhost:3141")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -174,6 +177,7 @@ async fn cli_sign_challenge_accepted_by_auth_token_wrong_nonce_refused() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/auth/challenge")
+                .header("host", "localhost:3141")
                 .body(Body::empty())
                 .unwrap(),
         )

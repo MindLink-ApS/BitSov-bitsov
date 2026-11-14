@@ -12,7 +12,7 @@ use crate::wire::{sanitized_peer_reason, Frame, WireError};
 
 use super::{
     write_noise_message, read_noise_message,
-    ControlEvent, Connection,
+    CallMediaEvent, ControlEvent, Connection,
     FRAME_BAN_DURATION, INVALID_FRAME_BUDGET, INVALID_FRAME_WINDOW,
     MEMORY_BUDGET_WINDOW, PEER_MEMORY_BUDGET,
 };
@@ -23,8 +23,28 @@ use super::NoiseTransport;
 pub enum Standing {
     /// We settled an admission on this connection (`admission_paid`).
     AdmissionPaid,
+    /// A verified paid envelope needs E2EE repair on this connection.
+    SessionRepair,
     /// The peer is privileged on this connection (whitelisted or promoted by its payment).
     Privileged,
+}
+
+/// Encryption consumes a nonce before the first socket await. If the caller
+/// abandons a record, invalidate this exact connection synchronously, while
+/// its write lock is still held, even if the reader has not observed EOF yet.
+struct MediaWriteGuard<'a> {
+    conn: &'a Connection,
+    peer: &'a NodeId,
+    complete: bool,
+}
+
+impl Drop for MediaWriteGuard<'_> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.conn.close();
+            info!(peer = %self.peer, "unfinished media record closed peer connection");
+        }
+    }
 }
 
 // ─── impl NoiseTransport — send_frame ────────────────────────────────────────
@@ -168,9 +188,14 @@ impl NoiseTransport {
                     "{}: connection generation replaced or gone", peer.to_hex()
                 )))?
         };
+        if standing == Standing::SessionRepair && !matches!(Frame::from_bytes(frame_bytes),
+            Ok(Frame::PrekeyOffer { .. } | Frame::SessionInit { .. } | Frame::SessionAck | Frame::RatchetInit { .. })) {
+            return Err(TransportError::Other("session repair standing permits only E2EE control frames".into()));
+        }
         let mut state = conn.lock().await;
         let holds = match standing {
             Standing::AdmissionPaid => conn.admission_paid.load(std::sync::atomic::Ordering::Acquire),
+            Standing::SessionRepair => conn.session_repair_active(),
             Standing::Privileged => state.privileged,
         };
         if conn.is_closed() || !holds {
@@ -185,6 +210,57 @@ impl NoiseTransport {
         write_noise_message(&mut state.writer, &encrypted)
             .await
             .map_err(|e| TransportError::Other(e.to_string()))
+    }
+
+    /// Write one encoded [`Frame::CallMedia`] to `peer`, waiting at most
+    /// [`CALL_MEDIA_WRITE_DEADLINE`] for the connection's writer (M6 N2).
+    ///
+    /// Every frame on a connection shares one writer, so a bulk frame in
+    /// flight would otherwise queue audio behind it for as long as it takes.
+    /// Media is instead bounded: a packet that cannot start within the
+    /// deadline is dropped and `Timeout` returned, never written late. Wait
+    /// for socket readiness within that deadline before consuming a nonce;
+    /// congestion or cancellation here leaves the connection usable. Once
+    /// encrypted, the write has its own deadline: cancellation, failure or
+    /// timeout closes this connection before releasing the write lock.
+    ///
+    /// [`CALL_MEDIA_WRITE_DEADLINE`]: super::CALL_MEDIA_WRITE_DEADLINE
+    pub async fn send_call_media(&self, peer: &NodeId, frame_bytes: &[u8]) -> Result<(), TransportError> {
+        let conn = {
+            let peers = self.peers.read().await;
+            Arc::clone(
+                peers
+                    .get(peer)
+                    .ok_or_else(|| TransportError::NotConnected(peer.to_hex()))?,
+            )
+        };
+        let deadline = tokio::time::Instant::now() + super::CALL_MEDIA_WRITE_DEADLINE;
+        let mut state = tokio::time::timeout_at(deadline, conn.lock())
+            .await
+            .map_err(|_| TransportError::Timeout("call media writer busy".into()))?;
+        if conn.is_closed() {
+            return Err(TransportError::NotConnected(peer.to_hex()));
+        }
+        tokio::time::timeout_at(deadline, state.writer.writable())
+            .await
+            .map_err(|_| TransportError::Timeout("call media socket not writable".into()))?
+            .map_err(|e| TransportError::Other(e.to_string()))?;
+        // Readiness can race or be a false positive. After encrypting we
+        // must still close on an incomplete record; never reuse its nonce.
+        let mut guard = MediaWriteGuard { conn: &conn, peer, complete: false };
+        let encrypted = state
+            .noise
+            .encrypt(frame_bytes)
+            .map_err(|e| TransportError::NoiseError(e.to_string()))?;
+        tokio::time::timeout(
+            super::CALL_MEDIA_WRITE_DEADLINE,
+            write_noise_message(&mut state.writer, &encrypted),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout("call media record write stalled; connection closed".into()))?
+        .map_err(|e| TransportError::Other(e.to_string()))?;
+        guard.complete = true;
+        Ok(())
     }
 
     /// M1b promote-on-paid: flip a connection's `privileged` flag to `true`.
@@ -257,8 +333,25 @@ impl NoiseTransport {
         privileged
     }
 
+    /// Permit only E2EE repair on this exact live connection until its deadline. Callers must
+    /// have durably deferred a verified paid envelope, or matched a paid
+    /// outbound delivery to an authenticated recovery refusal.
+    pub async fn allow_session_repair(&self, peer: &NodeId, since: Instant, until: Instant) -> bool {
+        let peers = self.peers.read().await;
+        let Some(conn) = peers.get(peer).filter(|conn| conn.connected_at == since && !conn.is_closed()) else {
+            return false;
+        };
+        conn.allow_session_repair_until(until)
+    }
+
+    pub async fn session_repair_on_connection(&self, peer: &NodeId) -> bool {
+        self.peers.read().await.get(peer).is_some_and(|conn|
+            !conn.is_closed() && conn.session_repair_active())
+    }
+
     /// Connected peers eligible for E2EE session setup: privileged ones, plus
-    /// a peer whose admission WE settled on this live connection
+    /// a peer with a paid deferral needing repair, or whose admission WE settled
+    /// on this live connection
     /// (`Connection::admission_paid`, BUG-PSI). Offering our prekey to the node
     /// we paid is our own choice and completes the act we bought; it is how
     /// the session forms when the payee is the X3DH initiator.
@@ -274,7 +367,9 @@ impl NoiseTransport {
         };
         let mut eligible = Vec::with_capacity(conns.len());
         for (id, conn) in conns {
-            if conn.admission_paid.load(std::sync::atomic::Ordering::Acquire) || conn.lock().await.privileged {
+            if conn.admission_paid.load(std::sync::atomic::Ordering::Acquire)
+                || conn.session_repair_active()
+                || conn.lock().await.privileged {
                 eligible.push(id);
             }
         }
@@ -320,10 +415,19 @@ pub(super) fn spawn_reader_task(
     ctx: super::TransportCtx,
 ) {
     tokio::spawn(async move {
-        let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, mut shutdown, .. } = ctx;
+        let super::TransportCtx { peers, banned_peers, incoming_tx, control_tx, call_media_tx, media_ingress, mut shutdown, .. } = ctx;
         if *shutdown.borrow() { conn.remove(&peer_id, &peers).await; return; }
         // Keep the read future alive across ping ticks: cancelling/restarting a
         // partial length-prefixed read would corrupt framing and reset its deadline.
+        // Fixed for this connection's life, and stamped on its session frames.
+        let connection = {
+            let state = conn.lock().await;
+            Arc::new(super::ConnectionContext {
+                generation: conn.connected_at,
+                hello_key: state.noise.remote_static_key().copied(),
+                capabilities: state.capabilities.clone(),
+            })
+        };
         let read_frames = async {
         loop {
             // Read the next encrypted message
@@ -434,11 +538,15 @@ pub(super) fn spawn_reader_task(
             // its session handshake, acks/rejects of our messages and its prices.
             // Every other frame (peer exchange, Lightning info, gossip, price
             // queries, invoice requests) keeps plain `privileged`.
-            let (privileged, bought, source_ip) = {
+            // A deferred paid envelope opens only the E2EE repair controls.
+            // Prices, invoices, media and other services keep their own standing.
+            let (privileged, bought, session_control, source_ip) = {
                 let mut state = conn.lock().await;
                 state.last_recv = Instant::now();
                 let paid = conn.admission_paid.load(std::sync::atomic::Ordering::Acquire);
-                (state.privileged, state.privileged || paid, state.source_ip)
+                let bought = state.privileged || paid;
+                let session_control = bought || conn.session_repair_active();
+                (state.privileged, bought, session_control, state.source_ip)
             };
 
             // Handle frame
@@ -472,10 +580,11 @@ pub(super) fn spawn_reader_task(
                     info!(peer = %peer_id, reason = %sanitized_peer_reason(&reason), "peer disconnected gracefully");
                     break;
                 }
-                Frame::MessageAck { id, duplicate } => {
+                Frame::MessageAck { id, duplicate, paid_until_ms } => {
                     debug!(peer = %peer_id, msg_id = %id, "received message ack");
                     if let Err(e) = control_tx
                         .send(ControlEvent::MessageAcked {
+                            paid_until_ms,
                             duplicate,
                             peer_id,
                             message_id: id,
@@ -506,7 +615,9 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::PrekeyOffer {
                             peer_id,
                             bundle,
-                            privileged: bought,
+                            privileged: session_control,
+                            connection: Arc::clone(&connection),
+                            received_at: std::time::Instant::now(),
                         })
                         .await
                     {
@@ -519,7 +630,8 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::SessionInit {
                             peer_id,
                             init_data,
-                            privileged: bought,
+                            privileged: session_control,
+                            connection: Arc::clone(&connection),
                         })
                         .await
                     {
@@ -529,7 +641,7 @@ pub(super) fn spawn_reader_task(
                 Frame::SessionAck => {
                     debug!(peer = %peer_id, "received session ack");
                     if let Err(e) = control_tx
-                        .send(ControlEvent::SessionAck { peer_id, privileged: bought })
+                        .send(ControlEvent::SessionAck { peer_id, privileged: session_control, connection: Arc::clone(&connection) })
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send SessionAck control event");
@@ -541,7 +653,8 @@ pub(super) fn spawn_reader_task(
                         .send(ControlEvent::RatchetInit {
                             peer_id,
                             payload,
-                            privileged: bought,
+                            privileged: session_control,
+                            connection: Arc::clone(&connection),
                         })
                         .await
                     {
@@ -736,6 +849,27 @@ pub(super) fn spawn_reader_task(
                         .await
                     {
                         warn!(peer = %peer_id, error = %e, "failed to send GossipReceived control event");
+                    }
+                }
+                Frame::CallMedia { call_id, seq, data } => {
+                    // Reject strangers and excess traffic before it can
+                    // compete with other peers in the shared media channel.
+                    if !bought {
+                        continue;
+                    }
+                    let Some(slot) = media_ingress.try_acquire(peer_id, Instant::now()) else {
+                        continue;
+                    };
+                    // Never block the reader on media: the router drains its
+                    // own channel; a full one drops the newest packet.
+                    if call_media_tx
+                        .try_send(super::QueuedCallMedia {
+                            event: CallMediaEvent { peer_id, call_id, seq, data, privileged: bought },
+                            _slot: slot,
+                        })
+                        .is_err()
+                    {
+                        debug!(peer = %peer_id, "call media channel full; packet dropped");
                     }
                 }
                 Frame::CallOffer { session_id, .. } => {

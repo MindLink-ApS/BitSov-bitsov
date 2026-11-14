@@ -100,8 +100,33 @@ user, starts at boot, and restarts after failures and setup exit 75. The older
 [konsensus.service user unit](konsensus.service) remains available for existing
 installations. Run only one service against a data directory.
 
-On a Linux system with systemd, from the repository root, install the verified
-binary at `/usr/bin/konsensus` and create the account and data directory:
+On a Linux system with systemd, from the repository root, verify the release
+directory and install the Linux binary at `/usr/bin/konsensus`. The install
+runs only when the verifier exits 0. The verifier checks the detached
+signature's primary-key fingerprint and every hash in `SHA256SUMS`. It copies
+`SHA256SUMS`, `SHA256SUMS.asc`, and each of the seventeen payloads into a
+private mode-0700 seal directory and hashes those copies. Copying the manifest
+does not seal the payloads. Install from the seal path the script prints.
+Mode 0700 stops a different user from writing the seal. It does not stop a
+process running as the same user. The script does not install and does not
+download the key or the binaries. `RELEASE_KEY.asc` is the reviewed copy, not
+a file fetched from `main`.
+
+```sh
+out=$(bash scripts/verify-release.sh /path/to/download RELEASE_KEY.asc) &&
+  printf '%s\n' "$out" &&
+  seal=$(printf '%s\n' "$out" | sed -n 's/^verify-release: sealed //p') &&
+  test -n "$seal" &&
+  test -f "$seal/bitsov-linux-x86_64" &&
+  test ! -L "$seal/bitsov-linux-x86_64" &&
+  sudo install -m 0755 "$seal/bitsov-linux-x86_64" /usr/bin/konsensus &&
+  bash scripts/verify-release.sh --cleanup "$seal"
+```
+
+On `aarch64`, install `bitsov-linux-aarch64` from that same seal in place of
+`bitsov-linux-x86_64`.
+
+Then create the account and data directory:
 
 ```sh
 sudo useradd --system --user-group --home-dir /var/lib/bitsov --shell /usr/sbin/nologin bitsov
@@ -291,7 +316,7 @@ Unlock promptly after every restart; do not treat these estimates as guarantees.
 The local watchtower client core cannot yet send to a guard. There is no active
 keyless watch-only protection in W2a. Started with `--remote-unlock`,
 the node therefore opens and accepts new channels only with the configured
-hub/LSPs (see [hub-only channels](#hub-only-channels-hub_only_while_lockable)).
+hub/LSPs (see [channel capacity and hub-only admission](#channel-capacity-and-hub-only-admission)).
 A longer breach window (below) gives more time to unlock but does not lift that
 rule.
 
@@ -555,7 +580,7 @@ Set a human-readable box label independently of custody:
 
 ```toml
 [node]
-hosted_by = "Rasmus's Pi"
+hosted_by = "Alice's Pi"
 ```
 
 The label appears in tickets, `/api/v1/node/lock` and `/api/v1/health` (`null` when
@@ -896,7 +921,7 @@ On an owner-managed node started with `--owner-control`, run this in another
 terminal under the same OS account (use the running node's config path):
 
 ```sh
-konsensus peer add --node-id <64hex> --addr 203.0.113.7:9735 --label Dad --config /path/to/konsensus.toml
+konsensus peer add --node-id <64hex> --addr 203.0.113.7:9735 --label Bob --config /path/to/konsensus.toml
 ```
 
 Review the node ID, fingerprint, address and label, then press Enter. Use `--yes`

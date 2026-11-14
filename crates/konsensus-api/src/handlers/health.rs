@@ -6,7 +6,7 @@
 //! [`ScopedAuth<Read>`] at `GET /api/v1/status`. Exposing identity/topology/funds on an
 //! unauthenticated endpoint links the node's IP to its NodeID, social graph,
 //! and wallet, and is precisely the kind of free, unpaid disclosure the
-//! payment-is-the-connection invariant forbids (see CODEX.md).
+//! payment-is-the-connection invariant forbids.
 
 use std::sync::Arc;
 
@@ -18,6 +18,9 @@ use serde::Serialize;
 use crate::auth::scoped::{Read, ScopedAuth};
 use crate::freshness::DataFreshness;
 use crate::state::AppState;
+
+/// Workspace release version, shared by every crate and the `konsensus` binary.
+pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
@@ -68,6 +71,10 @@ pub struct HealthResponse {
     pub uptime_secs: u64,
     /// Protocol version.
     pub version: u16,
+    /// Release version of the running binary, as `konsensus --version` prints it
+    /// (e.g. `0.3.0-rc22`). Owner-only: the public `/health` leaves it out so an
+    /// unauthenticated caller can't pick nodes by release.
+    pub node_version: &'static str,
     /// Lightning backend name (e.g. "lnbits", "mock", "void").
     pub lightning_backend: String,
     /// Lightning node public key (hex, compressed secp256k1). Used for channel opening.
@@ -86,6 +93,9 @@ pub struct HealthResponse {
     /// server for calls, never switch to it by itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stun_port: Option<u16>,
+    /// `[calls] max_call_minutes`: the paid-duration cap a new outgoing call
+    /// reserves against, so an app can compute the hold before ringing. Read-only.
+    pub max_call_minutes: u16,
     /// `stun:host:port` for ICE: this node's own STUN responder when it has a
     /// dialable peer host, else the owner's `[network] stun_server` when set and
     /// valid; omitted when neither applies.
@@ -385,6 +395,7 @@ async fn status(
                 "message_operations_v1",
                 "message_operation_abandon_v1",
                 "channel_open_operations_v1",
+                super::payments::direct::CAPABILITY,
                 super::messages::caps::CAPABILITY,
                 super::messages::caps::QUOTED_READMISSION_CAPABILITY,
                 super::messages::caps::ROOM_CAPABILITY,
@@ -401,6 +412,7 @@ async fn status(
                 super::sponsor::CAPABILITY,
                 konsensus_core::payloads::call::MEETING_CAPABILITY,
                 konsensus_core::payloads::room::ROOM_BINDING_CAPABILITY,
+                konsensus_message::wire::CALL_MEDIA_CAPABILITY,
             ];
             if state.starter.config.enabled {
                 capabilities.push("starter_channel_request_v1");
@@ -425,6 +437,7 @@ async fn status(
         lightning_balance_msat: ln_balance,
         uptime_secs: uptime,
         version: 2,
+        node_version: NODE_VERSION,
         lightning_backend: state.lightning_backend.clone(),
         lightning_node_pubkey: state.lightning.get_node_pubkey().await,
         chain_backend: state.chain_backend.clone(),
@@ -432,6 +445,7 @@ async fn status(
         chain_sync,
         block_height,
         stun_port: state.stun_port,
+        max_call_minutes: state.max_call_minutes,
         stun_url,
         stun_source,
         peer_endpoint: peer.endpoint,

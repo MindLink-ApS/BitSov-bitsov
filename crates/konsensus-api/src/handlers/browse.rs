@@ -233,6 +233,8 @@ async fn fetch(
             operation_id: None,
             wait_ack_ms: None,
             max_routing_fee_msat: req.max_routing_fee_msat,
+            max_block_msat: None,
+            max_hold_msat: None,
             max_total_msat: req.max_total_msat,
             max_recipient_msat: None,
             recipient: req.node_id.clone(),
@@ -525,6 +527,7 @@ pub(crate) async fn page_price(
     peer: NodeId,
     plaintext: &str,
     fee_cap: Option<u64>,
+    tip: &mut Option<crate::error::ObservedTip>,
 ) -> Result<u64, ApiError> {
     let request: PageRequest = serde_json::from_str(plaintext)
         .map_err(|e| ApiError::BadRequest(format!("invalid page request: {e}")))?;
@@ -532,6 +535,10 @@ pub(crate) async fn page_price(
         return Err(ApiError::BadRequest(
             "porch supports GET only; nothing paid".into(),
         ));
+    }
+    // A porch page is always paid: no quote is asked without a usable tip.
+    if tip.is_none() {
+        *tip = Some(crate::error::observe_tip(state).await?);
     }
     let quote = peer_quote(state, peer, &request.path, fee_cap).await?;
     match quote.status {

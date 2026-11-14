@@ -923,7 +923,7 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
@@ -951,8 +951,10 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
         front_door: Default::default(),
         sponsor: Default::default(),
         stun_port: None,
+        max_call_minutes: 60,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
+        call_media: None,
         recovery_dir: None,
         gossip_validator: None,
     });
@@ -1070,4 +1072,64 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
             peer.to_hex()
         );
     }
+}
+
+/// T2: a money-ready room send checks member prices against the local tip.
+/// A tip that cannot be read refuses the send before any price, invoice or
+/// payment, instead of checking prices against height 0.
+#[tokio::test]
+async fn room_compose_without_a_chain_tip_pays_nothing() {
+    let lightning = Arc::new(CountingLightning::default());
+    let mut state = test_state_with_lightning(lightning.clone());
+    let member = setup_e2ee_session_with_mnemonic(
+        &state.session_manager,
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+    )
+    .await;
+    let transport = Arc::new(ConnectedStubTransport::new(
+        vec![member],
+        state.invoice_requests.clone(),
+    ));
+    let chain = Arc::new(TipDownChain::down());
+    {
+        let state = Arc::get_mut(&mut state).unwrap();
+        state.transport = transport.clone();
+        state.chain = chain.clone();
+    }
+    state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(member, "02aaaa".repeat(5));
+    let room = Room::new("tip-down".into(), *state.identity.node_id());
+    state.storage.create_room(&room).await.unwrap();
+    state
+        .storage
+        .add_room_member(&room.id, &member)
+        .await
+        .unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/messages/compose")
+        .header("authorization", auth_header(&state))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "recipient": room.id.to_string(), "is_room": true, "kind": 1,
+                "plaintext": "hello room",
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let response = build_router(state.clone()).oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_chain_not_ready(status, &body);
+    assert_eq!(chain.reads(), 1);
+    assert_eq!(lightning.money(), 0);
+    assert_eq!(lightning.invoices(), 0);
+    assert!(transport.sent_envelopes.lock().unwrap().is_empty());
 }

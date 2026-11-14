@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 
 use crate::config::{NodeConfig, NodeTier, StorageConfig};
 use konsensus_api::bootstrap::{self, DataDirLayout, StartupMode};
-use konsensus_api::control::{self, ControlRequest, ControlResponse};
+use konsensus_api::control::{self, utc_iso8601, ControlRequest, ControlResponse};
 use konsensus_api::pairing::PairingService;
 use konsensus_api::rate_limit::RemoteTunnelClients;
 use konsensus_api::spend_budget::{self, GrantTerms};
@@ -208,8 +208,30 @@ fn socket_path(config_path: &Path) -> PathBuf {
     data_dir_of(config_path).join(control::SOCKET_FILE)
 }
 
+/// Refuse early, naming the path, when no node lives at `config_path`.
+///
+/// `--config` defaults to `konsensus.toml` in the current directory, so running
+/// an owner command from the wrong directory lands here. Only the socket is
+/// needed to reach a node, and it sits beside the config: a socket with a
+/// differently named config still works, so both must be absent.
+fn ensure_node_dir(config_path: &Path) -> Result<()> {
+    let config = absolute_config_path(config_path)?;
+    let socket = socket_path(&config);
+    if config.try_exists().unwrap_or(true) || socket.try_exists().unwrap_or(true) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "config file not found: {config:?}\n\
+         There is no owner control socket at {socket:?} either; a node started with \
+         `--owner-control` creates one there.\n\
+         `--config` defaults to konsensus.toml in the current directory. Run this from the \
+         node's data directory or pass --config <path>."
+    )
+}
+
 #[cfg(unix)]
 async fn send(config_path: &Path, req: ControlRequest) -> Result<ControlResponse> {
+    ensure_node_dir(config_path)?;
     let socket = socket_path(config_path);
     control::send(&socket, &req).await.with_context(|| {
         if matches!(req, ControlRequest::LockStatus {}) {
@@ -315,9 +337,10 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             if let Some(status) = &enrollment {
                 for provisional in &status.provisional {
                     safe_println!(
-                        "PROVISIONAL client={} deadline={}",
+                        "PROVISIONAL client={} deadline={} ({})",
                         provisional.client_id,
-                        provisional.expires_at
+                        provisional.expires_at,
+                        utc_iso8601(provisional.expires_at)
                     );
                 }
             }
@@ -325,7 +348,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                 safe_println!("This QR was used again after you approved {:?}. Revoke it if it wasn't yours. (client={})",alert.name,alert.client_id);
             }
             for p in pending_owner_approvals {
-                safe_println!("PENDING OWNER APPROVAL {} kind={} client={} expires_at={} (approve on a different enrolled owner device)", p.op_id, p.kind, p.client_id, p.expires_at);
+                safe_println!("PENDING OWNER APPROVAL {} kind={} client={} expires_at={} ({}) (approve on a different enrolled owner device)", p.op_id, p.kind, p.client_id, p.expires_at, utc_iso8601(p.expires_at));
             }
             for k in &device_keys {
                 safe_println!(
@@ -337,7 +360,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             }
             for p in pending_device_keys.iter().filter(|p| !p.lost) {
                 if let Some(words) = enrollment.as_ref().and_then(|e| e.words.get(&p.op_id)) {
-                    safe_println!("SAS v2 {}: {}  expires_at={}", p.op_id, words, p.expires_at);
+                    safe_println!("SAS v2 {}: {}  expires_at={} ({})", p.op_id, words, p.expires_at, utc_iso8601(p.expires_at));
                 }
                 safe_println!(
                     "PENDING DEVICE KEY {}  {:?}  client={}\n  approve with: konsensus device approve --op {}",
@@ -359,12 +382,14 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             for g in &grants {
                 safe_println!(
                     "SPEND GRANT client={}  {} of {} sats left  per-call<={} sats  \
-                     expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
+                     messages<={} sats  expires_at={} ({})\n  revoke with: konsensus grant-revoke --client-id {}",
                     g.client_id,
                     spend_budget::sats(g.remaining_msat),
                     spend_budget::sats(g.budget_msat),
                     spend_budget::sats(g.per_call_max_msat),
+                    spend_budget::sats(g.message_per_payment_max_msat),
                     g.expires_at,
+                    utc_iso8601(g.expires_at),
                     g.client_id
                 );
             }
@@ -379,9 +404,10 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             for g in &front_door_grants {
                 safe_println!(
                     "FRONT DOOR GRANT client={}  may publish the front-door card only  \
-                     expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
+                     expires_at={} ({})\n  revoke with: konsensus grant-revoke --client-id {}",
                     g.client_id,
                     g.expires_at,
+                    utc_iso8601(g.expires_at),
                     g.client_id
                 );
             }
@@ -392,18 +418,19 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                     format!("approve with: konsensus grant --op {}", e.op_id)
                 };
                 safe_println!(
-                    "PENDING ELEVATION op={}  client={} ({})  scopes={}  expires_at={}\n  {next}",
+                    "PENDING ELEVATION op={}  client={} ({})  scopes={}  expires_at={} ({})\n  {next}",
                     e.op_id,
                     e.client_name,
                     e.client_id,
                     e.scopes.join("+"),
                     e.expires_at,
+                    utc_iso8601(e.expires_at),
                 );
             }
             for r in &pending_replacements {
                 safe_println!(
                     "PENDING IDENTITY REPLACEMENT op={}  client={} ({})  current={}  \
-                     replacement={}  expires_at={}  approved={}\n  \
+                     replacement={}  expires_at={} ({})  approved={}\n  \
                      approve with: konsensus approve-replacement --op {}",
                     r.op_id,
                     r.client_name,
@@ -411,6 +438,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                     r.current_identity_fingerprint,
                     r.replacement_identity_fingerprint,
                     r.expires_at,
+                    utc_iso8601(r.expires_at),
                     r.approved,
                     r.op_id
                 );
@@ -881,12 +909,13 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
                         format!("approve with: konsensus device approve --op {}", p.op_id)
                     };
                     safe_println!(
-                        "PENDING DEVICE KEY {}  {:?}  client={} ({})  expires_at={}\n  {next}",
+                        "PENDING DEVICE KEY {}  {:?}  client={} ({})  expires_at={} ({})\n  {next}",
                         p.fingerprint,
                         p.name,
                         p.client_name,
                         p.client_id,
-                        p.expires_at
+                        p.expires_at,
+                        utc_iso8601(p.expires_at)
                     );
                 }
                 Ok(())
@@ -2229,6 +2258,7 @@ pub async fn cmd_approve(command: crate::cli::ApprovalCommand) -> Result<()> {
             )
         }
     };
+    ensure_node_dir(&config)?;
     println!("{summary}");
     std::io::stdout().flush()?;
     report(send(&config, request).await?)
@@ -2237,6 +2267,22 @@ pub async fn cmd_approve(command: crate::cli::ApprovalCommand) -> Result<()> {
 #[cfg(all(test, unix))]
 mod connection_error_tests {
     use super::*;
+
+    #[test]
+    fn ensure_node_dir_names_the_path_only_when_config_and_socket_are_both_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("konsensus.toml");
+        let error = format!("{:#}", ensure_node_dir(&config).unwrap_err());
+        assert!(error.contains("config file not found"), "{error}");
+        assert!(error.contains(&config.display().to_string()), "{error}");
+
+        std::fs::write(dir.path().join(control::SOCKET_FILE), b"").unwrap();
+        ensure_node_dir(&config).unwrap();
+        std::fs::remove_file(dir.path().join(control::SOCKET_FILE)).unwrap();
+
+        std::fs::write(&config, b"").unwrap();
+        ensure_node_dir(&config).unwrap();
+    }
 
     #[tokio::test]
     async fn socket_errors_escape_controls_even_without_approval_parsing() {
@@ -2385,6 +2431,7 @@ pub async fn cmd_peer_add(
         .context("invalid address: IP address and port only (no hostnames)")?;
     konsensus_api::peer_validation::validate_peer_addr(&address)?;
     konsensus_api::peer_validation::validate_peer_label(label.as_deref())?;
+    ensure_node_dir(config_path)?;
     if config_path.try_exists()? {
         let config = NodeConfig::load_before_identity_validation(config_path)?;
         if config

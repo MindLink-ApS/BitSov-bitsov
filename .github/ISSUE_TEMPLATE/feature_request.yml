@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest an improvement to BitSov.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Keep this public request free of secrets and private infrastructure details.
+        Report security vulnerabilities privately using [SECURITY.md](https://github.com/MindLink-ApS/BitSov-bitsov/blob/main/SECURITY.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Who is affected, and what are they trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you would like to see.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Include any existing workarounds.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Relevant examples or constraints, with secrets and private details removed.
