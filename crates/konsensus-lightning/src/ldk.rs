@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rand::Rng;
+use rand::RngExt;
 
 use async_trait::async_trait;
 use bip39::Mnemonic;
@@ -2630,7 +2630,7 @@ async fn start_esplora_with_retry(
         let Some(delay_secs) = DELAYS.get(attempts - 1) else {
             break;
         };
-        let jitter = rand::thread_rng().gen_range(0.8..=1.2);
+        let jitter = rand::rng().random_range(0.8..=1.2);
         let delay = Duration::from_secs_f64(*delay_secs as f64 * jitter);
         if started.elapsed() + delay + FEE_WINDOW > BUDGET {
             break;

@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rand::RngCore;
+use rand::Rng;
 use serde_json::json;
 use tokio::{sync::oneshot, time::Instant};
 use zeroize::Zeroizing;
@@ -246,7 +246,7 @@ async fn challenge(
         .map(|k| k.key_id)
         .collect();
     let mut random = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut random);
+    rand::rng().fill_bytes(&mut random);
     let value = hex::encode(random);
     let mut challenges = state.challenges.lock().unwrap_or_else(|e| e.into_inner());
     challenges.retain(|_, c| c.deadline > Instant::now());

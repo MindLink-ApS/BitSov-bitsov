@@ -16,7 +16,7 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use argon2::Argon2;
-use rand::RngCore;
+use rand::Rng;
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -109,8 +109,8 @@ pub fn encrypt_mnemonic(mnemonic: &str, password: &str) -> Result<Vec<u8>, Mnemo
     validate_encryption_password(password)?;
     let mut salt = [0u8; SALT_LEN];
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut salt);
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut nonce_bytes);
 
     let key = derive_key(password.as_bytes(), &salt)?;
     let cipher = Aes256Gcm::new_from_slice(key.as_slice())

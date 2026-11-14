@@ -93,7 +93,7 @@ pub(crate) async fn issue_quote(
     }
     let plain =
         serde_json::to_vec(&Frame::PeerExchangeResponse { peers }).map_err(|e| e.to_string())?;
-    let nonce = Aes256Gcm::generate_nonce(&mut rand::rngs::OsRng);
+    let nonce = Aes256Gcm::generate_nonce(&mut aes_gcm::aead::OsRng);
     let mut snapshot = nonce.to_vec();
     snapshot.extend(
         cipher(identity)
