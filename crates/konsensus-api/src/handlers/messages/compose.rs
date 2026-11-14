@@ -598,14 +598,27 @@ pub(crate) async fn create_metered_payment_proof(
     }
 }
 
-/// The admission payment itself; it takes the tip this send read.
+/// The admission payment itself; it takes the tip this send read. The
+/// contact's binding is read again here, when the wallet is handed the
+/// payment, so one that changed while the admission was being reserved
+/// refuses it as not dispatched. An invoice that no longer parses is refused
+/// the same way.
 fn pay_admission_invoice<'a>(
     state: &'a AppState,
+    peer_id: &'a NodeId,
     bolt11: &'a str,
     fee_ceiling_msat: u64,
     _tip: &crate::error::ObservedTip,
 ) -> impl std::future::Future<Output = Result<PaymentDetails, LightningError>> + 'a {
-    state.lightning.pay_invoice_with_fee_limit(bolt11, fee_ceiling_msat)
+    async move {
+        let invoice = bolt11
+            .parse::<lightning_invoice::Bolt11Invoice>()
+            .map_err(|_| LightningError::PaymentNotDispatched(INVOICE_PAYEE_MISMATCH.to_owned()))?;
+        if let Err(reason) = invoice_payee_reason(state, peer_id, &invoice).await {
+            return Err(LightningError::PaymentNotDispatched(reason.to_owned()));
+        }
+        state.lightning.pay_invoice_with_fee_limit(bolt11, fee_ceiling_msat).await
+    }
 }
 
 /// A target issues at most one admission quote per source address per this
@@ -1079,14 +1092,42 @@ async fn require_invoice_payee_bound(
     invoice: &lightning_invoice::Bolt11Invoice,
     mismatch: &'static str,
 ) -> Result<(), ApiError> {
+    invoice_payee_reason(state, peer_id, invoice)
+        .await
+        .map_err(|reason| invoice_binding_error(reason, mismatch).unwrap_or(ApiError::Lightning(mismatch.into())))
+}
+
+/// Internal marker for a refused invoice whose payee is not the contact's
+/// verified key. It travels as a not-dispatched reason from the dispatch
+/// future and is mapped back to the caller's mismatch error; never shown.
+const INVOICE_PAYEE_MISMATCH: &str = "invoice_payee_mismatch";
+
+/// Read the contact's current binding and decide whether `invoice` may be
+/// paid. Called when the invoice is validated and again inside the dispatch
+/// future, so a binding that turns `Unsigned` or moves to another key while
+/// the payment is being prepared still refuses it before the wallet sees it.
+async fn invoice_payee_reason(
+    state: &AppState,
+    peer_id: &NodeId,
+    invoice: &lightning_invoice::Bolt11Invoice,
+) -> Result<(), &'static str> {
     let binding = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
     match binding {
         Some(PeerLightningKey::Verified(key)) if invoice_payee_is(invoice, &key) => Ok(()),
-        Some(PeerLightningKey::Verified(_)) => Err(ApiError::Lightning(mismatch.into())),
-        Some(PeerLightningKey::Unsigned) => Err(ApiError::PeerNotReady {
+        Some(PeerLightningKey::Verified(_)) => Err(INVOICE_PAYEE_MISMATCH),
+        Some(PeerLightningKey::Unsigned) => Err(REASON_CONTACT_MUST_UPDATE),
+        None => Ok(()),
+    }
+}
+
+/// The caller-facing error for an invoice binding refusal, if `reason` is one.
+fn invoice_binding_error(reason: &str, mismatch: &'static str) -> Option<ApiError> {
+    match reason {
+        INVOICE_PAYEE_MISMATCH => Some(ApiError::Lightning(mismatch.into())),
+        REASON_CONTACT_MUST_UPDATE => Some(ApiError::PeerNotReady {
             reason: REASON_CONTACT_MUST_UPDATE,
         }),
-        None => Ok(()),
+        _ => None,
     }
 }
 
@@ -1241,13 +1282,26 @@ async fn create_payment_proof_via_invoice(
     // settlement (it commonly returns Pending/InFlight before the preimage is
     // known; treating that as failure dropped settling messages).
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
-    let details = debit.dispatch_message(state, Some(invoice.payment_hash().to_string()), invoice_amount_msat, tip, state
-        .lightning
-        .pay_invoice_with_fee_limit(&response.bolt11, debit.fee_limit(state, invoice_amount_msat)))
+    let fee_limit = debit.fee_limit(state, invoice_amount_msat);
+    // The binding is read again at the moment the wallet is handed the
+    // payment, as for keysend: a binding that changed during the journal and
+    // budget awaits refuses it as not dispatched, so nothing is paid.
+    let dispatch = async {
+        if let Err(reason) = invoice_payee_reason(state, peer_id, &invoice).await {
+            return Err(LightningError::PaymentNotDispatched(reason.to_owned()));
+        }
+        state.lightning.pay_invoice_with_fee_limit(&response.bolt11, fee_limit).await
+    };
+    let details = debit.dispatch_message(state, Some(invoice.payment_hash().to_string()), invoice_amount_msat, tip, dispatch)
         .await?
         .map_err(|e| match e {
             LightningError::NotReady => ApiError::NotReady,
-            LightningError::PaymentNotDispatched(reason) => ApiError::NotDispatched(reason),
+            LightningError::PaymentNotDispatched(reason) => {
+                match invoice_binding_error(&reason, "invoice payee does not match recipient") {
+                    Some(refused) => refused,
+                    None => ApiError::NotDispatched(reason),
+                }
+            }
             other => ApiError::PaymentUnresolved(format!("failed to pay recipient invoice: {other}")),
         })?;
 
@@ -3185,7 +3239,7 @@ async fn first_contact_admission_at(
         counter.fetch_add(admission_fee_ceiling, std::sync::atomic::Ordering::Relaxed);
     }
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
-    let dispatched = match debit.dispatch(pay_admission_invoice(state, &response.bolt11, admission_fee_ceiling, &tip)).await {
+    let dispatched = match debit.dispatch(pay_admission_invoice(state, peer_id, &response.bolt11, admission_fee_ceiling, &tip)).await {
         Ok(result) => result,
         Err(error @ ApiError::BudgetExceeded(_)) => {
             super::admission_journal::mark_undispatched(state, peer_id, &bolt11_payment_hash)?;
@@ -3213,7 +3267,10 @@ async fn first_contact_admission_at(
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
             charge.reserved_msat = 0;
-            return Err(ApiError::NotDispatched(reason));
+            return Err(match invoice_binding_error(&reason, "admission invoice payee does not match recipient") {
+                Some(refused) => refused,
+                None => ApiError::NotDispatched(reason),
+            });
         }
         Err(error) => return Err(ApiError::PaymentUnresolved(format!(
             "admission dispatch outcome unknown for {bolt11_payment_hash}; retry will reconcile the same invoice: {error}"
