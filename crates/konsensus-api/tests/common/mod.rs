@@ -66,6 +66,7 @@ pub struct MemStorage {
     pub call_offer_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub fail_call_get_for: Mutex<Option<String>>,
     pub fail_call_put_for: Mutex<Option<String>>,
+    pub call_get_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     calls: Mutex<HashMap<(NodeId, String), konsensus_core::payloads::call::CallEntry>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
     /// The channel-open / send-onchain / direct-payment operation ledger.
@@ -96,6 +97,7 @@ impl MemStorage {
             call_offer_dispatch_gate: Mutex::new(None),
             fail_call_get_for: Mutex::new(None),
             fail_call_put_for: Mutex::new(None),
+            call_get_hook: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
             outbox: Mutex::new(HashMap::new()),
             operations: Mutex::new(HashMap::new()),
@@ -139,6 +141,10 @@ impl Storage for MemStorage {
         peer: &NodeId,
         call_id: &str,
     ) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+        let hook = self.call_get_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         if self.fail_call_get_for.lock().unwrap().as_deref() == Some(call_id) {
             return Err(StorageError::Serialization(
                 "injected call read failure".into(),

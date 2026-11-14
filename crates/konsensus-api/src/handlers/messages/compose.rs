@@ -599,10 +599,10 @@ pub(crate) async fn create_metered_payment_proof(
 }
 
 /// The admission payment itself; it takes the tip this send read. The
-/// contact's binding is read again here, when the wallet is handed the
-/// payment, so one that changed while the admission was being reserved
-/// refuses it as not dispatched. An invoice that no longer parses is refused
-/// the same way.
+/// contact's binding is read again here, without waiting, when the wallet is
+/// handed the payment, so one that changed while the admission was being
+/// reserved refuses it as not dispatched. An invoice that no longer parses is
+/// refused the same way.
 fn pay_admission_invoice<'a>(
     state: &'a AppState,
     peer_id: &'a NodeId,
@@ -614,7 +614,7 @@ fn pay_admission_invoice<'a>(
         let invoice = bolt11
             .parse::<lightning_invoice::Bolt11Invoice>()
             .map_err(|_| LightningError::PaymentNotDispatched(INVOICE_PAYEE_MISMATCH.to_owned()))?;
-        if let Err(reason) = invoice_payee_reason(state, peer_id, &invoice).await {
+        if let Err(reason) = invoice_payee_reason_now(state, peer_id, &invoice) {
             return Err(LightningError::PaymentNotDispatched(reason.to_owned()));
         }
         state.lightning.pay_invoice_with_fee_limit(bolt11, fee_ceiling_msat).await
@@ -889,9 +889,10 @@ async fn try_keysend(
     // rotation or removal that landed during those awaits refuses the
     // payment instead of paying a key the identity no longer signs; the
     // refusal is a positive not-dispatched, so the bookkeeping is rolled
-    // back and nothing is paid.
+    // back and nothing is paid. The read does not wait: the first poll of
+    // this future is the backend's first poll.
     let dispatch = async {
-        if let Err(reason) = keysend_destination_reason(state, peer_id, &destination).await {
+        if let Err(reason) = keysend_destination_reason_now(state, peer_id, &destination) {
             return Err(LightningError::PaymentNotDispatched(reason.to_owned()));
         }
         state
@@ -996,6 +997,35 @@ async fn keysend_destination_reason(
     keysend_destination_allowed(binding.as_ref(), destination)
 }
 
+/// [`keysend_destination_reason`] at the dispatch boundary: the binding is
+/// read without waiting, and [`BINDING_BUSY`] refuses when it cannot be.
+fn keysend_destination_reason_now(
+    state: &AppState,
+    peer_id: &NodeId,
+    destination: &str,
+) -> Result<(), &'static str> {
+    let binding = binding_now(state, peer_id)?;
+    keysend_destination_allowed(binding.as_ref(), destination)
+}
+
+/// Internal marker for a payment refused at the dispatch boundary because the
+/// contact's binding was being changed at that instant. It travels as a
+/// not-dispatched reason, so the bookkeeping is rolled back and nothing is
+/// paid. It is not a binding refusal: a keysend refused this way may still
+/// fall back to the invoice path, which reads the binding itself.
+const BINDING_BUSY: &str = "lightning_binding_busy";
+
+/// The contact's current binding, read without waiting. The dispatch future
+/// must not suspend before the wallet's first poll, so a binding that cannot
+/// be read at once refuses the payment with [`BINDING_BUSY`].
+fn binding_now(state: &AppState, peer_id: &NodeId) -> Result<Option<PeerLightningKey>, &'static str> {
+    state
+        .peer_ln_pubkeys
+        .try_lock()
+        .map(|map| map.get(peer_id).cloned())
+        .map_err(|_| BINDING_BUSY)
+}
+
 /// The decision behind [`require_verified_keysend_destination`]: only a
 /// verified binding equal to the destination lets a keysend proceed.
 fn keysend_destination_allowed(
@@ -1045,6 +1075,11 @@ mod keysend_destination_tests {
         }
         assert_eq!(binding_refusal_reason("no route"), None);
         assert_eq!(binding_refusal_reason("disk_low"), None);
+    }
+
+    #[test]
+    fn a_busy_binding_is_not_a_binding_refusal() {
+        assert_eq!(binding_refusal_reason(BINDING_BUSY), None);
     }
 
     #[test]
@@ -1103,17 +1138,37 @@ async fn require_invoice_payee_bound(
 const INVOICE_PAYEE_MISMATCH: &str = "invoice_payee_mismatch";
 
 /// Read the contact's current binding and decide whether `invoice` may be
-/// paid. Called when the invoice is validated and again inside the dispatch
-/// future, so a binding that turns `Unsigned` or moves to another key while
-/// the payment is being prepared still refuses it before the wallet sees it.
+/// paid. Called when the invoice is validated; the dispatch future decides
+/// again through [`invoice_payee_reason_now`], so a binding that turns
+/// `Unsigned` or moves to another key while the payment is being prepared
+/// still refuses it before the wallet sees it.
 async fn invoice_payee_reason(
     state: &AppState,
     peer_id: &NodeId,
     invoice: &lightning_invoice::Bolt11Invoice,
 ) -> Result<(), &'static str> {
     let binding = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
+    invoice_payee_allowed(binding.as_ref(), invoice)
+}
+
+/// [`invoice_payee_reason`] at the dispatch boundary: the binding is read
+/// without waiting, and [`BINDING_BUSY`] refuses when it cannot be.
+fn invoice_payee_reason_now(
+    state: &AppState,
+    peer_id: &NodeId,
+    invoice: &lightning_invoice::Bolt11Invoice,
+) -> Result<(), &'static str> {
+    let binding = binding_now(state, peer_id)?;
+    invoice_payee_allowed(binding.as_ref(), invoice)
+}
+
+/// The decision behind [`invoice_payee_reason`].
+fn invoice_payee_allowed(
+    binding: Option<&PeerLightningKey>,
+    invoice: &lightning_invoice::Bolt11Invoice,
+) -> Result<(), &'static str> {
     match binding {
-        Some(PeerLightningKey::Verified(key)) if invoice_payee_is(invoice, &key) => Ok(()),
+        Some(PeerLightningKey::Verified(key)) if invoice_payee_is(invoice, key) => Ok(()),
         Some(PeerLightningKey::Verified(_)) => Err(INVOICE_PAYEE_MISMATCH),
         Some(PeerLightningKey::Unsigned) => Err(REASON_CONTACT_MUST_UPDATE),
         None => Ok(()),
@@ -1285,9 +1340,10 @@ async fn create_payment_proof_via_invoice(
     let fee_limit = debit.fee_limit(state, invoice_amount_msat);
     // The binding is read again at the moment the wallet is handed the
     // payment, as for keysend: a binding that changed during the journal and
-    // budget awaits refuses it as not dispatched, so nothing is paid.
+    // budget awaits refuses it as not dispatched, so nothing is paid. The
+    // read does not wait: the first poll of this future is the wallet's.
     let dispatch = async {
-        if let Err(reason) = invoice_payee_reason(state, peer_id, &invoice).await {
+        if let Err(reason) = invoice_payee_reason_now(state, peer_id, &invoice) {
             return Err(LightningError::PaymentNotDispatched(reason.to_owned()));
         }
         state.lightning.pay_invoice_with_fee_limit(&response.bolt11, fee_limit).await
