@@ -16,7 +16,9 @@
 //!
 //! Each direction of each call is capped by its [`MediaLimits`]: by default
 //! [`MAX_FRAMES_PER_SECOND`] and [`MAX_BYTES_PER_SECOND`], or what the operator
-//! set under `[calls]`. Packets over the cap are dropped. Packets larger than
+//! set under `[calls]`. Token buckets may bank two seconds of credit so a
+//! backlog released after a short path stall passes while a sustained overrun
+//! does not. Packets over the cap are dropped. Packets larger than
 //! audio may use only what the cap leaves after a reservation for small
 //! packets, so they can never spend the budget audio needs ([`MediaCap`]).
 //! This changes no price and no admission: a call is admitted and paid the
@@ -61,6 +63,12 @@ pub const MAX_FRAMES_PER_SECOND: u32 = DEFAULT_MAX_FRAMES_PER_SECOND;
 /// the operator set otherwise.
 #[cfg(test)]
 pub const MAX_BYTES_PER_SECOND: u64 = DEFAULT_MAX_BYTES_PER_SECOND;
+/// Default packet burst: two seconds' worth, to catch up after a path stall.
+#[cfg(test)]
+pub const MEDIA_BURST_FRAMES: u32 = 2 * MAX_FRAMES_PER_SECOND;
+/// Default payload byte burst: two seconds' worth.
+#[cfg(test)]
+pub const MEDIA_BURST_BYTES: u64 = 2 * MAX_BYTES_PER_SECOND;
 /// Calls this node routes media for at once (sockets attached).
 pub const MAX_ROUTED_CALLS: usize = 64;
 /// How long a positive admission answer is trusted before it is re-read.
@@ -190,33 +198,53 @@ impl MediaDrop {
     }
 }
 
-/// One direction's cap over a one-second window: at most `max_frames`
-/// packets and `max_bytes` payload bytes per second.
+/// Token units per packet or byte: credit is kept in millionths so that
+/// refill over any elapsed time is exact enough without floating point.
+const CREDIT_UNIT: u64 = 1_000_000;
+
+/// One direction's cap as a token bucket: credit refills at `frame_rate`
+/// packets and `byte_rate` payload bytes per second, up to `frame_burst`
+/// and `byte_burst`, and each admitted packet spends one packet and its
+/// bytes. The bucket starts full.
 #[derive(Debug, Clone)]
 pub struct RateCap {
-    window_start: Instant,
-    frames: u32,
-    bytes: u64,
-    max_frames: u32,
-    max_bytes: u64,
+    last: Instant,
+    /// Packet credit, in [`CREDIT_UNIT`]ths of a packet.
+    frame_credit: u64,
+    /// Byte credit, in [`CREDIT_UNIT`]ths of a byte.
+    byte_credit: u64,
+    frame_rate: u64,
+    byte_rate: u64,
+    frame_cap: u64,
+    byte_cap: u64,
 }
 
 impl RateCap {
-    pub fn new(max_frames: u32, max_bytes: u64, now: Instant) -> Self {
-        Self { window_start: now, frames: 0, bytes: 0, max_frames, max_bytes }
+    pub fn new(frame_rate: u32, byte_rate: u64, frame_burst: u32, byte_burst: u64, now: Instant) -> Self {
+        let frame_cap = u64::from(frame_burst).saturating_mul(CREDIT_UNIT);
+        let byte_cap = byte_burst.saturating_mul(CREDIT_UNIT);
+        Self {
+            last: now,
+            frame_credit: frame_cap,
+            byte_credit: byte_cap,
+            frame_rate: u64::from(frame_rate),
+            byte_rate,
+            frame_cap,
+            byte_cap,
+        }
     }
 
     /// The default media caps.
     #[cfg(test)]
     pub fn media(now: Instant) -> Self {
-        Self::new(MAX_FRAMES_PER_SECOND, MAX_BYTES_PER_SECOND, now)
+        Self::new(MAX_FRAMES_PER_SECOND, MAX_BYTES_PER_SECOND, MEDIA_BURST_FRAMES, MEDIA_BURST_BYTES, now)
     }
 
-    /// Whether a packet of `bytes` payload bytes fits the current window.
-    /// A refused packet counts nothing.
+    /// Whether a packet of `bytes` payload bytes fits the credit now.
+    /// A refused packet spends nothing.
     #[cfg(test)]
     pub fn admit(&mut self, now: Instant, bytes: usize) -> bool {
-        self.roll(now);
+        self.refill(now);
         if !self.fits(bytes) {
             return false;
         }
@@ -224,21 +252,28 @@ impl RateCap {
         true
     }
 
-    fn roll(&mut self, now: Instant) {
-        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
-            self.window_start = now;
-            self.frames = 0;
-            self.bytes = 0;
+    fn refill(&mut self, now: Instant) {
+        if now <= self.last {
+            return;
         }
+        let elapsed = now.duration_since(self.last).as_nanos();
+        self.last = now;
+        // rate per second × elapsed ns × CREDIT_UNIT / 1e9 ns.
+        let earned = |rate: u64| -> u64 {
+            let units = elapsed.saturating_mul(u128::from(rate)) / (1_000_000_000 / u128::from(CREDIT_UNIT));
+            u64::try_from(units).unwrap_or(u64::MAX)
+        };
+        self.frame_credit = self.frame_credit.saturating_add(earned(self.frame_rate)).min(self.frame_cap);
+        self.byte_credit = self.byte_credit.saturating_add(earned(self.byte_rate)).min(self.byte_cap);
     }
 
     fn fits(&self, bytes: usize) -> bool {
-        self.frames < self.max_frames && self.bytes.saturating_add(bytes as u64) <= self.max_bytes
+        self.frame_credit >= CREDIT_UNIT && self.byte_credit >= (bytes as u64).saturating_mul(CREDIT_UNIT)
     }
 
     fn take(&mut self, bytes: usize) {
-        self.frames += 1;
-        self.bytes += bytes as u64;
+        self.frame_credit -= CREDIT_UNIT;
+        self.byte_credit -= (bytes as u64).saturating_mul(CREDIT_UNIT);
     }
 }
 
@@ -255,16 +290,22 @@ pub struct MediaCap {
 impl MediaCap {
     pub fn new(limits: MediaLimits, now: Instant) -> Self {
         Self {
-            total: RateCap::new(limits.max_frames_per_second, limits.max_bytes_per_second, now),
-            bulk: RateCap::new(limits.bulk_frames_per_second(), limits.bulk_bytes_per_second(), now),
+            total: RateCap::new(
+                limits.max_frames_per_second, limits.max_bytes_per_second,
+                limits.max_frames_per_second.saturating_mul(2), limits.max_bytes_per_second.saturating_mul(2), now,
+            ),
+            bulk: RateCap::new(
+                limits.bulk_frames_per_second(), limits.bulk_bytes_per_second(),
+                limits.bulk_frames_per_second().saturating_mul(2), limits.bulk_bytes_per_second().saturating_mul(2), now,
+            ),
         }
     }
 
-    /// Whether a packet of `bytes` payload bytes fits the current window.
-    /// A refused packet counts nothing.
+    /// Whether a packet of `bytes` payload bytes fits the credit now.
+    /// A refused packet spends nothing from either bucket.
     pub fn admit(&mut self, now: Instant, bytes: usize) -> bool {
-        self.total.roll(now);
-        self.bulk.roll(now);
+        self.total.refill(now);
+        self.bulk.refill(now);
         let bulk = is_bulk_payload(bytes);
         if !self.total.fits(bytes) || (bulk && !self.bulk.fits(bytes)) {
             return false;
