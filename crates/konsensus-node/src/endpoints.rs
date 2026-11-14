@@ -84,6 +84,67 @@ pub fn ordered(configured: Option<&str>, bound: SocketAddr, ips: &[IpAddr]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn local_bind_interface_candidates() -> [IpAddr; 6] {
+        [
+            Ipv4Addr::LOCALHOST.into(),
+            Ipv4Addr::new(10, 20, 30, 40).into(),
+            Ipv4Addr::new(203, 0, 113, 7).into(),
+            Ipv6Addr::LOCALHOST.into(),
+            Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 7).into(),
+            Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 7).into(),
+        ]
+    }
+
+    fn assert_local_bind_advertises_only_configured_endpoint(bound: SocketAddr) {
+        let ips = local_bind_interface_candidates();
+        let endpoints = ordered(Some("relay.example:9737"), bound, &ips).unwrap();
+        for ip in ips.into_iter().filter(|ip| !ip.is_loopback()) {
+            assert!(
+                !endpoints.contains(&SocketAddr::new(ip, bound.port()).to_string()),
+                "unbound interface included in endpoints"
+            );
+        }
+        assert_eq!(
+            endpoints,
+            ["relay.example:9737".to_owned(), bound.to_string()]
+        );
+    }
+
+    #[test]
+    fn loopback_v4_with_configured_endpoint_advertises_only_configured_endpoint() {
+        assert_local_bind_advertises_only_configured_endpoint(SocketAddr::new(
+            Ipv4Addr::LOCALHOST.into(),
+            9737,
+        ));
+    }
+
+    #[test]
+    fn loopback_v6_with_configured_endpoint_advertises_only_configured_endpoint() {
+        assert_local_bind_advertises_only_configured_endpoint(SocketAddr::new(
+            Ipv6Addr::LOCALHOST.into(),
+            9737,
+        ));
+    }
+
+    #[test]
+    fn loopback_v4_without_configured_endpoint_advertises_only_bound_endpoint() {
+        let bound = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9737);
+        assert_eq!(
+            ordered(None, bound, &local_bind_interface_candidates()).unwrap(),
+            [bound.to_string()]
+        );
+    }
+
+    #[test]
+    fn loopback_v6_without_configured_endpoint_advertises_only_bound_endpoint() {
+        let bound = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 9737);
+        assert_eq!(
+            ordered(None, bound, &local_bind_interface_candidates()).unwrap(),
+            [bound.to_string()]
+        );
+    }
 
     #[test]
     fn mdns_is_home_only_and_can_be_disabled() {
