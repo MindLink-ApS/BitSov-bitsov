@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, Scope, TokenError};
@@ -308,26 +308,26 @@ impl From<PairingError> for PairingRefusal {
         // Exhaustive on purpose: a new variant must name its own log reason
         // instead of collapsing into `pairing_refused`.
         let reason = match &error {
-            PairingError::Closed => "pairing_closed",
-            PairingError::TooManyPending => "rate_limited",
-            PairingError::UnknownPending => "unknown_pending",
             PairingError::BadProof => "bad_signature",
-            PairingError::Malformed(_) => "malformed",
-            PairingError::UnknownClient => "unknown_client",
-            PairingError::PairingInvalid(_) => "invalid_pairing",
-            PairingError::NotGrantable(_) => "unknown_or_revoked_key",
-            PairingError::UnknownOperation => "unknown_operation",
-            PairingError::ConfirmationMismatch => "confirmation_mismatch",
-            PairingError::WrongOwnerCode(_) => "wrong_owner_code",
-            PairingError::ConfirmationLost => "confirmation_lost",
-            PairingError::DeviceApprovalsDisabled(_) => "device_approvals_disabled",
-            PairingError::ShortCodesOff => "short_codes_off",
             PairingError::Expired => "stale_or_future",
-            PairingError::NotApproved => "not_approved",
-            PairingError::BindingMismatch => "binding_mismatch",
+            PairingError::NotGrantable(_) => "unknown_or_revoked_key",
+            PairingError::PairingInvalid(_) => "invalid_pairing",
+            PairingError::UnknownClient => "unknown_client",
             PairingError::OwnerChannelUnavailable => "owner_channel_off",
-            PairingError::OwnerApprovalUnavailable => "owner_approval_unavailable",
+            PairingError::DeviceApprovalsDisabled(_) => "device_approvals_disabled",
+            PairingError::Malformed(_) => "malformed",
+            PairingError::TooManyPending => "rate_limited_client",
             PairingError::Io(_) => "storage_error",
+            PairingError::Closed => "pairing_refused:Closed",
+            PairingError::UnknownPending => "pairing_refused:UnknownPending",
+            PairingError::UnknownOperation => "pairing_refused:UnknownOperation",
+            PairingError::ConfirmationMismatch => "pairing_refused:ConfirmationMismatch",
+            PairingError::WrongOwnerCode(_) => "pairing_refused:WrongOwnerCode",
+            PairingError::ConfirmationLost => "pairing_refused:ConfirmationLost",
+            PairingError::ShortCodesOff => "pairing_refused:ShortCodesOff",
+            PairingError::NotApproved => "pairing_refused:NotApproved",
+            PairingError::BindingMismatch => "pairing_refused:BindingMismatch",
+            PairingError::OwnerApprovalUnavailable => "pairing_refused:OwnerApprovalUnavailable",
         };
         Self::new(error, reason)
     }
@@ -841,7 +841,7 @@ impl Drop for OwnerApprovalFile {
 /// A fresh short owner code, `XXXX-XXXX`: 40 bits from the CSPRNG.
 fn new_owner_code() -> String {
     let mut bytes = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let mut out = String::with_capacity(9);
     for (i, b) in bytes.iter().enumerate() {
         if i == 4 {
@@ -1126,7 +1126,7 @@ impl PairingService {
             return Ok(());
         }
         let mut nonce = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         let phrase = format!("{label} CODE {}", hex::encode(nonce));
         let codes_on = inner.owner_code_failures < OWNER_CODE_FAILURES_PER_RUN;
         let code = (short_code && codes_on).then(new_owner_code);
@@ -1598,9 +1598,9 @@ impl PairingService {
         let name = sanitize_name(name);
 
         let mut challenge = [0u8; CHALLENGE_LEN];
-        rand::thread_rng().fill_bytes(&mut challenge);
+        rand::rng().fill_bytes(&mut challenge);
         let mut pair_id_bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut pair_id_bytes);
+        rand::rng().fill_bytes(&mut pair_id_bytes);
         let pair_id = hex::encode(pair_id_bytes);
 
         let expires_at_unix = chrono::Utc::now().timestamp() + PENDING_PAIRING_TTL.as_secs() as i64;
@@ -2087,7 +2087,7 @@ impl PairingService {
         client_id: &str,
     ) -> Result<String, PairingError> {
         let mut nonce = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         if !inner.file.clients.iter().any(|c| c.client_id == client_id) {
             return Err(PairingError::UnknownClient);
         }
@@ -2652,7 +2652,7 @@ impl PairingService {
         }
         let now = chrono::Utc::now().timestamp();
         let mut op_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut op_bytes);
+        rand::rng().fill_bytes(&mut op_bytes);
 
         let mut inner = self.lock();
         let client = inner
@@ -2994,7 +2994,7 @@ impl PairingService {
         let replacement = fingerprint_for_mnemonic(mnemonic)?;
         let now = chrono::Utc::now().timestamp();
         let mut op_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut op_bytes);
+        rand::rng().fill_bytes(&mut op_bytes);
 
         let mut inner = self.lock();
         let client = inner
@@ -4508,7 +4508,7 @@ fn load_box_transport_key_with_io(
             let mut file = options.open(&temporary)?;
             let published = (|| -> io::Result<()> {
                 let mut secret = zeroize::Zeroizing::new([0u8; 32]);
-                rand::thread_rng().fill_bytes(secret.as_mut());
+                rand::rng().fill_bytes(secret.as_mut());
                 file.write_all(secret.as_ref())?;
                 file.sync_all()?;
                 // Publish a complete, synced key without clobbering a winner
@@ -4744,3 +4744,48 @@ mod token_challenge_tests;
 #[cfg(test)]
 #[path = "pairing/pending_tests.rs"]
 mod pending_tests;
+
+#[cfg(test)]
+mod refusal_reason_tests {
+    use super::{PairingError, PairingRefusal};
+
+    #[test]
+    fn refusal_classifications_distinguish_client_limits_and_fixed_variants() {
+        for (error, expected) in [
+            (PairingError::TooManyPending, "rate_limited_client"),
+            (PairingError::Closed, "pairing_refused:Closed"),
+            (
+                PairingError::UnknownPending,
+                "pairing_refused:UnknownPending",
+            ),
+            (
+                PairingError::UnknownOperation,
+                "pairing_refused:UnknownOperation",
+            ),
+            (
+                PairingError::ConfirmationMismatch,
+                "pairing_refused:ConfirmationMismatch",
+            ),
+            (
+                PairingError::WrongOwnerCode(3),
+                "pairing_refused:WrongOwnerCode",
+            ),
+            (
+                PairingError::ConfirmationLost,
+                "pairing_refused:ConfirmationLost",
+            ),
+            (PairingError::ShortCodesOff, "pairing_refused:ShortCodesOff"),
+            (PairingError::NotApproved, "pairing_refused:NotApproved"),
+            (
+                PairingError::BindingMismatch,
+                "pairing_refused:BindingMismatch",
+            ),
+            (
+                PairingError::OwnerApprovalUnavailable,
+                "pairing_refused:OwnerApprovalUnavailable",
+            ),
+        ] {
+            assert_eq!(PairingRefusal::from(error).reason, expected);
+        }
+    }
+}

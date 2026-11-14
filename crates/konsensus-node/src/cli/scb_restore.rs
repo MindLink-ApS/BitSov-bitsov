@@ -29,7 +29,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(err.to_string().contains("disabled"), "{err}");
+            let text = err.to_string();
+            assert!(text.contains("disabled"), "{text}");
+            assert!(text.contains("konsensus recover"), "{text}");
+            assert!(text.contains("owner console"), "{text}");
+            assert!(!text.contains("channel peers"), "{text}");
         }
     }
 

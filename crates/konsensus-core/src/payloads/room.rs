@@ -149,9 +149,9 @@ impl RoomChat {
 impl RoomBinding {
     /// A new room of `members` (any order) with a fresh random salt.
     pub fn create(members: &[NodeId]) -> Result<Self, RoomRefusal> {
-        use rand::RngCore;
+        use rand::Rng;
         let mut salt = [0u8; ROOM_SALT_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut salt);
         Self::with_salt(members, salt)
     }
 
