@@ -65,3 +65,14 @@ deadline = 2027-02-03
 [[waiver]]
 ids = ["GHSA-qwgh-2vcv-g2f7"]
 deadline = 2027-02-03
+
+# Bundled SQLite in libsqlite3-sys 0.28.0 (trusted local DB/WAL provenance only).
+# Same date as the waiver's own expiry in .cargo/audit.toml and osv-scanner.toml.
+[[waiver]]
+ids = ["RUSTSEC-2026-0459"]
+deadline = 2026-12-09
+
+# OSV-only maintenance notice for pin-utils 0.1.0; same date as its ignoreUntil.
+[[waiver]]
+ids = ["RUSTSEC-2026-0441"]
+deadline = 2027-02-09
