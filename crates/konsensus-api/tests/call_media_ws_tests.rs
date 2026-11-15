@@ -117,6 +117,9 @@ impl Fixture {
             calls::admit_incoming(self.state.storage.as_ref(), self.state.identity.node_id(), peer, 400,
                 Some(&serde_json::json!({"v":1,"call_id":CALL,"sdp":"offer","media":"audio"}).to_string()))
                 .await.unwrap();
+            // A paired device fetched the invite: it rings.
+            let fetched = self.state.storage.call_get(peer, CALL).await.unwrap().unwrap().device_fetched(calls::now_ms()).unwrap();
+            self.state.storage.call_put(peer, CALL, &fetched).await.unwrap();
         }
         let kind = if answer { 401 } else { 400 };
         let signal = if answer { serde_json::json!({"v":1,"call_id":CALL,"sdp":"answer"}) }

@@ -127,6 +127,7 @@ async fn start_node_with(
         sensitive_identity_routes_enabled: false,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::mnemonic_reveal_default()),
@@ -205,6 +206,9 @@ impl Node {
         let offer = serde_json::json!({"v":1,"call_id":CALL,"sdp":"offer","media":"audio"}).to_string();
         if side == Side::Callee {
             konsensus_api::calls::admit_incoming(self.storage.as_ref(), &self.id, peer, 400, Some(&offer)).await.unwrap();
+            // A paired device fetched the invite: it rings.
+            let fetched = self.storage.call_get(peer, CALL).await.unwrap().unwrap().device_fetched(konsensus_api::calls::now_ms()).unwrap();
+            self.storage.call_put(peer, CALL, &fetched).await.unwrap();
         }
         let signal = if side == Side::Caller { offer }
             else { serde_json::json!({"v":1,"call_id":CALL,"sdp":"answer"}).to_string() };
