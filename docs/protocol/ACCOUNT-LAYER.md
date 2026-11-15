@@ -92,12 +92,12 @@ bitsov-relation-intent-v1\nnode:{fp}\nclient:{client_id}\ndevice:{key_id}\npeer:
 - `level` is the relation-ladder rung: 0 Knock, 1 Contact, 2 Close, 3 Anchored. Only 1 is accepted until first contact (step 4). The field is fixed now so that plasticity can move relations later.
 - Enforcement, limits and residual risks are in `docs/security/device-keys.md`.
 
-**Node-wide gate (the authority boundary).** Device-key registration, owner approval of a device and relation intents all run only if the node **started from an encrypted recovery phrase whose password was typed at that start**. Otherwise the node refuses them with HTTP 403 and a stable `reason`. `GET /api/v1/pair/device-keys` reports the same value as `device_approvals`, so the app can say why before the owner tries.
+**Node-wide gate (the authority boundary).** Device-key registration, owner approval of a device and relation intents all run only if the node **started from an encrypted recovery phrase whose password was typed at that start**, or the owner chose [`[pairing] unattended_device_approvals`](../operations/password-input.md#unattended-box-device-approvals-from-a-stored-password) for this box. Otherwise the node refuses them with HTTP 403 and a stable `reason`. `GET /api/v1/pair/device-keys` reports the same value as `device_approvals`, so the app can say why before the owner tries.
 
 | `reason` | when | the app shows |
 |---|---|---|
 | `seed_not_encrypted` | plaintext `mnemonic.txt`, or a plaintext copy beside the `.enc` | "Encrypt your recovery phrase to enable Touch ID approvals." |
-| `seed_password_not_typed` | started with `--password`, `--password-file`, or `--password-fd` | "Restart the node and type the password to enable Touch ID approvals." |
+| `seed_password_not_typed` | started with `--password`, `--password-file`, or `--password-fd`, without the owner's setting or with the setting refused for this start | "Restart the node and type the password to enable Touch ID approvals." |
 | `owner_key_unavailable` | no owner key at start (for example a wrong password) | "Touch ID approvals are off on this node." |
 
 Why the gate lives in the node, and why the key needs the password:
@@ -105,6 +105,7 @@ Why the gate lives in the node, and why the key needs the password:
 - So the node enables device authority only when it can derive an owner key that such a program can't: the key is derived from the seed **and** the typed password (argon2id, the same cost as the file encryption).
 - An old copy of `mnemonic.txt`, taken before the phrase was encrypted, therefore does not yield the owner key.
 - Changing the password changes the owner key. Devices must then be registered again (fail closed).
+- The owner's unattended setting gives up the second point on purpose, for that box only: with the password in a file, a same-user program can derive the owner key and write a signed device record. On such a box that program can already decrypt the seed, so the setting adds no new secret, but the node then honours what that program signs. Off by default; the trade is stated at start and in [the handoff contract](../operations/password-input.md#unattended-box-device-approvals-from-a-stored-password).
 
 **Tiers, labelled in the app:**
 - **Secure Enclave + Touch ID**: the default where available.
@@ -118,6 +119,7 @@ Why the gate lives in the node, and why the key needs the password:
 - **Boundary.** The owner-approval key is protected by the encryption password, which is required for signing (step 2). What is left:
   - a same-user process that captures the typed password, for example with a keylogger, or reads the owner CLI's memory while it signs, is out of scope for this tier;
   - a node started from an encrypted phrase holds the decrypted seed in memory, so a same-user process that can read the node's memory can derive the key;
+  - with the owner's `[pairing] unattended_device_approvals`, the password is on the box, so whoever has the disk and that file, or runs as that OS user, can derive the key and sign a device record;
   - the BIP-39 `identity.passphrase` is plaintext in `konsensus.toml`.
   A remote signer (§7) is the real fix.
 - **Enabling Touch ID approvals on an existing node (the pilot path):**
@@ -149,8 +151,8 @@ Why the gate lives in the node, and why the key needs the password:
 
   The running-node check can only see an owner-run node (its control socket), so stop the node yourself first. On SSDs, APFS snapshots and Time Machine, older copies of the plaintext can persist; they hold the same words as the owner's written backup, which stays the recovery.
 - **Starting an encrypted node.** `konsensus start` prompts for the password on the terminal. That includes a dev node the app launches: the prompt appears in the terminal that started the app.
-- **Password file (opt-in).** `--password-file <path>` reads the password from a file instead. It must be a regular file owned by the current user, with no group or other permissions. Symlinks are refused, and the opened file is checked against the one inspected. Starting this way leaves **Touch ID approvals off** (`seed_password_not_typed`), because the password was not typed. The node warns that any program running as this user, including a paired app, can read it. With it, the owner key is protected from **other OS users only**, the same as a plaintext seed against a same-user app. `konsensus device approve` never reads it; it always prompts.
-- **Password descriptor.** A launcher without a terminal can pass a Keychain-held password using `init --password-fd <n>` and `start --password-fd <n>` (`0` = stdin). The node reads once to EOF and zeroizes its password buffers after use. This avoids argv and a plaintext password file; it still leaves Touch ID approvals off (`seed_password_not_typed`). See [the handoff contract](../operations/password-input.md).
+- **Password file (opt-in).** `--password-file <path>` reads the password from a file instead. It must be a regular file owned by the current user, with no group or other permissions. Symlinks are refused, and the opened file is checked against the one inspected. Starting this way leaves **Touch ID approvals off** (`seed_password_not_typed`), because the password was not typed, unless the owner sets `[pairing] unattended_device_approvals`. The node warns that any program running as this user, including a paired app, can read it. With it, the owner key is protected from **other OS users only**, the same as a plaintext seed against a same-user app. `konsensus device approve` never reads it; it always prompts.
+- **Password descriptor.** A launcher without a terminal can pass a Keychain-held password using `init --password-fd <n>` and `start --password-fd <n>` (`0` = stdin). The node reads once to EOF and zeroizes its password buffers after use. This avoids argv and a plaintext password file; it still leaves Touch ID approvals off (`seed_password_not_typed`) without `--local-owner-device` or the owner's setting. See [the handoff contract](../operations/password-input.md).
 - **GAP.** The file-key tier and its label are not built. Today a Mac without a usable Touch ID falls back to the console grant.
 
 ## 5. The profile card is the public profile

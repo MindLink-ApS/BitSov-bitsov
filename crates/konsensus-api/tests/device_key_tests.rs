@@ -13,7 +13,7 @@ mod owner_console;
 use owner_console::OwnerConsole;
 
 use ed25519_dalek::{Signer, SigningKey};
-use rand::RngCore;
+use rand::Rng;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
 use konsensus_api::auth::Scope;
@@ -121,7 +121,7 @@ impl Device {
 
 fn nonce() -> String {
     let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     hex::encode(b)
 }
 

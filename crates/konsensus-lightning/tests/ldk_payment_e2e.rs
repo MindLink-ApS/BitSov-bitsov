@@ -64,8 +64,8 @@ fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
 
 /// Pick a random port to avoid conflicts between parallel test runs.
 fn random_port() -> u16 {
-    use rand::Rng;
-    rand::thread_rng().gen_range(10000..30000)
+    use rand::RngExt;
+    rand::rng().random_range(10000..30000)
 }
 
 /// Build and start an LDK node pointed at the given esplora URL.

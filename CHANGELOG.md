@@ -5,6 +5,24 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- `init` and `restore` take `--network signet|regtest|bitcoin` (default
+  `signet`) and write `[lightning] network` and the matching `[lightning]` and
+  `[chain]` server URLs. The last line printed names the network.
+- `start` refuses a mainnet `[lightning] network` with `mainnet_not_approved`
+  unless `[node] allow_mainnet = true` is set by hand. `starter_hub.allow_mainnet`
+  does not count. **An existing mainnet config, including a start with no config
+  file, is refused until that key is added.**
+- `start` refuses a known public server on another network than
+  `[lightning] network` before any network I/O; the runtime source check now
+  reports `chain_network_mismatch`.
+- New owner setting `[pairing] unattended_device_approvals` (default off): a box
+  with an encrypted seed and its password in an owner-only file or a descriptor
+  can load the owner's approval verifier, so device approvals work while nobody
+  is at the keyboard. Whoever gets the disk and the password file can then
+  approve as the owner; the node says so at start. Refused for a plaintext seed,
+  a password on the command line, and a machine declared as run for someone else.
+  What an approval can authorize and all spending limits are unchanged.
+
 ## [0.3.0-rc24] — 2026-11-12
 
 - A paid call now ends after the callee's app connection is lost, including a

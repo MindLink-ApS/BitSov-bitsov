@@ -2837,3 +2837,199 @@ async fn owner_peer_add_requires_matching_services_and_audits_admission() {
         assert_eq!(peers[0]["connected"], false);
     }
 }
+
+#[cfg(unix)]
+async fn shutdown_control_fixture(
+    dir: &std::path::Path,
+) -> (
+    Arc<AppState>,
+    Arc<peer_admission_probe::AdmissionTransport>,
+    control::ControlServer,
+) {
+    let (base, service, _console) = state_with_pairing(dir, true);
+    let storage =
+        konsensus_storage::SqliteStorage::open(dir.join("control-test.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+    let base = Arc::new(AppState {
+        storage: Arc::new(storage),
+        ..(*base).clone()
+    });
+    let transport = Arc::new(peer_admission_probe::AdmissionTransport {
+        storage: base.storage.clone(),
+        registry: base.peer_registry.clone(),
+        calls: Default::default(),
+        dial_started: Default::default(),
+        finish_dial: Default::default(),
+        live: Default::default(),
+        supervised_addrs: Default::default(),
+        dial: "gate",
+    });
+    let state = Arc::new(AppState {
+        transport: transport.clone(),
+        ..(*base).clone()
+    });
+    let ctx = Arc::new(control::ControlContext {
+        identity_fingerprint: service.bound_fingerprint(),
+        service,
+        data_dir: dir.to_path_buf(),
+        mnemonic_path: dir.join("unused-mnemonic"),
+        replacement_guard: control::ReplacementGuard {
+            layout: konsensus_api::bootstrap::DataDirLayout::new(dir),
+            uses_identity_derived_keys: false,
+            has_identity_passphrase: false,
+        },
+    });
+    let server = control::ControlServer::bind(dir, ctx)
+        .unwrap()
+        .with_approval_state(state.clone());
+    (state, transport, server)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn control_shutdown_drains_started_operation_and_closes_idle_and_queued_requests() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, transport, server) = shutdown_control_fixture(tmp.path()).await;
+    let path = server.path().to_path_buf();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let idle = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let mut busy = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let first = "ab".repeat(32);
+    let second = "ac".repeat(32);
+    for peer in [&first, &second] {
+        busy.write_all(format!("{{\"op\":\"add-peer\",\"node_id\":\"{peer}\",\"addr\":\"127.0.0.1:9735\",\"label\":null}}\n").as_bytes()).await.unwrap();
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        transport.dial_started.notified(),
+    )
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    let mut idle = BufReader::new(idle).lines();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), idle.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !task.is_finished(),
+        "started operation must retain its drain opportunity"
+    );
+    transport.finish_dial.notify_one();
+    let mut busy = BufReader::new(busy).lines();
+    let line = tokio::time::timeout(std::time::Duration::from_secs(2), busy.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("completed operation response");
+    assert!(
+        matches!(serde_json::from_str::<control::ControlResponse>(&line).unwrap(), control::ControlResponse::Ok { detail } if detail.contains("connected"))
+    );
+    assert!(busy.next_line().await.unwrap().is_none());
+    task.await.unwrap();
+    assert_eq!(
+        *transport.calls.lock().unwrap(),
+        ["whitelist", "dial", "supervise"]
+    );
+    assert!(state
+        .storage
+        .get_peer(&konsensus_core::NodeId::from_hex(&first).unwrap())
+        .await
+        .unwrap()
+        .is_some());
+    assert!(state
+        .storage
+        .get_peer(&konsensus_core::NodeId::from_hex(&second).unwrap())
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn control_shutdown_timeout_reports_unknown_after_partial_effects() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, transport, server) = shutdown_control_fixture(tmp.path()).await;
+    let path = server.path().to_path_buf();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let mut busy = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let peer = "ab".repeat(32);
+    busy.write_all(format!("{{\"op\":\"add-peer\",\"node_id\":\"{peer}\",\"addr\":\"127.0.0.1:9735\",\"label\":null}}\n").as_bytes()).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        transport.dial_started.notified(),
+    )
+    .await
+    .unwrap();
+    stop.send(true).unwrap();
+    let mut lines = BufReader::new(busy).lines();
+    let line = tokio::time::timeout(std::time::Duration::from_secs(8), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("interrupted operation response");
+    assert!(
+        matches!(serde_json::from_str::<control::ControlResponse>(&line).unwrap(), control::ControlResponse::Error { message } if message.starts_with("node_stopping:") && message.contains("outcome is unknown") && message.contains("check status"))
+    );
+    assert!(lines.next_line().await.unwrap().is_none());
+    task.await.unwrap();
+    assert!(state
+        .storage
+        .get_peer(&konsensus_core::NodeId::from_hex(&peer).unwrap())
+        .await
+        .unwrap()
+        .is_some());
+    transport.finish_dial.notify_one();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        *transport.calls.lock().unwrap(),
+        ["whitelist", "dial"],
+        "no operation may outlive the server"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn control_shutdown_client_disconnect_keeps_started_operation_until_completion() {
+    use tokio::io::AsyncWriteExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (_state, transport, server) = shutdown_control_fixture(tmp.path()).await;
+    let path = server.path().to_path_buf();
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(server.serve(rx));
+    let idle = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let mut busy = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let peer = "ab".repeat(32);
+    busy.write_all(format!("{{\"op\":\"add-peer\",\"node_id\":\"{peer}\",\"addr\":\"127.0.0.1:9735\",\"label\":null}}\n").as_bytes()).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        transport.dial_started.notified(),
+    )
+    .await
+    .unwrap();
+    drop(busy);
+    stop.send(true).unwrap();
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut idle = BufReader::new(idle).lines();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), idle.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    transport.finish_dial.notify_one();
+    task.await.unwrap();
+    assert_eq!(
+        *transport.calls.lock().unwrap(),
+        ["whitelist", "dial", "supervise"]
+    );
+}
