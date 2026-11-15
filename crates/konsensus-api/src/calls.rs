@@ -611,6 +611,11 @@ async fn admit_locked(store: Store<'_>, peer: &NodeId, kind: u16, signal: &CallS
     let unavailable = |_| CallRefusal::Invalid("call state unavailable");
     let raw = store.call_get(peer, &signal.call_id).await.map_err(unavailable)?;
     let entry = raw.clone().and_then(|e| e.at(now));
+    // As `current`: an aged-out call id whose media teardown is still pending
+    // cannot be reused until that teardown is resolved.
+    if entry.is_none() && store.call_media_has_pending(peer, &signal.call_id).await.map_err(unavailable)? {
+        return Err(CallRefusal::Invalid("call state unavailable"));
+    }
     if kind == konsensus_core::kind::KIND_CALL_HANGUP {
         // A device wait past its deadline can still be rung by a stream write
         // armed before it, or by retained delivery evidence. A cancellation
