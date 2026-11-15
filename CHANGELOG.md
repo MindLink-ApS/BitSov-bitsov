@@ -11,6 +11,11 @@ also live on the corresponding GitHub pre-release pages.
   before any identity exists. The field is absent when the lightning backend
   does not state a network; no other field, route or authentication rule of the
   bootstrap router changes (#443).
+- A CLN `[lightning] network` now reads the same way as an LDK one: `mainnet`
+  and `testnet3` and any letter case map to `bitcoin`, `testnet`, `signet` or
+  `regtest`, and any other text states no network. Before, CLN passed its
+  setting through unchanged, so `bootstrap/state` left `network` out for a
+  value such as `Signet`.
 - Bind device-signed relation intents to the pairing epoch (`bitsov-relation-intent-v2`; `relation_intent_v2`). v1 signatures are refused. The remote route uses the same authenticated Noise session as the other signed tunnel intents. `GET /api/v1/pair/device-keys` returns that epoch.
 - `init` and `restore` take `--network signet|regtest|bitcoin` (default
   `signet`) and write `[lightning] network` and the matching `[lightning]` and
