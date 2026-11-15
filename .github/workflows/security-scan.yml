@@ -149,6 +149,7 @@ jobs:
           CARGO_EXIT_CODE: ${{ steps.cargo_audit.outputs.exit_code }}
           OSV_EXIT_CODE: ${{ steps.osv_scan.outputs.exit_code }}
           GITLEAKS_EXIT_CODE: ${{ steps.gitleaks.outputs.exit_code }}
+          WAIVER_DEADLINES_OUTCOME: ${{ steps.waiver_deadlines.outcome }}
         run: |
           SCAN_DATE=$(date -u +"%Y-%m-%d")
           SCAN_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -219,23 +220,9 @@ jobs:
             LEAK_ERROR=true
           fi
 
-          # ── Overall status ──
-          HAS_FINDINGS=false
-          [ "${CARGO_VULN_COUNT}" -gt 0 ] && HAS_FINDINGS=true
-          [ "${OSV_COUNT}"        -gt 0 ] && HAS_FINDINGS=true
-          [ "${LEAK_COUNT}"       -gt 0 ] && HAS_FINDINGS=true
-
-          cargo_status=$([ "${CARGO_VULN_COUNT}" -gt 0 ] && echo "FINDINGS (${CARGO_VULN_COUNT})" || echo "clean")
-          osv_status=$([ "${OSV_COUNT}"           -gt 0 ] && echo "FINDINGS (${OSV_COUNT})"        || echo "clean")
-          leak_status=$([ "${LEAK_COUNT}"         -gt 0 ] && echo "FINDINGS (${LEAK_COUNT})"       || echo "clean")
-          overall=$([ "${HAS_FINDINGS}" = "true" ]         && echo "REQUIRES REVIEW"               || echo "ALL CLEAR")
-          if [ "$CARGO_ERROR" = true ] || [ "$OSV_ERROR" = true ] || [ "$LEAK_ERROR" = true ]; then
-            SCAN_ERROR=true
-            overall="SCAN ERROR — triage privately"
-          fi
-          [ "$CARGO_ERROR" = true ] && cargo_status="SCAN ERROR"
-          [ "$OSV_ERROR" = true ] && osv_status="SCAN ERROR"
-          [ "$LEAK_ERROR" = true ] && leak_status="SCAN ERROR"
+          # ── Overall status ── (ALL CLEAR needs clean scanners and a passed waiver-deadline check)
+          source scripts/security-report-status.sh
+          security_overall
 
           # ── Build cargo-audit detail section ──
           CARGO_DETAIL="No vulnerabilities found."
@@ -288,7 +275,8 @@ jobs:
             printf '|---------|--------|\n'
             printf '| cargo-audit | %s |\n' "${cargo_status}"
             printf '| osv-scanner | %s |\n' "${osv_status}"
-            printf '| gitleaks | %s |\n\n' "${leak_status}"
+            printf '| gitleaks | %s |\n' "${leak_status}"
+            printf '| waiver deadlines | %s |\n\n' "${waiver_status}"
             printf '%s\n\n' '---'
             printf '## cargo-audit\n\n'
             printf '%s\n\n' "${CARGO_DETAIL}"
