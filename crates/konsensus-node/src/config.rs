@@ -884,18 +884,21 @@ impl LightningConfig {
         }
     }
 
-    /// Bitcoin network this backend pays on, when it states one. Mock
-    /// backends are regtest; LND and LNbits do not say.
+    /// Bitcoin network this backend pays on, when it states one, as one of
+    /// `bitcoin`, `testnet`, `signet` or `regtest`. LDK and CLN accept the
+    /// `mainnet` and `testnet3` aliases in any letter case; other text states
+    /// no network. Mock backends are regtest; LND and LNbits do not say.
     pub fn bitcoin_network(&self) -> Option<String> {
         match self {
-            Self::Ldk { network, .. } => match network.to_ascii_lowercase().as_str() {
-                "bitcoin" | "mainnet" => Some("bitcoin".into()),
-                "testnet" | "testnet3" => Some("testnet".into()),
-                "signet" => Some("signet".into()),
-                "regtest" => Some("regtest".into()),
-                _ => None,
-            },
-            Self::Cln { network, .. } => Some(network.clone()),
+            Self::Ldk { network, .. } | Self::Cln { network, .. } => {
+                match network.to_ascii_lowercase().as_str() {
+                    "bitcoin" | "mainnet" => Some("bitcoin".into()),
+                    "testnet" | "testnet3" => Some("testnet".into()),
+                    "signet" => Some("signet".into()),
+                    "regtest" => Some("regtest".into()),
+                    _ => None,
+                }
+            }
             Self::Mock { .. } | Self::SharedMock { .. } => Some("regtest".into()),
             Self::Lnbits { .. } | Self::Lnd { .. } => None,
         }
