@@ -136,6 +136,11 @@ impl NodeTier {
 #[serde(deny_unknown_fields)]
 pub struct NodeDisplayConfig {
     pub hosted_by: Option<String>,
+    /// The owner's opt-in to run on Bitcoin mainnet, added to `[node]` by hand.
+    /// `start` refuses a mainnet `[lightning] network` without it. Defaults to
+    /// false, is never written by the node, and is omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_mainnet: bool,
 }
 
 const HOSTED_BY_MAX_CHARS: usize = 64;
@@ -237,7 +242,8 @@ pub struct NodeConfig {
     /// Opt-in local tower client core; transport and payments are W2b.
     #[serde(default)]
     pub tower: konsensus_lightning::tower::TowerConfig,
-    /// Display metadata only; independent of identity.hosted custody.
+    /// Display metadata and the owner's mainnet opt-in; independent of
+    /// identity.hosted custody.
     #[serde(default)]
     pub node: NodeDisplayConfig,
 
@@ -1824,6 +1830,87 @@ impl NodeConfig {
         settings
     }
 
+    /// Start-time network policy: refuse an unapproved mainnet, then a known
+    /// server URL on another network. Reads no file and contacts no source.
+    pub(crate) fn validate_bitcoin_network(&self) -> anyhow::Result<()> {
+        self.refuse_unapproved_mainnet()?;
+        self.refuse_known_chain_url_on_another_network()
+    }
+
+    /// Mainnet is not supported in this beta: `start` refuses it unless the
+    /// owner added `[node] allow_mainnet = true`. Backends that state no
+    /// network (mock, LND, LNbits) are not refused here.
+    pub(crate) fn refuse_unapproved_mainnet(&self) -> anyhow::Result<()> {
+        if self.node.allow_mainnet
+            || self.lightning.chain_source_network() != Some(bitcoin::Network::Bitcoin)
+        {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{MAINNET_NOT_APPROVED}: [lightning] network is bitcoin (mainnet), which this beta \
+             does not support. Switch [lightning] network and the [lightning] and [chain] server \
+             URLs to signet (docs/QUICKSTART-SIGNET.md, step 2). To run on mainnet anyway, add \
+             allow_mainnet = true to the [node] section by hand"
+        );
+    }
+
+    /// Offline part of the chain source network check: a public server URL
+    /// known to serve one network, named in a config set to another, is
+    /// refused before any source is asked. Every other URL is left to the
+    /// check that asks the source itself. Same code as that check.
+    pub(crate) fn refuse_known_chain_url_on_another_network(&self) -> anyhow::Result<()> {
+        let Some(configured) = self.lightning.chain_source_network() else {
+            return Ok(());
+        };
+        let mut urls: Vec<(&str, &str)> = Vec::new();
+        if let ChainConfig::Esplora {
+            api_url,
+            esplora_url_fallback,
+            ..
+        } = &self.chain
+        {
+            urls.push(("[chain] api_url", api_url));
+            urls.extend(
+                esplora_url_fallback
+                    .as_deref()
+                    .map(|url| ("[chain] esplora_url_fallback", url)),
+            );
+        }
+        // LDK uses the [chain] source instead of its own URLs for these backends.
+        if !matches!(self.chain, ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_)) {
+            if let LightningConfig::Ldk {
+                esplora_url,
+                esplora_url_fallback,
+                ..
+            } = &self.lightning
+            {
+                urls.push(("[lightning] esplora_url", esplora_url));
+                urls.extend(
+                    esplora_url_fallback
+                        .as_deref()
+                        .map(|url| ("[lightning] esplora_url_fallback", url)),
+                );
+            }
+        }
+        for (field, url) in urls {
+            let Some((known, served)) = known_public_esplora(url) else {
+                continue;
+            };
+            if served != configured {
+                anyhow::bail!(
+                    "{}: [lightning] network is {} but {field} is {known}, a {} server. \
+                     Set the [lightning] and [chain] server URLs for {}, or set [lightning] \
+                     network to match, then restart",
+                    konsensus_chain::network::NETWORK_MISMATCH_CODE,
+                    konsensus_chain::network::network_name(configured),
+                    konsensus_chain::network::network_name(served),
+                    konsensus_chain::network::network_name(configured),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_starter_hub(&self, lockable: bool) -> anyhow::Result<()> {
         let network = self.lightning.bitcoin_network();
         self.starter
@@ -2215,6 +2302,41 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// [`Self::default_for_tier`] on one Bitcoin network, as `init` and
+    /// `restore` write it: `[lightning] network` and the `[lightning]` and
+    /// `[chain]` Esplora URLs all name `network` (one of [`INIT_NETWORKS`]).
+    /// Mock tiers have no network or server to set and are unchanged.
+    pub fn default_for_tier_on_network(
+        tier: NodeTier,
+        network: &str,
+        mnemonic_file: PathBuf,
+        node_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        let endpoints = fresh_endpoints(network)?;
+        let mut config = Self::default_for_tier(tier, mnemonic_file, node_dir);
+        if let LightningConfig::Ldk {
+            network: ldk_network,
+            esplora_url,
+            esplora_url_fallback,
+            ..
+        } = &mut config.lightning
+        {
+            *ldk_network = network.to_string();
+            *esplora_url = endpoints.ldk.to_string();
+            *esplora_url_fallback = endpoints.ldk_fallback.map(str::to_string);
+        }
+        if let ChainConfig::Esplora {
+            api_url,
+            esplora_url_fallback,
+            ..
+        } = &mut config.chain
+        {
+            *api_url = endpoints.chain.to_string();
+            *esplora_url_fallback = endpoints.chain_fallback.map(str::to_string);
+        }
+        Ok(config)
+    }
+
     /// Generate a default configuration with absolute paths rooted in `node_dir`.
     ///
     /// Uses mock Lightning and chain backends so the node starts immediately
@@ -2421,6 +2543,74 @@ const FRESH_CHAIN_FALLBACK: &str = "https://mempool.space";
 const FRESH_LDK_PRIMARY: &str = "https://blockstream.info/api";
 /// LDK takes the full API URL, `/api` included.
 const FRESH_LDK_FALLBACK: &str = "https://mempool.space/api";
+
+/// Bitcoin networks `init` and `restore` write (`--network`).
+pub const INIT_NETWORKS: [&str; 3] = ["signet", "regtest", "bitcoin"];
+/// What `init` and `restore` write without `--network`.
+pub const DEFAULT_INIT_NETWORK: &str = "signet";
+
+/// Stable refusal code: `start` on mainnet without `[node] allow_mainnet`.
+pub const MAINNET_NOT_APPROVED: &str = "mainnet_not_approved";
+
+/// The Esplora servers a fresh config names for one network.
+struct FreshEndpoints {
+    /// Full API URL, `/api` included.
+    ldk: &'static str,
+    ldk_fallback: Option<&'static str>,
+    /// Base URL; the chain client appends `/api`.
+    chain: &'static str,
+    chain_fallback: Option<&'static str>,
+}
+
+fn fresh_endpoints(network: &str) -> anyhow::Result<FreshEndpoints> {
+    Ok(match network {
+        "bitcoin" => FreshEndpoints {
+            ldk: FRESH_LDK_PRIMARY,
+            ldk_fallback: Some(FRESH_LDK_FALLBACK),
+            chain: FRESH_CHAIN_PRIMARY,
+            chain_fallback: Some(FRESH_CHAIN_FALLBACK),
+        },
+        // The signet endpoints of the same two public operators.
+        "signet" => FreshEndpoints {
+            ldk: "https://mempool.space/signet/api",
+            ldk_fallback: Some("https://blockstream.info/signet/api"),
+            chain: "https://mempool.space/signet",
+            chain_fallback: Some("https://blockstream.info/signet"),
+        },
+        // No public regtest server exists. Local default: an Esplora on this
+        // machine at port 3002; point both URLs at your own regtest server.
+        // One local server, so no fallback.
+        "regtest" => FreshEndpoints {
+            ldk: "http://localhost:3002/api",
+            ldk_fallback: None,
+            chain: "http://localhost:3002",
+            chain_fallback: None,
+        },
+        other => anyhow::bail!(
+            "unknown network '{other}'. Valid options: {}",
+            INIT_NETWORKS.join(", ")
+        ),
+    })
+}
+
+/// Public Esplora servers, by base URL, and the network each one serves.
+const KNOWN_PUBLIC_ESPLORA: [(&str, bitcoin::Network); 6] = [
+    ("https://blockstream.info", bitcoin::Network::Bitcoin),
+    ("https://mempool.space", bitcoin::Network::Bitcoin),
+    ("https://blockstream.info/signet", bitcoin::Network::Signet),
+    ("https://mempool.space/signet", bitcoin::Network::Signet),
+    ("https://blockstream.info/testnet", bitcoin::Network::Testnet),
+    ("https://mempool.space/testnet", bitcoin::Network::Testnet),
+];
+
+/// The known server a URL names (with or without `/api`), and its network.
+fn known_public_esplora(url: &str) -> Option<(&'static str, bitcoin::Network)> {
+    let base = url.trim().trim_end_matches('/');
+    let base = base.strip_suffix("/api").unwrap_or(base).trim_end_matches('/');
+    KNOWN_PUBLIC_ESPLORA
+        .into_iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(base))
+}
 
 fn default_sqlite_path() -> String {
     "konsensus.db".into()

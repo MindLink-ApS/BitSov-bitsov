@@ -3776,6 +3776,15 @@ pub(super) async fn compose_peer(
             super::caps::check_payment(&state, price_msat, req.max_routing_fee_msat, cap)?;
         } else if cap.is_none() {
             auth.refuse_unpriced("first contact requires an aggregate cap")?;
+            // The owner's key too: a payment to a peer without an open session
+            // (first contact or re-admission) is bounded by a total the caller
+            // states. A cap of 0 is a cap ("pay nothing new") and passes here.
+            return Err(ApiError::PriceCapExceeded(
+                "a payment to a peer without an open session needs max_total_msat (0 pays \
+                 nothing new) — nothing was requested or paid"
+                    .into(),
+            )
+            .with_reason("total_cap_required"));
         }
 
         // Reject budget limits before advancing the ratchet or requesting an invoice.
@@ -3914,8 +3923,9 @@ pub(super) async fn compose_peer(
                             "first-contact admission payment for {peer_id} settled and a signed \
                              proof is held, but the E2EE session did not establish within {}s \
                              (the proof envelope may still need re-delivery) — retry the message \
-                             shortly; the retry is guarded by admission idempotence and will NOT \
-                             pay admission again",
+                             shortly; on this connection the retry is guarded by admission \
+                             idempotence and will NOT pay admission again (after a reconnect a new \
+                             admission is paid only within the request's max_total_msat)",
                             ADMISSION_SESSION_TIMEOUT.as_secs()
                         )));
                     }

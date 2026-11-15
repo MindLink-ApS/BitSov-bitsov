@@ -202,7 +202,8 @@ async fn compose_fails_without_e2ee_session() {
             serde_json::json!({
                 "recipient": peer_id.to_hex(),
                 "kind": 1,
-                "plaintext": "hello"
+                "plaintext": "hello",
+                "max_total_msat": 0
             })
             .to_string(),
         ))
