@@ -253,7 +253,9 @@ request/confirm, first-contact-grant POST and identity replacement
 requests remain absent on the tunnel. Console approval itself remains available
 only at `konsensus device approve`. Console enrollment requires
 `--owner-control` with a **typed** seed password; `--password-fd` disables owner device authority in that
-mode. Spend elevation is still granted only through the owner control socket.
+mode, unless the owner chose
+[`[pairing] unattended_device_approvals`](../operations/password-input.md#unattended-box-device-approvals-from-a-stored-password).
+`konsensus device approve` always prompts for the typed password. Spend elevation is still granted only through the owner control socket.
 Asking or quoting confers no spend scope.
 
 The remote router also omits the loopback token mint, public probes and metrics.

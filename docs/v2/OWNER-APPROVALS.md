@@ -165,6 +165,9 @@ The node must be running with `--owner-control` or `--local-owner-device`
 (including `--home`), with device approvals enabled. Capability advertisement
 indicates protocol support, not that device authority is currently enabled.
 Consult the existing `device_approvals` readiness signal before offering approval.
+An unattended box has them off unless its owner chose
+[`[pairing] unattended_device_approvals`](../operations/password-input.md#unattended-box-device-approvals-from-a-stored-password);
+that choice changes nothing below.
 
 ## Request and discover
 
