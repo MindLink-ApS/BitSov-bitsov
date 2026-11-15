@@ -292,11 +292,50 @@ struct ReceiverSenderKey {
     skipped_keys: HashMap<u32, ([u8; 32], u64)>,
 }
 
-/// Zeroize and drop every skipped key.
-fn clear_skipped(skipped: &mut HashMap<u32, ([u8; 32], u64)>) {
-    for (_, (mut key, _)) in skipped.drain() {
+impl Zeroize for ReceiverSenderKey {
+    /// Wipe the chain key and every skipped key where they are stored.
+    fn zeroize(&mut self) {
+        self.chain_key.zeroize();
+        wipe_skipped(&mut self.skipped_keys);
+    }
+}
+
+impl Drop for ReceiverSenderKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+/// Zeroize every skipped key where it is stored. `[u8; 32]` is `Copy`, so a key
+/// taken out of the map first (drain, remove) would leave its bytes in the bucket.
+fn wipe_skipped(skipped: &mut HashMap<u32, ([u8; 32], u64)>) {
+    for (key, _) in skipped.values_mut() {
         key.zeroize();
     }
+}
+
+/// Zeroize and drop every skipped key.
+fn clear_skipped(skipped: &mut HashMap<u32, ([u8; 32], u64)>) {
+    wipe_skipped(skipped);
+    skipped.clear();
+}
+
+/// Zeroize one skipped key where it is stored. Returns whether it was there.
+fn wipe_skipped_key(skipped: &mut HashMap<u32, ([u8; 32], u64)>, number: u32) -> bool {
+    match skipped.get_mut(&number) {
+        Some((key, _)) => {
+            key.zeroize();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Zeroize one skipped key in place, then drop it. Returns whether it was there.
+fn remove_skipped(skipped: &mut HashMap<u32, ([u8; 32], u64)>, number: u32) -> bool {
+    let found = wipe_skipped_key(skipped, number);
+    skipped.remove(&number);
+    found
 }
 
 /// A group session managing sender keys for all members.
@@ -437,9 +476,7 @@ impl GroupSession {
         // its message, so a message that fails to decrypt cannot burn it.
         if let Some((message_key, _)) = entry.skipped_keys.get(&message.message_number) {
             let plaintext = aead_decrypt(message_key, &message.ciphertext, &aad)?;
-            if let Some((mut used, _)) = entry.skipped_keys.remove(&message.message_number) {
-                used.zeroize();
-            }
+            remove_skipped(&mut entry.skipped_keys, message.message_number);
             return Ok(plaintext);
         }
 
@@ -524,12 +561,8 @@ impl GroupSession {
             .collect();
         oldest.select_nth_unstable_by_key(excess - 1, |(seq, _, _)| *seq);
         for (_, node, number) in oldest.into_iter().take(excess) {
-            if let Some((mut key, _)) = self
-                .member_keys
-                .get_mut(&node)
-                .and_then(|m| m.skipped_keys.remove(&number))
-            {
-                key.zeroize();
+            if let Some(m) = self.member_keys.get_mut(&node) {
+                remove_skipped(&mut m.skipped_keys, number);
             }
         }
     }
@@ -540,9 +573,8 @@ impl GroupSession {
     /// The caller must redistribute our new `SenderKeyDistribution` to
     /// all remaining members.
     pub fn remove_member(&mut self, node_id: &NodeId) -> SenderKeyDistribution {
-        if let Some(mut removed) = self.member_keys.remove(node_id) {
-            clear_skipped(&mut removed.skipped_keys);
-        }
+        // Dropping the removed entry zeroizes its chain key and skipped keys (Drop).
+        drop(self.member_keys.remove(node_id));
         self.our_sender_key.rotate();
         self.our_distribution()
     }
