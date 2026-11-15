@@ -5,6 +5,7 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Bind device-signed relation intents to the pairing epoch (`bitsov-relation-intent-v2`; `relation_intent_v2`). v1 signatures are refused. The remote route uses the same authenticated Noise session as the other signed tunnel intents. `GET /api/v1/pair/device-keys` returns that epoch.
 - `init` and `restore` take `--network signet|regtest|bitcoin` (default
   `signet`) and write `[lightning] network` and the matching `[lightning]` and
   `[chain]` server URLs. The last line printed names the network.
