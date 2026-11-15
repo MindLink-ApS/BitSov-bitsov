@@ -305,6 +305,8 @@ impl PairingRefusal {
 
 impl From<PairingError> for PairingRefusal {
     fn from(error: PairingError) -> Self {
+        // Exhaustive on purpose: a new variant must name its own log reason
+        // instead of collapsing into `pairing_refused`.
         let reason = match &error {
             PairingError::BadProof => "bad_signature",
             PairingError::Expired => "stale_or_future",
