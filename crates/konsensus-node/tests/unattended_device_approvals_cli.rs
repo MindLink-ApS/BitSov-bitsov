@@ -59,7 +59,7 @@ fn initialized_node() -> Node {
     assert!(dir.path().join("mnemonic.enc").exists());
 
     let config = dir.path().join("konsensus.toml");
-    let mut toml_config: toml::Value = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    let mut toml_config: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
     toml_config["network"]["listen_addr"] = "127.0.0.1:0".into();
     let api_port = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     toml_config["api"]["listen_addr"] = api_port.local_addr().unwrap().to_string().into();
@@ -76,8 +76,8 @@ fn initialized_node() -> Node {
 }
 
 fn set_setting(config: &Path, on: bool) {
-    let mut value: toml::Value = std::fs::read_to_string(config).unwrap().parse().unwrap();
-    let table = value.as_table_mut().unwrap();
+    let mut value: toml::Table = std::fs::read_to_string(config).unwrap().parse().unwrap();
+    let table = &mut value;
     let pairing = table
         .entry("pairing")
         .or_insert_with(|| toml::Value::Table(Default::default()));
@@ -133,7 +133,7 @@ fn the_owner_setting_notice_is_on_stdout_when_logging_is_off_or_error() {
     for filter in ["off", "error"] {
         let node = initialized_node();
         set_setting(&node.config, true);
-        let config: toml::Value = std::fs::read_to_string(&node.config)
+        let config: toml::Table = std::fs::read_to_string(&node.config)
             .unwrap()
             .parse()
             .unwrap();
@@ -334,7 +334,7 @@ fn a_password_on_the_command_line_keeps_approvals_off_with_the_setting_on() {
 fn a_hosted_box_keeps_approvals_off_and_says_why() {
     let node = initialized_node();
     set_setting(&node.config, true);
-    let mut value: toml::Value = std::fs::read_to_string(&node.config)
+    let mut value: toml::Table = std::fs::read_to_string(&node.config)
         .unwrap()
         .parse()
         .unwrap();
