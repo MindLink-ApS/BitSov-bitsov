@@ -123,6 +123,13 @@ jobs:
             --exit-code 0 > /tmp/gitleaks.log 2>&1 || status=$?
           echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
 
+      # cargo-audit and cargo-deny have no expiry for an ignore. Keep going so the
+      # report is still published; the fail step below reads this outcome.
+      - name: Check advisory waiver deadlines
+        id: waiver_deadlines
+        continue-on-error: true
+        run: python3 scripts/check-waiver-deadlines.py
+
       # ── Ensure label exists in repository ─────────────────────────────────
 
       - name: Ensure security-scanning label
@@ -316,7 +323,7 @@ jobs:
       # Do not commit leak metadata or open public PRs with confirmed file paths.
 
       - name: Fail on security findings or scan errors
-        if: steps.report.outputs.has_findings == 'true' || steps.report.outputs.scan_error == 'true'
+        if: steps.report.outputs.has_findings == 'true' || steps.report.outputs.scan_error == 'true' || steps.waiver_deadlines.outcome != 'success'
         run: |
           echo "Security scan found issues or could not be verified. Triage privately; do not publish leak metadata in a PR."
           exit 1

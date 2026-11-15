@@ -1,6 +1,6 @@
 //! File-backed OAuth client credentials. Secrets and responses never enter diagnostics.
 use esplora_client::r#async::HttpTransport;
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{
     header::{HeaderValue, AUTHORIZATION},
     Client, RequestBuilder, Response,
@@ -159,7 +159,7 @@ impl BearerAuth {
         }
         // A failed refresh must never cause reuse of a rejected/expiring token.
         cached.token = None;
-        let backoff = Duration::from_millis(rand::thread_rng().gen_range(1_000..=3_000));
+        let backoff = Duration::from_millis(rand::rng().random_range(1_000..=3_000));
         // Also cover cancellation while the POST/body is in flight. Waiters never
         // sleep through a cooldown: they immediately take the caller's fallback.
         cached.retry_at = Some(Instant::now() + TOKEN_TIMEOUT + backoff);

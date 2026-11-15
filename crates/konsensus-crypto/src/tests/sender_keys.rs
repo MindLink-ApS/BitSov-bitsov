@@ -635,6 +635,56 @@ fn aead_roundtrip_same_context_succeeds() {
     assert_eq!(bob.decrypt(&alice_id, &ct).unwrap(), b"post-rotation");
 }
 
+#[test]
+fn skipped_keys_are_capped_across_all_senders_oldest_first() {
+    let group_id = test_group_id();
+    let (alice_id, carol_id, bob_id) = (make_node_id(1), make_node_id(3), make_node_id(2));
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut carol = GroupSession::new(group_id, carol_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+    bob.process_distribution(&carol.our_distribution()).unwrap();
+
+    // Each sender emits 2,048 messages; Bob receives every 257th, so each
+    // delivery skips the per-sender maximum of 256 keys.
+    let send = |session: &mut GroupSession| -> Vec<GroupCiphertext> {
+        (0..2048)
+            .map(|i| session.encrypt(format!("m{i}").as_bytes()).unwrap())
+            .collect()
+    };
+    let (from_alice, from_carol) = (send(&mut alice), send(&mut carol));
+
+    // Alice's skips are the oldest; Carol's arrive afterwards.
+    for i in (256..2048).step_by(257) {
+        bob.decrypt(&alice_id, &from_alice[i]).unwrap();
+    }
+    for i in (256..2048).step_by(257) {
+        bob.decrypt(&carol_id, &from_carol[i]).unwrap();
+        assert!(bob.skipped_key_count() <= MAX_TOTAL_SKIPPED_KEYS);
+    }
+    assert_eq!(bob.skipped_key_count(), MAX_TOTAL_SKIPPED_KEYS);
+
+    // 7 deliveries x 256 skips per sender = 3,584 keys; the 1,584 oldest
+    // (all Alice's) are evicted and every key Carol skipped is still held.
+    assert!(bob.decrypt(&alice_id, &from_alice[0]).is_err());
+    assert_eq!(bob.decrypt(&carol_id, &from_carol[0]).unwrap(), b"m0");
+    assert_eq!(bob.decrypt(&carol_id, &from_carol[1797]).unwrap(), b"m1797");
+}
+
+#[test]
+fn removing_a_member_drops_its_skipped_keys() {
+    let group_id = test_group_id();
+    let (alice_id, bob_id) = (make_node_id(1), make_node_id(2));
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+    let cts: Vec<_> = (0..11).map(|_| alice.encrypt(b"x").unwrap()).collect();
+    bob.decrypt(&alice_id, &cts[10]).unwrap();
+    assert_eq!(bob.skipped_key_count(), 10);
+    bob.remove_member(&alice_id);
+    assert_eq!(bob.skipped_key_count(), 0);
+}
+
 // ─── Atomic decryption ───────────────────────────────────────────────────────
 
 /// A message carrying a valid sender signature over a ciphertext that does not
@@ -804,4 +854,79 @@ fn failed_skipped_sender_key_decrypt_keeps_the_key() {
     assert_eq!(bob.decrypt(&alice_id, &first).unwrap(), b"first");
     assert_eq!(skipped_len(&bob, &alice_id), 0);
     assert_eq!(chain_index(&bob, &alice_id), 2);
+}
+
+// Key bytes are wiped where they are stored, not in a copy taken out of the
+// map: `[u8; 32]` is `Copy`, so zeroizing a value returned by `drain` or
+// `remove` would leave the bytes in the table. Each wipe runs while the key is
+// still in the map, so these tests read the stored bytes back safely.
+fn session_with_skipped(skips: usize) -> (GroupSession, NodeId, Vec<GroupCiphertext>) {
+    let group_id = test_group_id();
+    let (alice_id, bob_id) = (make_node_id(1), make_node_id(2));
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+    let cts: Vec<_> = (0..=skips).map(|_| alice.encrypt(b"x").unwrap()).collect();
+    bob.decrypt(&alice_id, &cts[skips]).unwrap();
+    assert_eq!(bob.skipped_key_count(), skips);
+    (bob, alice_id, cts)
+}
+
+#[test]
+fn wiping_skipped_keys_zeroes_the_stored_bytes() {
+    let (mut bob, alice_id, _) = session_with_skipped(3);
+    let entry = bob.member_keys.get_mut(&alice_id).unwrap();
+    assert!(entry.skipped_keys.values().all(|(k, _)| *k != [0u8; 32]));
+    wipe_skipped(&mut entry.skipped_keys);
+    assert_eq!(entry.skipped_keys.len(), 3, "the wipe itself removes nothing");
+    assert!(entry.skipped_keys.values().all(|(k, _)| *k == [0u8; 32]), "every stored key is zero");
+}
+
+#[test]
+fn wiping_one_skipped_key_zeroes_only_that_stored_key() {
+    let (mut bob, alice_id, _) = session_with_skipped(3);
+    let entry = bob.member_keys.get_mut(&alice_id).unwrap();
+    assert!(wipe_skipped_key(&mut entry.skipped_keys, 1));
+    assert_eq!(entry.skipped_keys[&1].0, [0u8; 32]);
+    assert_ne!(entry.skipped_keys[&0].0, [0u8; 32]);
+    assert_ne!(entry.skipped_keys[&2].0, [0u8; 32]);
+    assert!(!wipe_skipped_key(&mut entry.skipped_keys, 9), "a missing key reports false");
+}
+
+#[test]
+fn remove_skipped_wipes_then_removes() {
+    let (mut bob, alice_id, cts) = session_with_skipped(3);
+    let entry = bob.member_keys.get_mut(&alice_id).unwrap();
+    assert!(remove_skipped(&mut entry.skipped_keys, 0));
+    assert!(!entry.skipped_keys.contains_key(&0));
+    assert!(!remove_skipped(&mut entry.skipped_keys, 0), "a second removal finds nothing");
+    // The consumed-key path uses the same helper: one use, then gone.
+    assert_eq!(bob.decrypt(&alice_id, &cts[1]).unwrap(), b"x");
+    assert!(bob.decrypt(&alice_id, &cts[1]).is_err());
+}
+
+#[test]
+fn zeroizing_a_receiver_entry_wipes_its_chain_key_and_skipped_keys() {
+    // Drop calls this, so remove_member, a dropped session and a replaced entry all wipe.
+    let (mut bob, alice_id, _) = session_with_skipped(3);
+    let entry = bob.member_keys.get_mut(&alice_id).unwrap();
+    assert_ne!(entry.chain_key, [0u8; 32]);
+    entry.zeroize();
+    assert_eq!(entry.chain_key, [0u8; 32]);
+    assert!(entry.skipped_keys.values().all(|(k, _)| *k == [0u8; 32]));
+}
+
+#[test]
+fn wiping_a_member_zeroes_its_stored_keys_before_removal() {
+    // remove_member wipes in place first, because `remove` moves the entry out
+    // of its bucket and a wipe after that would only clear the moved copy.
+    let (mut bob, alice_id, _) = session_with_skipped(3);
+    assert_ne!(bob.member_keys[&alice_id].chain_key, [0u8; 32]);
+    assert!(bob.wipe_member(&alice_id));
+    let entry = &bob.member_keys[&alice_id];
+    assert_eq!(entry.chain_key, [0u8; 32], "the stored chain key is zero");
+    assert!(entry.skipped_keys.values().all(|(k, _)| *k == [0u8; 32]));
+    assert!(!bob.wipe_member(&make_node_id(9)), "an unknown member reports false");
+    bob.remove_member(&alice_id);
+    assert!(!bob.has_member(&alice_id));
 }

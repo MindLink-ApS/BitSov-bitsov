@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Integration tests reach internal values (for example the cookie secret source).
+test-support = []
+
 [dependencies]
 uuid = { workspace = true }
 konsensus-core = { path = "../konsensus-core" }
@@ -28,8 +32,14 @@ zeroize.workspace = true
 socket2 = "0.6"
 
 [dev-dependencies]
+konsensus-message = { path = ".", features = ["test-support"] }
+libc = "0.2"
 mockall.workspace = true
 proptest.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 konsensus-storage = { path = "../konsensus-storage" }
 uuid.workspace = true
+
+[[test]]
+name = "os_rng"
+harness = false
