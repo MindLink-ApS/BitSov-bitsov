@@ -181,9 +181,10 @@ async fn lightning_info_rejects_tampered_signature() {
         handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
 
     assert!(verified.is_none());
-    assert!(
-        pubkeys.lock().await.is_empty(),
-        "a bad signature stores nothing"
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
     );
 }
 
@@ -199,7 +200,11 @@ async fn lightning_info_rejects_signature_for_a_different_key() {
         handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
 
     assert!(verified.is_none());
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
@@ -214,7 +219,11 @@ async fn lightning_info_rejects_signature_by_another_identity() {
         handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
 
     assert!(verified.is_none());
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
@@ -243,7 +252,11 @@ async fn lightning_info_rejects_short_pubkey() {
 
     handle_lightning_info_received(&peer_id, "02abcdef", &sig, &pubkeys).await;
 
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
@@ -256,7 +269,11 @@ async fn lightning_info_rejects_wrong_prefix() {
     let bad_pk = "04abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
     handle_lightning_info_received(&peer_id, bad_pk, &sig, &pubkeys).await;
 
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
@@ -269,18 +286,26 @@ async fn lightning_info_rejects_invalid_hex() {
     let bad_pk = "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456zzab";
     handle_lightning_info_received(&peer_id, bad_pk, &sig, &pubkeys).await;
 
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
-async fn lightning_info_malformed_unsigned_key_records_nothing() {
-    // Legacy peers get the Unsigned marker only for a well-formed key.
+async fn lightning_info_malformed_unsigned_key_is_recorded_unpayable() {
+    // A malformed key, signed or not, is recorded as unpayable rather than absent.
     let peer_id = test_peer_id();
     let pubkeys = empty_peer_ln_keys();
 
     handle_lightning_info_received(&peer_id, "02abcdef", &[], &pubkeys).await;
 
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
@@ -7630,4 +7655,24 @@ async fn legacy_unreadable_lookup_failure_retains_paid_state_and_withholds_confi
     assert_eq!(op.settled_msat, 1000);
     assert_eq!(op.last_error.as_deref(), Some(initial));
     assert_eq!(reopened.count_pending_deliveries().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_rejected_key_never_downgrades_a_verified_binding_and_never_leaves_it_absent() {
+    // First contact with a bad binding: recorded as unpayable (fail closed).
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let mut bad = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    bad[0] ^= 0x01;
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &bad, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+    // A valid binding afterwards is accepted and verified.
+    let good = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    let verified = handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &good, &pubkeys).await;
+    assert!(verified.is_some());
+    assert!(matches!(pubkeys.lock().await.get(&peer_id), Some(PeerLightningKey::Verified(_))));
+    // A later bad binding or malformed key keeps the verified key.
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &bad, &pubkeys).await;
+    handle_lightning_info_received(&peer_id, "02abcdef", &good, &pubkeys).await;
+    assert!(matches!(pubkeys.lock().await.get(&peer_id), Some(PeerLightningKey::Verified(_))));
 }

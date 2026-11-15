@@ -2791,8 +2791,9 @@ async fn handle_lightning_info_received(
             peer = %peer_id,
             len = ln_pubkey.len(),
             error = %e,
-            "received invalid Lightning pubkey"
+            "received invalid Lightning pubkey; it will not be paid until the peer advertises a valid one"
         );
+        refuse_unless_verified(peer_id, peer_ln_pubkeys).await;
         return None;
     }
 
@@ -2824,10 +2825,26 @@ async fn handle_lightning_info_received(
             warn!(
                 peer = %peer_id,
                 error = %e,
-                "rejected Lightning key binding; keeping previous state"
+                "rejected Lightning key binding; keeping a verified key, otherwise refusing to pay"
             );
+            refuse_unless_verified(peer_id, peer_ln_pubkeys).await;
             None
         }
+    }
+}
+
+/// A peer that advertised a Lightning key we could not accept must not be paid
+/// through the unbound invoice path, which is only for peers that never
+/// advertise a key. Record `Unsigned` (every payment path refuses it) unless a
+/// verified key is already held, which stays: only this authenticated peer can
+/// send these frames, so a bad one is never a reason to drop a good binding.
+async fn refuse_unless_verified(
+    peer_id: &NodeId,
+    peer_ln_pubkeys: &Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, PeerLightningKey>>>,
+) {
+    let mut keys = peer_ln_pubkeys.lock().await;
+    if !matches!(keys.get(peer_id), Some(PeerLightningKey::Verified(_))) {
+        keys.insert(*peer_id, PeerLightningKey::Unsigned);
     }
 }
 

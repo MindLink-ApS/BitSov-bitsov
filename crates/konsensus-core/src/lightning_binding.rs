@@ -93,6 +93,11 @@ pub fn canonical_ln_pubkey(ln_pubkey: &str) -> Result<String, BindingError> {
 }
 
 /// The bytes the identity key signs: tag, node id, canonical hex key.
+///
+/// v1 carries no timestamp or session binding, so an older valid binding from
+/// the same identity could replace a newer one. It relies on arriving only over
+/// the peer's own authenticated session. Do not persist, relay or cache
+/// bindings without moving to a format that adds freshness.
 pub fn signable_bytes(node_id: &NodeId, ln_pubkey: &str) -> Result<Vec<u8>, BindingError> {
     let key = canonical_ln_pubkey(ln_pubkey)?;
     let mut out = Vec::with_capacity(SIGNED_LEN);
