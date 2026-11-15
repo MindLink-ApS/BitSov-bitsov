@@ -64,8 +64,9 @@ recompiled on every test. The job then deleted `libldk_node-*` before
   labels cannot restart or cancel the suite. The job name is unchanged. It is
   not a required check; a skipped run is not a pass.
 - The release matrix stays on `v*` tags only.
-- `Cargo Audit` runs when `Cargo.lock`, `.cargo/audit.toml`, `SECURITY.md`, or
-  the security-key scripts change, on every main push, on `v*` tags, in the
+- `Cargo Audit` runs when `Cargo.lock`, `.cargo/audit.toml`,
+  `.cargo/waiver-deadlines.toml`, `deny.toml`, `osv-scanner.toml`, `SECURITY.md`,
+  the security-key scripts, or the waiver-deadline scripts change, on every main push, on `v*` tags, in the
   merge queue, and on PR code pushes with an existing `full-ci` label. The
   daily security scan runs `cargo audit` against the default
   branch every day at 06:00 UTC. The check name is unchanged. Both path-filter

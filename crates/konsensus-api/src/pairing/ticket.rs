@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::RngCore;
+use rand::TryRng;
 
 use super::{device, Inner, PairedClient, PairingError, PairingService};
 use crate::remote_access::{self, PairLink};
@@ -40,7 +40,9 @@ struct Ticket {
 
 fn random_hex() -> String {
     let mut bytes = [0; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS randomness unavailable");
     hex::encode(bytes)
 }
 

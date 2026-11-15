@@ -45,6 +45,7 @@ bitcoin-io
 bitcoin-units
 bitcoin_hashes
 bitcoinconsensus
+bitcoind
 bitflags
 bitreq
 blake2
@@ -87,6 +88,7 @@ core-foundation-sys
 core_detect
 corepc-client
 corepc-node
+corepc-regtest-client
 corepc-types
 cpufeatures
 crc
@@ -401,6 +403,7 @@ toml
 toml_datetime
 toml_edit
 toml_parser
+toml_writer
 tower
 tower-http
 tower-layer

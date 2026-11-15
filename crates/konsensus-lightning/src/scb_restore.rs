@@ -4,7 +4,7 @@ use bip39::Mnemonic;
 use ldk_node::Node as LdkNode;
 use std::{path::Path, str::FromStr};
 
-pub const RESTORE_DISABLED: &str = "SCB restore is disabled: stale channel state can broadcast a revoked commitment and lose channel funds with the pinned LDK. Preview is disabled too; there is no override. To move funds from a healthy node with its current live state, use `konsensus move-home` (docs/operations/move-home.md). For a lost disk, preserve backups and coordinate recovery with channel peers; move-home cannot recover lost channel state. Restore relationships separately with `konsensus whitelist restore`.";
+pub const RESTORE_DISABLED: &str = "SCB restore is disabled: stale channel state can broadcast a revoked commitment and lose channel funds with the pinned LDK. Preview is disabled too; there is no override. To move funds from a healthy node with its current live state, use `konsensus move-home` on the owner console (docs/operations/move-home.md). For a lost disk, run `konsensus recover` on the owner console (docs/operations/recover.md); do not start a copied channel store. Restore relationships separately with `konsensus whitelist restore`.";
 const LDK_KDF_CONTEXT: &str = "konsensus-v2 ldk-lightning";
 const SCB_ROTATION_KDF_CONTEXT: &str = "konsensus-v2 scb-rotation";
 
