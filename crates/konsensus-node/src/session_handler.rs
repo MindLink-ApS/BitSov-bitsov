@@ -663,10 +663,11 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         if !privileged {
                             continue;
                         }
-                        // Only a key the peer's identity signed is stored or
-                        // acted on. An unsigned key is recorded as such so the
-                        // payer refuses it out loud; it never reaches the
-                        // inviter record or the auto-channel opener.
+                        // Only a key the peer's identity signed is acted on.
+                        // An unsigned, malformed or rejected key is recorded as
+                        // unsigned (unless a verified key is held) so the payer
+                        // refuses it out loud; it never reaches the inviter
+                        // record or the auto-channel opener.
                         let verified = handle_lightning_info_received(
                             &peer_id, &ln_pubkey, &identity_sig, &peer_ln_pubkeys,
                         ).await;
@@ -2778,7 +2779,10 @@ fn is_routable_peer_addr(addr: &std::net::SocketAddr) -> bool {
 /// (a rotation). A well-formed key without a signature comes from a peer that
 /// predates signed bindings: it is recorded as [`PeerLightningKey::Unsigned`],
 /// replacing any earlier entry, so the payer refuses it with a fixed reason.
-/// A malformed key or a signature that does not verify changes nothing.
+/// A malformed key or a signature that does not verify is recorded as
+/// [`PeerLightningKey::Unsigned`] too, unless a verified binding is already
+/// held (that binding is kept). The contact is then refused, never paid through
+/// an invoice to an unbound node.
 async fn handle_lightning_info_received(
     peer_id: &NodeId,
     ln_pubkey: &str,
