@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rand::Rng;
+use rand::RngExt;
 
 use async_trait::async_trait;
 use bip39::Mnemonic;
@@ -275,6 +275,22 @@ fn offline_channel_windows(
             window_blocks: ch.counterparty_force_close_spend_delay,
         })
         .collect()
+}
+
+/// How far past the readiness limit a settlement still counts at the gate while
+/// not ready. Covers a transient chain-source loss; a longer one refuses as usual.
+const GATE_SETTLEMENT_GRACE_SECS: u64 = 180;
+
+/// Latest settlement time the gate's read may confirm while not ready: what
+/// readiness itself tolerates after the last good Lightning sync, plus the grace.
+/// Even at the longest sync interval this stays far inside the shortest
+/// `to_self_delay`; a test asserts that.
+fn gate_settlement_cutoff(last_lightning_sync: Option<u64>, sync_period_secs: u64) -> Option<u64> {
+    last_lightning_sync.map(|synced| {
+        synced
+            .saturating_add(sync_period_secs.saturating_mul(2))
+            .saturating_add(GATE_SETTLEMENT_GRACE_SECS)
+    })
 }
 
 fn sync_status_is_ready(
@@ -1776,6 +1792,13 @@ impl LightningProvider for LdkProvider {
         sync_status_is_ready(&status, self.sync_baseline, &self.sync_intervals, now)
     }
 
+    fn gate_settlement_cutoff(&self) -> Option<u64> {
+        gate_settlement_cutoff(
+            self.node.status().latest_lightning_wallet_sync_timestamp,
+            self.sync_intervals.lightning_wallet_sync_interval_secs,
+        )
+    }
+
     fn routing_fee_policy(&self) -> konsensus_core::traits::lightning::RoutingFeePolicy {
         self.routing_fee_policy
     }
@@ -2630,7 +2653,7 @@ async fn start_esplora_with_retry(
         let Some(delay_secs) = DELAYS.get(attempts - 1) else {
             break;
         };
-        let jitter = rand::thread_rng().gen_range(0.8..=1.2);
+        let jitter = rand::rng().random_range(0.8..=1.2);
         let delay = Duration::from_secs_f64(*delay_secs as f64 * jitter);
         if started.elapsed() + delay + FEE_WINDOW > BUDGET {
             break;

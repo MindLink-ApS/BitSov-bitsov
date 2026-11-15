@@ -323,7 +323,7 @@ pub fn lightning_config(dir: &std::path::Path, url: &str) -> konsensus_lightning
 pub async fn router(dir: &std::path::Path, chain: &Chain) -> (Arc<ldk_node::Node>, String) {
     let addr = loopback();
     let mut seed = [0u8; 64];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
     let mut builder = ldk_node::Builder::new();
     builder
         .set_network(ldk_node::bitcoin::Network::Regtest)
