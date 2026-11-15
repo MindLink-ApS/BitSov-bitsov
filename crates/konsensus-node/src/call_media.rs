@@ -75,6 +75,10 @@ const DETACH_ATTEMPTS: usize = 5;
 #[async_trait]
 pub trait CallMediaAdmission: Send + Sync {
     async fn call_media_admitted(&self, peer: &NodeId, call_id: &str, now_ms: u64) -> bool;
+    /// Persist attachment identity before the route becomes visible.
+    async fn media_attached(&self, _peer: &NodeId, _call_id: &str) -> Result<Option<u64>, konsensus_storage::StorageError> { Ok(None) }
+    /// Retain the teardown policy before scheduling an asynchronous notification.
+    fn media_stopped(&self, _peer: &NodeId, _call_id: &str, _detach: &MediaDetach) {}
     /// Notify admission when the current local attachment has closed.
     async fn media_detached(&self, _peer: &NodeId, _call_id: &str, _detach: MediaDetach) {}
 }
@@ -95,6 +99,14 @@ impl PaidCallAdmission {
 impl CallMediaAdmission for PaidCallAdmission {
     async fn call_media_admitted(&self, peer: &NodeId, call_id: &str, now_ms: u64) -> bool {
         konsensus_api::calls::call_media_admitted(self.storage.as_ref(), peer, call_id, now_ms).await
+    }
+
+    async fn media_attached(&self, peer: &NodeId, call_id: &str) -> Result<Option<u64>, konsensus_storage::StorageError> {
+        konsensus_api::calls::publish_media_attachment(&self.storage, peer, call_id).await.map(Some)
+    }
+
+    fn media_stopped(&self, peer: &NodeId, call_id: &str, detach: &MediaDetach) {
+        konsensus_api::calls::stop_media_attachment(self.storage.as_ref(), peer, call_id, detach);
     }
 
     async fn media_detached(&self, peer: &NodeId, call_id: &str, detach: MediaDetach) {
@@ -431,6 +443,7 @@ pub struct CallMediaRouter {
     admission: Arc<dyn CallMediaAdmission>,
     limits: MediaLimits,
     routes: Mutex<HashMap<(NodeId, String), Arc<Route>>>,
+    publication: tokio::sync::Mutex<()>,
     generations: Mutex<AttachmentGenerations>,
     drops: DropLog,
     me: Weak<Self>,
@@ -454,6 +467,7 @@ impl CallMediaRouter {
             admission,
             limits,
             routes: Mutex::new(HashMap::new()),
+            publication: tokio::sync::Mutex::new(()),
             generations: Mutex::new(HashMap::new()),
             drops: DropLog::default(),
             me: me.clone(),
@@ -586,6 +600,7 @@ impl CallMediaRouter {
                 only_unpaid: reason == EndReason::NotAdmitted,
                 may_hangup_live: !route.admission_ended.load(Ordering::Acquire),
             };
+            admission.media_stopped(&peer, &call_id, &detach);
             tokio::spawn(async move { admission.media_detached(&peer, &call_id, detach).await; });
         }
     }
@@ -680,7 +695,29 @@ impl CallMediaPort for CallMediaRouter {
         if !self.admission.call_media_admitted(peer, call_id, now_ms()).await {
             return Err(AttachRefusal::NotAdmitted);
         }
-        let generation_id = current_generation.checked_add(1).ok_or(AttachRefusal::Unavailable)?;
+        // Serialize publication across calls so capacity and takeover checks
+        // remain valid while the durable attachment record is appended.
+        let _publication = self.publication.lock().await;
+        {
+            let routes = self.routes();
+            let key = (*peer, call_id.to_string());
+            if let Some(current) = routes.get(&key) {
+                if current.client.as_ref() != client || !current.activity.is_stale() {
+                    return Err(AttachRefusal::AlreadyAttached);
+                }
+            }
+            if routes.len() >= MAX_ROUTED_CALLS && !routes.contains_key(&key) {
+                return Err(AttachRefusal::Unavailable);
+            }
+        }
+        let generation_id = match self.admission.media_attached(peer, call_id).await {
+            Ok(Some(generation)) => generation,
+            Ok(None) => current_generation.checked_add(1).ok_or(AttachRefusal::Unavailable)?,
+            Err(error) => {
+                warn!(%error, "call media attachment journal unavailable");
+                return Err(AttachRefusal::Unavailable);
+            }
+        };
         let now = Instant::now();
         let route = Arc::new(Route {
             call_id: call_id.to_string(),
@@ -702,16 +739,9 @@ impl CallMediaPort for CallMediaRouter {
             let mut routes = self.routes();
             let key = (*peer, call_id.to_string());
             if let Some(current) = routes.get(&key) {
-                if current.client.as_ref() != client || !current.activity.is_stale() {
-                    return Err(AttachRefusal::AlreadyAttached);
-                }
                 // Close both queues and abort the old pump before publishing
                 // its replacement. A late old-socket drop cannot remove it.
                 current.end(EndReason::Detached);
-            }
-            if routes.len() >= MAX_ROUTED_CALLS && !routes.contains_key(&key) {
-                warn!(call_id, max = MAX_ROUTED_CALLS, "call media: too many routed calls");
-                return Err(AttachRefusal::Unavailable);
             }
             *current_generation = generation_id;
             routes.insert(key, Arc::clone(&route));

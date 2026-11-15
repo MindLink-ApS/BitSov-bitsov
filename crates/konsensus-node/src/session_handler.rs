@@ -3086,21 +3086,8 @@ async fn prepare_call_block_invoice(
             );
             return Err(REFUSED);
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let entry = storage
-            .call_get(peer, call_id)
-            .await
-            .map_err(|_| REFUSED)?
-            .ok_or(REFUSED)?;
-        calls::validate_block_invoice(&entry, seq, now).map_err(|_| REFUSED)?;
-        Ok::<_, &'static str>(
-            entry
-                .deadline_ms
-                .saturating_add(calls::CALL_BLOCK_RESUME_MS),
-        )
+        konsensus_api::calls::validate_call_block_invoice(storage, peer, call_id, seq)
+            .await.map_err(|_| REFUSED)
     };
     validate().await?;
     // The binding cap is what stops a repeat from filling the wallet. Check it

@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod calendar;
+pub mod call_media;
 pub mod contacts;
 pub mod encrypted;
 pub mod record_upgrade;
