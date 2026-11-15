@@ -874,6 +874,26 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.sweep_outstanding_web_requests(now_ms, max).await
     }
 
+    async fn call_media_publish(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<u64, StorageError> {
+        self.inner.call_media_publish(peer, call_id).await
+    }
+
+    async fn call_media_generation(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<u64>, StorageError> {
+        self.inner.call_media_generation(peer, call_id).await
+    }
+
+    async fn call_media_has_pending(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<bool, StorageError> {
+        self.inner.call_media_has_pending(peer, call_id).await
+    }
+
+    async fn call_media_record_detach(&self, intent: &crate::call_media::PendingMediaDetach, completed: bool) -> Result<(), StorageError> {
+        self.inner.call_media_record_detach(intent, completed).await
+    }
+
+    async fn call_media_pending(&self, after: u64, max: u32) -> Result<Vec<crate::call_media::PendingMediaDetach>, StorageError> {
+        self.inner.call_media_pending(after, max).await
+    }
+
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         self.inner.call_get(peer, call_id).await
     }

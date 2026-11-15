@@ -1216,6 +1216,32 @@ pub trait Storage: Send + Sync {
     // ── 1:1 call state (kinds 400-403) ─────────────────────────────────
     // Defaults refuse: a backend without durable call state cannot take calls.
 
+    /// Append an armed attachment record and return its durable, never-reused generation.
+    async fn call_media_publish(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<u64, StorageError> {
+        Err(StorageError::Unsupported("call media journal".into()))
+    }
+
+    /// Latest published generation, including across process restarts.
+    async fn call_media_generation(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<Option<u64>, StorageError> {
+        Ok(None)
+    }
+
+    /// Whether this call id remains pinned by unresolved media recovery.
+    async fn call_media_has_pending(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Append policy or completion evidence; never overwrite the armed attachment.
+    async fn call_media_record_detach(&self, _intent: &crate::call_media::PendingMediaDetach, _completed: bool) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call media journal".into()))
+    }
+
+    /// Page unresolved current attachments in generation order. Includes armed
+    /// attachments whose process may have died before recording a detach.
+    async fn call_media_pending(&self, _after: u64, _max: u32) -> Result<Vec<crate::call_media::PendingMediaDetach>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// The stored state of `(peer, call_id)`, as written (not yet aged).
     async fn call_get(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         Err(StorageError::Unsupported("call state".into()))
