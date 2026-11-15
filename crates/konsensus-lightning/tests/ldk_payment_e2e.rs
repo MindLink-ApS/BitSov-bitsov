@@ -40,7 +40,7 @@ fn setup_bitcoind_and_electrsd() -> (BitcoinD, ElectrsD) {
     let bitcoind_exe = std::env::var("BITCOIND_EXE")
         .ok()
         .or_else(|| bitcoind::downloaded_exe_path().ok())
-        .expect("Set BITCOIND_EXE env var or enable corepc-node download feature");
+        .expect("Set BITCOIND_EXE env var or enable the electrsd bitcoind_download feature");
 
     let mut bitcoind_conf = bitcoind::Conf::default();
     bitcoind_conf.network = "regtest";
