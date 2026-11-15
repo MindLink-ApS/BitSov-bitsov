@@ -242,7 +242,8 @@ An expired row is aged to `ended` before classification. A late fetch or
 resend cannot revive it. The node retains ordinary replay tombstones, bounds
 device waits with the existing call limits, and expires them in the call-state
 sweep. Startup ends awaiting calls rather than binding retained old invites to
-them. No database migration is required.
+them. The current offer for each call is recorded by migration 040
+(`040_call_offer_binding.sql`).
 
 The invite's existing `MessageAck` is delayed until device delivery. The
 background control writer sends it within its 100 ms sweep cadence, without
@@ -256,7 +257,7 @@ message ID. Apps can display this as the person's device being offline.
 Callers that do not recognize the reason use their existing generic rejection
 handling. The refused envelope and cached plaintext are withdrawn; its payment
 hash and nonce remain spent. Pending, fetched, and not-reachable outcomes use
-the existing payment receipt, without a new table or migration. An authenticated
+the existing payment receipt, without a new table. An authenticated
 resend matching its immutable receipt receives the same ACK or refusal after
 withdrawal, content retention, or restart, without new pricing or settlement.
 Startup withdraws pending device waits and retains a not-reachable refusal;
