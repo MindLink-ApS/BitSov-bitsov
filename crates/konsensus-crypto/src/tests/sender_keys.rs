@@ -664,8 +664,9 @@ fn skipped_keys_are_capped_across_all_senders_oldest_first() {
     }
     assert_eq!(bob.skipped_key_count(), MAX_TOTAL_SKIPPED_KEYS);
 
-    // 7 deliveries x 256 skips per sender = 3,584 keys; the 1,584 oldest
-    // (all Alice's) are evicted and every key Carol skipped is still held.
+    // 7 deliveries x 256 skips per sender = 3,584 keys; the 1,584 oldest are
+    // evicted. All of them are Alice's, 208 of her 1,792 stay, and every key
+    // Carol skipped is still held.
     assert!(bob.decrypt(&alice_id, &from_alice[0]).is_err());
     assert_eq!(bob.decrypt(&carol_id, &from_carol[0]).unwrap(), b"m0");
     assert_eq!(bob.decrypt(&carol_id, &from_carol[1797]).unwrap(), b"m1797");
@@ -976,4 +977,31 @@ fn the_shared_pool_evicts_exactly_at_its_cap_and_a_rotation_clears_only_that_sen
     assert_eq!(skipped_len(&bob, &alice_id), 10);
     assert_eq!(bob.skipped_key_count(), 219);
     assert_eq!(bob.decrypt(&alice_id, &after[0]).unwrap(), b"r0");
+
+    // Carol's keys from before Alice's rotation still decrypt.
+    assert_eq!(bob.decrypt(&carol_id, &from_carol[209]).unwrap(), b"c209");
+    assert_eq!(skipped_len(&bob, &alice_id), 9);
+    assert_eq!(skipped_len(&bob, &carol_id), 208);
+    assert_eq!(bob.skipped_key_count(), 217);
+
+    // Refill to exactly the cap with newer skips from Alice: 2,000 - 217 =
+    // 1,783 = 6 x 256 + 247. `later[n - 11]` is her post-rotation message n.
+    let later: Vec<_> = (11..1803).map(|i| alice.encrypt(format!("r{i}").as_bytes()).unwrap()).collect();
+    for n in [267, 524, 781, 1038, 1295, 1552, 1800] {
+        bob.decrypt(&alice_id, &later[n - 11]).unwrap();
+    }
+    assert_eq!(skipped_len(&bob, &alice_id), 9 + 1783);
+    assert_eq!(bob.skipped_key_count(), MAX_TOTAL_SKIPPED_KEYS, "exactly at the cap again");
+    assert_eq!(skipped_len(&bob, &carol_id), 208, "at the cap, nothing is evicted");
+
+    // One more skip (Alice's 1801) is one over: the single oldest key goes,
+    // which is Carol's message 0, not any of Alice's post-rotation keys.
+    bob.decrypt(&alice_id, &later[1802 - 11]).unwrap();
+    assert_eq!(bob.skipped_key_count(), MAX_TOTAL_SKIPPED_KEYS);
+    assert_eq!(skipped_len(&bob, &carol_id), 207);
+    assert_eq!(skipped_len(&bob, &alice_id), 9 + 1783 + 1);
+    assert!(bob.decrypt(&carol_id, &from_carol[0]).is_err(), "the oldest key was evicted");
+    assert_eq!(bob.decrypt(&carol_id, &from_carol[1]).unwrap(), b"c1", "the next oldest is kept");
+    assert_eq!(bob.decrypt(&alice_id, &after[1]).unwrap(), b"r1", "Alice's oldest post-rotation key is kept");
+    assert_eq!(bob.decrypt(&alice_id, &after[2]).unwrap(), b"r2");
 }
