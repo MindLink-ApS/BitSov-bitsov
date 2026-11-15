@@ -51,6 +51,79 @@ fn detach(generation: u64, only_unpaid: bool, may_hangup_live: bool) -> MediaDet
     }
 }
 
+async fn unpublished_block_remains_retryable(store: &Arc<dyn Storage>) {
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let mut renewable = store.call_get(&peer(), CALL).await.unwrap().unwrap();
+    renewable.paid_until_ms = Some(now + 20_000);
+    renewable.deadline_ms = now + 30_000;
+    store.call_put(&peer(), CALL, &renewable).await.unwrap();
+    let hash = [91; 32];
+    store
+        .record_call_block_invoice(&peer(), CALL, 1, &hash, now + 120_000)
+        .await
+        .unwrap();
+    let body = format!(r#"{{"call_id":"{CALL}","seq":1}}"#);
+    let result = calls::prepare_incoming_block(store.as_ref(), &peer(), Some(&body), &hash).await;
+    assert!(
+        matches!(
+            result,
+            Err(rules::CallRefusal::Invalid("call media state unavailable"))
+        ),
+        "unconfirmed publication must defer payment acceptance"
+    );
+    assert!(matches!(
+        calls::validate_call_block_invoice(store.as_ref(), &peer(), CALL, 1).await,
+        Err(rules::CallRefusal::Invalid("call state unavailable"))
+    ));
+    assert_eq!(
+        store.call_get(&peer(), CALL).await.unwrap(),
+        Some(renewable)
+    );
+    calls::publish_media_attachment(store, &peer(), CALL)
+        .await
+        .unwrap();
+    let retry = calls::prepare_incoming_block(store.as_ref(), &peer(), Some(&body), &hash)
+        .await
+        .unwrap();
+    assert!(retry.refusal().is_none());
+}
+
+#[tokio::test]
+async fn failed_replacement_publication_keeps_the_new_generation_retryable() {
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let store: Arc<dyn Storage> = db.clone();
+    let original = paid();
+    store.call_put(&peer(), CALL, &original).await.unwrap();
+    let generation = calls::publish_media_attachment(&store, &peer(), CALL)
+        .await
+        .unwrap();
+    calls::stop_media_attachment(
+        store.as_ref(),
+        &peer(),
+        CALL,
+        &detach(generation, true, false),
+    );
+    sqlx::query("CREATE TRIGGER publication_read_failure AFTER UPDATE OF generation ON call_media_heads BEGIN UPDATE call_state SET side = 'unavailable'; END")
+        .execute(db.pool()).await.unwrap();
+    assert!(calls::publish_media_attachment(&store, &peer(), CALL)
+        .await
+        .is_err());
+    assert!(
+        store
+            .call_media_generation(&peer(), CALL)
+            .await
+            .unwrap()
+            .unwrap()
+            > generation
+    );
+    sqlx::query("DROP TRIGGER publication_read_failure")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    store.call_put(&peer(), CALL, &original).await.unwrap();
+    unpublished_block_remains_retryable(&store).await;
+}
+
 async fn replay_contract(store: Arc<dyn Storage>) {
     let original = paid();
     store.call_put(&peer(), CALL, &original).await.unwrap();
@@ -623,12 +696,20 @@ async fn expiry_atomically_closes_a_detached_resume_window() {
         "expiry cannot expose a resumable row between replay passes"
     );
     let body = format!(r#"{{"call_id":"{CALL}","seq":1}}"#);
+    let block = calls::prepare_incoming_block(&store, &peer(), Some(&body), &hash).await;
+    assert!(matches!(
+        block,
+        Err(rules::CallRefusal::Invalid("call media state unavailable"))
+    ));
+    calls::replay_media_detaches(&store, now, false)
+        .await
+        .unwrap();
     let block = calls::prepare_incoming_block(&store, &peer(), Some(&body), &hash)
         .await
         .unwrap();
     assert!(
         block.refusal().is_some(),
-        "a settled block immediately after expiry must not restore detached media"
+        "a settled block after recovery must not restore detached media"
     );
 }
 
@@ -812,6 +893,7 @@ async fn publication_read_failure_preserves_paid_live_during_maintenance() {
     calls::expire_calls(store.as_ref(), *NOW).await.unwrap();
     assert_eq!(store.call_get(&peer(), CALL).await.unwrap(), Some(original));
     assert!(store.call_media_has_pending(&peer(), CALL).await.unwrap());
+    unpublished_block_remains_retryable(&store).await;
 }
 
 #[tokio::test]
@@ -997,6 +1079,7 @@ async fn cancelled_publication_preserves_paid_live_during_maintenance() {
     calls::expire_calls(store.as_ref(), *NOW).await.unwrap();
     assert_eq!(store.call_get(&peer(), CALL).await.unwrap(), Some(original));
     assert!(store.call_media_has_pending(&peer(), CALL).await.unwrap());
+    unpublished_block_remains_retryable(&store).await;
 }
 
 #[tokio::test]

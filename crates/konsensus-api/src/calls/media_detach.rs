@@ -207,6 +207,7 @@ async fn update_call(
 /// Whether an unresolved current attachment has no surviving socket here.
 /// Payment admission holds the call lock through this final ownership snapshot;
 /// invoice validation repeats the snapshot before publishing a payable invoice.
+/// An unconfirmed publication is unavailable until replacement or recovery.
 pub(super) async fn media_attachment_stopped(
     store: Store<'_>,
     peer: &NodeId,
@@ -217,14 +218,11 @@ pub(super) async fn media_attachment_stopped(
     }
     let current = store.call_media_generation(peer, call_id).await?;
     let active = attachments().lock().unwrap_or_else(|e| e.into_inner());
-    let owns_socket = active
+    let state = active
         .get(&key(store, *peer, call_id))
-        .is_some_and(|state| {
-            state.store.strong_count() > 0
-                && Some(state.generation) == current
-                && state.stopped.is_none()
-        });
-    Ok(!owns_socket)
+        .filter(|state| state.store.strong_count() > 0 && Some(state.generation) == current)
+        .ok_or_else(|| StorageError::Conversion("call media publication unresolved".into()))?;
+    Ok(state.stopped.is_some())
 }
 
 /// Replay before startup accepts call work, and on each expiry tick. Startup
