@@ -37,7 +37,7 @@ async fn retry_after_loss(stored: bool, cache: bool) {
     inner.session_manager = b.clone();
     inner.transport = transport.clone();
     inner.plaintext_cipher = cache.then(|| Arc::new(PlaintextCacheCipher::new(&[7; 32])));
-    state.peer_ln_pubkeys.lock().await.insert(a_id, "02aaaa".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(a_id, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
 
     let init = a.initiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
     b.accept_session(&a_id, &init).await.unwrap();

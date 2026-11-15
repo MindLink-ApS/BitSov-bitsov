@@ -5892,7 +5892,7 @@ async fn recovery_reconnect_verified_keysend_deferral_opens_only_session_control
         (Frame::RequestInvoice { request_id: "service".into(), amount_msat: 1000, purpose: "konsensus message".into() }, false),
         (Frame::PeerExchangeRequest, false),
         (Frame::PeerExchangeResponse { peers: vec![] }, false),
-        (Frame::LightningInfo { ln_pubkey: "02".repeat(33), ln_addr: None }, false),
+        (Frame::LightningInfo { ln_pubkey: "02".repeat(33), ln_addr: None, identity_sig: vec![] }, false),
         (Frame::Gossip(Box::new(env.clone())), false),
     ];
     for (frame, allowed) in frames {

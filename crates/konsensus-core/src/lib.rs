@@ -21,6 +21,7 @@ pub mod introduction;
 pub mod sponsor;
 pub mod invite;
 pub mod kind;
+pub mod lightning_binding;
 pub mod payloads;
 pub mod profile;
 pub mod tower;

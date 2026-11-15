@@ -944,7 +944,10 @@ async fn paid_signals_count_briefly_while_callee_is_not_ready() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(bid, b.node().node_id().to_string());
+        .insert(
+            bid,
+            konsensus_api::state::PeerLightningKey::Verified(b.node().node_id().to_string()),
+        );
     steps.pass("two funded nodes, direct channel, callee behind the readiness wrappers");
 
     fault.set_limited(true);
