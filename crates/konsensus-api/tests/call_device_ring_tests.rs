@@ -1081,3 +1081,66 @@ async fn stale_or_future_offer_is_refused_as_not_reachable() {
     db.accept_paid_envelope(&env).await.unwrap();
     devices.admit(&db, &own(), &env, Some(&text), 1_000 + INVITE_MAX_AGE_MS, || 1_000 + INVITE_MAX_AGE_MS).await.unwrap();
 }
+
+/// Only a waiting invite's write is bounded by the device write deadline. An
+/// ordinary inbound message to a paired app that reads slowly (here: not at
+/// all for longer than the deadline) is still delivered in full, not cut off.
+#[tokio::test]
+async fn ordinary_inbound_slow_write_survives_device_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_dir, state, _db, token) = paired_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = konsensus_api::build_router_for_addr(state.clone(), addr);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let (status, mut socket) = ws_connect(addr, &token, true).await;
+    assert_eq!(status, 101);
+    socket.write_all(&[0x89, 0x80, 0, 0, 0, 0]).await.unwrap();
+    assert_eq!(socket.read_u8().await.unwrap(), 0x8a);
+    assert_eq!(socket.read_u8().await.unwrap(), 0);
+    let message = UkmEnvelopeBuilder::new(
+        0,
+        NodeId::from_bytes([202; 32]),
+        Recipient::Node(*state.identity.node_id()),
+        vec![7],
+        PaymentProof::new([7; 32], [7; 32], 10_000),
+    )
+    .build();
+    // Far larger than the socket buffers, so the server's write blocks
+    // until the app reads again.
+    let text = "x".repeat(16 * 1024 * 1024);
+    state
+        .ws_broadcast
+        .send(std::sync::Arc::new(konsensus_api::state::WsMessage {
+            envelope: message.clone(),
+            plaintext: Some(text),
+        }))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(
+        konsensus_core::payloads::call::DEVICE_WRITE_TIMEOUT_MS + 1_500,
+    ))
+    .await;
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        assert_eq!(socket.read_u8().await.unwrap(), 0x81);
+        let size = match socket.read_u8().await.unwrap() {
+            127 => socket.read_u64().await.unwrap() as usize,
+            126 => socket.read_u16().await.unwrap() as usize,
+            n => n as usize,
+        };
+        let mut bytes = vec![0; size];
+        socket.read_exact(&mut bytes).await.map(|_| bytes)
+    })
+    .await
+    .expect("frame within 20 s")
+    .expect("a slow ordinary write must not be cut off");
+    let received: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+    assert_eq!(received["id"], message.id.to_hex());
+    server.abort();
+}

@@ -180,10 +180,11 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                         // Serialize WsMessage to JSON for the client
                         match serde_json::to_string(ws_msg.as_ref()) {
                             Ok(json) => {
-                                // Only the write that carries a waiting invite's ticket is
-                                // bounded: its expiry waits on this write. Any other frame
-                                // is sent as before, so a slow one is not a disconnect.
-                                let sent = if ticket.is_some() {
+                                // Only the write whose armed ticket holds off a waiting
+                                // invite's expiry is bounded. Any other frame (an ordinary
+                                // message, a ringing or live invite, our own outgoing
+                                // signal) is sent as before, so a slow one is not a disconnect.
+                                let sent = if ticket.as_ref().is_some_and(|t| t.holds_wait()) {
                                     matches!(tokio::time::timeout(std::time::Duration::from_millis(konsensus_core::payloads::call::DEVICE_WRITE_TIMEOUT_MS), socket.send(Message::Text(json))).await, Ok(Ok(())))
                                 } else {
                                     socket.send(Message::Text(json)).await.is_ok()

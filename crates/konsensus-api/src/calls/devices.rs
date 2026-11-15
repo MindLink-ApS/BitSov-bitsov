@@ -42,6 +42,13 @@ impl StreamTicket<'_> {
     pub fn written(&mut self, at_ms: u64) {
         self.written_ms = Some(at_ms);
     }
+
+    /// Whether this write holds off a waiting invite's expiry. Only such a
+    /// write is bounded by the device write deadline; every other frame,
+    /// an ordinary message or a ringing/live invite, is sent unbounded.
+    pub fn holds_wait(&self) -> bool {
+        self.armed
+    }
 }
 
 impl Drop for StreamTicket<'_> {
