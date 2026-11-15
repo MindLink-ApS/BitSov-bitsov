@@ -30,6 +30,13 @@ open as descriptor 3 in the child (clear close-on-exec), then use
 end, so the child receives EOF. The node borrows the supplied descriptor,
 advances it to EOF, and closes its own duplicate; it does not close the original.
 
+Piped stdin and inherited pipes can unlock the seed on both Linux and macOS.
+The unattended device-approval setting below additionally checks their owner and
+mode. Ordinary unnamed pipes normally have mode `0600` on Linux and qualify;
+on macOS they normally have mode `0660` and keep unattended approvals off. An
+owner-only FIFO or a connected Unix stream socket with the same-user peer also
+qualifies on both platforms.
+
 The input is a nonempty UTF-8 password, at most **4096 bytes**, including any
 line ending. Trailing CR and LF bytes are removed; spaces and interior newlines
 are preserved. Empty, invalid UTF-8, oversized, unreadable, and closed-descriptor
@@ -90,8 +97,8 @@ run Rust destructors.
 
 Descriptor input alone is **non-interactive**: Touch ID device approvals remain
 off with `seed_password_not_typed`, just as with `--password-file`. The explicit
-explicit local-owner exception is described below. The node does not implement Keychain
-access.
+local-owner exception and the owner's unattended setting are described below. The
+node does not implement Keychain access.
 
 For an initialized local node with a first-run or console-enrolled owner device,
 start with `--password-fd 0 --local-owner-device` to enable device-signed,
@@ -137,6 +144,75 @@ Persisted spend grants remain trusted state: the `device:` provenance prefix
 and budget fields are not signed grants. A writer of `pairing/clients.json` can
 forge those fields. Owner signatures protect device registration records, not
 the grant ledger; this mode retains that existing account-layer limitation.
+
+## Unattended box: device approvals from a stored password
+
+A box that restarts with nobody at its keyboard has its password in a file or a
+launcher. By default device approvals stay off there, and the terminal is the
+only owner authority. The owner can choose otherwise, once per box:
+
+```toml
+[pairing]
+unattended_device_approvals = true
+```
+
+**The trade.** Whoever gets the disk and the password file can then approve as
+the owner, and so can any program running as the node's OS user. Keep the file
+owner-only and out of backups, and do not use this setting on a machine someone
+else runs for you. Off is the default; leave it off if the terminal is enough.
+
+What it needs, on every start:
+
+| Condition | If it does not hold |
+|---|---|
+| The seed is encrypted, with no `mnemonic.txt` beside it | Off, `seed_not_encrypted` |
+| `--password-file`: a regular file you own, with no group or other permissions (`chmod 600`), not a symlink | `start` refuses to run |
+| `--password-fd`: an owner-only regular file or FIFO (including an unnamed pipe with owner-only mode), or a connected AF_UNIX stream socket whose peer UID equals the node's `getuid()` (Linux and macOS) | Off, `seed_password_not_typed` |
+| The password opens the seed | `start` refuses to run |
+| The machine is not declared as run for someone else (`tier = "cloud"`, `[identity] hosted = true`) | Off, `seed_password_not_typed` |
+
+`--password` on the command line never qualifies, because other OS users can read
+a process's arguments. Use a file or a descriptor. A platform without Unix file
+modes also stays off, because the node cannot check who can read the file. Regular
+files and FIFOs must belong to the node's OS user and have no group or other
+permissions (`mode & 077 == 0`). Sockets use peer credentials instead of mode bits:
+`SO_PEERCRED` on Linux and `getpeereid` on macOS. Internet sockets (AF_INET and
+AF_INET6), listening sockets, datagram sockets, sockets without a connected peer,
+and sockets on other platforms do not qualify. The file/FIFO check reads the
+owner and mode bits; it does not read access-control lists
+that grant more than those bits show (for example `chmod +a` on macOS), so do not
+add any to this file. `chmod 600` alone does not remove existing macOS ACL entries;
+remove them separately before use. Refusals keep the reason code
+`seed_password_not_typed`, so existing apps show what they already show. The
+startup log says which rule applied:
+
+- `mode="owner_setting"` with the trade above: on, by this setting.
+- `mode="typed_password"` or `mode="local_owner"`: on, and this setting played no
+  part.
+- `device approvals (Touch ID) are OFF`, plus `is set but does not apply: <why>` when
+  the setting is on but refused.
+
+The `owner_setting` notice is also written directly to stdout, including when
+`RUST_LOG=error` or `RUST_LOG=off` suppresses the startup log.
+
+What it does not change:
+
+- It loads the owner key's **public half** only. The signing key is derived at
+  start and dropped; it is kept only with `--local-owner-device`, which this setting
+  does not imply and cannot reach. No key or password is written anywhere new.
+- What a device approval can authorize, every spending limit, and the budget and
+  rate checks stay as they are. A device still needs an owner-signed registration.
+- `konsensus device approve` still prompts for the typed password; it never reads the
+  file. `--owner-control`, `--local-owner-device`, `--remote-unlock` and `--home` remain
+  flags, and remote unlock without `--local-owner-device` stays off.
+
+**If you run a box for another person, do not set this.** A password file on a
+machine you operate means you hold what decrypts their seed. Declare such a machine
+(`[identity] hosted = true`) so the node refuses this setting and reports
+`hosted_custody`. The node cannot detect an undeclared one: this limit depends on
+the declaration, and the [charter](../../CHARTER.md) forbids the product either way.
+`[node] hosted_by` is only a display label, including for an owner-operated box;
+it does not declare custody or change whether this setting applies.
 
 ## Remote unlock after reboot
 
