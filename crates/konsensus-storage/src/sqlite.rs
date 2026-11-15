@@ -782,7 +782,11 @@ impl SqliteStorage {
 }
 
 impl SqliteStorage {
-    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+    /// `require_hold`: a held kind (call signal, candidate room chat,
+    /// calendar) is accepted fresh only while its admission hold exists,
+    /// checked under the writer lock this transaction holds from its first
+    /// INSERT. Only `readable` acceptance may require the hold.
+    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool, require_hold: bool) -> Result<Option<crate::PaidAcceptance>, StorageError> {
         use crate::PaidAcceptance::*;
         let id = envelope.id.to_hex();
         let kind = i64::from(envelope.kind);
@@ -871,6 +875,19 @@ impl SqliteStorage {
             // This also rolls back speculative receipt and nonce inserts.
             tx.rollback().await?;
             return Ok(None);
+        }
+        // A held kind is accepted fresh only under its admission hold: the hold
+        // sweep may have withdrawn an expired or inherited hold between the hold
+        // and this acceptance, and an unheld acceptance would never be admitted
+        // yet be replay-acknowledged. Checked here, under the writer lock this
+        // transaction already holds.
+        if require_hold {
+            let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_admission_hold WHERE message_id = ?")
+                .bind(&id).fetch_one(&mut *tx).await?;
+            if held != 1 {
+                tx.rollback().await?;
+                return Err(StorageError::NotFound(format!("admission hold for {id}")));
+            }
         }
         sqlx::query(
             "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
@@ -1268,11 +1285,16 @@ impl Storage for SqliteStorage {
     }
 
     async fn paid_envelope_status(&self, envelope: &UkmEnvelope) -> Result<Option<crate::PaidAcceptance>, StorageError> {
-        self.accept_paid_envelope_inner(envelope, false).await
+        self.accept_paid_envelope_inner(envelope, false, false).await
     }
 
     async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        self.accept_paid_envelope_inner(envelope, true).await?
+        self.accept_paid_envelope_inner(envelope, true, false).await?
+            .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
+    }
+
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.accept_paid_envelope_inner(envelope, true, true).await?
             .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
     }
 
@@ -2006,6 +2028,13 @@ impl Storage for SqliteStorage {
             .bind(&id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn is_application_rejected(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = -1")
+            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
+            .fetch_one(&self.pool).await?;
+        Ok(n > 0)
     }
 
     async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
@@ -3484,6 +3513,91 @@ impl Storage for SqliteStorage {
         .bind(&record.comment)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn commit_calendar_admission(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        admission: &crate::CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        let id = envelope.id.to_hex();
+        let mut tx = self.pool.begin().await?;
+        // The hold must still be there: a missing hold means the sweep withdrew
+        // the envelope (or it was never held), and nothing may be written for it.
+        let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_admission_hold WHERE message_id = ?")
+            .bind(&id).fetch_one(&mut *tx).await?;
+        if held != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ? AND sender = ?")
+            .bind(&id).bind(envelope.sender.to_hex()).fetch_one(&mut *tx).await?;
+        if stored != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("accepted envelope {id}")));
+        }
+        match admission {
+            crate::CalendarAdmission::Event(record) => {
+                sqlx::query(
+                    "INSERT INTO calendar_events
+                       (id, message_id, organizer, title, description, start_ms, end_ms, tz,
+                        location, attendees_json, recurrence_json, color, parent_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     ON CONFLICT(id) DO UPDATE SET
+                       message_id      = excluded.message_id,
+                       title           = excluded.title,
+                       description     = excluded.description,
+                       start_ms        = excluded.start_ms,
+                       end_ms          = excluded.end_ms,
+                       tz              = excluded.tz,
+                       location        = excluded.location,
+                       attendees_json  = excluded.attendees_json,
+                       recurrence_json = excluded.recurrence_json,
+                       color           = excluded.color,
+                       parent_id       = excluded.parent_id",
+                )
+                .bind(&record.id)
+                .bind(&record.message_id)
+                .bind(&record.organizer)
+                .bind(&record.title)
+                .bind(&record.description)
+                .bind(record.start_ms as i64)
+                .bind(record.end_ms as i64)
+                .bind(&record.tz)
+                .bind(&record.location)
+                .bind(&record.attendees_json)
+                .bind(&record.recurrence_json)
+                .bind(&record.color)
+                .bind(&record.parent_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            crate::CalendarAdmission::Rsvp(record) => {
+                sqlx::query(
+                    "INSERT INTO calendar_rsvps (id, event_id, responder, response, comment)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(event_id, responder) DO UPDATE SET
+                       response = excluded.response,
+                       comment  = excluded.comment",
+                )
+                .bind(&record.id)
+                .bind(&record.event_id)
+                .bind(&record.responder)
+                .bind(&record.response)
+                .bind(&record.comment)
+                .execute(&mut *tx)
+                .await?;
+            }
+            crate::CalendarAdmission::Opaque => {}
+        }
+        let released = sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
+            .bind(&id).execute(&mut *tx).await?;
+        if released.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
+        tx.commit().await?;
         Ok(())
     }
 
