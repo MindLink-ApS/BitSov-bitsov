@@ -952,7 +952,12 @@ impl PostgresStorage {
 }
 
 impl PostgresStorage {
-    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+    /// `require_hold`: a held kind (call signal, candidate room chat,
+    /// calendar) is accepted fresh only while its admission hold exists. The
+    /// hold row is locked first, before the paid-identity advisory lock, the
+    /// same hold-first order as the hold sweep, the withdrawal and the
+    /// calendar admission. Only `readable` acceptance may require the hold.
+    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool, require_hold: bool) -> Result<Option<crate::PaidAcceptance>, StorageError> {
         use crate::PaidAcceptance::*;
         let id = envelope.id.to_hex();
         let kind = i64::from(envelope.kind);
@@ -972,6 +977,14 @@ impl PostgresStorage {
             serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         let mut tx = self.pool.begin().await?;
+        // Hold-first lock order, shared with the sweep, the withdrawal and the
+        // calendar admission; none of them takes the advisory lock below.
+        let hold_locked = if require_hold {
+            sqlx::query_as::<_, (String,)>("SELECT message_id FROM call_admission_hold WHERE message_id = $1 FOR UPDATE")
+                .bind(&id).fetch_optional(&mut *tx).await?.is_some()
+        } else {
+            false
+        };
         // Acceptance and deferral serialize on the same paid identity.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&ph).execute(&mut *tx).await?;
@@ -1044,6 +1057,14 @@ impl PostgresStorage {
             // This also rolls back speculative receipt and nonce inserts.
             tx.rollback().await?;
             return Ok(None);
+        }
+        // A held kind is accepted fresh only under its admission hold: the hold
+        // sweep may have withdrawn an expired or inherited hold between the hold
+        // and this acceptance, and an unheld acceptance would never be admitted
+        // yet be replay-acknowledged. The hold row was locked first, above.
+        if require_hold && !hold_locked {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
         }
         sqlx::query(
             "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
@@ -1443,11 +1464,16 @@ impl Storage for PostgresStorage {
     }
 
     async fn paid_envelope_status(&self, envelope: &UkmEnvelope) -> Result<Option<crate::PaidAcceptance>, StorageError> {
-        self.accept_paid_envelope_inner(envelope, false).await
+        self.accept_paid_envelope_inner(envelope, false, false).await
     }
 
     async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        self.accept_paid_envelope_inner(envelope, true).await?
+        self.accept_paid_envelope_inner(envelope, true, false).await?
+            .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
+    }
+
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.accept_paid_envelope_inner(envelope, true, true).await?
             .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
     }
 
@@ -2126,6 +2152,9 @@ impl Storage for PostgresStorage {
     async fn reject_accepted_envelope(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
         let id = envelope.id.to_hex();
         let mut tx = self.pool.begin().await?;
+        // Hold-first lock order, shared with the sweep and the calendar admission.
+        sqlx::query_as::<_, (String,)>("SELECT message_id FROM call_admission_hold WHERE message_id = $1 FOR UPDATE")
+            .bind(&id).fetch_optional(&mut *tx).await?;
         sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
         sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = $1 AND message_id = $2")
@@ -2134,6 +2163,13 @@ impl Storage for PostgresStorage {
             .bind(&id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn is_application_rejected(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = -1")
+            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
+            .fetch_one(&self.pool).await?;
+        Ok(n > 0)
     }
 
     async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
@@ -2159,14 +2195,23 @@ impl Storage for PostgresStorage {
     async fn call_admission_withdraw(&self, held_before_ms: u64) -> Result<u64, StorageError> {
         let before = i64::try_from(held_before_ms).unwrap_or(i64::MAX);
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE (message_id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1)")
-            .bind(before).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM messages WHERE (id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1)")
-            .bind(before).execute(&mut *tx).await?;
-        let done = sqlx::query("DELETE FROM call_admission_hold WHERE held_at_ms < $1")
-            .bind(before).execute(&mut *tx).await?;
+        // Lock the candidate holds first and act only on the locked set: a
+        // concurrent admission that already consumed a hold (it locks the hold
+        // row first as well) is skipped once it commits, and one that starts
+        // after this lock finds the hold gone and rolls back.
+        let held: Vec<(String, String)> = sqlx::query_as("SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1 FOR UPDATE")
+            .bind(before).fetch_all(&mut *tx).await?;
+        let mut done = 0u64;
+        for (message_id, sender) in &held {
+            sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE message_id = $1 AND sender = $2")
+                .bind(message_id).bind(sender).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
+                .bind(message_id).bind(sender).execute(&mut *tx).await?;
+            done += sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+                .bind(message_id).execute(&mut *tx).await?.rows_affected();
+        }
         tx.commit().await?;
-        Ok(done.rows_affected())
+        Ok(done)
     }
 
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
@@ -3681,6 +3726,92 @@ impl Storage for PostgresStorage {
             .collect())
     }
 
+    async fn commit_calendar_admission(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        admission: &crate::CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        let id = envelope.id.to_hex();
+        let mut tx = self.pool.begin().await?;
+        // Lock the hold row first (the sweep locks holds first too, so the two
+        // serialize without deadlock): if the sweep withdrew the envelope the
+        // row is gone and nothing may be written for it. Then lock the message.
+        let held: Option<(String,)> = sqlx::query_as("SELECT message_id FROM call_admission_hold WHERE message_id = $1 FOR UPDATE")
+            .bind(&id).fetch_optional(&mut *tx).await?;
+        if held.is_none() {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
+        let stored: Option<(String,)> = sqlx::query_as("SELECT id FROM messages WHERE id = $1 AND sender = $2 FOR UPDATE")
+            .bind(&id).bind(envelope.sender.to_hex()).fetch_optional(&mut *tx).await?;
+        if stored.is_none() {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("accepted envelope {id}")));
+        }
+        match admission {
+            crate::CalendarAdmission::Event(record) => {
+                sqlx::query(
+                    "INSERT INTO calendar_events
+                       (id, message_id, organizer, title, description, start_ms, end_ms, tz,
+                        location, attendees_json, recurrence_json, color, parent_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                     ON CONFLICT(id) DO UPDATE SET
+                       message_id      = EXCLUDED.message_id,
+                       title           = EXCLUDED.title,
+                       description     = EXCLUDED.description,
+                       start_ms        = EXCLUDED.start_ms,
+                       end_ms          = EXCLUDED.end_ms,
+                       tz              = EXCLUDED.tz,
+                       location        = EXCLUDED.location,
+                       attendees_json  = EXCLUDED.attendees_json,
+                       recurrence_json = EXCLUDED.recurrence_json,
+                       color           = EXCLUDED.color,
+                       parent_id       = EXCLUDED.parent_id",
+                )
+                .bind(&record.id)
+                .bind(&record.message_id)
+                .bind(&record.organizer)
+                .bind(&record.title)
+                .bind(&record.description)
+                .bind(record.start_ms as i64)
+                .bind(record.end_ms as i64)
+                .bind(&record.tz)
+                .bind(&record.location)
+                .bind(&record.attendees_json)
+                .bind(&record.recurrence_json)
+                .bind(&record.color)
+                .bind(&record.parent_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            crate::CalendarAdmission::Rsvp(record) => {
+                sqlx::query(
+                    "INSERT INTO calendar_rsvps (id, event_id, responder, response, comment)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT(event_id, responder) DO UPDATE SET
+                       response = EXCLUDED.response,
+                       comment  = EXCLUDED.comment",
+                )
+                .bind(&record.id)
+                .bind(&record.event_id)
+                .bind(&record.responder)
+                .bind(&record.response)
+                .bind(&record.comment)
+                .execute(&mut *tx)
+                .await?;
+            }
+            crate::CalendarAdmission::Opaque => {}
+        }
+        let released = sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+            .bind(&id).execute(&mut *tx).await?;
+        if released.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn upsert_operator_hosting_contract(
         &self,
         contract: &OperatorHostingContract,
@@ -4120,6 +4251,208 @@ mod migration_recovery_tests {
         assert_eq!(db.sweep_outstanding_web_requests(1_000, 2).await.unwrap(), 1);
         assert_eq!(db.take_outstanding_web_request(&[1; 32]).await.unwrap(), Some(row(1, 10_000)));
         assert_eq!(db.take_outstanding_web_request(&[1; 32]).await.unwrap(), None);
+        db.pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
+    }
+
+    /// Calendar admission and the hold sweep serialize on the hold row: while
+    /// a sweep transaction holds the lock, admission blocks; once the sweep has
+    /// withdrawn the envelope, admission finds no hold, rolls back, and writes
+    /// nothing. An envelope with no hold is refused before any write.
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn calendar_admission_serializes_against_the_hold_sweep() {
+        use crate::{CalendarAdmission, RsvpRecord, Storage};
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+        let admin = PgPool::connect(&url).await.unwrap();
+        let name = format!("caladmit_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+        let db_url = format!("{}/{name}", url.rsplit_once('/').unwrap().0);
+        let db = std::sync::Arc::new(PostgresStorage::connect(&db_url).await.unwrap());
+        let sender = NodeId::from_bytes([7u8; 32]);
+        let proof = {
+            use sha2::Digest;
+            let preimage = [9u8; 32];
+            let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
+            konsensus_core::PaymentProof::new(hash, preimage, 1_000)
+        };
+        let env = konsensus_core::UkmEnvelopeBuilder::new(
+            konsensus_core::kind::KIND_RSVP,
+            sender,
+            konsensus_core::Recipient::Node(NodeId::from_bytes([8u8; 32])),
+            vec![1],
+            proof,
+        )
+        .build();
+        let rsvp = CalendarAdmission::Rsvp(RsvpRecord {
+            id: "r1".into(),
+            event_id: "evt-1".into(),
+            responder: sender.to_hex(),
+            response: "accepted".into(),
+            comment: None,
+            created_at: String::new(),
+        });
+        let rsvps = |db: &PostgresStorage| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM calendar_rsvps")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // No hold: refused before any write.
+        db.store_message(&env).await.unwrap();
+        let err = db.commit_calendar_admission(&env, &rsvp).await.unwrap_err();
+        assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+        assert_eq!(rsvps(&db).await, 0);
+
+        // Held, and a sweep transaction has locked the hold: admission blocks
+        // until the sweep commits its withdrawal, then rolls back.
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) VALUES ($1, $2, 1)")
+            .bind(env.id.to_hex()).bind(sender.to_hex()).execute(&db.pool).await.unwrap();
+        let mut sweep = db.pool.begin().await.unwrap();
+        let locked: Vec<(String, String)> = sqlx::query_as("SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1 FOR UPDATE")
+            .bind(i64::MAX).fetch_all(&mut *sweep).await.unwrap();
+        assert_eq!(locked.len(), 1);
+        let admission = tokio::spawn({
+            let db = db.clone();
+            let env = env.clone();
+            let rsvp = rsvp.clone();
+            async move { db.commit_calendar_admission(&env, &rsvp).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!admission.is_finished(), "admission must wait for the sweep's lock");
+        for (message_id, s) in &locked {
+            sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE message_id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+            sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+            sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+                .bind(message_id).execute(&mut *sweep).await.unwrap();
+        }
+        sweep.commit().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), admission)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(StorageError::NotFound(_))), "{outcome:?}");
+        assert_eq!(rsvps(&db).await, 0, "a withdrawn envelope must not leave an RSVP behind");
+        assert!(db.get_message(&env.id).await.unwrap().is_none());
+
+        // Held and stored, no contention: the write and the release commit together.
+        db.store_message(&env).await.unwrap();
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) VALUES ($1, $2, 1)")
+            .bind(env.id.to_hex()).bind(sender.to_hex()).execute(&db.pool).await.unwrap();
+        db.commit_calendar_admission(&env, &rsvp).await.unwrap();
+        assert_eq!(rsvps(&db).await, 1);
+        assert!(!db.call_admission_held(&env.id).await.unwrap());
+        assert_eq!(db.call_admission_withdraw(u64::MAX).await.unwrap(), 0);
+
+        // Held paid acceptance against the sweep: a fresh envelope is held, the
+        // sweep transaction locks that hold, the acceptance blocks on it, and
+        // once the sweep has withdrawn the hold the acceptance is refused with
+        // nothing written. A fresh hold then lets it be accepted.
+        let fresh = konsensus_core::UkmEnvelopeBuilder::new(
+            konsensus_core::kind::KIND_RSVP,
+            sender,
+            konsensus_core::Recipient::Node(NodeId::from_bytes([8u8; 32])),
+            vec![2],
+            {
+                use sha2::Digest;
+                let preimage = [10u8; 32];
+                let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
+                konsensus_core::PaymentProof::new(hash, preimage, 1_000)
+            },
+        )
+        .build();
+        assert!(db.call_admission_hold(&fresh, 1).await.unwrap());
+        let mut sweep = db.pool.begin().await.unwrap();
+        let locked: Vec<(String, String)> = sqlx::query_as("SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1 FOR UPDATE")
+            .bind(i64::MAX).fetch_all(&mut *sweep).await.unwrap();
+        assert_eq!(locked.len(), 1);
+        let acceptance = tokio::spawn({
+            let db = db.clone();
+            let fresh = fresh.clone();
+            async move { db.accept_held_paid_envelope(&fresh).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!acceptance.is_finished(), "held acceptance must wait for the sweep's hold lock");
+        for (message_id, s) in &locked {
+            sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+        }
+        sweep.commit().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), acceptance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(StorageError::NotFound(_))), "{outcome:?}");
+        assert!(db.get_message(&fresh.id).await.unwrap().is_none());
+        assert!(!db.has_nonce(&fresh.nonce).await.unwrap(), "no replay key burned");
+        assert!(db.call_admission_hold(&fresh, 2).await.unwrap());
+        assert!(matches!(
+            db.accept_held_paid_envelope(&fresh).await.unwrap(),
+            crate::PaidAcceptance::Accepted
+        ));
+        assert!(db.call_admission_held(&fresh.id).await.unwrap());
+
+        // Opaque admission against the sweep: the accepted, held envelope's
+        // opaque admission blocks on the sweep's hold lock and, once the sweep
+        // has withdrawn it, is refused with the envelope gone. A later held
+        // and accepted envelope's opaque admission consumes its hold.
+        let mut sweep = db.pool.begin().await.unwrap();
+        let locked: Vec<(String, String)> = sqlx::query_as("SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1 FOR UPDATE")
+            .bind(i64::MAX).fetch_all(&mut *sweep).await.unwrap();
+        assert_eq!(locked.len(), 1);
+        let opaque = tokio::spawn({
+            let db = db.clone();
+            let fresh = fresh.clone();
+            async move { db.commit_calendar_admission(&fresh, &CalendarAdmission::Opaque).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!opaque.is_finished(), "opaque admission must wait for the sweep's hold lock");
+        for (message_id, s) in &locked {
+            sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE message_id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+            sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+            sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+                .bind(message_id).execute(&mut *sweep).await.unwrap();
+        }
+        sweep.commit().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), opaque)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(StorageError::NotFound(_))), "{outcome:?}");
+        assert!(db.get_message(&fresh.id).await.unwrap().is_none());
+        assert!(db.is_application_rejected(&fresh).await.unwrap());
+        assert!(!db.is_paid_envelope_accepted(&fresh).await.unwrap());
+        let later = konsensus_core::UkmEnvelopeBuilder::new(
+            konsensus_core::kind::KIND_CALENDAR_EVENT,
+            sender,
+            konsensus_core::Recipient::Node(NodeId::from_bytes([8u8; 32])),
+            vec![3],
+            {
+                use sha2::Digest;
+                let preimage = [11u8; 32];
+                let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
+                konsensus_core::PaymentProof::new(hash, preimage, 1_000)
+            },
+        )
+        .build();
+        assert!(db.call_admission_hold(&later, 1).await.unwrap());
+        assert!(matches!(
+            db.accept_held_paid_envelope(&later).await.unwrap(),
+            crate::PaidAcceptance::Accepted
+        ));
+        db.commit_calendar_admission(&later, &CalendarAdmission::Opaque).await.unwrap();
+        assert!(!db.call_admission_held(&later.id).await.unwrap());
+        assert!(db.get_message(&later.id).await.unwrap().is_some());
+        assert!(db.is_paid_envelope_accepted(&later).await.unwrap());
+
         db.pool.close().await;
         sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
     }
