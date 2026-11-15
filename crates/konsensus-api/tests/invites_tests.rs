@@ -911,6 +911,7 @@ async fn issued_invite_promotes_live_handshake_whitelist_without_restart() {
                 &Frame::LightningInfo {
                     ln_pubkey: "02".repeat(33),
                     ln_addr: None,
+                    identity_sig: vec![],
                 },
             )
             .await

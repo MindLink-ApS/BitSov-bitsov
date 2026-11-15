@@ -1942,11 +1942,10 @@ async fn compose_happy_path_keysend() {
     });
 
     // Step 3: Register peer's Lightning pubkey (enables keysend path).
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, "02aaaa".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)),
+    );
 
     // Step 4: Compose a message via the HTTP endpoint.
     let auth = auth_header(&state);
@@ -2426,11 +2425,10 @@ async fn compose_keysend_fallback_to_invoice() {
         .unwrap()
         .recover_payee_pub_key()
         .to_string();
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, invoice_payee);
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified(invoice_payee),
+    );
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2560,11 +2558,10 @@ async fn compose_queues_when_transport_send_fails() {
     });
 
     // Register LN pubkey for keysend path (simpler than invoice flow).
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, "02cccc".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified("02cccc".repeat(5)),
+    );
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2677,11 +2674,10 @@ async fn compose_room_delivers_to_all_connected_members() {
     });
 
     // Register LN pubkey for keysend (avoids invoice flow complexity).
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, "02dddd".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified("02dddd".repeat(5)),
+    );
 
     // Create a room with our node + the peer as members.
     let auth = auth_header(&state);
@@ -2824,11 +2820,10 @@ async fn compose_broadcasts_to_websocket() {
         gossip_validator: None,
     });
 
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, "02eeee".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified("02eeee".repeat(5)),
+    );
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2933,11 +2928,10 @@ async fn compose_records_send_timestamp_for_stdp() {
         gossip_validator: None,
     });
 
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, "02ffff".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified("02ffff".repeat(5)),
+    );
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));

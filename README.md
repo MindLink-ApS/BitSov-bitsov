@@ -26,6 +26,8 @@ The public protocol/core repository is source-first until the signed release is 
 
 Verifying a release: artifacts are signed with the release key described under [Reporting a Vulnerability in `SECURITY.md`](SECURITY.md#reporting-a-vulnerability). The commands to verify and install one binary are in [install a signed pre-release binary](docs/QUICKSTART-SIGNET.md#1b-or-install-a-signed-pre-release-binary). The release policy has the [pinned build recipe](docs/ops/RELEASE_POLICY.md#reproducibility-inputs) and the [independent rebuild gate](docs/ops/RELEASE_POLICY.md#independent-rebuild-gate-h3), and the per-release checklists live under [`docs/releases/`](docs/releases/).
 
+Signet beta testers (phase 0, by invitation): follow the [beta-tester guide](docs/BETA-TESTERS.md).
+
 ```bash
 # Prerequisite: rustup. The toolchain is pinned in rust-toolchain.toml (1.99.1)
 # and installed automatically on the first build.

@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use konsensus_core::admission_quote;
 use konsensus_core::identity::NodeIdentity;
+use konsensus_core::lightning_binding::{self, PeerLightningKey};
 use konsensus_core::kind::KindCategory;
 use konsensus_core::payloads::call as calls;
 use konsensus_core::traits::chain::ChainProvider;
@@ -74,7 +75,8 @@ pub(crate) struct SessionHandlerDeps {
             std::collections::HashMap<String, tokio::sync::oneshot::Sender<InvoiceRequestOutcome>>,
         >,
     >,
-    pub peer_ln_pubkeys: Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, String>>>,
+    pub peer_ln_pubkeys:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, PeerLightningKey>>>,
     pub ws_broadcast: broadcast::Sender<Arc<konsensus_api::state::WsMessage>>,
     pub ws_delivery_tx: broadcast::Sender<Arc<WsDeliveryStatus>>,
     pub pending_tx: tokio::sync::mpsc::Sender<NodeId>,
@@ -657,14 +659,19 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                             }
                         }
                     }
-                    ControlEvent::LightningInfoReceived { peer_id, ln_pubkey, ln_addr, privileged } => {
+                    ControlEvent::LightningInfoReceived { peer_id, ln_pubkey, ln_addr, identity_sig, privileged } => {
                         if !privileged {
                             continue;
                         }
-                        let valid = handle_lightning_info_received(
-                            &peer_id, &ln_pubkey, &peer_ln_pubkeys,
+                        // Only a key the peer's identity signed is acted on.
+                        // An unsigned, malformed or rejected key is recorded as
+                        // unsigned, replacing any earlier key, so the payer
+                        // refuses it out loud; it never reaches the inviter
+                        // record or the auto-channel opener.
+                        let verified = handle_lightning_info_received(
+                            &peer_id, &ln_pubkey, &identity_sig, &peer_ln_pubkeys,
                         ).await;
-                        if valid {
+                        if let Some(ln_pubkey) = verified {
                             match funding_poll::record_inviter_lightning_info(
                                 storage.as_ref(),
                                 &ws_delivery_tx,
@@ -801,8 +808,9 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     (lightning_addr.clone(), ws_delivery_tx.clone(), last_negotiation.clone());
                 let mut checked = std::mem::take(&mut connections_checked);
                 let mut ready = lightning_was_ready;
+                let identity = identity.clone();
                 session_maintenance.spawn(async move {
-                    refresh_recovered_lightning(&mut ready, &transport, &lightning, &lightning_addr,
+                    refresh_recovered_lightning(&mut ready, &identity, &transport, &lightning, &lightning_addr,
                         &storage, &ws_delivery_tx, our_node_id).await;
                     heal_connected_e2ee_sessions(&session_manager, &transport).await;
                     check_connected_e2ee_sessions(&session_manager, &transport, &negotiation, &mut checked).await;
@@ -819,8 +827,10 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
 
 /// Recovery reuses the existing session maintenance task, and only shares
 /// identity with already privileged connections. No reconnect or re-admission.
+#[allow(clippy::too_many_arguments)]
 async fn refresh_recovered_lightning(
     was_ready: &mut bool,
+    identity: &NodeIdentity,
     transport: &Arc<NoiseTransport>,
     lightning: &Arc<dyn LightningProvider>,
     lightning_addr: &Option<String>,
@@ -833,6 +843,7 @@ async fn refresh_recovered_lightning(
         for peer in transport.connected_privileged_peers().await {
             send_lightning_info(
                 &peer,
+                identity,
                 transport,
                 lightning,
                 lightning_addr,
@@ -846,8 +857,24 @@ async fn refresh_recovered_lightning(
     *was_ready = ready;
 }
 
+/// Sign our Lightning pubkey with our identity key so the peer can bind it to
+/// us before paying by keysend (`konsensus_core::lightning_binding`).
+fn sign_lightning_info(identity: &NodeIdentity, ln_pubkey: &str) -> Vec<u8> {
+    match lightning_binding::sign(identity, ln_pubkey) {
+        Ok(sig) => sig,
+        Err(e) => {
+            // Our own backend returned a key we cannot vouch for. Advertise it
+            // unsigned: peers will refuse to pay it rather than pay blindly.
+            warn!(error = %e, "Lightning pubkey could not be bound to our identity");
+            Vec::new()
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn send_lightning_info(
     peer_id: &NodeId,
+    identity: &NodeIdentity,
     transport: &Arc<NoiseTransport>,
     lightning: &Arc<dyn LightningProvider>,
     lightning_addr: &Option<String>,
@@ -857,9 +884,11 @@ async fn send_lightning_info(
 ) {
     // Send our Lightning pubkey if available (enables keysend payments from peer).
     if let Some(ln_pubkey) = lightning.get_node_pubkey().await {
+        let identity_sig = sign_lightning_info(identity, &ln_pubkey);
         let ln_frame = Frame::LightningInfo {
             ln_pubkey,
             ln_addr: lightning_addr.clone(),
+            identity_sig,
         };
         if let Err(e) = transport.send_frame(peer_id, &ln_frame).await {
             warn!(peer = %peer_id, error = %e, "failed to send Lightning info");
@@ -970,6 +999,7 @@ async fn handle_peer_connected(
 
     send_lightning_info(
         peer_id,
+        identity,
         transport,
         lightning,
         lightning_addr,
@@ -2751,44 +2781,80 @@ fn is_routable_peer_addr(addr: &std::net::SocketAddr) -> bool {
 
 /// Handle a peer's Lightning pubkey announcement.
 ///
-/// Validates the pubkey format (66-char hex compressed pubkey) and stores
-/// it for keysend payments. Invalid pubkeys are logged and discarded.
+/// Returns the canonical key when the peer's identity signed it; that key is
+/// stored as [`PeerLightningKey::Verified`] and replaces any earlier binding
+/// (a rotation). A well-formed key without a signature comes from a peer that
+/// predates signed bindings: it is recorded as [`PeerLightningKey::Unsigned`],
+/// replacing any earlier entry, so the payer refuses it with a fixed reason.
+/// A malformed key or a signature that does not verify is recorded as
+/// [`PeerLightningKey::Unsigned`] too, replacing any earlier entry, a verified
+/// one included: the announcement comes from the peer's own authenticated
+/// session, so it means the peer no longer stands behind the earlier key.
 async fn handle_lightning_info_received(
     peer_id: &NodeId,
     ln_pubkey: &str,
-    peer_ln_pubkeys: &Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, String>>>,
-) -> bool {
+    identity_sig: &[u8],
+    peer_ln_pubkeys: &Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, PeerLightningKey>>>,
+) -> Option<String> {
     // Validate compressed pubkey format: 66 hex chars, starts with 02 or 03.
-    if ln_pubkey.len() != 66 {
+    if let Err(e) = lightning_binding::canonical_ln_pubkey(ln_pubkey) {
         warn!(
             peer = %peer_id,
             len = ln_pubkey.len(),
-            "received invalid Lightning pubkey — expected 66 hex chars"
+            error = %e,
+            "received invalid Lightning pubkey; it will not be paid until the peer advertises a valid one"
         );
-        return false;
-    }
-    if !ln_pubkey.starts_with("02") && !ln_pubkey.starts_with("03") {
-        warn!(
-            peer = %peer_id,
-            prefix = &ln_pubkey[..2],
-            "received invalid Lightning pubkey — must start with 02 or 03"
-        );
-        return false;
-    }
-    if hex::decode(ln_pubkey).is_err() {
-        warn!(
-            peer = %peer_id,
-            "received Lightning pubkey with invalid hex encoding"
-        );
-        return false;
+        record_unpayable(peer_id, peer_ln_pubkeys).await;
+        return None;
     }
 
+    if identity_sig.is_empty() {
+        warn!(
+            peer = %peer_id,
+            "peer advertised a Lightning key without an identity signature; it will not be paid until the peer updates"
+        );
+        record_unpayable(peer_id, peer_ln_pubkeys).await;
+        return None;
+    }
+
+    match lightning_binding::verify(peer_id, ln_pubkey, identity_sig) {
+        Ok(key) => {
+            peer_ln_pubkeys
+                .lock()
+                .await
+                .insert(*peer_id, PeerLightningKey::Verified(key.clone()));
+            debug!(
+                peer = %peer_id,
+                "stored identity-bound peer Lightning key for keysend"
+            );
+            Some(key)
+        }
+        Err(e) => {
+            warn!(
+                peer = %peer_id,
+                error = %e,
+                "rejected Lightning key binding; refusing to pay this peer until it advertises a valid one"
+            );
+            record_unpayable(peer_id, peer_ln_pubkeys).await;
+            None
+        }
+    }
+}
+
+/// A peer whose latest Lightning announcement we could not accept is not paid.
+/// Record `Unsigned` (every payment path refuses it), replacing any earlier
+/// entry. A verified key is not kept: only the peer's own authenticated session
+/// sends these frames, and its latest one says it no longer stands behind that
+/// key. Leaving the entry absent would mean the unbound invoice path, which is
+/// only for peers that never advertise a key.
+async fn record_unpayable(
+    peer_id: &NodeId,
+    peer_ln_pubkeys: &Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, PeerLightningKey>>>,
+) {
     peer_ln_pubkeys
         .lock()
         .await
-        .insert(*peer_id, ln_pubkey.to_string());
-    debug!(peer = %peer_id, "stored peer Lightning info for keysend");
-    true
+        .insert(*peer_id, PeerLightningKey::Unsigned);
 }
 
 /// Allowed legacy free-gossip kinds.
@@ -3093,21 +3159,8 @@ async fn prepare_call_block_invoice(
             );
             return Err(REFUSED);
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let entry = storage
-            .call_get(peer, call_id)
-            .await
-            .map_err(|_| REFUSED)?
-            .ok_or(REFUSED)?;
-        calls::validate_block_invoice(&entry, seq, now).map_err(|_| REFUSED)?;
-        Ok::<_, &'static str>(
-            entry
-                .deadline_ms
-                .saturating_add(calls::CALL_BLOCK_RESUME_MS),
-        )
+        konsensus_api::calls::validate_call_block_invoice(storage, peer, call_id, seq)
+            .await.map_err(|_| REFUSED)
     };
     validate().await?;
     // The binding cap is what stops a repeat from filling the wallet. Check it

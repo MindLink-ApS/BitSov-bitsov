@@ -31,11 +31,10 @@ async fn concurrent_operation_posts_pay_once_and_mismatch_never_pays() {
         .initiate_session(&peer, &target.prekey_bundle().await)
         .await
         .unwrap();
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer, format!("02{}", "ab".repeat(32)));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "ab".repeat(32))),
+    );
     let transport = Arc::new(common::ConnectedStubTransport::new(
         vec![peer],
         state.invoice_requests.clone(),
@@ -110,11 +109,10 @@ async fn paid_web_request_reply_row_is_committed_and_restored_on_resend() {
         .initiate_session(&peer, &target.prekey_bundle().await)
         .await
         .unwrap();
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer, format!("02{}", "ab".repeat(32)));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "ab".repeat(32))),
+    );
     let transport = Arc::new(common::ConnectedStubTransport::new(
         vec![peer],
         state.invoice_requests.clone(),
@@ -320,11 +318,10 @@ impl Fixture {
         });
         let mut state = common::test_state_with_lightning(wallet.clone());
         let peer = common::setup_e2ee_session(&state.session_manager).await;
-        state
-            .peer_ln_pubkeys
-            .lock()
-            .await
-            .insert(peer, format!("02{}", "ab".repeat(32)));
+        state.peer_ln_pubkeys.lock().await.insert(
+            peer,
+            konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "ab".repeat(32))),
+        );
         let transport = Arc::new(common::ConnectedStubTransport::new(
             vec![peer],
             state.invoice_requests.clone(),

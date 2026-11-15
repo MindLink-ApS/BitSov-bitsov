@@ -238,11 +238,13 @@ claim-bound SAS v2 message. See the [owner-device contract](device-keys.md#addin
 
 The tunnel also accepts `POST /pair/relation-intent` from a live paired client.
 It writes a contact budget only with a registered device key's signature bound
-to the node, client and device key ID, plus a fresh nonce. The server binds the
-key record's epoch to the token epoch; v1 does not sign an epoch field. An epoch
-bump invalidates registered keys, but re-approving the same public key within
-the clock window can allow an unused captured v1 intent to verify. The ±300-second
-clock window can span 10 minutes of node time for a fast device clock.
+to the node, client, pairing epoch and device key ID, plus a fresh nonce. The
+epoch in the signed bytes is the token epoch, so an intent signed before an
+epoch bump does not verify after the same public key is approved again at the
+new epoch. v1 signatures, which omit the epoch, are refused. The request must
+also present the caller's authenticated Noise session, the same channel binding
+the other signed tunnel intents use. The ±300-second clock window can span 10
+minutes of node time for a fast device clock.
 Provisional sessions remain blocked. Non-2xx responses log only the path, HTTP
 status, numeric code and a fixed refusal reason at info level; bodies, keys,
 signatures and nonces are never included in that log. Reasons remain internal
@@ -403,7 +405,15 @@ and is discarded on the next touch (`410 ceremony_expired` on finalize).
 Cancellation, shutdown and failures drop zeroizing buffers. A fresh ceremony
 always generates a fresh phrase. There is no resend or mnemonic-reveal route.
 `GET /api/v1/bootstrap/state` is unauthenticated. It exposes only `state`,
-`can_create`, `can_restore`, and `local_owner: {available, enroll_device, pending}`.
+`can_create`, `can_restore`, `local_owner: {available, enroll_device, pending}`,
+and `network`: the configured Bitcoin network name (`bitcoin`, `testnet`,
+`signet` or `regtest`), present only when the lightning backend states one.
+The field is the name alone: no node id, balances, addresses or endpoints. A
+client that requires a particular network, such as a beta app that sets up home
+nodes on signet only, reads it here and must refuse setup when it is absent or
+differs. Like the rest of this response it needs no token and no pairing: any
+client that reaches the bootstrap router, on the loopback API or through the
+tunnel, can read it.
 If an interrupted commit requires repair, it returns `state: "refused"` with
 `can_create: false` and `can_restore: false`, including before a restart. It
 does not expose a refusal object, reason, disk-state details, or repair text.
@@ -455,6 +465,9 @@ tunnel as usual.
 `GET /api/v1/bootstrap/state` reports `can_restore: false` and
 `local_owner: {available: true, enroll_device: true, pending,
 tunnel_password: true}`. `tunnel_password` is absent in local mode. The
+response also carries `network` as above, so the app can confirm the box runs
+on the network it expects before it commits a password or enrolls a device;
+the router, its routes and their authentication are otherwise unchanged. The
 ceremony routes change in this mode only:
 
 1. `POST /api/v1/identity/create-pending` takes

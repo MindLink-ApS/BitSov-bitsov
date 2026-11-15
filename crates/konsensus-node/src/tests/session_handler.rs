@@ -117,81 +117,247 @@ async fn progress_event_persisted_and_replayable() {
     assert_eq!(state.current_step, "waiting_for_inviter_channel");
 }
 
+type PeerLnKeys = Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, PeerLightningKey>>>;
+
+fn empty_peer_ln_keys() -> PeerLnKeys {
+    Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn signing_peer() -> (NodeIdentity, NodeId) {
+    let (_, identity) = NodeIdentity::generate().unwrap();
+    let id = *identity.node_id();
+    (identity, id)
+}
+
 #[tokio::test]
-async fn lightning_info_stores_valid_pubkey() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+async fn lightning_info_stores_identity_signed_pubkey() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
-    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &pubkeys).await;
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
 
+    assert_eq!(verified.as_deref(), Some(valid_ln_pubkey().as_str()));
     let map = pubkeys.lock().await;
-    assert!(map.contains_key(&peer_id));
-    assert_eq!(map[&peer_id], valid_ln_pubkey());
+    assert_eq!(map[&peer_id], PeerLightningKey::Verified(valid_ln_pubkey()));
+}
+
+#[tokio::test]
+async fn lightning_info_unsigned_is_recorded_but_never_verified() {
+    // An older peer advertises its key without a signature: the entry says so
+    // and the key is not handed to the inviter record or auto-channel opener.
+    let peer_id = test_peer_id();
+    let pubkeys = empty_peer_ln_keys();
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &[], &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
+}
+
+#[tokio::test]
+async fn lightning_info_unsigned_replaces_earlier_verified_binding() {
+    // A peer that stops signing (downgrade) is no longer paid at the old key.
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &[], &pubkeys).await;
+
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
+}
+
+#[tokio::test]
+async fn lightning_info_rejects_tampered_signature() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let mut sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    sig[3] ^= 0x80;
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_rejects_signature_for_a_different_key() {
+    // A valid signature over one key does not vouch for another (mismatch).
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let other = "03abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
+    let sig = lightning_binding::sign(&identity, other).unwrap();
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_rejects_signature_by_another_identity() {
+    // Signed by someone who is not the connected peer.
+    let (other_identity, _) = signing_peer();
+    let peer_id = test_peer_id();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&other_identity, &valid_ln_pubkey()).unwrap();
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_bad_signature_replaces_previous_binding_with_unsigned() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    let other = "03abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
+    let mut bad = lightning_binding::sign(&identity, other).unwrap();
+    bad[0] ^= 0x01;
+    handle_lightning_info_received(&peer_id, other, &bad, &pubkeys).await;
+
+    // The peer's own session announced a key we cannot accept: it no longer
+    // stands behind the verified one, so neither key is paid.
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
 }
 
 #[tokio::test]
 async fn lightning_info_rejects_short_pubkey() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
-    handle_lightning_info_received(&peer_id, "02abcdef", &pubkeys).await;
+    handle_lightning_info_received(&peer_id, "02abcdef", &sig, &pubkeys).await;
 
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
 async fn lightning_info_rejects_wrong_prefix() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
     // Starts with 04 (uncompressed) — invalid.
     let bad_pk = "04abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
-    handle_lightning_info_received(&peer_id, bad_pk, &pubkeys).await;
+    handle_lightning_info_received(&peer_id, bad_pk, &sig, &pubkeys).await;
 
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
 async fn lightning_info_rejects_invalid_hex() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
     // Correct length but contains non-hex character 'zz'.
     let bad_pk = "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456zzab";
-    handle_lightning_info_received(&peer_id, bad_pk, &pubkeys).await;
+    handle_lightning_info_received(&peer_id, bad_pk, &sig, &pubkeys).await;
 
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
-async fn lightning_info_updates_on_reconnect() {
+async fn lightning_info_malformed_unsigned_key_is_recorded_unpayable() {
+    // A malformed key, signed or not, is recorded as unpayable rather than absent.
     let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let pubkeys = empty_peer_ln_keys();
+
+    handle_lightning_info_received(&peer_id, "02abcdef", &[], &pubkeys).await;
+
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_rotation_with_new_signature_updates_binding() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
 
     let pk1 = "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
     let pk2 = "03abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
 
-    handle_lightning_info_received(&peer_id, pk1, &pubkeys).await;
-    assert_eq!(pubkeys.lock().await[&peer_id], pk1);
+    let sig1 = lightning_binding::sign(&identity, pk1).unwrap();
+    handle_lightning_info_received(&peer_id, pk1, &sig1, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(pk1.into())
+    );
 
-    // Peer reconnects with new Lightning node — pubkey is updated.
-    handle_lightning_info_received(&peer_id, pk2, &pubkeys).await;
-    assert_eq!(pubkeys.lock().await[&peer_id], pk2);
+    // Peer moves to a new Lightning node and signs the new key: binding follows.
+    let sig2 = lightning_binding::sign(&identity, pk2).unwrap();
+    handle_lightning_info_received(&peer_id, pk2, &sig2, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(pk2.into())
+    );
+
+    // The old signature does not vouch for the new key (mismatch): the peer's
+    // latest announcement is not accepted, so it is not paid at either key.
+    handle_lightning_info_received(&peer_id, pk2, &sig1, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
+
+    // Policy: the latest announcement that verifies wins. A complete earlier
+    // announcement (old key with its own signature) is still a key this
+    // identity signed, so it is accepted again. Announcements only travel
+    // over the peer's own authenticated session, so this is the peer moving
+    // back, not a third party rolling it back; the binding carries no
+    // freshness and claims none.
+    handle_lightning_info_received(&peer_id, pk1, &sig1, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(pk1.into())
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_stores_canonical_lowercase_key() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let upper = valid_ln_pubkey().to_ascii_uppercase();
+    let sig = lightning_binding::sign(&identity, &upper).unwrap();
+
+    let verified = handle_lightning_info_received(&peer_id, &upper, &sig, &pubkeys).await;
+
+    assert_eq!(verified.as_deref(), Some(valid_ln_pubkey().as_str()));
 }
 
 // ── Invoice response handler tests ──────────────────────────
@@ -2853,6 +3019,7 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     peer_id,
                     ln_pubkey: "private-ln-key".into(),
                     ln_addr: Some("192.0.2.123:9735".into()),
+                    identity_sig: vec![],
                     privileged,
                 },
                 ControlEvent::PeerExchangeRequested {
@@ -3663,6 +3830,7 @@ async fn recovery_announces_lightning_once_only_to_privileged_connected_peers() 
     let mut was_ready = false;
     refresh_recovered_lightning(
         &mut was_ready,
+        b.as_ref(),
         &target,
         &lightning,
         &None,
@@ -3675,11 +3843,21 @@ async fn recovery_announces_lightning_once_only_to_privileged_connected_peers() 
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        matches!(event, ControlEvent::LightningInfoReceived { ln_pubkey, .. } if ln_pubkey == expected)
-    );
+    match event {
+        ControlEvent::LightningInfoReceived {
+            ln_pubkey,
+            identity_sig,
+            ..
+        } => {
+            assert_eq!(ln_pubkey, expected);
+            // The announcement is bound to our identity so the peer can pay it.
+            lightning_binding::verify(b.node_id(), &ln_pubkey, &identity_sig).unwrap();
+        }
+        other => panic!("expected LightningInfoReceived, got {other:?}"),
+    }
     refresh_recovered_lightning(
         &mut was_ready,
+        b.as_ref(),
         &target,
         &lightning,
         &None,
@@ -7483,4 +7661,133 @@ fn not_reachable_invite_is_a_terminal_paid_rejection() {
     assert!(terminal_paid_rejection(konsensus_api::calls::devices::NOT_REACHABLE));
     assert!(terminal_paid_rejection("call_block_overpayment"));
     assert!(!terminal_paid_rejection("storage error"));
+}
+
+#[tokio::test]
+async fn a_rejected_key_replaces_a_verified_binding_and_never_leaves_it_absent() {
+    // First contact with a bad binding: recorded as unpayable (fail closed).
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let mut bad = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    bad[0] ^= 0x01;
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &bad, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+    // A valid binding afterwards is accepted and verified.
+    let good = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    let verified = handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &good, &pubkeys).await;
+    assert!(verified.is_some());
+    assert!(matches!(pubkeys.lock().await.get(&peer_id), Some(PeerLightningKey::Verified(_))));
+    // A later bad binding replaces the verified key with an unpayable entry.
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &bad, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+    // So does a malformed key after a fresh verified binding.
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &good, &pubkeys).await;
+    assert!(matches!(pubkeys.lock().await.get(&peer_id), Some(PeerLightningKey::Verified(_))));
+    handle_lightning_info_received(&peer_id, "02abcdef", &good, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+}
+
+#[tokio::test]
+async fn a_peer_announcing_its_own_malformed_key_unsigned_is_no_longer_paid_at_its_verified_key() {
+    // The sending side: a backend key the node cannot vouch for goes out unsigned.
+    let (identity, peer_id) = signing_peer();
+    let malformed = "02abcdef";
+    let sig = sign_lightning_info(&identity, malformed);
+    assert!(sig.is_empty(), "a key that cannot be bound is advertised without a signature");
+
+    // The receiving side held a verified key for this peer.
+    let pubkeys = empty_peer_ln_keys();
+    let good = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &good, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Verified(valid_ln_pubkey()))
+    );
+
+    // The unsigned announcement of the malformed key ends payment at the old key.
+    assert!(handle_lightning_info_received(&peer_id, malformed, &sig, &pubkeys).await.is_none());
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+}
+
+#[tokio::test]
+async fn pending_media_invoice_refuses_stopped_media_until_replacement() {
+    use konsensus_core::payloads::call as rules;
+    use konsensus_api::calls::{publish_media_attachment, stop_media_attachment, MediaDetach};
+    let storage: Arc<dyn konsensus_storage::Storage> = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let paid = rules::CallEntry {
+        side: rules::Side::Callee, phase: rules::Phase::Live, deadline_ms: now + 30_000,
+        pending: None, paid_until_ms: Some(now + 20_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    rules::validate_block_invoice(&paid, 1, now).unwrap();
+    storage.call_put(&peer, id, &paid).await.unwrap();
+    let generation = publish_media_attachment(&storage, &peer, id).await.unwrap();
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let sessions = session_with(&peer).await;
+    let purpose = format!("{}{id}:1", rules::CALL_BLOCK_INVOICE_PREFIX);
+    let mut invoices = ready_invoice_book().await;
+    prepare_call_block_invoice(storage.as_ref(), &sessions, &peer, &purpose, 23_000, "active", &wallet, &mut invoices).await.unwrap();
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 1);
+    let stopped = MediaDetach {
+        generation: Arc::new(tokio::sync::Mutex::new(generation)), expected_generation: generation,
+        only_unpaid: true, may_hangup_live: false,
+    };
+    stop_media_attachment(storage.as_ref(), &peer, id, &stopped);
+    let refused = prepare_call_block_invoice(storage.as_ref(), &sessions, &peer, &purpose, 23_000, "stopped", &wallet, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 1, "no payable invoice for an attachment known to have stopped");
+    assert_eq!(storage.call_get(&peer, id).await.unwrap().unwrap(), paid);
+    publish_media_attachment(&storage, &peer, id).await.unwrap();
+    prepare_call_block_invoice(storage.as_ref(), &sessions, &peer, &purpose, 23_000, "replacement", &wallet, &mut invoices).await.unwrap();
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn pending_media_invoice_serializes_lifecycle_and_head_reads() {
+    use konsensus_core::payloads::call as rules;
+    use konsensus_api::calls::{self as api_calls, MediaDetach};
+    let storage: Arc<dyn konsensus_storage::Storage> = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let paid = rules::CallEntry {
+        side: rules::Side::Callee, phase: rules::Phase::Live, deadline_ms: now + 30_000,
+        pending: None, paid_until_ms: Some(now + 20_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    rules::validate_block_invoice(&paid, 1, now).unwrap();
+    storage.call_put(&peer, id, &paid).await.unwrap();
+    let generation = api_calls::publish_media_attachment(&storage, &peer, id).await.unwrap();
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let sessions = session_with(&peer).await;
+    let purpose = format!("{}{id}:1", rules::CALL_BLOCK_INVOICE_PREFIX);
+    let mut invoices = ready_invoice_book().await;
+    let body = format!(r#"{{"call_id":"{id}","seq":1}}"#);
+    let transition = api_calls::prepare_incoming_block(storage.as_ref(), &peer, Some(&body), &[15;32]).await.unwrap();
+    let mut quote = Box::pin(prepare_call_block_invoice(storage.as_ref(), &sessions, &peer, &purpose, 23_000, "during-transition", &wallet, &mut invoices));
+    let early = tokio::time::timeout(Duration::from_millis(50), &mut quote).await;
+    let blocked = early.is_err();
+    let stopped = MediaDetach {
+        generation: Arc::new(tokio::sync::Mutex::new(generation)), expected_generation: generation,
+        only_unpaid: false, may_hangup_live: true,
+    };
+    api_calls::stop_media_attachment(storage.as_ref(), &peer, id, &stopped);
+    let ended = rules::CallEntry { phase: rules::Phase::Ended, end_reason: Some(rules::HangupReason::Hangup), ..paid };
+    storage.call_put(&peer, id, &ended).await.unwrap();
+    let intent = konsensus_storage::call_media::PendingMediaDetach {
+        peer, call_id: id.into(), generation, only_unpaid: false, may_hangup_live: true, has_stop_policy: true,
+    };
+    storage.call_media_record_detach(&intent, false).await.unwrap();
+    storage.call_media_record_detach(&intent, true).await.unwrap();
+    drop(transition);
+    let result = match early {
+        Ok(result) => result,
+        Err(_) => tokio::time::timeout(Duration::from_secs(2), quote).await.unwrap(),
+    };
+    assert!(blocked, "invoice validation must wait for the lifecycle transition's call lock");
+    assert_eq!(result.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 0);
 }

@@ -195,7 +195,9 @@ async fn wait_direct_channel(app: &app::App, peer: &NodeId) {
             app.state.identity.node_id()
         ),
         || async {
-            let Some(key) = app.state.peer_ln_pubkeys.lock().await.get(peer).cloned() else {
+            let Some(konsensus_api::state::PeerLightningKey::Verified(key)) =
+                app.state.peer_ln_pubkeys.lock().await.get(peer).cloned()
+            else {
                 return false;
             };
             app.state

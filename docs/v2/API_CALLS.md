@@ -242,8 +242,8 @@ An expired row is aged to `ended` before classification. A late fetch or
 resend cannot revive it. The node retains ordinary replay tombstones, bounds
 device waits with the existing call limits, and expires them in the call-state
 sweep. Startup ends awaiting calls rather than binding retained old invites to
-them. The current offer for each call is recorded by migration 040
-(`040_call_offer_binding.sql`).
+them. The current offer for each call is recorded by migration 041
+(`041_call_offer_binding.sql`).
 
 The invite's existing `MessageAck` is delayed until device delivery. The
 background control writer sends it within its 100 ms sweep cadence, without

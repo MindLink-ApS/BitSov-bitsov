@@ -71,7 +71,7 @@ Into an empty directory, download your platform's binary, `SHA256SUMS` and
 the same tag:
 
 ```sh
-TAG=v0.3.0-rc22   # the release you downloaded
+TAG=v0.3.0-rc24   # the release you downloaded
 curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/RELEASE_KEY.asc"
 ```
 
@@ -128,7 +128,7 @@ the mark (`curl` and `gh` downloads have none):
 mv bitsov-darwin-aarch64 konsensus   # your platform's file; or: ln -s bitsov-darwin-aarch64 konsensus
 chmod +x konsensus
 xattr -d com.apple.quarantine konsensus 2>/dev/null   # macOS only
-./konsensus --version                # konsensus 0.3.0-rc22
+./konsensus --version                # konsensus 0.3.0-rc24
 export PATH="$PWD:$PATH"
 ```
 
@@ -141,7 +141,7 @@ curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/doc
 shasum -a 256 owner-token.sh   # Linux: sha256sum owner-token.sh
 ```
 
-For `v0.3.0-rc22` the hash is
+For `v0.3.0-rc24` the hash is
 `a23f002e754f91416c5580a3ff6b82ef8447cea7cc6a125e505fef3a5ff95764`, the file at
 that tag (`docs/ops/owner-token.sh` in the tag's tree on GitHub). That value
 comes from the same site as the file, so it catches a damaged or mismatched

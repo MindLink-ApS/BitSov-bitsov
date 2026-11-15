@@ -53,8 +53,9 @@ impl Renewal {
             issued_at: chrono::Utc::now().timestamp(),
             nonce: hex::encode(nonce),
         };
-        let signature = device_sign(&self.key, &device::intent_message(&self.fingerprint, &self.client_id, &intent));
-        self.service.apply_relation_intent(&self.client_id, 1, &intent, &signature).unwrap();
+        let epoch = 1;
+        let signature = device_sign(&self.key, &device::intent_message(&self.fingerprint, &self.client_id, epoch, &intent));
+        self.service.apply_relation_intent(&self.client_id, epoch, &intent, &signature).unwrap();
     }
 }
 
@@ -138,6 +139,7 @@ pub(super) async fn approved_grant_renewable(mut fx: Fx, relation: bool, budget_
                 &sign(&device::intent_message(
                     &fingerprint,
                     &fx.client_id,
+                    1,
                     &intent,
                 )),
             )
@@ -345,11 +347,10 @@ async fn console_room_fanout_is_capped_as_one_call() {
             .initiate_session(&peer, &peer_sm.prekey_bundle().await)
             .await
             .unwrap();
-        fx.state
-            .peer_ln_pubkeys
-            .lock()
-            .await
-            .insert(peer, PEER_LN.into());
+        fx.state.peer_ln_pubkeys.lock().await.insert(
+            peer,
+            konsensus_api::state::PeerLightningKey::Verified(PEER_LN.into()),
+        );
         members.push(peer);
     }
     fx.state = Arc::new(AppState {

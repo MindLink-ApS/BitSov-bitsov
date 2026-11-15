@@ -94,11 +94,10 @@ async fn call_ready(mut fx: Fx) -> Fx {
         .initiate_session(&fx.peer, &target.prekey_bundle().await)
         .await
         .unwrap();
-    fx.state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(fx.peer, invoice_payee());
+    fx.state.peer_ln_pubkeys.lock().await.insert(
+        fx.peer,
+        konsensus_api::state::PeerLightningKey::Verified(invoice_payee()),
+    );
     // Exercise the production encrypted call storage as well as the pairing file.
     let store = SqliteStorage::open(fx.tmp.path().join("calls.sqlite").to_str().unwrap())
         .await
