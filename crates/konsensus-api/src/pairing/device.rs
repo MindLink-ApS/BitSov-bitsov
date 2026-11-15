@@ -26,7 +26,8 @@ use crate::spend_budget::{GrantBudget, GrantView, MAX_SPEND_GRANT_TTL_SECS};
 /// Reason code: the node runs from a plaintext recovery phrase.
 pub const SEED_NOT_ENCRYPTED: &str = "seed_not_encrypted";
 /// Reason code: the encrypted phrase's password came from a flag or file, not
-/// typed at start, so a same-user program could have it.
+/// typed at start, so a same-user program could have it, and the owner has not
+/// chosen `[pairing] unattended_device_approvals` or it was refused for this start.
 pub const SEED_PASSWORD_NOT_TYPED: &str = "seed_password_not_typed";
 /// Reason code: no owner-approval key was configured at start.
 pub const OWNER_KEY_UNAVAILABLE: &str = "owner_key_unavailable";
@@ -42,7 +43,8 @@ pub fn device_approvals_off_message(reason: &str) -> &'static str {
         SEED_PASSWORD_NOT_TYPED => {
             "Touch ID approvals are off on this node: it was started with the recovery-phrase \
              password from a flag or file. Restart it and type the password at start to enable \
-             Touch ID approvals."
+             Touch ID approvals, or choose `[pairing] unattended_device_approvals` for an \
+             unattended box and accept its trade (docs/operations/password-input.md)."
         }
         _ => "Touch ID approvals are off on this node: it has no owner-approval key.",
     }
