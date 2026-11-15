@@ -5,8 +5,9 @@
 //! to the Ed25519 identity the peer was admitted under. A binding is the
 //! identity key's signature over the Lightning key, with a domain tag so the
 //! signature can never be mistaken for a handshake, envelope, introduction or
-//! invite signature. A node keeps only bindings it has verified, and it pays a
-//! contact by keysend only at a verified Lightning key.
+//! invite signature. A node trusts only bindings it has verified: an unsigned,
+//! malformed or rejected announcement is recorded as unsigned, never as a
+//! binding, and a contact is paid by keysend only at a verified Lightning key.
 //!
 //! Peers that predate this module advertise an unsigned key. Such a key is
 //! recorded as [`PeerLightningKey::Unsigned`] so the paying side can refuse

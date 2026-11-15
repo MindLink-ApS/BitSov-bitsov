@@ -663,10 +663,11 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                         if !privileged {
                             continue;
                         }
-                        // Only a key the peer's identity signed is stored or
-                        // acted on. An unsigned key is recorded as such so the
-                        // payer refuses it out loud; it never reaches the
-                        // inviter record or the auto-channel opener.
+                        // Only a key the peer's identity signed is acted on.
+                        // An unsigned, malformed or rejected key is recorded as
+                        // unsigned, replacing any earlier key, so the payer
+                        // refuses it out loud; it never reaches the inviter
+                        // record or the auto-channel opener.
                         let verified = handle_lightning_info_received(
                             &peer_id, &ln_pubkey, &identity_sig, &peer_ln_pubkeys,
                         ).await;
@@ -2778,7 +2779,10 @@ fn is_routable_peer_addr(addr: &std::net::SocketAddr) -> bool {
 /// (a rotation). A well-formed key without a signature comes from a peer that
 /// predates signed bindings: it is recorded as [`PeerLightningKey::Unsigned`],
 /// replacing any earlier entry, so the payer refuses it with a fixed reason.
-/// A malformed key or a signature that does not verify changes nothing.
+/// A malformed key or a signature that does not verify is recorded as
+/// [`PeerLightningKey::Unsigned`] too, replacing any earlier entry, a verified
+/// one included: the announcement comes from the peer's own authenticated
+/// session, so it means the peer no longer stands behind the earlier key.
 async fn handle_lightning_info_received(
     peer_id: &NodeId,
     ln_pubkey: &str,
@@ -2793,7 +2797,7 @@ async fn handle_lightning_info_received(
             error = %e,
             "received invalid Lightning pubkey; it will not be paid until the peer advertises a valid one"
         );
-        refuse_unless_verified(peer_id, peer_ln_pubkeys).await;
+        record_unpayable(peer_id, peer_ln_pubkeys).await;
         return None;
     }
 
@@ -2802,10 +2806,7 @@ async fn handle_lightning_info_received(
             peer = %peer_id,
             "peer advertised a Lightning key without an identity signature; it will not be paid until the peer updates"
         );
-        peer_ln_pubkeys
-            .lock()
-            .await
-            .insert(*peer_id, PeerLightningKey::Unsigned);
+        record_unpayable(peer_id, peer_ln_pubkeys).await;
         return None;
     }
 
@@ -2825,27 +2826,28 @@ async fn handle_lightning_info_received(
             warn!(
                 peer = %peer_id,
                 error = %e,
-                "rejected Lightning key binding; keeping a verified key, otherwise refusing to pay"
+                "rejected Lightning key binding; refusing to pay this peer until it advertises a valid one"
             );
-            refuse_unless_verified(peer_id, peer_ln_pubkeys).await;
+            record_unpayable(peer_id, peer_ln_pubkeys).await;
             None
         }
     }
 }
 
-/// A peer that advertised a Lightning key we could not accept must not be paid
-/// through the unbound invoice path, which is only for peers that never
-/// advertise a key. Record `Unsigned` (every payment path refuses it) unless a
-/// verified key is already held, which stays: only this authenticated peer can
-/// send these frames, so a bad one is never a reason to drop a good binding.
-async fn refuse_unless_verified(
+/// A peer whose latest Lightning announcement we could not accept is not paid.
+/// Record `Unsigned` (every payment path refuses it), replacing any earlier
+/// entry. A verified key is not kept: only the peer's own authenticated session
+/// sends these frames, and its latest one says it no longer stands behind that
+/// key. Leaving the entry absent would mean the unbound invoice path, which is
+/// only for peers that never advertise a key.
+async fn record_unpayable(
     peer_id: &NodeId,
     peer_ln_pubkeys: &Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, PeerLightningKey>>>,
 ) {
-    let mut keys = peer_ln_pubkeys.lock().await;
-    if !matches!(keys.get(peer_id), Some(PeerLightningKey::Verified(_))) {
-        keys.insert(*peer_id, PeerLightningKey::Unsigned);
-    }
+    peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(*peer_id, PeerLightningKey::Unsigned);
 }
 
 /// Allowed legacy free-gossip kinds.

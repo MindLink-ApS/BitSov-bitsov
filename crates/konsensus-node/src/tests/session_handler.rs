@@ -227,7 +227,7 @@ async fn lightning_info_rejects_signature_by_another_identity() {
 }
 
 #[tokio::test]
-async fn lightning_info_bad_signature_keeps_previous_binding() {
+async fn lightning_info_bad_signature_replaces_previous_binding_with_unsigned() {
     let (identity, peer_id) = signing_peer();
     let pubkeys = empty_peer_ln_keys();
     let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
@@ -238,10 +238,9 @@ async fn lightning_info_bad_signature_keeps_previous_binding() {
     bad[0] ^= 0x01;
     handle_lightning_info_received(&peer_id, other, &bad, &pubkeys).await;
 
-    assert_eq!(
-        pubkeys.lock().await[&peer_id],
-        PeerLightningKey::Verified(valid_ln_pubkey())
-    );
+    // The peer's own session announced a key we cannot accept: it no longer
+    // stands behind the verified one, so neither key is paid.
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
 }
 
 #[tokio::test]
@@ -331,12 +330,10 @@ async fn lightning_info_rotation_with_new_signature_updates_binding() {
         PeerLightningKey::Verified(pk2.into())
     );
 
-    // The old signature does not vouch for the new key (mismatch).
+    // The old signature does not vouch for the new key (mismatch): the peer's
+    // latest announcement is not accepted, so it is not paid at either key.
     handle_lightning_info_received(&peer_id, pk2, &sig1, &pubkeys).await;
-    assert_eq!(
-        pubkeys.lock().await[&peer_id],
-        PeerLightningKey::Verified(pk2.into())
-    );
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
 
     // Policy: the latest announcement that verifies wins. A complete earlier
     // announcement (old key with its own signature) is still a key this
@@ -7658,7 +7655,7 @@ async fn legacy_unreadable_lookup_failure_retains_paid_state_and_withholds_confi
 }
 
 #[tokio::test]
-async fn a_rejected_key_never_downgrades_a_verified_binding_and_never_leaves_it_absent() {
+async fn a_rejected_key_replaces_a_verified_binding_and_never_leaves_it_absent() {
     // First contact with a bad binding: recorded as unpayable (fail closed).
     let (identity, peer_id) = signing_peer();
     let pubkeys = empty_peer_ln_keys();
@@ -7671,8 +7668,34 @@ async fn a_rejected_key_never_downgrades_a_verified_binding_and_never_leaves_it_
     let verified = handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &good, &pubkeys).await;
     assert!(verified.is_some());
     assert!(matches!(pubkeys.lock().await.get(&peer_id), Some(PeerLightningKey::Verified(_))));
-    // A later bad binding or malformed key keeps the verified key.
+    // A later bad binding replaces the verified key with an unpayable entry.
     handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &bad, &pubkeys).await;
-    handle_lightning_info_received(&peer_id, "02abcdef", &good, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+    // So does a malformed key after a fresh verified binding.
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &good, &pubkeys).await;
     assert!(matches!(pubkeys.lock().await.get(&peer_id), Some(PeerLightningKey::Verified(_))));
+    handle_lightning_info_received(&peer_id, "02abcdef", &good, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+}
+
+#[tokio::test]
+async fn a_peer_announcing_its_own_malformed_key_unsigned_is_no_longer_paid_at_its_verified_key() {
+    // The sending side: a backend key the node cannot vouch for goes out unsigned.
+    let (identity, peer_id) = signing_peer();
+    let malformed = "02abcdef";
+    let sig = sign_lightning_info(&identity, malformed);
+    assert!(sig.is_empty(), "a key that cannot be bound is advertised without a signature");
+
+    // The receiving side held a verified key for this peer.
+    let pubkeys = empty_peer_ln_keys();
+    let good = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &good, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Verified(valid_ln_pubkey()))
+    );
+
+    // The unsigned announcement of the malformed key ends payment at the old key.
+    assert!(handle_lightning_info_received(&peer_id, malformed, &sig, &pubkeys).await.is_none());
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
 }
