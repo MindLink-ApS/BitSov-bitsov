@@ -238,11 +238,13 @@ claim-bound SAS v2 message. See the [owner-device contract](device-keys.md#addin
 
 The tunnel also accepts `POST /pair/relation-intent` from a live paired client.
 It writes a contact budget only with a registered device key's signature bound
-to the node, client and device key ID, plus a fresh nonce. The server binds the
-key record's epoch to the token epoch; v1 does not sign an epoch field. An epoch
-bump invalidates registered keys, but re-approving the same public key within
-the clock window can allow an unused captured v1 intent to verify. The ±300-second
-clock window can span 10 minutes of node time for a fast device clock.
+to the node, client, pairing epoch and device key ID, plus a fresh nonce. The
+epoch in the signed bytes is the token epoch, so an intent signed before an
+epoch bump does not verify after the same public key is approved again at the
+new epoch. v1 signatures, which omit the epoch, are refused. The request must
+also present the caller's authenticated Noise session, the same channel binding
+the other signed tunnel intents use. The ±300-second clock window can span 10
+minutes of node time for a fast device clock.
 Provisional sessions remain blocked. Non-2xx responses log only the path, HTTP
 status, numeric code and a fixed refusal reason at info level; bodies, keys,
 signatures and nonces are never included in that log. Reasons remain internal
@@ -253,7 +255,9 @@ request/confirm, first-contact-grant POST and identity replacement
 requests remain absent on the tunnel. Console approval itself remains available
 only at `konsensus device approve`. Console enrollment requires
 `--owner-control` with a **typed** seed password; `--password-fd` disables owner device authority in that
-mode. Spend elevation is still granted only through the owner control socket.
+mode, unless the owner chose
+[`[pairing] unattended_device_approvals`](../operations/password-input.md#unattended-box-device-approvals-from-a-stored-password).
+`konsensus device approve` always prompts for the typed password. Spend elevation is still granted only through the owner control socket.
 Asking or quoting confers no spend scope.
 
 The remote router also omits the loopback token mint, public probes and metrics.
