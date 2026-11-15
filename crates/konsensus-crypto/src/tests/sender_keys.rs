@@ -930,3 +930,50 @@ fn wiping_a_member_zeroes_its_stored_keys_before_removal() {
     bob.remove_member(&alice_id);
     assert!(!bob.has_member(&alice_id));
 }
+
+#[test]
+fn the_shared_pool_evicts_exactly_at_its_cap_and_a_rotation_clears_only_that_sender() {
+    let group_id = test_group_id();
+    let (alice_id, carol_id, bob_id) = (make_node_id(1), make_node_id(3), make_node_id(2));
+    let mut alice = GroupSession::new(group_id, alice_id);
+    let mut carol = GroupSession::new(group_id, carol_id);
+    let mut bob = GroupSession::new(group_id, bob_id);
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+    bob.process_distribution(&carol.our_distribution()).unwrap();
+    let from_alice: Vec<_> = (0..2048).map(|i| alice.encrypt(format!("a{i}").as_bytes()).unwrap()).collect();
+    let from_carol: Vec<_> = (0..300).map(|i| carol.encrypt(format!("c{i}").as_bytes()).unwrap()).collect();
+
+    // Alice: 7 deliveries of every 257th message skip 7 x 256 = 1,792 keys.
+    for i in (256..2048).step_by(257).take(7) {
+        bob.decrypt(&alice_id, &from_alice[i]).unwrap();
+    }
+    assert_eq!(skipped_len(&bob, &alice_id), 1792);
+    // Carol fills the pool to exactly the cap: message 208 skips 0..=207.
+    bob.decrypt(&carol_id, &from_carol[208]).unwrap();
+    assert_eq!(skipped_len(&bob, &carol_id), 208);
+    assert_eq!(bob.skipped_key_count(), MAX_TOTAL_SKIPPED_KEYS, "exactly at the cap");
+    assert_eq!(skipped_len(&bob, &alice_id), 1792, "at the cap, nothing is evicted");
+
+    // One more skip (Carol's 209) is one over: exactly the single oldest key goes, Alice's message 0.
+    bob.decrypt(&carol_id, &from_carol[210]).unwrap();
+    assert_eq!(bob.skipped_key_count(), MAX_TOTAL_SKIPPED_KEYS);
+    assert_eq!(skipped_len(&bob, &alice_id), 1791);
+    assert_eq!(skipped_len(&bob, &carol_id), 209);
+    assert!(bob.decrypt(&alice_id, &from_alice[0]).is_err(), "the oldest key was evicted");
+    assert_eq!(bob.decrypt(&alice_id, &from_alice[1]).unwrap(), b"a1", "the next oldest is kept");
+    assert_eq!(bob.skipped_key_count(), MAX_TOTAL_SKIPPED_KEYS - 1);
+
+    // Alice rotates: her new generation clears only her stored keys; Carol's stay.
+    alice.our_sender_key.rotate();
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+    assert_eq!(skipped_len(&bob, &alice_id), 0);
+    assert_eq!(skipped_len(&bob, &carol_id), 209);
+    assert_eq!(bob.skipped_key_count(), 209, "the count drops by exactly Alice's keys");
+
+    // New skips after the rotation count from there: Alice's 11th message skips 10.
+    let after: Vec<_> = (0..11).map(|i| alice.encrypt(format!("r{i}").as_bytes()).unwrap()).collect();
+    bob.decrypt(&alice_id, &after[10]).unwrap();
+    assert_eq!(skipped_len(&bob, &alice_id), 10);
+    assert_eq!(bob.skipped_key_count(), 219);
+    assert_eq!(bob.decrypt(&alice_id, &after[0]).unwrap(), b"r0");
+}
