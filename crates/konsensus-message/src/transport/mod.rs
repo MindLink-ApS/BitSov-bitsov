@@ -23,6 +23,14 @@ mod supervisor;
 
 pub use cookie::CookieMode;
 pub use edge::DosEdgeConfig;
+
+/// A fresh ingress-cookie secret, for integration tests that check where it
+/// comes from. Not part of the API; built only with the `test-support` feature.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn __fresh_cookie_secret() -> [u8; 32] {
+    *cookie::fresh_secret()
+}
 pub use messaging::Standing;
 
 // Re-export internal helpers that sibling submodules access via `super::`.

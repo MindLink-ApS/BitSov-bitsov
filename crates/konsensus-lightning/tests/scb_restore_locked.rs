@@ -16,6 +16,12 @@ fn restore_is_locked_before_decryption_or_any_storage_write() {
     assert!(error.contains("disabled"), "{error}");
     assert!(error.contains("revoked commitment"), "{error}");
     assert!(error.contains("move-home"), "{error}");
+    assert!(error.contains("konsensus recover"), "{error}");
+    assert!(error.contains("owner console"), "{error}");
+    assert!(
+        !error.contains("channel peers"),
+        "lost-disk refusal must name konsensus recover, not channel-peer coordination: {error}"
+    );
     assert!(!destination.exists());
 }
 

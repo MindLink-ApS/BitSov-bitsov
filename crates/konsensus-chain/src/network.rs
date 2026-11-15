@@ -101,6 +101,10 @@ impl fmt::Display for ReportedNetwork {
     }
 }
 
+/// Stable refusal code for a chain source, or a chain server URL, on a
+/// network other than the configured one. Every such refusal starts with it.
+pub const NETWORK_MISMATCH_CODE: &str = "chain_network_mismatch";
+
 /// The configured network and the source's network disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkMismatch {
@@ -114,7 +118,7 @@ impl fmt::Display for NetworkMismatch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "chain source network mismatch: the configured network is {} but the {} chain source is on {}. \
+            "{NETWORK_MISMATCH_CODE}: chain source network mismatch: the configured network is {} but the {} chain source is on {}. \
              Refusing to use it and trying no other source. Point the chain source at a {} node, \
              or set the configured network to match, then restart.",
             network_name(self.configured),
@@ -461,6 +465,18 @@ mod tests {
         assert_eq!(parse_configured_network("signet"), Some(Network::Signet));
         assert_eq!(parse_configured_network("regtest"), Some(Network::Regtest));
         assert_eq!(parse_configured_network("main"), None);
+    }
+
+    #[test]
+    fn a_mismatch_starts_with_its_stable_code() {
+        let mismatch = NetworkMismatch {
+            configured: Network::Signet,
+            source: "esplora",
+            reported: ReportedNetwork::Known(Network::Bitcoin),
+        };
+        let text = mismatch.to_string();
+        assert!(text.starts_with("chain_network_mismatch: "), "{text}");
+        assert!(text.starts_with(NETWORK_MISMATCH_CODE), "{text}");
     }
 
     #[test]

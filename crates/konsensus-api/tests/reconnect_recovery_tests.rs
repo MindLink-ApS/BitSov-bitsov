@@ -507,7 +507,7 @@ async fn fourteen_minute_admission_resend_renews_same_paid_envelope() {
     let response = app.oneshot(Request::builder().method("POST").uri("/api/v1/messages/compose")
         .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
-        .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"after admission"}).to_string())).unwrap()).await.unwrap();
+        .body(Body::from(serde_json::json!({"recipient":peer.to_hex(),"kind":0,"plaintext":"after admission","max_total_msat":4000}).to_string())).unwrap()).await.unwrap();
     // No X3DH peer is running, so compose eventually times out after resending.
     assert!(response.status().is_server_error());
     assert_eq!(sender_wallet.money(), 0);
