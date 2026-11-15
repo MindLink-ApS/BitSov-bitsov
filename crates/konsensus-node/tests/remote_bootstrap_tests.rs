@@ -426,6 +426,8 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
         .await;
     assert_eq!(state["local_owner"]["tunnel_password"], true);
     assert_eq!(state["can_restore"], false);
+    // The mock lightning backend is regtest; the app reads this before setup.
+    assert_eq!(state["network"], "regtest", "{state}");
 
     // 4. Commit to the password, then show the phrase.
     let rng = ring::rand::SystemRandom::new();

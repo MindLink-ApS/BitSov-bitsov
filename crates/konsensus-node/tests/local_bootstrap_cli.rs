@@ -239,6 +239,16 @@ async fn descriptor_bootstrap_restart_intent_and_no_secret_logs() {
         .unwrap();
     let mut node = start(&config, &log, true, true);
     ready(&mut node, &http, &base, &log, true).await;
+    // The configured network (mock backend: regtest) is published unauthenticated.
+    let state: Value = http
+        .get(format!("{base}/api/v1/bootstrap/state"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["network"], "regtest", "{state}");
     let (client, client_key, bst) = pair(&http, &base).await;
     let p = post(&http, &base, "identity/create-pending", &bst, json!({})).await;
     assert!(!dir.path().join("identity").exists());

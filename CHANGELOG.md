@@ -5,6 +5,12 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Report the node's configured Bitcoin network (`bitcoin`, `testnet`, `signet`
+  or `regtest`) as `network` in the unauthenticated `GET /api/v1/bootstrap/state`
+  response, so a client can confirm the network during remote-owner first run
+  before any identity exists. The field is absent when the lightning backend
+  does not state a network; no other field, route or authentication rule of the
+  bootstrap router changes (#443).
 - Bind device-signed relation intents to the pairing epoch (`bitsov-relation-intent-v2`; `relation_intent_v2`). v1 signatures are refused. The remote route uses the same authenticated Noise session as the other signed tunnel intents. `GET /api/v1/pair/device-keys` returns that epoch.
 - `init` and `restore` take `--network signet|regtest|bitcoin` (default
   `signet`) and write `[lightning] network` and the matching `[lightning]` and
