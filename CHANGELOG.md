@@ -15,6 +15,7 @@ also live on the corresponding GitHub pre-release pages.
   an older version that advertises an unsigned key is refused with the fixed
   reason "contact must update"; the payment never falls back to an invoice to
   the unbound node.
+- Bind device-signed relation intents to the pairing epoch (`bitsov-relation-intent-v2`; `relation_intent_v2`). v1 signatures are refused. The remote route uses the same authenticated Noise session as the other signed tunnel intents. `GET /api/v1/pair/device-keys` returns that epoch.
 - `init` and `restore` take `--network signet|regtest|bitcoin` (default
   `signet`) and write `[lightning] network` and the matching `[lightning]` and
   `[chain]` server URLs. The last line printed names the network.
