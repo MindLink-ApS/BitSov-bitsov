@@ -174,7 +174,7 @@ Run these in order and note pass or fail for each in your report.
 | S8 | Connected | `api $API/peers/connected \| jq .` | lists the other tester's node ID |
 | S9 | Channel (**your OK first**) | [quickstart step 7](QUICKSTART-SIGNET.md#7-open-a-channel-to-the-contact): preview with `dry_run`, then open; one tester opens it | `api $API/payments/channels \| jq .` shows the channel ready on both ends |
 | S10 | Paid message (**your OK first**) | [quickstart step 8](QUICKSTART-SIGNET.md#8-send-a-paid-message) | `"state": "acked"`, `"delivered": true`; the other tester reads it |
-| S11 | Paid call (**your OK first**) | [M6 call runbook](ops/M6-CALL-RUNBOOK.md) | **only when both nodes run `v0.3.0-rc24`.** Audio needs the matching M6 app build. Without it, mark S11 "skipped (no M6 app build)" |
+| S11 | Paid call (**your OK first**) | [M6 call runbook](ops/M6-CALL-RUNBOOK.md) | **only when both nodes run `v0.3.0-rc24`.** Audio needs the matching M6 app build. If the other node is on another version, mark S11 "skipped (mixed versions)"; without the app build, "skipped (no M6 app build)" |
 
 For S11, follow the runbook's "Checks before dialing" first, and its "Capture
 proof without publishing private data" afterwards.
@@ -206,7 +206,7 @@ S7 add tester:         pass / fail
 S8 connected:          pass / fail
 S9 channel:            pass / fail
 S10 paid message:      pass / fail
-S11 paid call:         pass / fail / skipped (why)
+S11 paid call:         pass / fail / skipped (mixed versions / no M6 app build)
 Errors (exact code or message, with private values removed):
 Waits (wallet sync, confirmation, channel ready), roughly:
 What was confusing:
