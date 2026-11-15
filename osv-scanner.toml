@@ -19,7 +19,7 @@ reason = "Unmaintained rustls-pemfile 1.0.4 is transitive through sqlx-core 0.8.
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0441"
 ignoreUntil = 2027-02-09
-reason = "Maintenance-only notice for pin-utils 0.1.0, with no vulnerability or patched release identified by this advisory. Its only consumer is nix 0.25.1 through optional electrsd 0.36.1 (konsensus-lightning/ldk-integration-test), absent from the default shipped node. Version 0.1.1 remains unmaintained. Recheck electrsd/nix upgrades and any new pin-utils consumers; remove when pin-utils leaves the graph. Expires 2027-02-09."
+reason = "Maintenance-only notice for pin-utils 0.1.0, with no vulnerability or patched release identified by this advisory. Its only consumer is nix 0.25.1 through optional electrsd 0.43.2 (konsensus-lightning/ldk-integration-test), absent from the default shipped node. Version 0.1.1 remains unmaintained. Recheck electrsd/nix upgrades and any new pin-utils consumers; remove when pin-utils leaves the graph. Expires 2027-02-09."
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0459"

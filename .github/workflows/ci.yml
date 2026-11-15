@@ -92,6 +92,8 @@ jobs:
               - 'scripts/test-security-key.sh'
               - 'scripts/check-waiver-deadlines.py'
               - 'scripts/test-waiver-deadlines.py'
+              - 'scripts/security-report-status.sh'
+              - 'scripts/test-security-report-status.sh'
               - '.github/workflows/ci.yml'
               - '.github/workflows/security-scan.yml'
 
@@ -308,6 +310,9 @@ jobs:
 
       - name: Advisory waiver deadlines
         run: python3 scripts/test-waiver-deadlines.py && python3 scripts/check-waiver-deadlines.py
+
+      - name: Security report status
+        run: bash scripts/test-security-report-status.sh
 
       - name: Read Rust toolchain pin
         id: rust-toolchain

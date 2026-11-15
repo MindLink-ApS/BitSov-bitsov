@@ -17,6 +17,10 @@ use konsensus_message::{CallMediaEvent, Frame};
 
 use super::{CallMediaAdmission, CallMediaRouter, MediaCap, MediaDrop, MediaLink, RateCap, MAX_BYTES_PER_SECOND, MAX_FRAMES_PER_SECOND};
 
+#[path = "log_capture.rs"]
+mod log_capture;
+use log_capture::{capture_logs, LogBuf};
+
 const CALL: &str = "0123456789abcdef0123456789abcdef";
 const OTHER_CALL: &str = "fedcba9876543210fedcba9876543210";
 
@@ -583,35 +587,6 @@ async fn idle_paid_route_expires_after_grace_without_media() {
     assert!(attachment.from_node.is_closed() && attachment.to_node.is_closed());
 }
 
-/// Captures this thread's log output; the runtime in these tests is
-/// single-threaded, so the router's tasks log into it too.
-#[derive(Clone, Default)]
-struct LogBuf(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogBuf {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-    type Writer = LogBuf;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
-    let buf = LogBuf::default();
-    let sub = tracing_subscriber::fmt().with_writer(buf.clone()).with_ansi(false).with_max_level(tracing::Level::INFO).finish();
-    let guard = tracing::subscriber::set_default(sub);
-    (buf, guard)
-}
-
 fn summaries(buf: &LogBuf) -> Vec<String> {
     let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
     text.lines().filter(|l| l.contains("call media route summary")).map(str::to_string).collect()
@@ -1073,12 +1048,24 @@ async fn callee_detach_stops_retrying_a_persistent_state_write_failure() {
     let f = fixture();
     let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store.clone())));
     drop(router.attach(&peer(), CALL, None).await.unwrap());
-    tokio::time::sleep(Duration::from_millis(6500)).await;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            if text.contains("call media detachment retries exhausted") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap_or_else(|_| {
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        panic!("detachment retries did not finish: {text}");
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     assert_eq!(text.matches("call media detachment state update failed").count(), 5,
-        "persistent failures must stop after five attempts");
-    assert!(text.contains("call media detachment retries exhausted"));
-    assert_eq!(store.call_get(&peer(), CALL).await.unwrap().unwrap(), paid);
+        "persistent failures must stop after five attempts: {text}");
+    assert!(text.contains("call media detachment retries exhausted"), "{text}");
+    assert_eq!(store.call_get(&peer(), CALL).await.unwrap().unwrap(), paid, "{text}");
 }
 
 #[tokio::test]

@@ -787,6 +787,10 @@ pub struct BootstrapState {
     before_marker: Option<BeforeMarkerHookOwned>,
     local: Option<LocalOwnerHooks>,
     remote: Option<RemoteOwner>,
+    /// Configured Bitcoin network name, when the lightning backend states one.
+    /// Published in `bootstrap/state` so a client can refuse to set up a home
+    /// node on the wrong network before any identity exists.
+    network: Option<String>,
     pending: Mutex<Option<PendingIdentity>>,
     sas_failures: std::sync::atomic::AtomicU8,
     sas_started_at: tokio::time::Instant,
@@ -809,6 +813,7 @@ impl BootstrapState {
             before_marker: None,
             local: None,
             remote: None,
+            network: None,
             pending: Mutex::new(None),
             sas_failures: std::sync::atomic::AtomicU8::new(0),
             sas_started_at: tokio::time::Instant::now(),
@@ -846,6 +851,18 @@ impl BootstrapState {
     pub fn with_remote_owner(mut self, remote: RemoteOwner) -> Self {
         self.remote = Some(remote);
         self.local = None;
+        self
+    }
+
+    /// Publish the configured Bitcoin network in `bootstrap/state`. Only one
+    /// of the four canonical names (`bitcoin`, `testnet`, `signet`, `regtest`)
+    /// is ever published; anything else, or `None`, omits the field, which a
+    /// client must treat as "network unknown". The whitelist keeps arbitrary
+    /// configuration text off the unauthenticated surface.
+    pub fn with_network(mut self, network: Option<String>) -> Self {
+        self.network = network.filter(|n| {
+            matches!(n.as_str(), "bitcoin" | "testnet" | "signet" | "regtest")
+        });
         self
     }
 
@@ -1224,6 +1241,8 @@ impl FromRequestParts<Arc<BootstrapState>> for BootstrapAuth {
 
 /// Unauthenticated `GET /api/v1/bootstrap/state` response.
 /// Refusal diagnostics and repair guidance belong in the CLI/stderr output.
+/// Besides the ceremony availability flags, the only node metadata here is the
+/// configured network name: no node id, balances, addresses or endpoints.
 #[derive(Debug, Serialize)]
 pub struct BootstrapStateResponse {
     /// `"bootstrap"`, `"initialized"`, or `"refused"` (operator repair required).
@@ -1234,6 +1253,11 @@ pub struct BootstrapStateResponse {
     pub can_create: bool,
     /// Explicit local ceremony availability, with no secret material.
     pub local_owner: LocalOwnerState,
+    /// Configured Bitcoin network: `"bitcoin"`, `"testnet"`, `"signet"` or
+    /// `"regtest"`. Absent when the node does not state one. A client that
+    /// requires a particular network must refuse setup when this is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
 }
 
 /// Public local ceremony status.
@@ -1284,6 +1308,7 @@ async fn bootstrap_state(
             pending: pending.is_some(),
             tunnel_password: remote,
         },
+        network: state.network.clone(),
     }))
 }
 

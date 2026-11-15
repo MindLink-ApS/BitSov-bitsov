@@ -14,7 +14,7 @@ async fn node_shutdown_waits_for_the_control_operation_response() {
         .unwrap();
     assert!(init.status.success());
     let config = dir.path().join("konsensus.toml");
-    let mut cfg: toml::Value = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+    let mut cfg: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
     let api_port = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     let peer_port = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     cfg["api"]["listen_addr"] = api_port.local_addr().unwrap().to_string().into();
