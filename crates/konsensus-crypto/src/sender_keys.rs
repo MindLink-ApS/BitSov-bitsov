@@ -81,7 +81,9 @@ pub enum SenderKeyError {
     InvalidDistribution(String),
 }
 
-/// Maximum number of skipped message keys to store per sender.
+/// Maximum number of message keys one message may skip ahead in a sender's
+/// chain (a larger gap is refused). Storage is capped across all senders by
+/// [`MAX_TOTAL_SKIPPED_KEYS`], not per sender.
 const MAX_SKIP: u32 = 256;
 
 /// Maximum skipped message keys stored across all senders of one group
@@ -573,10 +575,24 @@ impl GroupSession {
     /// The caller must redistribute our new `SenderKeyDistribution` to
     /// all remaining members.
     pub fn remove_member(&mut self, node_id: &NodeId) -> SenderKeyDistribution {
-        // Dropping the removed entry zeroizes its chain key and skipped keys (Drop).
+        // Wipe the entry where it is stored, then remove it: `remove` moves it out
+        // of its bucket, so a wipe after that (Drop) would leave the bytes behind.
+        self.wipe_member(node_id);
         drop(self.member_keys.remove(node_id));
         self.our_sender_key.rotate();
         self.our_distribution()
+    }
+
+    /// Zeroize a member's chain key and skipped keys in place. Returns whether
+    /// the member was there.
+    fn wipe_member(&mut self, node_id: &NodeId) -> bool {
+        match self.member_keys.get_mut(node_id) {
+            Some(entry) => {
+                entry.zeroize();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Get the set of group member NodeIds (excluding ourselves).

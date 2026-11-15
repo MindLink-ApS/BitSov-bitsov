@@ -915,3 +915,18 @@ fn zeroizing_a_receiver_entry_wipes_its_chain_key_and_skipped_keys() {
     assert_eq!(entry.chain_key, [0u8; 32]);
     assert!(entry.skipped_keys.values().all(|(k, _)| *k == [0u8; 32]));
 }
+
+#[test]
+fn wiping_a_member_zeroes_its_stored_keys_before_removal() {
+    // remove_member wipes in place first, because `remove` moves the entry out
+    // of its bucket and a wipe after that would only clear the moved copy.
+    let (mut bob, alice_id, _) = session_with_skipped(3);
+    assert_ne!(bob.member_keys[&alice_id].chain_key, [0u8; 32]);
+    assert!(bob.wipe_member(&alice_id));
+    let entry = &bob.member_keys[&alice_id];
+    assert_eq!(entry.chain_key, [0u8; 32], "the stored chain key is zero");
+    assert!(entry.skipped_keys.values().all(|(k, _)| *k == [0u8; 32]));
+    assert!(!bob.wipe_member(&make_node_id(9)), "an unknown member reports false");
+    bob.remove_member(&alice_id);
+    assert!(!bob.has_member(&alice_id));
+}
