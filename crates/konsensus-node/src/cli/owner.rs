@@ -276,6 +276,22 @@ pub fn terminal_safe(text: &str) -> String {
         .collect()
 }
 
+/// Preserve JSON values while escaping terminal-sensitive Unicode.
+fn terminal_json(value: &serde_json::Value) -> Result<String, serde_json::Error> {
+    Ok(serde_json::to_string(value)?
+        .chars()
+        .map(|c| {
+            let invisible = matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}');
+            if c.is_control() || invisible {
+                format!("\\u{:04x}", u32::from(c))
+            } else {
+                c.to_string()
+            }
+        })
+        .collect())
+}
+
 /// `println!` for lines that carry control-socket text: the whole line goes
 /// through [`terminal_safe`].
 macro_rules! safe_println {
@@ -289,17 +305,7 @@ fn report(resp: ControlResponse) -> Result<()> {
             println!("{}", terminal_safe(&detail));
             Ok(())
         }
-        ControlResponse::Error { message } => {
-            if message
-                .split_once(':')
-                .is_some_and(|(code, _)| code == control::MALFORMED_CONTROL_REQUEST)
-            {
-                anyhow::bail!(
-                    "refused: malformed_control_request: invalid control request; check that the owner CLI and node versions match"
-                );
-            }
-            anyhow::bail!("refused: {}", terminal_safe(&message))
-        }
+        ControlResponse::Error { message } => Err(control_error(&message)),
         other => {
             println!("{}", serde_json::to_string_pretty(&other)?);
             Ok(())
@@ -307,11 +313,28 @@ fn report(resp: ControlResponse) -> Result<()> {
     }
 }
 
+/// The error for a node's error response. A shutdown interrupt is an unknown
+/// outcome, not a refusal, so it carries no "refused:" label.
+fn control_error(message: &str) -> anyhow::Error {
+    if message.starts_with("node_stopping:") {
+        return anyhow::anyhow!("{}", terminal_safe(message));
+    }
+    if message
+        .split_once(':')
+        .is_some_and(|(code, _)| code == control::MALFORMED_CONTROL_REQUEST)
+    {
+        return anyhow::anyhow!(
+            "refused: malformed_control_request: invalid control request; check that the owner CLI and node versions match"
+        );
+    }
+    anyhow::anyhow!("refused: {}", terminal_safe(message))
+}
+
 /// `konsensus lock-status` — JSON for local monitors, without a control envelope.
 pub async fn cmd_lock_status(config_path: &Path) -> Result<()> {
     match send(config_path, ControlRequest::LockStatus {}).await? {
         ControlResponse::LockStatus { status } => {
-            println!("{}", serde_json::to_string(&status)?);
+            println!("{}", terminal_json(&status)?);
             Ok(())
         }
         error @ ControlResponse::Error { .. } => report(error),
@@ -459,14 +482,20 @@ struct Described {
 }
 
 async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
-    match send(
-        config_path,
-        ControlRequest::Describe {
-            op_id: op_id.to_string(),
-        },
+    described(
+        send(
+            config_path,
+            ControlRequest::Describe {
+                op_id: op_id.to_string(),
+            },
+        )
+        .await?,
     )
-    .await?
-    {
+}
+
+/// The node's answer to a describe request.
+fn described(resp: ControlResponse) -> Result<Described> {
+    match resp {
         ControlResponse::Describe {
             summary,
             confirmation_label,
@@ -480,7 +509,7 @@ async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
             front_door,
             device,
         }),
-        ControlResponse::Error { message } => anyhow::bail!("refused: {}", terminal_safe(&message)),
+        ControlResponse::Error { message } => Err(control_error(&message)),
         other => anyhow::bail!("unexpected control response: {other:?}"),
     }
 }
@@ -2135,6 +2164,26 @@ mod startup_tests {
             (t.budget_msat, t.per_call_max_msat, t.ttl_secs),
             (50_000, 50_000, 1800)
         );
+    }
+
+    #[test]
+    fn describe_reports_a_shutdown_interrupt_as_report_does() {
+        let message = "node_stopping: the node is shutting down; the outcome is unknown";
+        let error = described(ControlResponse::Error { message: message.into() })
+            .err()
+            .expect("an error response is an error")
+            .to_string();
+        assert!(!error.starts_with("refused:"), "{error}");
+        let reported = report(ControlResponse::Error { message: message.into() })
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, reported);
+        // A real refusal keeps its label on both paths.
+        let refused = described(ControlResponse::Error { message: "unknown_op: no such operation".into() })
+            .err()
+            .expect("an error response is an error")
+            .to_string();
+        assert!(refused.starts_with("refused:"), "{refused}");
     }
 
     #[test]

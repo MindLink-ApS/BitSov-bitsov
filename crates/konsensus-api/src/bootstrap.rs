@@ -795,9 +795,9 @@ pub struct BootstrapState {
 impl BootstrapState {
     /// Build bootstrap state for `layout`, generating the ephemeral secret.
     pub fn new(layout: DataDirLayout, pairing: Arc<PairingService>) -> Self {
-        use rand::RngCore;
+        use rand::Rng;
         let mut secret = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret);
+        rand::rng().fill_bytes(&mut secret);
         Self {
             layout,
             pairing,
@@ -1646,11 +1646,13 @@ fn begin_pending(
     }
     // All inputs and the exclusive pending slot are committed before this RNG call.
     let (sas, box_nonce) = if let Some((device_key, device_name, binding)) = sas_input {
-        use rand::RngCore;
+        use rand::TryRng;
         let claim = crate::sas::load(&state.layout.data_dir)
             .map_err(|_| ceremony_error(StatusCode::CONFLICT, "claim_code_unavailable"))?;
         let mut nonce = [0; 16];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut nonce)
+            .expect("OS randomness unavailable");
         let digest = crate::sas::digest(&binding, &device_key, &nonce, &claim.commitment());
         (
             Some(PendingSas {
@@ -1675,7 +1677,7 @@ fn begin_pending(
     let node_id = identity.node_id().to_hex();
     let ceremony_id = uuid::Uuid::new_v4().simple().to_string();
     let mut indices: Vec<usize> = (0..mnemonic.split_whitespace().count()).collect();
-    indices.shuffle(&mut rand::thread_rng());
+    indices.shuffle(&mut rand::rng());
     let backup_check = [indices[0], indices[1], indices[2]];
     *slot = Some(PendingIdentity {
         ceremony_id: ceremony_id.clone(),

@@ -24,7 +24,7 @@ use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use konsensus_core::introduction::{
@@ -291,7 +291,7 @@ pub(crate) async fn issue_card(state: &AppState) -> Result<Introduction, ApiErro
         .map_err(|e| crate::error::pricing_error_or(e, |e| ApiError::Internal(format!("price unavailable: {e}"))))?;
     let (admission_msat, message_msat) = first_contact_prices(chat, state.gate.min_admission_cost_msat());
     let mut intro_id = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut intro_id);
+    rand::rng().fill_bytes(&mut intro_id);
     let card = Introduction::issue(
         &state.identity,
         IntroductionFields {
