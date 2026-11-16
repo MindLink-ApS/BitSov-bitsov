@@ -30,11 +30,10 @@ async fn porch_room_compose_refuses_page_and_manifest_kinds_before_payment() {
         state.invoice_requests.clone(),
     ));
     Arc::get_mut(&mut state).unwrap().transport = transport.clone();
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(member, "02aaaa".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        member,
+        konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)),
+    );
     let room = Room::new("porch-refusal".into(), *state.identity.node_id());
     state.storage.create_room(&room).await.unwrap();
     state
@@ -930,6 +929,7 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -963,8 +963,14 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
     // is taken for both members.
     {
         let mut pks = state.peer_ln_pubkeys.lock().await;
-        pks.insert(member_a, "02aaaa".repeat(5));
-        pks.insert(member_b, "02bbbb".repeat(5));
+        pks.insert(
+            member_a,
+            konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)),
+        );
+        pks.insert(
+            member_b,
+            konsensus_api::state::PeerLightningKey::Verified("02bbbb".repeat(5)),
+        );
     }
 
     // ── Announce per-member price tables with distinct base + discount ──
@@ -1100,7 +1106,7 @@ async fn room_compose_without_a_chain_tip_pays_nothing() {
         .peer_ln_pubkeys
         .lock()
         .await
-        .insert(member, "02aaaa".repeat(5));
+        .insert(member, konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)));
     let room = Room::new("tip-down".into(), *state.identity.node_id());
     state.storage.create_room(&room).await.unwrap();
     state

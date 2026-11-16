@@ -84,9 +84,16 @@ jobs:
               - 'Cargo.lock'
               - '**/Cargo.lock'
               - '.cargo/audit.toml'
+              - '.cargo/waiver-deadlines.toml'
+              - 'deny.toml'
+              - 'osv-scanner.toml'
               - 'SECURITY.md'
               - 'scripts/check-security-key.sh'
               - 'scripts/test-security-key.sh'
+              - 'scripts/check-waiver-deadlines.py'
+              - 'scripts/test-waiver-deadlines.py'
+              - 'scripts/security-report-status.sh'
+              - 'scripts/test-security-report-status.sh'
               - '.github/workflows/ci.yml'
               - '.github/workflows/security-scan.yml'
 
@@ -300,6 +307,12 @@ jobs:
 
       - name: Security key ↔ policy consistency
         run: bash scripts/test-security-key.sh && bash scripts/check-security-key.sh
+
+      - name: Advisory waiver deadlines
+        run: python3 scripts/test-waiver-deadlines.py && python3 scripts/check-waiver-deadlines.py
+
+      - name: Security report status
+        run: bash scripts/test-security-report-status.sh
 
       - name: Read Rust toolchain pin
         id: rust-toolchain

@@ -277,6 +277,23 @@ async fn the_confirmed_amount_caps_the_whole_first_contact() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_confirmation_alone_is_the_cap_for_a_paired_first_contact() {
+    // A first contact without max_total_msat is refused for the owner's key, but a
+    // paired caller's one-time confirmation is its cap, so the same request
+    // without a cap pays once.
+    let s = stranger(2000).await;
+    let token = s.fx.grant(None, GrantTerms::new(10_000)).await;
+    let (status, _) = s.confirm(&token, &s.peer, 4000).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = s.send(&token, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["amount_msat"], 4000, "admission + message under the confirmed cap");
+    assert_eq!(s.spent().await, 4000);
+    assert_eq!(s.fx.used(), 4000, "one debit");
+    assert_eq!(s.invoices.load(Ordering::SeqCst), 2, "one admission and one message invoice");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_confirmation_must_fit_the_budget_grant() {
     let s = stranger(2000).await;
     let token = s

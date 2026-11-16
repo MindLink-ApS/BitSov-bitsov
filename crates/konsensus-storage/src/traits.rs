@@ -7,7 +7,7 @@ use konsensus_core::{
     OperatorHostingPayment, Recipient, RoomId, UkmEnvelope,
 };
 
-use crate::calendar::{CalendarEventRecord, RsvpRecord};
+use crate::calendar::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
 use crate::error::StorageError;
 use crate::invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,
@@ -42,6 +42,31 @@ pub(crate) fn deferral_now_ms() -> i64 {
         .map(|d| d.as_millis().min(i64::MAX as u128) as i64).unwrap_or(0)
 }
 
+/// Device-delivery outcome stored in the existing immutable payment receipt.
+/// Negative values cannot be mistaken for ordinary paid acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallInviteOutcome { Pending, Fetched, NotReachable }
+
+impl CallInviteOutcome {
+    pub(crate) fn stored(self) -> i32 {
+        match self { Self::Pending => -2, Self::Fetched => 1, Self::NotReachable => -3 }
+    }
+    pub(crate) fn from_stored(value: i32) -> Option<Self> {
+        match value { -2 => Some(Self::Pending), 1 => Some(Self::Fetched), -3 => Some(Self::NotReachable), _ => None }
+    }
+}
+
+/// How a device wait's expiry resolved against delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallInviteExpiry {
+    /// Not delivered: marked not reachable, held, and its awaiting row ended.
+    Expired,
+    /// A device delivery committed first: the call is ringing or live.
+    Delivered,
+    /// Neither: the call moved on without a delivery. Nothing was written.
+    Gone,
+}
+
 /// Backend-agnostic storage interface for UKM envelopes, rooms, peers, and nonces.
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -58,6 +83,49 @@ pub trait Storage: Send + Sync {
     }
     async fn record_upgrade_replace(&self, _table: crate::record_upgrade::RecordTable, _old: &crate::record_upgrade::RecordRow, _new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("record format upgrade".into()))
+    }
+
+    /// Exact immutable receipt binding; timestamp/signature renewal is allowed.
+    async fn call_invite_outcome(&self, _envelope: &UkmEnvelope) -> Result<Option<CallInviteOutcome>, StorageError> {
+        Ok(None)
+    }
+
+    /// Update an existing paid invite's outcome without inserting replay keys.
+    async fn call_invite_set_outcome(&self, _id: &MessageId, _peer: &NodeId, _outcome: CallInviteOutcome) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call invite outcome".into()))
+    }
+
+    /// Record a device delivery atomically: the invite's receipt becomes
+    /// `Fetched` and its call row is written in one transaction, so no reader
+    /// and no restart can observe one without the other.
+    async fn call_invite_deliver(&self, _id: &MessageId, _peer: &NodeId, _call_id: &str, _entry: &konsensus_core::payloads::call::CallEntry) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call invite delivery".into()))
+    }
+
+    /// Record `offer` as the caller's current paid offer for this call row.
+    async fn call_offer_bind(&self, _peer: &NodeId, _call_id: &str, _offer: &MessageId) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call offer binding".into()))
+    }
+
+    /// The caller's current paid offer for this call row, if bound.
+    async fn call_offer(&self, _peer: &NodeId, _call_id: &str) -> Result<Option<MessageId>, StorageError> {
+        Ok(None)
+    }
+
+    /// Expire a device wait atomically against delivery: only while the
+    /// invite's receipt is still pending (or already not reachable, on a
+    /// retry) mark it not reachable, re-hold the envelope and end the
+    /// awaiting row of this generation (`deadline_ms`). Writes nothing when a
+    /// delivery committed first, or the call moved on without one.
+    async fn call_invite_expire(&self, _id: &MessageId, _peer: &NodeId, _call_id: &str, _deadline_ms: u64) -> Result<CallInviteExpiry, StorageError> {
+        Err(StorageError::Unsupported("call invite expiry".into()))
+    }
+
+    /// Startup: withdraw at most `max` pending device waits, retaining refusals.
+    /// Returns each withdrawn invite (message id, caller) so the caller can
+    /// be told it is not reachable instead of waiting out its answer window.
+    async fn call_invite_recover(&self, _max: u32) -> Result<Vec<(MessageId, NodeId)>, StorageError> {
+        Ok(Vec::new())
     }
 
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
@@ -347,6 +415,20 @@ pub trait Storage: Send + Sync {
     /// ciphertext; backends compare the validated ID and immutable metadata.
     async fn accept_paid_envelope(&self, _envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
         Err(StorageError::Unsupported("accept_paid_envelope".into()))
+    }
+
+    /// Paid acceptance for a kind that is held before acceptance (call
+    /// signals, room chats, calendar). Identical to `accept_paid_envelope`,
+    /// except that a FRESH acceptance requires the envelope's admission hold to
+    /// exist, checked inside the acceptance transaction (hold-first row lock on
+    /// PostgreSQL; under the writer lock on SQLite). A hold the sweep already
+    /// withdrew therefore cannot be followed by an unheld acceptance: the
+    /// acceptance fails with `NotFound` and nothing is written, and the
+    /// sender's retry places a fresh hold. A replay of an already accepted
+    /// envelope needs no hold. Backends with holds must override this; the
+    /// default is for backends without holds.
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
+        self.accept_paid_envelope(envelope).await
     }
 
     /// Exact, previously accepted proof subsequently rejected by the application.
@@ -1000,6 +1082,24 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Admit an accepted inbound calendar envelope: in one transaction, require
+    /// its live admission hold, check that the envelope is stored for this
+    /// sender, persist its event (upsert by id) or RSVP (upsert by
+    /// `(event_id, responder)`) or nothing (`Opaque`, an undecryptable
+    /// envelope), and consume exactly that one hold. Rolls back on any failure, so the envelope either has
+    /// its mutation and is visible, or stays held (hidden, withdrawn by the
+    /// sweep) with no mutation. An envelope that is not stored is refused with
+    /// `NotFound` and nothing is written.
+    async fn commit_calendar_admission(
+        &self,
+        _envelope: &konsensus_core::UkmEnvelope,
+        _admission: &CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported(
+            "calendar storage not implemented for this backend".into(),
+        ))
+    }
+
     /// Return all recurring master events (recurrence_json IS NOT NULL, parent_id IS NULL).
     ///
     /// HARD-4: correctness-complete. The calendar view expands every master into
@@ -1216,6 +1316,32 @@ pub trait Storage: Send + Sync {
     // ── 1:1 call state (kinds 400-403) ─────────────────────────────────
     // Defaults refuse: a backend without durable call state cannot take calls.
 
+    /// Append an armed attachment record and return its durable, never-reused generation.
+    async fn call_media_publish(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<u64, StorageError> {
+        Err(StorageError::Unsupported("call media journal".into()))
+    }
+
+    /// Latest published generation, including across process restarts.
+    async fn call_media_generation(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<Option<u64>, StorageError> {
+        Ok(None)
+    }
+
+    /// Whether this call id remains pinned by unresolved media recovery.
+    async fn call_media_has_pending(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
+    /// Append policy or completion evidence; never overwrite the armed attachment.
+    async fn call_media_record_detach(&self, _intent: &crate::call_media::PendingMediaDetach, _completed: bool) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("call media journal".into()))
+    }
+
+    /// Page unresolved current attachments in generation order. Includes armed
+    /// attachments whose process may have died before recording a detach.
+    async fn call_media_pending(&self, _after: u64, _max: u32) -> Result<Vec<crate::call_media::PendingMediaDetach>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// The stored state of `(peer, call_id)`, as written (not yet aged).
     async fn call_get(&self, _peer: &konsensus_core::NodeId, _call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         Err(StorageError::Unsupported("call state".into()))
@@ -1291,6 +1417,12 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Unsupported("call block invoice provenance".into()))
     }
 
+    /// Awaiting-device rows for startup recovery, bounded by call admission.
+    /// Returns raw rows, including expired ones; recovery ends them all.
+    async fn call_awaiting(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        Ok(Vec::new())
+    }
+
     /// Reclaim stale ended reservations and drop up to `max` expired tombstones.
     /// Also prune up to `max` invoice bindings past their call's resume window.
     async fn call_sweep(&self, _now_ms: u64, _max: u32) -> Result<u64, StorageError> {
@@ -1309,9 +1441,25 @@ pub trait Storage: Send + Sync {
     // ── Incoming call signal admission hold (review delta2 #4) ──────────
     // A held message is invisible to history, resync and duplicate ACKs.
 
+    /// Whether `envelope` is a replay of a paid envelope this node accepted and
+    /// then refused at the application (`reject_accepted_envelope`, or the hold
+    /// sweep): its receipt is bound to this exact id and sender with
+    /// `accepted = -1`. The receive loop answers such a replay with a terminal
+    /// application rejection instead of a payment-reuse reason, which an older
+    /// sender would read as a legacy acknowledgement.
+    async fn is_application_rejected(&self, _envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
+        Ok(false)
+    }
+
     /// Hold `envelope` before its paid acceptance, unless a message with its
     /// id is already stored. Returns whether this call placed the hold.
     async fn call_admission_hold(&self, _envelope: &konsensus_core::UkmEnvelope, _now_ms: u64) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("call admission hold".into()))
+    }
+
+    /// Hide an already-stored refused invite durably before physical cleanup.
+    /// Reuses the admission hold and makes it eligible for the existing sweep.
+    async fn call_admission_rehold(&self, _envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
         Err(StorageError::Unsupported("call admission hold".into()))
     }
 

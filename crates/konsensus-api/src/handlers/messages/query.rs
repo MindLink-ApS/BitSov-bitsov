@@ -162,9 +162,20 @@ impl MessageResponse {
     }
 }
 
+/// Inspection by an owner token or an internal reader is not device receipt.
+/// Whether the paired device may be handed `envelope`: false for a waiting
+/// invite whose delivery could not start ringing (e.g. its wait expired).
+async fn device_fetched(auth: &ScopedAuth<Read>, state: &AppState, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, ApiError> {
+    if auth.pairing.is_some() && auth.node_id == state.identity.node_id().to_hex() {
+        return state.call_devices.fetched(state.storage.as_ref(), envelope, crate::calls::now_ms).await
+            .map_err(|e| ApiError::Storage(e.to_string()));
+    }
+    Ok(true)
+}
+
 /// `GET /api/v1/messages/:id` — get a specific message.
 pub(super) async fn get_message(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(id_hex): Path<String>,
 ) -> Result<Json<MessageResponse>, ApiError> {
@@ -185,6 +196,9 @@ pub(super) async fn get_message(
         .unwrap_or(None);
 
     let cipher = state.plaintext_cipher.as_deref();
+    if !device_fetched(&auth, &state, &envelope).await? {
+        return Err(ApiError::Conflict("call invite is no longer deliverable".into()));
+    }
     Ok(Json(MessageResponse::from_envelope(&envelope).with_cached_plaintext(cached, cipher)))
 }
 
@@ -195,7 +209,7 @@ pub(super) async fn get_message(
 /// derived key. Returns 404 if no cached plaintext exists (e.g., the message
 /// could not be decrypted on receive, or predates the plaintext cache).
 pub(super) async fn get_message_plaintext(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Path(id_hex): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -235,6 +249,13 @@ pub(super) async fn get_message_plaintext(
         }
     };
 
+    // Cached plaintext is only served with its message: a withdrawn invite
+    // (e.g. expired not reachable) must not leak out through this path.
+    let envelope = state.storage.get_message(&id).await.map_err(|e| ApiError::Storage(e.to_string()))?
+        .ok_or_else(|| ApiError::NotFound(format!("message {id_hex} not found")))?;
+    if !device_fetched(&auth, &state, &envelope).await? {
+        return Err(ApiError::Conflict("call invite is no longer deliverable".into()));
+    }
     Ok(Json(content))
 }
 
@@ -251,7 +272,7 @@ pub(super) async fn get_message_plaintext(
 /// `BitSov-Data-As-Of` is the time the message store was read for this
 /// response (the store is local and authoritative, so normally "now").
 pub(super) async fn list_messages(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListMessagesQuery>,
 ) -> Result<(DataFreshness, ListDiagnostics, Json<Vec<MessageResponse>>), ApiError> {
@@ -321,6 +342,26 @@ pub(super) async fn list_messages(
         responses.push(resp);
     }
 
+    // Mark device delivery only once the whole response is built, so a later
+    // item's failure can never leave earlier invites ringing but unreturned.
+    // An invite whose delivery did not commit is left out: returning it would
+    // hand the device a call it cannot answer. It stays awaiting, so the next
+    // listing retries it; other items are unaffected.
+    let mut undelivered = std::collections::HashSet::new();
+    for env in &messages.items {
+        match device_fetched(&auth, &state, env).await {
+            Ok(true) => {}
+            Ok(false) => { undelivered.insert(env.id); }
+            Err(error) => {
+                tracing::warn!(msg_id = %env.id, ?error, "listed call invite not marked delivered; withheld");
+                undelivered.insert(env.id);
+            }
+        }
+    }
+    let responses = messages.items.iter().zip(responses)
+        .filter(|(env, _)| !undelivered.contains(&env.id))
+        .map(|(_, resp)| resp)
+        .collect::<Vec<_>>();
     Ok((store_read, diagnostics, Json(responses)))
 }
 
@@ -448,7 +489,7 @@ fn search_snippet(text: &str, needle_lower: &str, ctx: usize) -> String {
 /// are silently skipped. Without `peer`, searches received messages (mirrors
 /// `list_messages`); with `peer`, searches that conversation.
 pub(super) async fn search_messages(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchMessagesQuery>,
 ) -> Result<(ListDiagnostics, Json<Vec<SearchResult>>), ApiError> {
@@ -497,6 +538,7 @@ pub(super) async fn search_messages(
     let limit = clamp_limit(params.limit) as usize;
     let mut diagnostics = ListDiagnostics::from(&messages);
     let mut results = Vec::new();
+    let mut matched = Vec::new();
     for env in &messages.items {
         if results.len() >= limit {
             diagnostics.next_before = results.last().map(|last: &SearchResult| konsensus_storage::ListCursor {
@@ -517,6 +559,7 @@ pub(super) async fn search_messages(
             Err(_) => continue, // binary content — not text-searchable
         };
         if text.to_lowercase().contains(&needle_lower) {
+            matched.push(env);
             let recipient_str = match &env.recipient {
                 Recipient::Node(id) => id.to_hex(),
                 Recipient::Room(id) => id.to_string(),
@@ -533,6 +576,21 @@ pub(super) async fn search_messages(
         }
     }
 
+    // A paired device sees a call invite here only as it would in a listing:
+    // its delivery is recorded (starting the ring), and one that cannot
+    // ring any more is withheld rather than handed out.
+    let mut undelivered = std::collections::HashSet::new();
+    for env in matched {
+        match device_fetched(&auth, &state, env).await {
+            Ok(true) => {}
+            Ok(false) => { undelivered.insert(env.id.to_hex()); }
+            Err(error) => {
+                tracing::warn!(msg_id = %env.id, ?error, "searched call invite not marked delivered; withheld");
+                undelivered.insert(env.id.to_hex());
+            }
+        }
+    }
+    results.retain(|r| !undelivered.contains(&r.id));
     Ok((diagnostics, Json(results)))
 }
 

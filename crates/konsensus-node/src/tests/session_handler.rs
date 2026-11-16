@@ -117,81 +117,247 @@ async fn progress_event_persisted_and_replayable() {
     assert_eq!(state.current_step, "waiting_for_inviter_channel");
 }
 
+type PeerLnKeys = Arc<tokio::sync::Mutex<std::collections::HashMap<NodeId, PeerLightningKey>>>;
+
+fn empty_peer_ln_keys() -> PeerLnKeys {
+    Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn signing_peer() -> (NodeIdentity, NodeId) {
+    let (_, identity) = NodeIdentity::generate().unwrap();
+    let id = *identity.node_id();
+    (identity, id)
+}
+
 #[tokio::test]
-async fn lightning_info_stores_valid_pubkey() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+async fn lightning_info_stores_identity_signed_pubkey() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
-    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &pubkeys).await;
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
 
+    assert_eq!(verified.as_deref(), Some(valid_ln_pubkey().as_str()));
     let map = pubkeys.lock().await;
-    assert!(map.contains_key(&peer_id));
-    assert_eq!(map[&peer_id], valid_ln_pubkey());
+    assert_eq!(map[&peer_id], PeerLightningKey::Verified(valid_ln_pubkey()));
+}
+
+#[tokio::test]
+async fn lightning_info_unsigned_is_recorded_but_never_verified() {
+    // An older peer advertises its key without a signature: the entry says so
+    // and the key is not handed to the inviter record or auto-channel opener.
+    let peer_id = test_peer_id();
+    let pubkeys = empty_peer_ln_keys();
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &[], &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
+}
+
+#[tokio::test]
+async fn lightning_info_unsigned_replaces_earlier_verified_binding() {
+    // A peer that stops signing (downgrade) is no longer paid at the old key.
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &[], &pubkeys).await;
+
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
+}
+
+#[tokio::test]
+async fn lightning_info_rejects_tampered_signature() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let mut sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    sig[3] ^= 0x80;
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_rejects_signature_for_a_different_key() {
+    // A valid signature over one key does not vouch for another (mismatch).
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let other = "03abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
+    let sig = lightning_binding::sign(&identity, other).unwrap();
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_rejects_signature_by_another_identity() {
+    // Signed by someone who is not the connected peer.
+    let (other_identity, _) = signing_peer();
+    let peer_id = test_peer_id();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&other_identity, &valid_ln_pubkey()).unwrap();
+
+    let verified =
+        handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    assert!(verified.is_none());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_bad_signature_replaces_previous_binding_with_unsigned() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &sig, &pubkeys).await;
+
+    let other = "03abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
+    let mut bad = lightning_binding::sign(&identity, other).unwrap();
+    bad[0] ^= 0x01;
+    handle_lightning_info_received(&peer_id, other, &bad, &pubkeys).await;
+
+    // The peer's own session announced a key we cannot accept: it no longer
+    // stands behind the verified one, so neither key is paid.
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
 }
 
 #[tokio::test]
 async fn lightning_info_rejects_short_pubkey() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
-    handle_lightning_info_received(&peer_id, "02abcdef", &pubkeys).await;
+    handle_lightning_info_received(&peer_id, "02abcdef", &sig, &pubkeys).await;
 
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
 async fn lightning_info_rejects_wrong_prefix() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
     // Starts with 04 (uncompressed) — invalid.
     let bad_pk = "04abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
-    handle_lightning_info_received(&peer_id, bad_pk, &pubkeys).await;
+    handle_lightning_info_received(&peer_id, bad_pk, &sig, &pubkeys).await;
 
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
 async fn lightning_info_rejects_invalid_hex() {
-    let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let sig = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
 
     // Correct length but contains non-hex character 'zz'.
     let bad_pk = "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef123456zzab";
-    handle_lightning_info_received(&peer_id, bad_pk, &pubkeys).await;
+    handle_lightning_info_received(&peer_id, bad_pk, &sig, &pubkeys).await;
 
-    assert!(pubkeys.lock().await.is_empty());
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
 }
 
 #[tokio::test]
-async fn lightning_info_updates_on_reconnect() {
+async fn lightning_info_malformed_unsigned_key_is_recorded_unpayable() {
+    // A malformed key, signed or not, is recorded as unpayable rather than absent.
     let peer_id = test_peer_id();
-    let pubkeys = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<
-        NodeId,
-        String,
-    >::new()));
+    let pubkeys = empty_peer_ln_keys();
+
+    handle_lightning_info_received(&peer_id, "02abcdef", &[], &pubkeys).await;
+
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Unsigned),
+        "a key we could not accept is recorded as unpayable, never left absent (absent means the unbound invoice path)"
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_rotation_with_new_signature_updates_binding() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
 
     let pk1 = "02abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
     let pk2 = "03abcdef1234567890abcdef1234567890abcdef1234567890abcdef12345678ab";
 
-    handle_lightning_info_received(&peer_id, pk1, &pubkeys).await;
-    assert_eq!(pubkeys.lock().await[&peer_id], pk1);
+    let sig1 = lightning_binding::sign(&identity, pk1).unwrap();
+    handle_lightning_info_received(&peer_id, pk1, &sig1, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(pk1.into())
+    );
 
-    // Peer reconnects with new Lightning node — pubkey is updated.
-    handle_lightning_info_received(&peer_id, pk2, &pubkeys).await;
-    assert_eq!(pubkeys.lock().await[&peer_id], pk2);
+    // Peer moves to a new Lightning node and signs the new key: binding follows.
+    let sig2 = lightning_binding::sign(&identity, pk2).unwrap();
+    handle_lightning_info_received(&peer_id, pk2, &sig2, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(pk2.into())
+    );
+
+    // The old signature does not vouch for the new key (mismatch): the peer's
+    // latest announcement is not accepted, so it is not paid at either key.
+    handle_lightning_info_received(&peer_id, pk2, &sig1, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await[&peer_id], PeerLightningKey::Unsigned);
+
+    // Policy: the latest announcement that verifies wins. A complete earlier
+    // announcement (old key with its own signature) is still a key this
+    // identity signed, so it is accepted again. Announcements only travel
+    // over the peer's own authenticated session, so this is the peer moving
+    // back, not a third party rolling it back; the binding carries no
+    // freshness and claims none.
+    handle_lightning_info_received(&peer_id, pk1, &sig1, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await[&peer_id],
+        PeerLightningKey::Verified(pk1.into())
+    );
+}
+
+#[tokio::test]
+async fn lightning_info_stores_canonical_lowercase_key() {
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let upper = valid_ln_pubkey().to_ascii_uppercase();
+    let sig = lightning_binding::sign(&identity, &upper).unwrap();
+
+    let verified = handle_lightning_info_received(&peer_id, &upper, &sig, &pubkeys).await;
+
+    assert_eq!(verified.as_deref(), Some(valid_ln_pubkey().as_str()));
 }
 
 // ── Invoice response handler tests ──────────────────────────
@@ -2853,6 +3019,7 @@ fn demo_pre_payment_frames_count_without_retaining_strangers() {
                     peer_id,
                     ln_pubkey: "private-ln-key".into(),
                     ln_addr: Some("192.0.2.123:9735".into()),
+                    identity_sig: vec![],
                     privileged,
                 },
                 ControlEvent::PeerExchangeRequested {
@@ -3079,6 +3246,7 @@ async fn definitive_paid_rejects_are_terminal_and_transient_rejects_back_off() {
         "insufficient payment: required 2000 msat, got 1000 msat",
         "recipient mismatch: envelope addressed to a, this node is b",
         "invalid signature: bad signature",
+        "call_not_reachable", // A refused device wait is final; resends only repeat it.
         "storage error",
         "lightning verification failed: offline",
         "session_handover: retry the existing operation",
@@ -3662,6 +3830,7 @@ async fn recovery_announces_lightning_once_only_to_privileged_connected_peers() 
     let mut was_ready = false;
     refresh_recovered_lightning(
         &mut was_ready,
+        b.as_ref(),
         &target,
         &lightning,
         &None,
@@ -3674,11 +3843,21 @@ async fn recovery_announces_lightning_once_only_to_privileged_connected_peers() 
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        matches!(event, ControlEvent::LightningInfoReceived { ln_pubkey, .. } if ln_pubkey == expected)
-    );
+    match event {
+        ControlEvent::LightningInfoReceived {
+            ln_pubkey,
+            identity_sig,
+            ..
+        } => {
+            assert_eq!(ln_pubkey, expected);
+            // The announcement is bound to our identity so the peer can pay it.
+            lightning_binding::verify(b.node_id(), &ln_pubkey, &identity_sig).unwrap();
+        }
+        other => panic!("expected LightningInfoReceived, got {other:?}"),
+    }
     refresh_recovered_lightning(
         &mut was_ready,
+        b.as_ref(),
         &target,
         &lightning,
         &None,
@@ -5629,6 +5808,141 @@ async fn review_regression_expiry_retries_run_before_slow_status_scan() {
     assert!(wallet.inner.list_payments(500).await.unwrap().is_empty());
 }
 
+/// A peer's calendar refusal consumed the payment proof and withdrew the
+/// envelope, so the sender must treat it as terminal: `failed_paid`, no resend,
+/// and no later ACK or reused-proof compatibility path may report delivery.
+/// The reasons are built by the receive side's own formatter.
+#[tokio::test]
+async fn calendar_refusals_are_terminal_and_never_deliver_later() {
+    use konsensus_core::payloads::calendar::CalendarPayloadError;
+    use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
+    let refusals = [
+        CalendarPayloadError::TooLarge {
+            actual: 70_000,
+            max: 65_536,
+        },
+        CalendarPayloadError::FieldTooLong {
+            field: "title",
+            max: 512,
+        },
+        CalendarPayloadError::TooManyEntries {
+            field: "attendees",
+            max: 100,
+        },
+        CalendarPayloadError::RecurrenceTooLarge {
+            estimated: 5_001,
+            max: 5_000,
+        },
+        CalendarPayloadError::RecurrenceInvalid("interval must be at least 1"),
+        CalendarPayloadError::TimestampOutOfRange { field: "until" },
+        CalendarPayloadError::Malformed,
+    ];
+    assert_eq!(refusals.len(), CalendarPayloadError::CODES.len());
+    let mut reasons: Vec<String> = refusals
+        .iter()
+        .map(|refusal| {
+            // The bare code without the separator is not a refusal line.
+            assert!(!terminal_paid_rejection(refusal.code()));
+            assert!(!terminal_paid_rejection(&format!("{}x: y", refusal.code())));
+            crate::msg_handler::calendar_reject_reason(refusal)
+        })
+        .collect();
+    // The reject frame was lost and the sender retried: the recipient answers
+    // the replay of a withdrawn envelope with this reason instead of a
+    // payment-reuse one, which the compatibility path below would take as an
+    // acknowledgement.
+    reasons.push(crate::msg_handler::application_rejected_reason());
+    assert!(!terminal_paid_rejection("application_rejected"));
+    for reason in reasons {
+        assert!(terminal_paid_rejection(&reason), "{reason}");
+
+        let mut limits = DeliveryConfirmationBudget::default();
+        let own = make_peer_id(71);
+        let peer = make_peer_id(72);
+        let db = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+        let storage: Arc<dyn Storage> = db.clone();
+        let routing = konsensus_routing::RoutingTable::new(Default::default());
+        let timestamps = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let (ws, mut updates) = broadcast::channel(16);
+        let dir = tempfile::tempdir().unwrap();
+        let audit = AuditLog::open(dir.path().join("audit.jsonl")).unwrap();
+        let env = UkmEnvelopeBuilder::new(
+            konsensus_core::kind::KIND_CALENDAR_EVENT,
+            own,
+            Recipient::Node(peer),
+            vec![1],
+            PaymentProof::new(sha2::Sha256::digest([5; 32]).into(), [5; 32], 1000),
+        )
+        .build();
+        db.store_message(&env).await.unwrap();
+        db.prepare_delivery(&env.id, &peer).await.unwrap();
+
+        handle_delivery_confirmation(
+            &peer,
+            &env.id,
+            Some(&reason),
+            false,
+            &own,
+            &storage,
+            &timestamps,
+            &routing,
+            &ws,
+            &audit,
+            &mut limits, None,
+        )
+        .await;
+        let update = updates.try_recv().unwrap();
+        assert_eq!(update.status, "failed_paid", "{reason}");
+        assert_eq!(update.reason.as_deref(), Some(reason.as_str()));
+        let (state, attempts): (String, i64) =
+            sqlx::query_as("SELECT state, attempts FROM pending_deliveries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((state.as_str(), attempts), ("failed_paid", 1));
+        assert!(
+            db.get_pending_for_peer(&peer).await.unwrap().is_empty(),
+            "no resend after a calendar refusal: {reason}"
+        );
+        db.cleanup_stale_pending(1).await.unwrap();
+        assert!(db.get_pending_for_peer(&peer).await.unwrap().is_empty());
+        assert!(
+            db.mark_pending_sent(&env.id, &peer).await.is_err(),
+            "a stale flusher snapshot cannot resend a refused calendar payload"
+        );
+
+        // A later plain ACK and a later reused-proof compatibility reply for
+        // the same id must not turn the withdrawn message into a delivery.
+        for later in [None, Some("replay detected: nonce already used")] {
+            handle_delivery_confirmation(
+                &peer,
+                &env.id,
+                later,
+                false,
+                &own,
+                &storage,
+                &timestamps,
+                &routing,
+                &ws,
+                &audit,
+                &mut limits, None,
+            )
+            .await;
+            assert!(
+                updates.try_recv().is_err(),
+                "late {later:?} after a calendar refusal must emit nothing"
+            );
+            let state: String = sqlx::query_scalar("SELECT state FROM pending_deliveries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(state, "failed_paid");
+        }
+        assert!(!db.acknowledge_pending(&env.id, &peer, &own).await.unwrap());
+        assert!(routing.get_peer_weight(&peer).await.is_none());
+    }
+}
+
 // ── Validate before replace ─────────────────────────────────────────
 
 /// Two identities with an established, bidirectional E2EE session, returned
@@ -6305,7 +6619,7 @@ async fn call_block_invoice_near_deadline_is_refused_without_payment() {
     let peer = test_peer_id();
     let id = "0123456789abcdef0123456789abcdef";
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap().device_fetched(now - 16_000).unwrap();
     let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
     let live = calls::commit(pending, "answer", now - 16_000).unwrap();
     storage.call_put(&peer, id, &live).await.unwrap();
@@ -6426,7 +6740,7 @@ async fn call_block_invoice_is_refused_without_a_session() {
     let peer = test_peer_id();
     let id = "0123456789abcdef0123456789abcdef";
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap().device_fetched(now - 16_000).unwrap();
     let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
     let live = calls::commit(pending, "answer", now - 16_000).unwrap();
     storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
@@ -6587,7 +6901,7 @@ impl DueCallBlock {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+        let ringing = calls::receive(None, 400, None, now - 16_000).unwrap().device_fetched(now - 16_000).unwrap();
         let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
         let live = calls::commit(pending, "answer", now - 16_000).unwrap();
         storage
@@ -6771,7 +7085,7 @@ async fn call_block_invoice_at_exact_price_is_minted_without_granting_a_minute()
     let sessions = session_with(&peer).await;
     let id = "0123456789abcdef0123456789abcdef";
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let ringing = calls::receive(None, 400, None, now).unwrap();
+    let ringing = calls::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap();
     let live = calls::commit(calls::reserve(Some(ringing), 401, "answer", "hash", now).unwrap(), "answer", now).unwrap();
     storage.call_put(&peer, id, &live).await.unwrap();
     let wallet = konsensus_lightning::MockLightningProvider::new();
@@ -6801,7 +7115,7 @@ async fn call_block_invoice_refuses_lower_and_higher_amounts_without_an_invoice(
         let sessions = session_with(&peer).await;
         let id = "0123456789abcdef0123456789abcdef";
         let now = chrono::Utc::now().timestamp_millis() as u64;
-        let ringing = calls::receive(None, 400, None, now).unwrap();
+        let ringing = calls::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap();
         let live = calls::commit(calls::reserve(Some(ringing), 401, "answer", "hash", now).unwrap(), "answer", now).unwrap();
         storage.call_put(&peer, id, &live).await.unwrap();
         // A still-valid lower delivery quote must not authorize a new invoice.
@@ -6835,7 +7149,7 @@ async fn call_block_invoice_after_price_raise_refuses_the_next_block_at_the_old_
     let sessions = session_with(&peer).await;
     let id = "0123456789abcdef0123456789abcdef";
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let ringing = calls::receive(None, 400, None, now).unwrap();
+    let ringing = calls::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap();
     let live = calls::commit(calls::reserve(Some(ringing), 401, "answer", "hash", now).unwrap(), "answer", now).unwrap();
     storage.call_put(&peer, id, &live).await.unwrap();
     let wallet = konsensus_lightning::MockLightningProvider::new();
@@ -6909,7 +7223,7 @@ async fn call_block_invoice_stops_at_the_cap_before_the_wallet() {
     let peer = test_peer_id();
     let id = "0123456789abcdef0123456789abcdef";
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap();
+    let ringing = calls::receive(None, 400, None, now - 16_000).unwrap().device_fetched(now - 16_000).unwrap();
     let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 16_000).unwrap();
     let live = calls::commit(pending, "answer", now - 16_000).unwrap();
     storage.call_put(&peer, id, &calls::CallEntry { deadline_ms: now + 30_000, ..live }).await.unwrap();
@@ -7208,7 +7522,7 @@ async fn call_block_invoice_payable_floors_settle_and_pass_the_receiving_gate() 
         let sessions = session_with(&peer).await;
         let id = "0123456789abcdef0123456789abcdef";
         let now = chrono::Utc::now().timestamp_millis() as u64;
-        let live = calls::commit(calls::reserve(Some(calls::receive(None, 400, None, now).unwrap()),
+        let live = calls::commit(calls::reserve(Some(calls::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap()),
             401, "answer", "hash", now).unwrap(), "answer", now).unwrap();
         storage.call_put(&peer, id, &live).await.unwrap();
         let wallet = konsensus_lightning::MockLightningProvider::new();
@@ -7390,7 +7704,7 @@ async fn recovery_handover_refuses_block_invoice_until_ack() {
     theirs.accept_session(&NodeId::from_bytes([8; 32]), &init).await.unwrap();
     let id = "0123456789abcdef0123456789abcdef";
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let ringing = calls::receive(None, 400, None, now).unwrap();
+    let ringing = calls::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap();
     let live = calls::commit(calls::reserve(Some(ringing), 401, "answer", "hash", now).unwrap(), "answer", now).unwrap();
     storage.call_put(&peer, id, &live).await.unwrap();
     let wallet = konsensus_lightning::MockLightningProvider::new();
@@ -7601,4 +7915,142 @@ async fn legacy_unreadable_lookup_failure_retains_paid_state_and_withholds_confi
     assert_eq!(op.settled_msat, 1000);
     assert_eq!(op.last_error.as_deref(), Some(initial));
     assert_eq!(reopened.count_pending_deliveries().await.unwrap(), 1);
+}
+
+#[test]
+fn not_reachable_invite_is_a_terminal_paid_rejection() {
+    // A refused device wait is final: resending the paid invite only repeats it.
+    assert!(terminal_paid_rejection(konsensus_api::calls::devices::NOT_REACHABLE));
+    assert!(terminal_paid_rejection("call_block_overpayment"));
+    assert!(!terminal_paid_rejection("storage error"));
+}
+
+#[tokio::test]
+async fn a_rejected_key_replaces_a_verified_binding_and_never_leaves_it_absent() {
+    // First contact with a bad binding: recorded as unpayable (fail closed).
+    let (identity, peer_id) = signing_peer();
+    let pubkeys = empty_peer_ln_keys();
+    let mut bad = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    bad[0] ^= 0x01;
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &bad, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+    // A valid binding afterwards is accepted and verified.
+    let good = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    let verified = handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &good, &pubkeys).await;
+    assert!(verified.is_some());
+    assert!(matches!(pubkeys.lock().await.get(&peer_id), Some(PeerLightningKey::Verified(_))));
+    // A later bad binding replaces the verified key with an unpayable entry.
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &bad, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+    // So does a malformed key after a fresh verified binding.
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &good, &pubkeys).await;
+    assert!(matches!(pubkeys.lock().await.get(&peer_id), Some(PeerLightningKey::Verified(_))));
+    handle_lightning_info_received(&peer_id, "02abcdef", &good, &pubkeys).await;
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+}
+
+#[tokio::test]
+async fn a_peer_announcing_its_own_malformed_key_unsigned_is_no_longer_paid_at_its_verified_key() {
+    // The sending side: a backend key the node cannot vouch for goes out unsigned.
+    let (identity, peer_id) = signing_peer();
+    let malformed = "02abcdef";
+    let sig = sign_lightning_info(&identity, malformed);
+    assert!(sig.is_empty(), "a key that cannot be bound is advertised without a signature");
+
+    // The receiving side held a verified key for this peer.
+    let pubkeys = empty_peer_ln_keys();
+    let good = lightning_binding::sign(&identity, &valid_ln_pubkey()).unwrap();
+    handle_lightning_info_received(&peer_id, &valid_ln_pubkey(), &good, &pubkeys).await;
+    assert_eq!(
+        pubkeys.lock().await.get(&peer_id),
+        Some(&PeerLightningKey::Verified(valid_ln_pubkey()))
+    );
+
+    // The unsigned announcement of the malformed key ends payment at the old key.
+    assert!(handle_lightning_info_received(&peer_id, malformed, &sig, &pubkeys).await.is_none());
+    assert_eq!(pubkeys.lock().await.get(&peer_id), Some(&PeerLightningKey::Unsigned));
+}
+
+#[tokio::test]
+async fn pending_media_invoice_refuses_stopped_media_until_replacement() {
+    use konsensus_core::payloads::call as rules;
+    use konsensus_api::calls::{publish_media_attachment, stop_media_attachment, MediaDetach};
+    let storage: Arc<dyn konsensus_storage::Storage> = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let paid = rules::CallEntry {
+        side: rules::Side::Callee, phase: rules::Phase::Live, deadline_ms: now + 30_000,
+        pending: None, paid_until_ms: Some(now + 20_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    rules::validate_block_invoice(&paid, 1, now).unwrap();
+    storage.call_put(&peer, id, &paid).await.unwrap();
+    let generation = publish_media_attachment(&storage, &peer, id).await.unwrap();
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let sessions = session_with(&peer).await;
+    let purpose = format!("{}{id}:1", rules::CALL_BLOCK_INVOICE_PREFIX);
+    let mut invoices = ready_invoice_book().await;
+    prepare_call_block_invoice(storage.as_ref(), &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "active", &wallet, 0, &mut invoices).await.unwrap();
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 1);
+    let stopped = MediaDetach {
+        generation: Arc::new(tokio::sync::Mutex::new(generation)), expected_generation: generation,
+        only_unpaid: true, may_hangup_live: false,
+    };
+    stop_media_attachment(storage.as_ref(), &peer, id, &stopped);
+    let refused = prepare_call_block_invoice(storage.as_ref(), &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "stopped", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 1, "no payable invoice for an attachment known to have stopped");
+    assert_eq!(storage.call_get(&peer, id).await.unwrap().unwrap(), paid);
+    publish_media_attachment(&storage, &peer, id).await.unwrap();
+    prepare_call_block_invoice(storage.as_ref(), &call_block_pricing(23_000), &sessions, &peer, &purpose, 23_000, "replacement", &wallet, 0, &mut invoices).await.unwrap();
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn pending_media_invoice_serializes_lifecycle_and_head_reads() {
+    use konsensus_core::payloads::call as rules;
+    use konsensus_api::calls::{self as api_calls, MediaDetach};
+    let storage: Arc<dyn konsensus_storage::Storage> = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let paid = rules::CallEntry {
+        side: rules::Side::Callee, phase: rules::Phase::Live, deadline_ms: now + 30_000,
+        pending: None, paid_until_ms: Some(now + 20_000), next_block_seq: 1,
+        end_reason: None, unpaid_notice_used: false,
+    };
+    rules::validate_block_invoice(&paid, 1, now).unwrap();
+    storage.call_put(&peer, id, &paid).await.unwrap();
+    let generation = api_calls::publish_media_attachment(&storage, &peer, id).await.unwrap();
+    let wallet = CallBlockWallet::new(CALL_WALLET_ISSUE);
+    let sessions = session_with(&peer).await;
+    let purpose = format!("{}{id}:1", rules::CALL_BLOCK_INVOICE_PREFIX);
+    let mut invoices = ready_invoice_book().await;
+    let body = format!(r#"{{"call_id":"{id}","seq":1}}"#);
+    let transition = api_calls::prepare_incoming_block(storage.as_ref(), &peer, Some(&body), &[15;32]).await.unwrap();
+    let pricing = call_block_pricing(23_000);
+    let mut quote = Box::pin(prepare_call_block_invoice(storage.as_ref(), &pricing, &sessions, &peer, &purpose, 23_000, "during-transition", &wallet, 0, &mut invoices));
+    let early = tokio::time::timeout(Duration::from_millis(50), &mut quote).await;
+    let blocked = early.is_err();
+    let stopped = MediaDetach {
+        generation: Arc::new(tokio::sync::Mutex::new(generation)), expected_generation: generation,
+        only_unpaid: false, may_hangup_live: true,
+    };
+    api_calls::stop_media_attachment(storage.as_ref(), &peer, id, &stopped);
+    let ended = rules::CallEntry { phase: rules::Phase::Ended, end_reason: Some(rules::HangupReason::Hangup), ..paid };
+    storage.call_put(&peer, id, &ended).await.unwrap();
+    let intent = konsensus_storage::call_media::PendingMediaDetach {
+        peer, call_id: id.into(), generation, only_unpaid: false, may_hangup_live: true, has_stop_policy: true,
+    };
+    storage.call_media_record_detach(&intent, false).await.unwrap();
+    storage.call_media_record_detach(&intent, true).await.unwrap();
+    drop(transition);
+    let result = match early {
+        Ok(result) => result,
+        Err(_) => tokio::time::timeout(Duration::from_secs(2), quote).await.unwrap(),
+    };
+    assert!(blocked, "invoice validation must wait for the lifecycle transition's call lock");
+    assert_eq!(result.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
+    assert_eq!(wallet.creates.load(Ordering::SeqCst), 0);
 }

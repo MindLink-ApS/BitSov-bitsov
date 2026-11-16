@@ -66,7 +66,11 @@ pub fn all_in(state: &crate::state::AppState, principal: u64, caller: Option<u64
 pub async fn direct_channel(state: &crate::state::AppState, peer: &konsensus_core::types::NodeId, principals: &[u64]) -> bool {
     let Some(total) = principals.iter().try_fold(0u64, |sum, p| sum.checked_add(payable(*p))) else { return false };
     if total == 0 { return false; }
-    let Some(key) = state.peer_ln_pubkeys.lock().await.get(peer).cloned() else { return false };
+    let Some(crate::state::PeerLightningKey::Verified(key)) =
+        state.peer_ln_pubkeys.lock().await.get(peer).cloned()
+    else {
+        return false;
+    };
     state.lightning.list_channels().await.is_ok_and(|channels| channels.iter().any(|c| {
         c.active && c.is_channel_ready != Some(false) && c.peer_pubkey.eq_ignore_ascii_case(&key)
             && c.outbound_capacity_msat.is_some_and(|cap| cap >= total)

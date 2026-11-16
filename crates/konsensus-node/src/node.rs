@@ -175,6 +175,9 @@ impl KonsensusNode {
         // Before any node state or Lightning: a source on another network
         // refuses startup.
         let network = config.lightning.chain_source_network();
+        // Offline first: a known public server on another network is refused
+        // without asking it.
+        config.refuse_known_chain_url_on_another_network()?;
         if network.is_none() && !matches!(config.chain, ChainConfig::Mock) {
             // [chain] has no network of its own; only the Lightning backend sets one.
             warn!("chain source network not checked: the Lightning backend sets no network");

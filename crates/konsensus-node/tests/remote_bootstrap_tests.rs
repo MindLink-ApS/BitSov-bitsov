@@ -426,6 +426,8 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
         .await;
     assert_eq!(state["local_owner"]["tunnel_password"], true);
     assert_eq!(state["can_restore"], false);
+    // The mock lightning backend is regtest; the app reads this before setup.
+    assert_eq!(state["network"], "regtest", "{state}");
 
     // 4. Commit to the password, then show the phrase.
     let rng = ring::rand::SystemRandom::new();
@@ -584,7 +586,7 @@ async fn bootstrap_restarts_locked_and_first_unlock_succeeds(flags: &[&str]) {
     assert_eq!(status.code(), Some(75), "{}", logs(&log));
     drop(node);
 
-    let cfg: toml::Value = std::fs::read_to_string(&f.config).unwrap().parse().unwrap();
+    let cfg: toml::Table = std::fs::read_to_string(&f.config).unwrap().parse().unwrap();
     let enc = f.dir.path().join("identity/mnemonic.enc");
     assert_eq!(
         cfg["identity"]["mnemonic_file"].as_str().unwrap(),

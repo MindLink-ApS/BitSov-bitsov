@@ -116,7 +116,7 @@ async fn calendar_encryption_failure_case(mixed: bool) {
                     .peer_ln_pubkeys
                     .lock()
                     .await
-                    .insert(*id, format!("02{}", "aa".repeat(32)));
+                    .insert(*id, konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))));
             }
             db.store_calendar_event(&konsensus_storage::CalendarEventRecord {
                 id: "event".into(),

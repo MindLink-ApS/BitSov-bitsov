@@ -479,11 +479,10 @@ async fn late_settlement(resume: bool) {
             .call_put(&fx.peer, CALL, &next)
             .await
             .unwrap();
-        fx.state
-            .peer_ln_pubkeys
-            .lock()
-            .await
-            .insert(peer, invoice_payee());
+        fx.state.peer_ln_pubkeys.lock().await.insert(
+            peer,
+            konsensus_api::state::PeerLightningKey::Verified(invoice_payee()),
+        );
         assert_eq!(send(&fx, &token, 404, 7000, 1).await.0, StatusCode::OK);
         assert_eq!(
             fx.service
