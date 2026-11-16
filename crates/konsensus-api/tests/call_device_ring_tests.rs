@@ -1177,9 +1177,19 @@ async fn restart_refuses_the_ended_wait_to_its_caller() {
     assert!(konsensus_api::calls::recover_devices(&db).await.unwrap().is_empty());
 
     let devices = Devices::default();
-    devices.queue_notices(notices);
-    let sent = devices.sweep(&db, 2_000).await.unwrap();
-    assert_eq!(sent.len(), 1, "the first sweep hands the refusal to the writer");
-    assert_eq!(sent[0].0, env.sender);
-    assert!(devices.sweep(&db, 2_100).await.unwrap().is_empty(), "sent once");
+    devices.queue_notices(notices, 10_000);
+    // The caller is not connected yet: the writer gives the refusal back.
+    let first = devices.take_queued(2_000);
+    assert_eq!(first.len(), 1);
+    let (peer, frame, until) = first.into_iter().next().unwrap();
+    assert_eq!(peer, env.sender);
+    devices.requeue(peer, frame, until);
+    // Still kept on the next tick, then handed over once.
+    let second = devices.take_queued(3_000);
+    assert_eq!(second.len(), 1, "a failed hand-over must not lose the refusal");
+    assert!(devices.take_queued(3_100).is_empty(), "handed over once");
+    // Past its time it is dropped rather than kept forever.
+    let (peer, frame, until) = second.into_iter().next().unwrap();
+    devices.requeue(peer, frame, until);
+    assert!(devices.take_queued(10_000).is_empty(), "expired refusal dropped");
 }

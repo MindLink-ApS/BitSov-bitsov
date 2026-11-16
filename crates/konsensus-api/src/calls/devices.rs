@@ -73,14 +73,36 @@ impl Drop for StreamTicket<'_> {
 pub struct Devices {
     invites: Mutex<HashMap<MessageId, Invite>>,
     /// Refusals decided before the receive loop ran (startup recovery),
-    /// handed to the background writer by the first sweep.
-    queued: Mutex<Vec<(NodeId, Frame)>>,
+    /// each kept until it is handed to a connected caller or its time ends.
+    queued: Mutex<Vec<(NodeId, Frame, u64)>>,
 }
 
+/// How long a refusal decided at startup is kept for a caller that has not
+/// reconnected yet. Past it, the caller's own answer window has long ended
+/// the call, and a resend of the invite still gets the durable refusal.
+pub const RESTART_REFUSAL_TTL_MS: u64 = 5 * 60 * 1000;
+
 impl Devices {
-    /// Queue replies decided at startup for the first [`Self::sweep`].
-    pub fn queue_notices(&self, notices: Vec<(NodeId, Frame)>) {
-        self.queued.lock().unwrap_or_else(|e| e.into_inner()).extend(notices);
+    /// Keep replies decided at startup until `until_ms`, for
+    /// [`Self::take_queued`].
+    pub fn queue_notices(&self, notices: Vec<(NodeId, Frame)>, until_ms: u64) {
+        self.queued
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(notices.into_iter().map(|(peer, frame)| (peer, frame, until_ms)));
+    }
+
+    /// Take the kept replies still within their time. A writer that cannot
+    /// hand one over (its caller is not connected yet) gives it back with
+    /// [`Self::requeue`], so a restart refusal is not lost to the first try.
+    pub fn take_queued(&self, now_ms: u64) -> Vec<(NodeId, Frame, u64)> {
+        let mut queued = self.queued.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *queued).into_iter().filter(|(_, _, until)| *until > now_ms).collect()
+    }
+
+    /// Give back a kept reply that could not be handed over yet.
+    pub fn requeue(&self, peer: NodeId, frame: Frame, until_ms: u64) {
+        self.queued.lock().unwrap_or_else(|e| e.into_inner()).push((peer, frame, until_ms));
     }
 
     /// Called only after the unchanged payment and admission gates. Register
@@ -412,8 +434,7 @@ impl Devices {
             })
             .map(|(id, _)| *id)
             .collect();
-        let mut notices = std::mem::take(&mut *self.queued.lock().unwrap_or_else(|e| e.into_inner()));
-        notices.reserve(due.len());
+        let mut notices = Vec::with_capacity(due.len());
         for id in due {
             let result: Result<(), StorageError> = async {
                 // Decide on the current entry, not the snapshot: a stream write
