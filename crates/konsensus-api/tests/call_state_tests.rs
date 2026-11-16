@@ -112,7 +112,7 @@ async fn a_meeting_leg_out_of_roster_order_is_refused_before_reservation_or_paym
     let right = id(0x9106);
     calls::admit_incoming(store, &me, &host, 400, Some(&meeting_offer(&right, &[&host, &me, &later]))).await.unwrap();
     // From here it is an ordinary call: answer, then hangup.
-    assert_eq!(store.call_get(&host, &right).await.unwrap().unwrap().phase, Phase::Ringing);
+    assert_eq!(store.call_get(&host, &right).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
     calls::admit_incoming(store, &me, &host, 403, Some(&body(403, &right))).await.unwrap();
     assert!(calls::admit_incoming(store, &me, &host, 400, Some(&meeting_offer(&right, &[&host, &me, &later]))).await.is_err(), "a leg id is single-use too");
 }
@@ -126,6 +126,8 @@ async fn an_unpaid_answer_leaves_the_call_ringing_and_retryable() {
     let peer = NodeId::from_bytes([84; 32]);
     let call = id(0x8400);
     calls::admit_incoming(state.storage.as_ref(), &own(), &peer, 400, Some(&body(400, &call))).await.unwrap();
+    let fetched = state.storage.call_get(&peer, &call).await.unwrap().unwrap().device_fetched(now_ms()).unwrap();
+    state.storage.call_put(&peer, &call, &fetched).await.unwrap();
     let op = uuid::Uuid::new_v4().to_string();
     let first = compose(&state, &op, &peer, 401, &body(401, &call)).await;
     println!("answer: {first}");

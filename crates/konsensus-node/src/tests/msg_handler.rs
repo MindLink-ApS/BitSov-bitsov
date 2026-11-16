@@ -1702,6 +1702,7 @@ async fn rejected_envelope_disclosures(privileged: bool) {
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        call_devices: Default::default(),
         ws_tx,
         audit_log: Arc::new(AuditLog::open(&audit_path).unwrap()),
         admission_mode: ReachabilityMode::PriceOpen,
@@ -2072,6 +2073,7 @@ async fn paid_acceptance_retry_case(
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        call_devices: Default::default(),
         ws_tx,
         audit_log: audit.clone(),
         admission_mode: ReachabilityMode::PriceOpen,
@@ -3238,6 +3240,10 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine> = Arc::new(
         konsensus_pricing::StaticPricingEngine::new(Default::default()),
     );
+    // The device registry and its cleanup task outlive a receive-loop restart.
+    let devices = Arc::new(konsensus_api::calls::devices::Devices::default());
+    let (cleanup_shutdown, cleanup_rx) = watch::channel(false);
+    let cleanup = tokio::spawn(crate::housekeeping::run_call_cleanup(db.clone(), devices.clone(), target.clone(), cleanup_rx));
     // The receive loop over Bob's durable store; started again for a restart.
     let start = |shutdown_rx| tokio::spawn(run(MsgHandlerDeps {
         transport: target.clone(),
@@ -3258,6 +3264,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        call_devices: devices.clone(),
         ws_tx: ws_tx.clone(),
         audit_log: audit.clone(),
         admission_mode: ReachabilityMode::PriceOpen,
@@ -3341,7 +3348,6 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     // Paid at Bob's call_msat (10 000 msat default): rings Bob's app once.
     let env = signal(400, 10_000, offer.clone()).await;
     source.send(bob.node_id(), &env).await.unwrap();
-    assert_eq!(outcome(source.clone()).await, Ok(false));
     let rung = tokio::time::timeout(Duration::from_secs(5), ws_rx.recv())
         .await
         .unwrap()
@@ -3350,6 +3356,15 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         (rung.envelope.kind, rung.plaintext.as_deref()),
         (400, Some(offer.as_str()))
     );
+    // A resend while the paired app has not fetched stays pending and does
+    // not decrypt, forward, consume another receipt, or ACK prematurely.
+    source.send(bob.node_id(), &env).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(150), outcome(source.clone())).await.is_err());
+    assert!(ws_rx.try_recv().is_err());
+    devices.fetched(db.as_ref(), &env, konsensus_api::calls::now_ms).await.unwrap();
+    assert_eq!(outcome(source.clone()).await, Ok(false));
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payment_receipts").fetch_one(db.pool()).await.unwrap(), 1);
+
     // Now a paid peer: an underpaid offer for another call is refused openly.
     let under = format!(
         r#"{{"v":1,"call_id":"{:032x}","media":"video","sdp":"v=0"}}"#,
@@ -3445,7 +3460,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let block_id = format!("{:032x}", rand::random::<u128>());
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let answered_at = now - 20_000;
-    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
+    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap().device_fetched(answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
     let entry = calls::commit(pending, "answer", answered_at).unwrap();
     db.call_put(alice.node_id(), &block_id, &entry).await.unwrap();
     let block = |seq| format!(r#"{{"v":1,"call_id":"{block_id}","seq":{seq}}}"#);
@@ -3758,7 +3773,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let fault_block = |seq: u32| format!(r#"{{"v":1,"call_id":"{fault_id}","seq":{seq}}}"#);
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let answered_at = now - 20_000;
-    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
+    let pending = calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap().device_fetched(answered_at).unwrap()), 401, "answer", "hash", answered_at).unwrap();
     let fault_entry = calls::commit(pending, "answer", answered_at).unwrap();
     db.call_put(alice.node_id(), &fault_id, &fault_entry).await.unwrap();
 
@@ -3866,7 +3881,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let fail_release = "CREATE TRIGGER fail_release BEFORE DELETE ON call_admission_hold BEGIN SELECT RAISE(ABORT, 'injected hold release failure'); END";
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let answered_at = now - 20_000;
-    let answered = || calls::commit(calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap()),
+    let answered = || calls::commit(calls::reserve(Some(calls::receive(None, 400, None, answered_at).unwrap().device_fetched(answered_at).unwrap()),
         401, "answer", "hash", answered_at).unwrap(), "answer", answered_at).unwrap();
 
     // The release fails: the grant rolls back with it and the block is refused.
@@ -3947,6 +3962,8 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     sqlx::query("DROP TRIGGER fail_release").execute(db.pool()).await.unwrap();
     shutdown.send(true).unwrap();
     worker.await.unwrap();
+    cleanup_shutdown.send(true).unwrap();
+    cleanup.await.unwrap();
     source.shutdown();
     target.shutdown();
 }
@@ -4019,6 +4036,7 @@ async fn room_chats_stay_hidden_until_their_binding_is_admitted() {
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        call_devices: Default::default(),
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -4266,6 +4284,154 @@ async fn porch_card_repricing_failure_returns_correlated_error() {
         !response.body.contains("page_msat"),
         "never serve the stale price"
     );
+}
+
+#[tokio::test]
+async fn duplicate_invites_age_before_ack_even_after_a_long_outage() {
+    use konsensus_api::calls::{devices::Devices, now_ms};
+    use konsensus_core::payloads::call::{Phase, TOMBSTONE_MS};
+    let identity = bob_identity();
+    for age in [16_000, 16_000 + TOMBSTONE_MS + 1] {
+        let db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+        let devices = Devices::default();
+        let arrived = now_ms() - age;
+        let env = UkmEnvelopeBuilder::new(400, *alice_identity().node_id(), Recipient::Node(*identity.node_id()), vec![1], PaymentProof::new([41;32], [41;32], 10_000)).timestamp(arrived).build();
+        let text = r#"{"v":1,"call_id":"0123456789abcdef0123456789abcdef","media":"audio","sdp":"v=0"}"#;
+        let cipher = PlaintextCacheCipher::new(identity.aes_key());
+        db.accept_paid_envelope(&env).await.unwrap();
+        db.store_message_plaintext(&env.id, &cipher.encrypt(&env.id.to_hex(), text.as_bytes()).unwrap()).await.unwrap();
+        devices.admit(&db, identity.node_id(), &env, Some(text), arrived, || arrived).await.unwrap();
+        devices.sweep(&db, now_ms()).await.unwrap();
+        let reply = duplicate_reply(&db, &env, None).await;
+        assert!(matches!(reply, Some(Frame::MessageReject { .. })), "expired wait must not be ACKed");
+        devices.fetched(&db, &env, now_ms).await.unwrap();
+        let row = db.call_get(&env.sender, "0123456789abcdef0123456789abcdef").await.unwrap().unwrap();
+        assert!(row.at(now_ms()).is_none_or(|e| e.phase == Phase::Ended));
+        sqlx::query("UPDATE messages SET plaintext_enc = NULL").execute(db.pool()).await.unwrap();
+        assert!(matches!(duplicate_reply(&db, &env, None).await, Some(Frame::MessageReject { reason, .. }) if reason == "call_not_reachable"), "withdrawal retains the refusal independently of cached plaintext");
+    }
+}
+
+
+/// A stale offer refused before ringing: if that refusal is lost, the exact
+/// retry replays `call_not_reachable`, never an ACK the caller would read as
+/// delivered.
+#[tokio::test]
+async fn stale_offer_refusal_is_replayed_to_a_retry() {
+    use konsensus_api::calls::{devices::Devices, now_ms};
+    use konsensus_core::payloads::call::INVITE_MAX_AGE_MS;
+    let bob = bob_identity();
+    let db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    let arrived = now_ms();
+    let env = UkmEnvelopeBuilder::new(400, *alice_identity().node_id(), Recipient::Node(*bob.node_id()), vec![2], PaymentProof::new([42;32], [42;32], 10_000))
+        .timestamp(arrived - INVITE_MAX_AGE_MS - 1)
+        .build();
+    let text = r#"{"v":1,"call_id":"0123456789abcdef0123456789abcdef","media":"audio","sdp":"v=0"}"#;
+    db.accept_paid_envelope(&env).await.unwrap();
+    assert!(devices.admit(&db, bob.node_id(), &env, Some(text), arrived, || arrived).await.is_err());
+    db.reject_accepted_envelope(&env).await.unwrap();
+    assert!(matches!(duplicate_reply(&db, &env, None).await, Some(Frame::MessageReject { reason, .. }) if reason == "call_not_reachable"));
+}
+
+/// An offer past the general age limit: a known exact retry replays its
+/// durable outcome (here delivered: ACK; withdrawn: not reachable), and an
+/// unseen one is refused as not reachable rather than left to retry forever.
+/// A withdrawal whose outcome write failed still reads as not reachable.
+#[tokio::test]
+async fn expired_offer_retries_replay_their_outcome_or_end() {
+    use konsensus_storage::CallInviteOutcome;
+    let bob = bob_identity();
+    let db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let offer = |seed: u8| UkmEnvelopeBuilder::new(400, *alice_identity().node_id(), Recipient::Node(*bob.node_id()), vec![seed], PaymentProof::new([seed;32], [seed;32], 10_000)).timestamp(1_000).build();
+    let delivered = offer(51);
+    db.accept_paid_envelope(&delivered).await.unwrap();
+    db.call_invite_set_outcome(&delivered.id, &delivered.sender, CallInviteOutcome::Fetched).await.unwrap();
+    assert!(matches!(expired_offer_reply(&db, &delivered).await, Some(Frame::MessageAck { duplicate: true, .. })));
+    // Refused at admission but its NotReachable write failed: the receipt
+    // still reads as plain paid acceptance until the withdrawal runs.
+    let withdrawn = offer(52);
+    db.accept_paid_envelope(&withdrawn).await.unwrap();
+    db.reject_accepted_envelope(&withdrawn).await.unwrap();
+    assert_eq!(db.call_invite_outcome(&withdrawn).await.unwrap(), Some(CallInviteOutcome::NotReachable));
+    assert!(matches!(expired_offer_reply(&db, &withdrawn).await, Some(Frame::MessageReject { reason, .. }) if reason == "call_not_reachable"));
+    let unseen = offer(53);
+    assert!(matches!(expired_offer_reply(&db, &unseen).await, Some(Frame::MessageReject { reason, .. }) if reason == "call_not_reachable"));
+}
+
+#[tokio::test]
+async fn invite_resend_during_device_wait_defers_ack_until_fetch() {
+    use konsensus_api::calls::{devices::Devices, now_ms};
+    let bob = bob_identity();
+    let db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    let env = make_envelope(&alice_identity(), *bob.node_id(), 400, vec![1]);
+    let text = r#"{"v":1,"call_id":"0123456789abcdef0123456789abcdef","media":"audio","sdp":"v=0"}"#;
+    let cipher = PlaintextCacheCipher::new(bob.aes_key());
+    let arrived = now_ms();
+    db.accept_paid_envelope(&env).await.unwrap();
+    db.store_message_plaintext(&env.id, &cipher.encrypt(&env.id.to_hex(), text.as_bytes()).unwrap()).await.unwrap();
+    devices.admit(&db, bob.node_id(), &env, Some(text), arrived, || arrived).await.unwrap();
+
+    assert!(duplicate_reply(&db, &env, None).await.is_none(), "resend must wait for the original outcome");
+    let gate = PaymentGate::with_config(konsensus_core::gate::GateConfig { verify_lightning_settlement: true, ..Default::default() });
+    let pricing = konsensus_pricing::StaticPricingEngine::new(Default::default());
+    assert!(gate.validate_received_paid_envelope(&env, &InviteReceipts(&db), &pricing, None, None, 0.0, Some(bob.node_id())).await.unwrap(), "the existing receipt avoids another price or settlement check");
+
+    devices.fetched(&db, &env, || arrived + 100).await.unwrap();
+    let notices = devices.sweep(&db, arrived + 100).await.unwrap();
+    assert!(matches!(&notices[..], [(peer, Frame::MessageAck { id, duplicate: false, paid_until_ms: None })] if *peer == env.sender && *id == env.id));
+    assert!(matches!(duplicate_reply(&db, &env, None).await, Some(Frame::MessageAck { id, duplicate: true, paid_until_ms: None }) if id == env.id));
+    assert_eq!(db.get_messages_for_recipient(&env.recipient, 10, None).await.unwrap().len(), 1);
+    assert!(devices.sweep(&db, arrived + 15_000).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_after_not_reachable_repeats_the_reject_without_readmitting() {
+    use konsensus_api::calls::{devices::Devices, now_ms};
+    let bob = bob_identity();
+    let db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let devices = Devices::default();
+    let env = make_envelope(&alice_identity(), *bob.node_id(), 400, vec![2]);
+    let text = r#"{"v":1,"call_id":"0123456789abcdef0123456789abcdef","media":"audio","sdp":"v=0"}"#;
+    let cipher = PlaintextCacheCipher::new(bob.aes_key());
+    let arrived = now_ms() - 15_000;
+    db.accept_paid_envelope(&env).await.unwrap();
+    db.store_message_plaintext(&env.id, &cipher.encrypt(&env.id.to_hex(), text.as_bytes()).unwrap()).await.unwrap();
+    devices.admit(&db, bob.node_id(), &env, Some(text), arrived, || arrived).await.unwrap();
+    let notices = devices.sweep(&db, arrived + 15_000).await.unwrap();
+    assert!(matches!(&notices[..], [(_, Frame::MessageReject { id, reason })] if *id == env.id && reason == "call_not_reachable"));
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    konsensus_api::calls::recover(&db).await.unwrap();
+    assert!(matches!(duplicate_reply(&db, &env, None).await, Some(Frame::MessageReject { id, reason }) if id == env.id && reason == "call_not_reachable"), "rejection must survive withdrawal and startup recovery");
+
+    let gate = PaymentGate::with_config(konsensus_core::gate::GateConfig { verify_lightning_settlement: true, ..Default::default() });
+    let pricing = konsensus_pricing::StaticPricingEngine::new(Default::default());
+    assert!(gate.validate_received_paid_envelope(&env, &InviteReceipts(&db), &pricing, None, None, 0.0, Some(bob.node_id())).await.unwrap(), "the existing receipt avoids another price or settlement check");
+    let mut changed = env.clone();
+    changed.payment_proof.amount_msat += 1;
+    changed.signature = Signature::from_ed25519(&alice_identity().sign(&changed.signable_bytes()));
+    assert!(db.call_invite_outcome(&changed).await.unwrap().is_none(), "a changed payment cannot borrow this outcome");
+    assert!(gate.validate_received_paid_envelope(&changed, &InviteReceipts(&db), &pricing, None, None, 0.0, Some(bob.node_id())).await.is_err());
+    let mut invalid_signature = env.clone();
+    invalid_signature.signature = Signature::from_ed25519(&bob.sign(&env.signable_bytes()));
+    assert!(gate.validate_received_paid_envelope(&invalid_signature, &InviteReceipts(&db), &pricing, None, None, 0.0, Some(bob.node_id())).await.is_err(), "receipt lookup must not bypass authentication");
+    assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
+    assert!(devices.sweep(&db, arrived + 15_100).await.unwrap().is_empty());
+}
+
+
+#[tokio::test]
+async fn held_invite_receipt_is_not_a_device_delivery_ack() {
+    let bob = bob_identity();
+    let db = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let env = make_envelope(&alice_identity(), *bob.node_id(), 400, vec![3]);
+    db.call_admission_hold(&env, konsensus_api::calls::now_ms()).await.unwrap();
+    db.accept_paid_envelope(&env).await.unwrap();
+    assert!(db.call_admission_held(&env.id).await.unwrap());
+    assert!(duplicate_reply(&db, &env, None).await.is_none(), "a paid receipt still held before admission is not proof of device delivery");
+    use konsensus_core::gate::NonceStore;
+    assert!(!InviteReceipts(&db).is_paid_envelope_accepted(&env).await.unwrap());
 }
 
 // ── inbound calendar caps ───────────────────────────────────────────
@@ -4570,6 +4736,7 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        call_devices: Default::default(),
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -5085,6 +5252,7 @@ async fn uncertain_paid_acceptance_keeps_the_calendar_hold() {
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        call_devices: Default::default(),
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -5267,6 +5435,7 @@ async fn sweep_winning_against_opaque_admission_or_replay_check_never_acknowledg
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        call_devices: Default::default(),
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -5450,6 +5619,7 @@ async fn receive_loop_ordered(lower_sender: bool) -> ReceiveLoop {
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        call_devices: Default::default(),
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -6861,7 +7031,7 @@ async fn recovery_handover_lower_id_block_keeps_one_grant_after_reencryption() {
     let call_id = "9876543210abcdef9876543210abcdef";
     let text = serde_json::json!({"call_id":call_id,"seq":0}).to_string();
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let ringing = calls::receive(None, 400, None, now).unwrap();
+    let ringing = calls::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap();
     let initial = calls::commit(
         calls::reserve(Some(ringing), 401, "answer", "request", now).unwrap(),
         "answer",
@@ -7129,6 +7299,7 @@ async fn recovery_reconnect_receive_loop(pricing: Arc<dyn konsensus_core::traits
         routing: Arc::new(RoutingTable::new(Default::default())),
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
+        call_devices: Default::default(),
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
