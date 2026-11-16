@@ -122,8 +122,10 @@ pub trait Storage: Send + Sync {
     }
 
     /// Startup: withdraw at most `max` pending device waits, retaining refusals.
-    async fn call_invite_recover(&self, _max: u32) -> Result<u64, StorageError> {
-        Ok(0)
+    /// Returns each withdrawn invite (message id, caller) so the caller can
+    /// be told it is not reachable instead of waiting out its answer window.
+    async fn call_invite_recover(&self, _max: u32) -> Result<Vec<(MessageId, NodeId)>, StorageError> {
+        Ok(Vec::new())
     }
 
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {

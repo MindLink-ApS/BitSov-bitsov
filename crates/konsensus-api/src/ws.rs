@@ -193,12 +193,14 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>, claims: auth::Cl
                                     debug!("WebSocket client disconnected");
                                     break;
                                 }
-                                if !stream_authorized(&state, &claims) { break; }
                                 let written_ms = crate::calls::now_ms();
                                 // Evidence first, then the transition: a failed or
-                                // delayed recording can no longer lose to expiry.
+                                // delayed recording can no longer lose to expiry. The
+                                // device has the frame, so record it even if this
+                                // stream lost its authorization meanwhile.
                                 if let Some(ticket) = ticket.as_mut() { ticket.written(written_ms); }
                                 drop(ticket);
+                                if !stream_authorized(&state, &claims) { break; }
                                 if let Err(e) = state.call_devices.fetched(state.storage.as_ref(), &ws_msg.envelope, || written_ms).await {
                                     warn!(error = %e, "could not record call device delivery; the sweep reconciles it");
                                     break;

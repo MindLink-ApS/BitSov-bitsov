@@ -489,7 +489,7 @@ fn search_snippet(text: &str, needle_lower: &str, ctx: usize) -> String {
 /// are silently skipped. Without `peer`, searches received messages (mirrors
 /// `list_messages`); with `peer`, searches that conversation.
 pub(super) async fn search_messages(
-    _auth: ScopedAuth<Read>,
+    auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchMessagesQuery>,
 ) -> Result<(ListDiagnostics, Json<Vec<SearchResult>>), ApiError> {
@@ -538,6 +538,7 @@ pub(super) async fn search_messages(
     let limit = clamp_limit(params.limit) as usize;
     let mut diagnostics = ListDiagnostics::from(&messages);
     let mut results = Vec::new();
+    let mut matched = Vec::new();
     for env in &messages.items {
         if results.len() >= limit {
             diagnostics.next_before = results.last().map(|last: &SearchResult| konsensus_storage::ListCursor {
@@ -558,6 +559,7 @@ pub(super) async fn search_messages(
             Err(_) => continue, // binary content — not text-searchable
         };
         if text.to_lowercase().contains(&needle_lower) {
+            matched.push(env);
             let recipient_str = match &env.recipient {
                 Recipient::Node(id) => id.to_hex(),
                 Recipient::Room(id) => id.to_string(),
@@ -574,6 +576,21 @@ pub(super) async fn search_messages(
         }
     }
 
+    // A paired device sees a call invite here only as it would in a listing:
+    // its delivery is recorded (starting the ring), and one that cannot
+    // ring any more is withheld rather than handed out.
+    let mut undelivered = std::collections::HashSet::new();
+    for env in matched {
+        match device_fetched(&auth, &state, env).await {
+            Ok(true) => {}
+            Ok(false) => { undelivered.insert(env.id.to_hex()); }
+            Err(error) => {
+                tracing::warn!(msg_id = %env.id, ?error, "searched call invite not marked delivered; withheld");
+                undelivered.insert(env.id.to_hex());
+            }
+        }
+    }
+    results.retain(|r| !undelivered.contains(&r.id));
     Ok((diagnostics, Json(results)))
 }
 

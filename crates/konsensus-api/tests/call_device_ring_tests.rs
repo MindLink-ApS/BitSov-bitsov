@@ -239,11 +239,13 @@ async fn stored_invite(
 async fn paired_message_fetch_starts_ringing_but_owner_inspection_does_not() {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
-    for path in ["", "/plaintext", "list"] {
+    for path in ["", "/plaintext", "list", "search"] {
         let (_dir, state, db, token) = paired_state().await;
         let (env, _) = stored_invite(&state, &db).await;
         let uri = if path == "list" {
             "/api/v1/messages".to_string()
+        } else if path == "search" {
+            "/api/v1/messages/search?q=call_id".to_string()
         } else {
             format!("/api/v1/messages/{}{path}", env.id.to_hex())
         };
@@ -1143,4 +1145,51 @@ async fn ordinary_inbound_slow_write_survives_device_deadline() {
     let received: serde_json::Value = serde_json::from_slice(&frame).unwrap();
     assert_eq!(received["id"], message.id.to_hex());
     server.abort();
+}
+
+/// A restart that ends an invite's device wait tells its caller at once: the
+/// refusal is returned by startup recovery and sent by the first sweep, not
+/// left to the caller's answer window.
+#[tokio::test]
+async fn restart_refuses_the_ended_wait_to_its_caller() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.sqlite");
+    let (env, text) = invite(9);
+    {
+        let db = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+        db.accept_paid_envelope(&env).await.unwrap();
+        Devices::default()
+            .admit(&db, &own(), &env, Some(&text), 1_000, || 1_000)
+            .await
+            .unwrap();
+        db.pool().close().await;
+    }
+    let db = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    let notices = konsensus_api::calls::recover_devices(&db).await.unwrap();
+    let expected = konsensus_message::Frame::MessageReject {
+        id: env.id,
+        reason: konsensus_api::calls::devices::NOT_REACHABLE.into(),
+    };
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].0, env.sender);
+    assert_eq!(format!("{:?}", notices[0].1), format!("{expected:?}"));
+    // A second recovery has nothing left to refuse.
+    assert!(konsensus_api::calls::recover_devices(&db).await.unwrap().is_empty());
+
+    let devices = Devices::default();
+    devices.queue_notices(notices, 10_000);
+    // The caller is not connected yet: the writer gives the refusal back.
+    let first = devices.take_queued(2_000);
+    assert_eq!(first.len(), 1);
+    let (peer, frame, until) = first.into_iter().next().unwrap();
+    assert_eq!(peer, env.sender);
+    devices.requeue(peer, frame, until);
+    // Still kept on the next tick, then handed over once.
+    let second = devices.take_queued(3_000);
+    assert_eq!(second.len(), 1, "a failed hand-over must not lose the refusal");
+    assert!(devices.take_queued(3_100).is_empty(), "handed over once");
+    // Past its time it is dropped rather than kept forever.
+    let (peer, frame, until) = second.into_iter().next().unwrap();
+    devices.requeue(peer, frame, until);
+    assert!(devices.take_queued(10_000).is_empty(), "expired refusal dropped");
 }

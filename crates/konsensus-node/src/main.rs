@@ -1890,7 +1890,7 @@ async fn start_node_services<'a>(
     );
     let call_media_handle = call_media.spawn(node.shutdown_rx());
 
-    konsensus_api::calls::recover_devices(node.storage().as_ref()).await
+    let device_refusals = konsensus_api::calls::recover_devices(node.storage().as_ref()).await
         .context("incoming call device recovery failed")?;
 
     let api_state = Arc::new(konsensus_api::AppState {
@@ -1982,6 +1982,12 @@ async fn start_node_services<'a>(
                 .join("ldk")
         }),
     });
+    // Callers whose invite the restart ended hear "not reachable" once they
+    // are connected, instead of ringing out their answer window.
+    api_state.call_devices.queue_notices(
+        device_refusals,
+        konsensus_api::calls::now_ms() + konsensus_api::calls::devices::RESTART_REFUSAL_TTL_MS,
+    );
 
     // Public remote access is Noise only. Decrypted bytes go to an ephemeral
     // loopback router that deliberately omits `/api/v1/auth/local`.

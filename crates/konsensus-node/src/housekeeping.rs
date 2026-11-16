@@ -111,6 +111,13 @@ pub(crate) async fn run_call_cleanup(
                     },
                     Err(e) => warn!(error = %e, "call device sweep failed"),
                 }
+                // Startup refusals wait for their caller's connection: one
+                // that cannot be handed over yet is kept for the next tick.
+                for (peer, frame, until_ms) in devices.take_queued(now_ms) {
+                    if transport.enqueue_control_frame(&peer, &frame).await.is_err() {
+                        devices.requeue(peer, frame, until_ms);
+                    }
+                }
                 if tokio::time::Instant::now() >= next_tombstone_sweep {
                     next_tombstone_sweep = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
                     if let Err(e) = storage.call_sweep(now_ms, 10_000).await {
