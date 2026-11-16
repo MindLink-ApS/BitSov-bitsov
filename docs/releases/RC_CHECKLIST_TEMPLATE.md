@@ -75,6 +75,14 @@ Pre-release; not for production use. Copy this template for each new RC.
 
 ## Independently verify and publish
 
+- [ ] For #458, inspect the first `v*` tag whose commit includes the action update
+      (rc25 if selected, otherwise the next qualifying release). In that tag's
+      `CI` run, confirm `Upload to Release` completed successfully in every
+      `Release CLI` matrix job: currently five targets across Linux, macOS and
+      Windows. PR runs do not exercise this tag-only job. Record the tag, full
+      commit SHA, run URL and per-target upload results in release evidence.
+      Confirm the release is still a **draft** after all uploads; resolve any
+      missing upload or unexpected publication before proceeding.
 - [ ] In a fresh download directory, run
       `bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` with the
       reviewed key file. Do not fetch that key from `main`. The script accepts
