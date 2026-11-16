@@ -20,6 +20,7 @@
 
 use async_trait::async_trait;
 use esplora_client::{r#async::HttpTransport, rate_limit::RateLimitedTransport};
+use futures::{stream::FuturesOrdered, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -39,6 +40,9 @@ use crate::network::{NetworkCheck, NetworkGate, ReportedNetwork};
 
 /// Maximum age of a cached tip height, shared by callers of one provider.
 const TIP_HEIGHT_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Leave time inside the node's five-second readiness deadline.
+const TIP_LOOKUP_TIMEOUT: Duration = Duration::from_millis(4800);
 
 /// Configuration for the Esplora provider.
 #[derive(Clone)]
@@ -107,6 +111,20 @@ struct CachedHeight {
     endpoint: usize,
 }
 
+/// An interrupted endpoint read must be verified again before reuse.
+struct PendingTip<'a> {
+    gate: Option<&'a NetworkGate>,
+    endpoint: usize,
+}
+
+impl Drop for PendingTip<'_> {
+    fn drop(&mut self) {
+        if let Some(gate) = self.gate {
+            gate.invalidate(self.endpoint);
+        }
+    }
+}
+
 /// JSON response from `/api/block/{hash}`.
 #[derive(Debug, Deserialize)]
 struct EsploraBlock {
@@ -118,6 +136,30 @@ struct EsploraBlock {
     nonce: u64,
     #[allow(dead_code)]
     difficulty: f64,
+}
+
+impl EsploraBlock {
+    fn into_header(self) -> Result<BlockHeader, ChainError> {
+        Ok(BlockHeader {
+            height: self.height,
+            hash: self.id,
+            timestamp: self.timestamp,
+            bits: u32::try_from(self.bits).map_err(|_| {
+                ChainError::Backend(format!("block bits overflows u32: {}", self.bits))
+            })?,
+        })
+    }
+}
+
+fn parse_height(text: &str) -> Result<u64, ChainError> {
+    let height = text
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| ChainError::Backend("invalid Esplora height".into()))?;
+    if height == 0 {
+        return Err(ChainError::NotAvailable("Esplora height is zero".into()));
+    }
+    Ok(height)
 }
 
 /// JSON response from `/api/tx/{txid}`.
@@ -318,7 +360,7 @@ impl EsploraProvider {
         let mut last_error = ChainError::NotAvailable("no usable Esplora endpoint".into());
         for index in 0..self.endpoints.len() {
             // Admission's outer readiness deadline is five seconds. Reserve
-            // four for the complete height lookup, divided across endpoints,
+            // four for height requests, divided across endpoints,
             // so even a blackholed primary leaves time to try every fallback.
             let timeout = if path == "/blocks/tip/height" {
                 std::time::Duration::from_secs(4) / self.endpoints.len() as u32
@@ -469,16 +511,7 @@ impl ChainProvider for EsploraProvider {
         }
 
         let (height, endpoint) = self
-            .get_parsed_from("/blocks/tip/height", |text| {
-                let height = text
-                    .trim()
-                    .parse::<u64>()
-                    .map_err(|_| ChainError::Backend("invalid Esplora height".into()))?;
-                if height == 0 {
-                    return Err(ChainError::NotAvailable("Esplora height is zero".into()));
-                }
-                Ok(height)
-            })
+            .get_parsed_from("/blocks/tip/height", parse_height)
             .await?;
 
         *cached = Some(CachedHeight {
@@ -505,14 +538,77 @@ impl ChainProvider for EsploraProvider {
         // Then get the full block info
         let block: EsploraBlock = self.get_json(&format!("/block/{hash}")).await?;
 
-        Ok(BlockHeader {
-            height: block.height,
-            hash: block.id,
-            timestamp: block.timestamp,
-            bits: u32::try_from(block.bits).map_err(|_| {
-                ChainError::Backend(format!("block bits overflows u32: {}", block.bits))
-            })?,
-        })
+        block.into_header()
+    }
+
+    async fn get_best_block_header(&self) -> Result<BlockHeader, ChainError> {
+        let started = Instant::now();
+        let deadline = started + TIP_LOOKUP_TIMEOUT;
+        let timeout = TIP_LOOKUP_TIMEOUT;
+        let mut attempts = FuturesOrdered::new();
+        for index in 0..self.endpoints.len() {
+            attempts.push_back(async move {
+                let mut pending = PendingTip {
+                    gate: self.network.as_ref(),
+                    endpoint: index,
+                };
+                // Every endpoint gets the full bounded window, including its
+                // network check. Ordered results prefer the primary without
+                // letting a stalled or slow primary starve a healthy fallback.
+                let result = tokio::time::timeout_at(deadline, async {
+                    if let Some(gate) = &self.network {
+                        self.ensure_network(gate, index, timeout).await?;
+                    }
+                    let height = self
+                        .fetch(index, "/blocks/tip/height", timeout, None, &parse_height)
+                        .await?;
+                    let hash = self
+                        .fetch(
+                            index,
+                            &format!("/block-height/{height}"),
+                            timeout,
+                            None,
+                            &|text: &str| Ok(text.trim().to_owned()),
+                        )
+                        .await?;
+                    if self.bearer.is_some() && hash.parse::<bitcoin::BlockHash>().is_err() {
+                        return Err(ChainError::Backend("invalid Esplora block hash".into()));
+                    }
+                    let block: EsploraBlock = self
+                        .fetch(index, &format!("/block/{hash}"), timeout, None, &|text| {
+                            serde_json::from_str(text)
+                                .map_err(|_| ChainError::Backend("invalid Esplora JSON".into()))
+                        })
+                        .await?;
+                    block.into_header()
+                })
+                .await
+                .unwrap_or_else(|_| Err(ChainError::NotAvailable("Esplora tip timed out".into())));
+                if matches!(
+                    result,
+                    Err(ChainError::Connection(_) | ChainError::NotAvailable(_))
+                ) {
+                    self.lost_connection(index);
+                }
+                pending.gate = None;
+                (index, result)
+            });
+        }
+        let mut last_error = ChainError::NotAvailable("no usable Esplora endpoint".into());
+        while let Some((index, result)) = attempts.next().await {
+            // A mismatch remains terminal, including one seen concurrently.
+            self.refusal()?;
+            match result {
+                Ok(header) => {
+                    self.active.store(index, Ordering::Relaxed);
+                    return Ok(header);
+                }
+                Err(error) => {
+                    last_error = error;
+                }
+            }
+        }
+        Err(last_error)
     }
 
     #[instrument(skip(self))]
