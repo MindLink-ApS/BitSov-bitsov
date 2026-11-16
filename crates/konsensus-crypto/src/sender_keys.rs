@@ -587,6 +587,8 @@ impl GroupSession {
         match self.member_keys.get_mut(node_id) {
             Some(entry) => {
                 entry.zeroize();
+                #[cfg(test)]
+                tests::observe_member_wipe(entry);
                 true
             }
             None => false,

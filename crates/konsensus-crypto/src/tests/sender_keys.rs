@@ -665,11 +665,39 @@ fn skipped_keys_are_capped_across_all_senders_oldest_first() {
     assert_eq!(bob.skipped_key_count(), MAX_TOTAL_SKIPPED_KEYS);
 
     // 7 deliveries x 256 skips per sender = 3,584 keys; the 1,584 oldest are
-    // evicted. All of them are Alice's, 208 of her 1,792 stay, and every key
-    // Carol skipped is still held.
+    // evicted. Alice loses six full batches and 48 keys from her seventh:
+    // message 1589 is the last evicted, and 1590 is the first retained.
+    // Her remaining 208 keys and all 1,792 of Carol's keys fill the cap.
+    assert_eq!(skipped_len(&bob, &alice_id), 208);
+    assert_eq!(skipped_len(&bob, &carol_id), 1792);
     assert!(bob.decrypt(&alice_id, &from_alice[0]).is_err());
+    assert!(matches!(
+        bob.decrypt(&alice_id, &from_alice[1589]),
+        Err(SenderKeyError::DecryptionFailed(_))
+    ));
+    assert_eq!(bob.decrypt(&alice_id, &from_alice[1590]).unwrap(), b"m1590");
     assert_eq!(bob.decrypt(&carol_id, &from_carol[0]).unwrap(), b"m0");
     assert_eq!(bob.decrypt(&carol_id, &from_carol[1797]).unwrap(), b"m1797");
+
+    // Reset the partly evicted sender. Only Carol's 1,790 unused keys remain.
+    alice.our_sender_key.rotate();
+    bob.process_distribution(&alice.our_distribution()).unwrap();
+    assert_eq!(skipped_len(&bob, &alice_id), 0);
+    assert_eq!(skipped_len(&bob, &carol_id), 1790);
+    assert_eq!(bob.skipped_key_count(), 1790);
+
+    // Another 211 skips exceed the cap by one, evicting Carol's oldest unused
+    // key (message 1) while keeping message 2 and Alice's new generation.
+    let after: Vec<_> = (0..212)
+        .map(|i| alice.encrypt(format!("r{i}").as_bytes()).unwrap())
+        .collect();
+    assert_eq!(bob.decrypt(&alice_id, &after[211]).unwrap(), b"r211");
+    assert_eq!(bob.skipped_key_count(), MAX_TOTAL_SKIPPED_KEYS);
+    assert_eq!(skipped_len(&bob, &alice_id), 211);
+    assert_eq!(skipped_len(&bob, &carol_id), 1789);
+    assert!(bob.decrypt(&carol_id, &from_carol[1]).is_err());
+    assert_eq!(bob.decrypt(&carol_id, &from_carol[2]).unwrap(), b"m2");
+    assert_eq!(bob.decrypt(&alice_id, &after[0]).unwrap(), b"r0");
 }
 
 #[test]
@@ -930,6 +958,44 @@ fn wiping_a_member_zeroes_its_stored_keys_before_removal() {
     assert!(!bob.wipe_member(&make_node_id(9)), "an unknown member reports false");
     bob.remove_member(&alice_id);
     assert!(!bob.has_member(&alice_id));
+}
+
+thread_local! {
+    static MEMBER_WIPE: std::cell::Cell<Option<(usize, bool, usize, bool)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+pub(super) fn observe_member_wipe(entry: &ReceiverSenderKey) {
+    MEMBER_WIPE.with(|observed| {
+        observed.set(Some((
+            std::ptr::from_ref(entry) as usize,
+            entry.chain_key == [0u8; 32],
+            entry.skipped_keys.len(),
+            entry.skipped_keys.values().all(|(key, _)| *key == [0u8; 32]),
+        )));
+    });
+}
+
+#[test]
+fn removing_a_member_wipes_its_keys_in_place() {
+    let (mut bob, alice_id, _) = session_with_skipped(3);
+    let entry = &bob.member_keys[&alice_id];
+    assert_ne!(entry.chain_key, [0u8; 32]);
+    assert!(entry.skipped_keys.values().all(|(key, _)| *key != [0u8; 32]));
+    let stored_address = std::ptr::from_ref(entry) as usize;
+    MEMBER_WIPE.with(|observed| observed.set(None));
+
+    bob.remove_member(&alice_id);
+
+    // Compare addresses only; the removed entry is never dereferenced.
+    assert_eq!(
+        MEMBER_WIPE.with(|observed| observed.take()),
+        Some((stored_address, true, 3, true)),
+        "the removal path must wipe the chain and skipped keys in their map entry",
+    );
+    assert!(!bob.has_member(&alice_id));
+    assert_eq!(bob.skipped_key_count(), 0);
 }
 
 #[test]
