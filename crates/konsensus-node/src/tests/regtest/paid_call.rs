@@ -70,7 +70,7 @@ async fn next_binary(socket: &mut Socket) -> Vec<u8> {
                 .expect("paid socket open")
                 .expect("media read")
             {
-                Message::Binary(bytes) => return bytes,
+                Message::Binary(bytes) => return bytes.to_vec(),
                 Message::Ping(_) | Message::Pong(_) | Message::Text(_) => {}
                 other => panic!("unexpected paid media: {other:?}"),
             }
@@ -92,8 +92,8 @@ async fn audio_until(a: &mut Socket, b: &mut Socket, until: u64, seq: &mut u32) 
         tick.tick().await;
         let ab = packet(*seq, 0xa0);
         let ba = packet(*seq, 0xb0);
-        a.send(Message::Binary(ab.clone())).await.unwrap();
-        b.send(Message::Binary(ba.clone())).await.unwrap();
+        a.send(Message::Binary(ab.clone().into())).await.unwrap();
+        b.send(Message::Binary(ba.clone().into())).await.unwrap();
         let (at_b, at_a) = tokio::join!(next_binary(b), next_binary(a));
         assert_eq!(at_b, ab, "A -> B ordered frame {seq}");
         assert_eq!(at_a, ba, "B -> A ordered frame {seq}");
@@ -103,7 +103,7 @@ async fn audio_until(a: &mut Socket, b: &mut Socket, until: u64, seq: &mut u32) 
 
 async fn closed_without_media(socket: &mut Socket) {
     // Try to send even if the close frame has not yet reached this app.
-    let _ = socket.send(Message::Binary(packet(u32::MAX, 0xee))).await;
+    let _ = socket.send(Message::Binary(packet(u32::MAX, 0xee).into())).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match socket.next().await {
@@ -1124,7 +1124,7 @@ async fn client_detach_stops_renewals_and_unanswered_calls_still_expire() {
             loop {
                 tick.tick().await;
                 // The surviving client keeps sending even with no received audio.
-                let _ = survivor.send(Message::Binary(packet(seq, 0xa0))).await;
+                let _ = survivor.send(Message::Binary(packet(seq, 0xa0).into())).await;
                 seq += 1;
                 let a_entry = caller.state.storage.call_get(&bid, call_id).await.unwrap().unwrap();
                 let b_entry = callee.state.storage.call_get(&aid, call_id).await.unwrap().unwrap();
