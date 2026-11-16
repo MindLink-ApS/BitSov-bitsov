@@ -87,6 +87,20 @@ Pre-release; not for production use. Copy this template for each new RC.
       the same key. A bare `gpg --verify` exit code is not this check.
 - [ ] Check SBOM, provenance and release notes. Record unverified targets as such;
       their signed checksums do not prove they were independently rebuilt.
+- [ ] For #459, inspect the first `v*` tag whose commit includes the action update
+      (rc25 if selected, otherwise the next qualifying release). Check
+      `Attest binary provenance` separately in every `Release CLI` matrix job:
+      currently five targets across Linux, macOS and Windows. The step uses
+      `continue-on-error: true`, so a green job alone does not establish success.
+      In a public repository, confirm the step completed successfully and each
+      uploaded binary has an attestation binding its SHA-256 to the tagged commit.
+      Record the tag, full commit SHA, run URL and per-target attestation evidence.
+      In a private repository the step is skipped; record the missing evidence
+      explicitly. CI treats this step as optional, but publication still requires
+      a GitHub artifact attestation or equivalent provenance under the
+      [release provenance requirements](../ops/RELEASE_POLICY.md#required-for-public-releases).
+      Resolve missing evidence before publication; a skipped step alone does not
+      supply it.
 - [ ] Obtain operator publication sign-off. The signing script never publishes.
 - [ ] Only after publication and verification, update distribution pins and follow
       the release's migration/rollback checklist.
