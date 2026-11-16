@@ -882,6 +882,7 @@ pub(crate) async fn release_abandoned(store: Store<'_>, operation_id: &str) -> R
 /// operation journal. Ambiguous ones stay for a same-operation retry. Run
 /// before the receive loop and the outbox resend start.
 pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_storage::StorageError> {
+    // Normally a no-op: the node recovers devices first and queues these.
     recover_devices(store).await?;
     let (mut committed, mut released) = (0, 0);
     for (peer, call_id, entry) in store.call_pending().await? {
@@ -904,9 +905,18 @@ pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_stora
 
 /// Startup prerequisite before serving devices or receiving peer messages.
 /// A failure must prevent startup: volatile bindings cannot recover pending
-/// receipt outcomes by an ordinary same-operation retry.
-pub async fn recover_devices(store: Store<'_>) -> Result<(), konsensus_storage::StorageError> {
-    while store.call_invite_recover(10_000).await? != 0 {}
+/// receipt outcomes by an ordinary same-operation retry. Returns a
+/// not-reachable refusal for each invite whose wait the restart ended, for
+/// [`devices::Devices::queue_notices`], so its caller stops ringing now.
+pub async fn recover_devices(store: Store<'_>) -> Result<Vec<(NodeId, konsensus_message::Frame)>, konsensus_storage::StorageError> {
+    let mut notices = Vec::new();
+    loop {
+        let withdrawn = store.call_invite_recover(10_000).await?;
+        if withdrawn.is_empty() { break; }
+        notices.extend(withdrawn.into_iter().map(|(id, caller)| {
+            (caller, konsensus_message::Frame::MessageReject { id, reason: devices::NOT_REACHABLE.into() })
+        }));
+    }
     // Device bindings are intentionally volatile. On restart, fail closed
     // rather than attach a historical envelope to an awaiting call id.
     let _guard = lock().lock().await;
@@ -918,7 +928,7 @@ pub async fn recover_devices(store: Store<'_>) -> Result<(), konsensus_storage::
             store.call_put(&peer, &id, &ended).await?;
         }
     }
-    Ok(())
+    Ok(notices)
 }
 
 /// How long an incoming signal may stay held by a live handler before the

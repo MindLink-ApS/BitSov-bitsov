@@ -1216,19 +1216,21 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn call_invite_recover(&self, max: u32) -> Result<u64, StorageError> {
+    async fn call_invite_recover(&self, max: u32) -> Result<Vec<(MessageId, NodeId)>, StorageError> {
         let mut tx = self.pool.begin().await?;
         // Holds make a partial/failed startup cleanup invisible to readers.
         sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT message_id, sender, 0 FROM payment_receipts WHERE kind = 400 AND accepted = -2 ORDER BY message_id LIMIT ? ON CONFLICT DO NOTHING")
             .bind(i64::from(max)).execute(&mut *tx).await?;
-        let done = sqlx::query("UPDATE payment_receipts SET accepted = -3 WHERE kind = 400 AND accepted = -2 AND message_id IN (SELECT message_id FROM call_admission_hold)")
-            .execute(&mut *tx).await?;
+        let done: Vec<(String, String)> = sqlx::query_as("UPDATE payment_receipts SET accepted = -3 WHERE kind = 400 AND accepted = -2 AND message_id IN (SELECT message_id FROM call_admission_hold) RETURNING message_id, sender")
+            .fetch_all(&mut *tx).await?;
         sqlx::query("DELETE FROM messages WHERE id IN (SELECT r.message_id FROM payment_receipts r JOIN call_admission_hold h ON h.message_id = r.message_id WHERE r.kind = 400 AND r.accepted = -3)")
             .execute(&mut *tx).await?;
         sqlx::query("DELETE FROM call_admission_hold WHERE message_id IN (SELECT r.message_id FROM payment_receipts r JOIN call_admission_hold h ON h.message_id = r.message_id WHERE r.kind = 400 AND r.accepted = -3)")
             .execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(done.rows_affected())
+        done.iter()
+            .map(|(id, sender)| Ok((MessageId::from_hex(id).map_err(|e| StorageError::Conversion(e.to_string()))?, NodeId::from_hex(sender).map_err(|e| StorageError::Conversion(e.to_string()))?)))
+            .collect()
     }
 
     async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {

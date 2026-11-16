@@ -903,7 +903,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_invite_deliver(id, peer, call_id, entry).await
     }
 
-    async fn call_invite_recover(&self, max: u32) -> Result<u64, StorageError> {
+    async fn call_invite_recover(&self, max: u32) -> Result<Vec<(MessageId, NodeId)>, StorageError> {
         self.inner.call_invite_recover(max).await
     }
 

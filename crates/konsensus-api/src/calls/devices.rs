@@ -72,9 +72,17 @@ impl Drop for StreamTicket<'_> {
 #[derive(Default)]
 pub struct Devices {
     invites: Mutex<HashMap<MessageId, Invite>>,
+    /// Refusals decided before the receive loop ran (startup recovery),
+    /// handed to the background writer by the first sweep.
+    queued: Mutex<Vec<(NodeId, Frame)>>,
 }
 
 impl Devices {
+    /// Queue replies decided at startup for the first [`Self::sweep`].
+    pub fn queue_notices(&self, notices: Vec<(NodeId, Frame)>) {
+        self.queued.lock().unwrap_or_else(|e| e.into_inner()).extend(notices);
+    }
+
     /// Called only after the unchanged payment and admission gates. Register
     /// before lifting the message hold, so an app cannot fetch ahead of us.
     pub async fn admit(
@@ -404,7 +412,8 @@ impl Devices {
             })
             .map(|(id, _)| *id)
             .collect();
-        let mut notices = Vec::with_capacity(due.len());
+        let mut notices = std::mem::take(&mut *self.queued.lock().unwrap_or_else(|e| e.into_inner()));
+        notices.reserve(due.len());
         for id in due {
             let result: Result<(), StorageError> = async {
                 // Decide on the current entry, not the snapshot: a stream write
