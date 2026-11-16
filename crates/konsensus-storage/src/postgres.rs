@@ -38,7 +38,7 @@ impl PostgresStorage {
             String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
             String, String,
         )>(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+            "SELECT id, kind::BIGINT, sender, recipient_type, recipient_id, timestamp_ms, \
              ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
              FROM messages WHERE id = $1 AND ($2 OR id NOT IN (SELECT message_id FROM call_admission_hold))",
         )
@@ -1611,7 +1611,7 @@ impl Storage for PostgresStorage {
 
     async fn message_page(&self, scope: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<Vec<UkmEnvelope>, StorageError> {
         let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND "
+            "SELECT id, kind::BIGINT, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND "
         );
         match scope {
             crate::MessageListQuery::Recipient(recipient) => {
