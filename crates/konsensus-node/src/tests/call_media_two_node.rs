@@ -246,7 +246,7 @@ impl Node {
 }
 
 fn packet(seq: u32, payload: &[u8]) -> Message {
-    Message::Binary([seq.to_be_bytes().as_slice(), payload].concat())
+    Message::Binary([seq.to_be_bytes().as_slice(), payload].concat().into())
 }
 
 async fn next_binary<S>(socket: &mut S) -> Vec<u8>
@@ -256,7 +256,7 @@ where
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match socket.next().await.expect("socket open").expect("socket ok") {
-                Message::Binary(bytes) => return bytes,
+                Message::Binary(bytes) => return bytes.to_vec(),
                 Message::Ping(_) | Message::Pong(_) | Message::Text(_) => continue,
                 other => panic!("unexpected message {other:?}"),
             }
@@ -464,7 +464,7 @@ async fn a_packet_into_node_a_s_socket_comes_out_of_node_b_s_socket() {
     assert_eq!(next_binary(&mut app_a).await, [&7u32.to_be_bytes()[..], b"hello from b"].concat());
 
     // A malformed app packet (no header) is dropped; the socket stays up.
-    app_a.send(Message::Binary(vec![1, 2])).await.unwrap();
+    app_a.send(Message::Binary(vec![1, 2].into())).await.unwrap();
     app_a.send(packet(21, b"still here")).await.unwrap();
     assert_eq!(next_binary(&mut app_b).await, [&21u32.to_be_bytes()[..], b"still here"].concat());
 
