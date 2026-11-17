@@ -1238,6 +1238,8 @@ struct Adversary {
     identity: Arc<NodeIdentity>,
     transport: Arc<NoiseTransport>,
     invoice_responses: Arc<AtomicUsize>,
+    /// InvoiceError replies by reason, so the flood can prove which path refused it.
+    invoice_refusals: Arc<Mutex<BTreeMap<String, usize>>>,
     other_replies: Arc<AtomicUsize>,
 }
 
@@ -1252,21 +1254,30 @@ fn adversary(seed: u64, k: usize) -> Adversary {
         },
     ));
     let invoice_responses = Arc::new(AtomicUsize::new(0));
+    let invoice_refusals: Arc<Mutex<BTreeMap<String, usize>>> = Default::default();
     let other_replies = Arc::new(AtomicUsize::new(0));
     {
-        let (t, inv, other) = (Arc::clone(&transport), Arc::clone(&invoice_responses), Arc::clone(&other_replies));
+        let (t, inv, refused, other) =
+            (Arc::clone(&transport), Arc::clone(&invoice_responses), Arc::clone(&invoice_refusals), Arc::clone(&other_replies));
         tokio::spawn(async move {
             while let Some(event) = t.recv_control().await {
                 match event {
-                    ControlEvent::InvoiceResponseReceived { .. } => inv.fetch_add(1, Ordering::SeqCst),
-                    _ => other.fetch_add(1, Ordering::SeqCst),
-                };
+                    ControlEvent::InvoiceResponseReceived { .. } => {
+                        inv.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ControlEvent::InvoiceErrorReceived { reason, .. } => {
+                        *refused.lock().unwrap().entry(reason).or_default() += 1;
+                    }
+                    _ => {
+                        other.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
             }
         });
         let t = Arc::clone(&transport);
         tokio::spawn(async move { while t.recv().await.is_ok() {} });
     }
-    Adversary { identity, transport, invoice_responses, other_replies }
+    Adversary { identity, transport, invoice_responses, invoice_refusals, other_replies }
 }
 
 fn signed_envelope(identity: &NodeIdentity, to: NodeId, ciphertext: Vec<u8>, proof: konsensus_core::PaymentProof) -> konsensus_core::UkmEnvelope {
@@ -1296,11 +1307,18 @@ enum Attack {
     Malformed,
     /// A message with a ciphertext near/over the frame cap.
     Oversized,
-    /// RequestInvoice flood.
+    /// RequestInvoice flood of well-formed first-contact quote attempts.
+    /// Runs in its own phase after the honest steps (see `run_adversarial`).
     InvoiceFlood,
 }
 
-const ATTACKS: [Attack; 6] = [Attack::UnpaidProof, Attack::RandomHash, Attack::Replay, Attack::Malformed, Attack::Oversized, Attack::InvoiceFlood];
+/// Attacks that run alongside honest traffic.
+const ATTACKS: [Attack; 5] = [Attack::UnpaidProof, Attack::RandomHash, Attack::Replay, Attack::Malformed, Attack::Oversized];
+
+/// The recipient allows one first-contact quote per source address per 10 s
+/// window (`admission_quotes.rs`). Waiting this long before the flood phase
+/// means the flood's first attempt at each target is quotable.
+const QUOTE_WINDOW_WAIT: Duration = Duration::from_secs(11);
 
 async fn attack(adv: &Adversary, target: &SimNode, kind: Attack, rng: &mut SimRng, ids: &Mutex<HashSet<String>>) -> usize {
     let to = target.id;
@@ -1353,8 +1371,17 @@ async fn attack(adv: &Adversary, target: &SimNode, kind: Attack, rng: &mut SimRn
             }
         }
         Attack::InvoiceFlood => {
-            for i in 0..300 {
-                let frame = Frame::RequestInvoice { request_id: format!("flood-{}-{i}", rng.next()), amount_msat: CHAT_MSAT, purpose: "admission".into() };
+            // Fresh, well-formed first-contact attempts built the way a real
+            // sender builds them, so the flood reaches quoting and its limit.
+            use konsensus_core::admission_quote;
+            let me = *adv.identity.node_id();
+            for _ in 0..300 {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                let frame = Frame::RequestInvoice {
+                    request_id: admission_quote::request_id(&to, &me, now),
+                    amount_msat: CHAT_MSAT,
+                    purpose: admission_quote::PURPOSE.into(),
+                };
                 if adv.transport.send_frame(&to, &frame).await.is_ok() { sent += 1; } else { break; }
             }
         }
@@ -1365,7 +1392,7 @@ async fn attack(adv: &Adversary, target: &SimNode, kind: Attack, rng: &mut SimRn
 async fn run_adversarial(cfg: SimConfig, adversaries: usize) {
     let mut net = Net::start(cfg, false).await;
     net.mesh(3).await;
-    let advs: Vec<_> = (0..adversaries).map(|k| adversary(cfg.seed, k)).collect();
+    let mut advs: Vec<_> = (0..adversaries).map(|k| adversary(cfg.seed, k)).collect();
     let ids: Arc<Mutex<HashSet<String>>> = Default::default();
     // Each adversary connects to a few random honest nodes.
     let mut targets: Vec<Vec<usize>> = Vec::new();
@@ -1414,6 +1441,62 @@ async fn run_adversarial(cfg: SimConfig, adversaries: usize) {
         let last = &net.sent[net.sent.len().saturating_sub(cfg.per_step)..];
         println!("sim: step {step}: {} sends, {} ok, t={:.1}s", last.len(), last.iter().filter(|s| s.ok()).count(), net.started.elapsed().as_secs_f64());
     }
+    // Invoice flood phase. In-process every node and adversary shares
+    // 127.0.0.1, and first-contact quoting is limited per source address, so
+    // a flood overlapping the honest steps would also limit honest first
+    // contact from that same address. It runs here instead, after the quote
+    // window has passed. The step attackers are banned by now for invalid
+    // frames, so each one floods its targets under a fresh identity from
+    // the same address (identity rotation), all at once.
+    tokio::time::sleep(QUOTE_WINDOW_WAIT).await;
+    let stepped = advs.len();
+    let mut flooded: HashSet<usize> = HashSet::new();
+    let mut flood_plan = Vec::new();
+    for k in 0..stepped {
+        let flooder = adversary(cfg.seed, stepped + k);
+        let mut t = Vec::new();
+        for &i in &targets[k] {
+            let node = net.node(i);
+            if net.up(i) && flooder.transport.connect(&node.id, &node.addr()).await.is_ok() {
+                t.push(i);
+                flooded.insert(i);
+                flood_plan.push((advs.len(), i, net.rng.next()));
+            }
+        }
+        advs.push(flooder);
+        targets.push(t);
+    }
+    let floods_by: Vec<usize> = (0..advs.len()).map(|k| if k < stepped { 0 } else { targets[k].len() }).collect();
+    *attack_log.entry(format!("{:?}", Attack::InvoiceFlood)).or_default() += flood_plan.len();
+    let flood_sent: usize = {
+        let (net, advs, ids) = (&net, &advs, &ids);
+        futures::future::join_all(flood_plan.into_iter().map(|(k, i, s)| async move {
+            let mut rng = SimRng::new(s);
+            attack(&advs[k], net.node(i), Attack::InvoiceFlood, &mut rng, ids).await
+        }))
+        .await
+        .into_iter()
+        .sum()
+    };
+    let flood_pairs: usize = floods_by.iter().sum();
+    if flood_sent < 300 * flood_pairs {
+        net.violation(format!("S3 invoice flood sent only {flood_sent} of {} frames", 300 * flood_pairs));
+    }
+    // Replies arrive on the adversaries' control channels; wait until they stop.
+    let replies = |advs: &[Adversary]| -> usize {
+        advs.iter()
+            .map(|a| a.invoice_responses.load(Ordering::SeqCst) + a.invoice_refusals.lock().unwrap().values().sum::<usize>())
+            .sum()
+    };
+    let mut seen = replies(&advs);
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = replies(&advs);
+        if now == seen {
+            break;
+        }
+        seen = now;
+    }
     let adv_ids = ids.lock().unwrap().clone();
     net.check_common(&adv_ids).await;
     // S3: honest traffic still flows.
@@ -1423,6 +1506,7 @@ async fn run_adversarial(cfg: SimConfig, adversaries: usize) {
     }
     // S3: unpaid adversaries got no session, no privilege, no cached prices,
     // and the invoice flood was bounded.
+    let (mut quotes, mut rate_limited) = (0, 0);
     for (k, adv) in advs.iter().enumerate() {
         let aid = *adv.identity.node_id();
         for &i in &targets[k] {
@@ -1441,15 +1525,40 @@ async fn run_adversarial(cfg: SimConfig, adversaries: usize) {
             }
         }
         let inv = adv.invoice_responses.load(Ordering::SeqCst);
-        println!("sim: a{k} targets={:?} invoice_responses={inv} other_replies={}", targets[k], adv.other_replies.load(Ordering::SeqCst));
-        let floods = attack_log.get("InvoiceFlood").copied().unwrap_or(0);
-        // A stranger flooding 300 requests per attack must not get hundreds of quotes back.
-        if floods > 0 && inv > 100 * targets[k].len().max(1) {
-            net.violation(format!("S3 a{k} got {inv} invoice responses from an unbounded flood"));
+        let refused = adv.invoice_refusals.lock().unwrap().clone();
+        println!(
+            "sim: a{k} targets={:?} floods={} invoice_responses={inv} invoice_refusals={refused:?} other_replies={}",
+            targets[k],
+            floods_by[k],
+            adv.other_replies.load(Ordering::SeqCst)
+        );
+        quotes += inv;
+        rate_limited += refused.get(konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED).copied().unwrap_or(0);
+        // Only floods request invoices. Each flood is 300 fresh first-contact
+        // attempts from one source in well under the quote window, so a
+        // recipient quotes at most once per flood.
+        if inv > floods_by[k] {
+            net.violation(format!("S3 a{k} got {inv} admission quotes from {} floods", floods_by[k]));
         }
         adv.transport.shutdown();
     }
-    println!("sim: attacks {attack_log:?}");
+    // The flood must reach the real first-contact quote path (a stranger
+    // gets one quote) and then the recipient's quote rate limit. A purpose or
+    // request id the node does not accept would be refused before either.
+    if !flooded.is_empty() {
+        // All adversaries share one source address, so each flooded
+        // recipient quotes at most once in the whole phase.
+        if quotes > flooded.len() {
+            net.violation(format!("S3 invoice flood got {quotes} admission quotes from {} recipients", flooded.len()));
+        }
+        if quotes == 0 {
+            net.violation("S3 invoice flood never reached admission quoting (0 quotes)".into());
+        }
+        if rate_limited == 0 {
+            net.violation("S3 invoice flood never hit the admission quote rate limit (0 rate-limited refusals)".into());
+        }
+    }
+    println!("sim: attacks {attack_log:?} flood_frames={flood_sent} flooded={} quotes={quotes} rate_limited={rate_limited}", flooded.len());
     net.finish();
 }
 
