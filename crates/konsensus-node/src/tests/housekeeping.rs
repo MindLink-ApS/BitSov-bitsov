@@ -1,4 +1,5 @@
 use super::*;
+use konsensus_core::lightning_binding::PeerLightningKey;
 use konsensus_core::types::{MessageId, NodeId, Nonce};
 use konsensus_core::{PaymentProof, Recipient, UkmEnvelopeBuilder};
 use konsensus_storage::{SqliteStorage, Storage};
@@ -516,8 +517,11 @@ async fn peer_ln_pubkeys_cleanup_removes_disconnected() {
     let map = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     {
         let mut m = map.lock().await;
-        m.insert(connected_peer, "02aabb".to_string());
-        m.insert(disconnected_peer, "02ccdd".to_string());
+        m.insert(
+            connected_peer,
+            PeerLightningKey::Verified("02aabb".to_string()),
+        );
+        m.insert(disconnected_peer, PeerLightningKey::Unsigned);
     }
 
     // Simulate: only connected_peer is connected
@@ -536,7 +540,7 @@ async fn peer_ln_pubkeys_cleanup_removes_disconnected() {
 /// Empty map: cleanup is a no-op.
 #[tokio::test]
 async fn peer_ln_pubkeys_cleanup_empty_is_noop() {
-    let map: HashMap<NodeId, String> = HashMap::new();
+    let map: HashMap<NodeId, PeerLightningKey> = HashMap::new();
     let connected: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
     let before = map.len();
     // retain on empty does nothing
@@ -551,8 +555,8 @@ async fn peer_ln_pubkeys_cleanup_all_connected_retains_all() {
     let peer_b = NodeId::from_bytes([2u8; 32]);
 
     let mut map = HashMap::new();
-    map.insert(peer_a, "02aa".to_string());
-    map.insert(peer_b, "02bb".to_string());
+    map.insert(peer_a, PeerLightningKey::Verified("02aa".to_string()));
+    map.insert(peer_b, PeerLightningKey::Verified("02bb".to_string()));
 
     let connected: std::collections::HashSet<_> = [peer_a, peer_b].into_iter().collect();
     map.retain(|peer_id, _| connected.contains(peer_id));
@@ -665,4 +669,30 @@ async fn nonce_cleanup_reclaims_expired_envelope_deferrals_at_startup() {
     }).await.expect("startup maintenance removes expired rows");
     shutdown.send(true).unwrap();
     task.await.unwrap();
+}
+
+#[tokio::test]
+async fn call_cleanup_expires_an_unfetched_invite_and_shuts_down() {
+    use konsensus_api::calls::{devices::Devices, now_ms};
+    use konsensus_core::payloads::call::Phase;
+    let identity = Arc::new(konsensus_core::NodeIdentity::from_mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", "").unwrap());
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let devices = Arc::new(Devices::default());
+    let env = UkmEnvelopeBuilder::new(400, NodeId::from_bytes([41;32]), Recipient::Node(*identity.node_id()), vec![1], make_proof()).build();
+    let text = r#"{"v":1,"call_id":"0123456789abcdef0123456789abcdef","media":"audio","sdp":"v=0"}"#;
+    db.accept_paid_envelope(&env).await.unwrap();
+    let arrived = now_ms() - 15_000;
+    devices.admit(db.as_ref(), identity.node_id(), &env, Some(text), arrived, || arrived).await.unwrap();
+    let transport = Arc::new(NoiseTransport::new(identity, Default::default()));
+    let (shutdown, rx) = watch::channel(false);
+    let worker = tokio::spawn(run_call_cleanup(db.clone(), devices, transport, rx));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if db.call_get(&env.sender, "0123456789abcdef0123456789abcdef").await.unwrap().unwrap().phase == Phase::Ended { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("background cleanup must expire the device wait");
+    assert!(db.get_message(&env.id).await.unwrap().is_none());
+    shutdown.send(true).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), worker).await.unwrap().unwrap();
 }

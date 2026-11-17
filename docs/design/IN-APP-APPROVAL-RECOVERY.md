@@ -178,6 +178,27 @@ Afterward, verify comprehension of four points: whose authority was used; what l
 
 An unsupported last-authority-loss scenario must be described honestly and must not be scored as successful recovery. Provisioned-device success does not establish complete unaided onboarding from empty hardware.
 
+### 9.1 Proposed amendment: two claims, scored separately (draft, not yet adopted)
+
+**Current claim, unchanged by this draft:** approval from an already-provisioned device, and nothing more. That means an enrolled owner device approving a different requesting client (§1, and the separate-device requirement in §4). Restart, pairing-loss and app-lockout recovery are **not** claimed today. They remain proposed outcomes until their implementation and the §9 acceptance gate pass. Unaided setup from empty hardware is not claimed, and no same-device setup ceremony (option B) is funded now. This amendment is targeted after v0.3.0-rc24. It changes how §9 is scored, not what is claimed, and it weakens no scored scenario.
+
+**Claim 1: provisioned-device use (proposed scope).**
+- Scope: spend approval (the only part claimed today), and node restart recovery, pairing-loss recovery with surviving authority, and app lockout once each passes its implementation and acceptance gates. Every scenario starts from a home node and at least one enrolled owner device that are already set up, with the requesting client on a separate pairing as required above.
+- Gate: unchanged from §9. At most five user decisions per scenario, zero hints, no terminal, no hidden settings, every retry counted, each participant and scenario reported, and the comprehension check. Enrollment, reenrollment or a role change needed during a scored scenario still counts toward that scenario.
+- Public wording must name the precondition, for example "once your devices are set up". It may not say or imply that setup itself is unaided, or that a recovery journey works before it has passed the gate.
+
+**Claim 2: setup (measured, not claimed as unaided).**
+- Scope: first launch through to the first scored scenario. This covers install, connecting the app to the home node, first-owner setup and second-device enrollment.
+- It is measured on every release with the same counting rules. Decisions, OS or biometric prompts, waits, terminal steps and helper actions are recorded per participant as separate totals; an interaction or a wait is not counted as a decision.
+- A helper is **allowed** and recorded. The result is published as observed: "setup with help: N user decisions, M helper actions, T user terminal steps", with helper provisioning and any terminal or expert work reported separately as §9 requires. Zero is reported only when zero was observed.
+- Targets, not results: no terminal step required of the user, and five user decisions or fewer for connecting the app to an already-provisioned home node. No path reaching either target is demonstrated yet; a release that misses a target reports it as unmet. Second-device enrollment is reported as its own line within the setup record until option B or C is designed. This is a reporting split, not an exemption: enrollment needed during a scored scenario still counts under §9.
+
+**Unchanged:** an end-to-end "unaided onboarding from empty hardware" claim still requires the full rule in §9 above (enrollment counted, no provisioned-device exemption). It stays unclaimed until a setup ceremony is designed and passes that gate. The last-authority-loss scenario is still described honestly and not scored as recovery.
+
+**Why this split:** we expect the whole fresh journey to exceed five decisions once OS prompts, enrollment and a role change are included. That is an unmeasured concern, not a result: no count pinned to an app revision, platform and starting state exists yet, and the app has conditional platform and enrollment paths. The first Claim 2 measurement should record the app revision, platform, starting state and the ordered steps, each classed as decision, interaction, wait or helper action. If setup were folded into each scored scenario, a long setup would either fail every scenario or invite quietly leaving steps out. Two separate, honest numbers are more useful than one misleading one.
+
+**Decision needed:** adopt 9.1 as written, or with changes, after v0.3.0-rc24 and before the next older-user acceptance run.
+
 ## 10. Handoff and implementation boundary
 
 The next engineering step is a version-specific contract inventory and owner decision record, followed by a reviewed implementation plan for the selected subset. Do not duplicate held work, silently broaden recovery authority, add a public fallback, or change live node configuration.

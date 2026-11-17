@@ -11,6 +11,7 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use konsensus_core::identity::NodeIdentity;
+use konsensus_core::payloads::calendar::{CalendarEventPayload, CalendarPayloadError, RsvpPayload};
 use konsensus_core::traits::chain::ChainProvider;
 use konsensus_core::traits::lightning::LightningProvider;
 use konsensus_core::traits::transport::MessageTransport;
@@ -47,6 +48,7 @@ pub(crate) struct MsgHandlerDeps {
     pub identity: Arc<NodeIdentity>,
     pub plaintext_cipher: Arc<PlaintextCacheCipher>,
     pub ws_tx: broadcast::Sender<Arc<WsMessage>>,
+    pub call_devices: Arc<konsensus_api::calls::devices::Devices>,
     pub audit_log: Arc<AuditLog>,
     /// Operator-selectable admission mode. In `Whitelist` (default) the receive-path
     /// gate still passes `Some(&whitelist)` (Step-2 membership enforced); in
@@ -266,6 +268,66 @@ impl std::fmt::Display for ReceiptRefusal {
     }
 }
 
+/// Receipt lookup used only by the receive gate. The gate authenticates the
+/// envelope and recipient before this lookup; a pending/refused device wait
+/// reuses its exact paid receipt without another price or settlement check.
+struct InviteReceipts<'a>(&'a dyn konsensus_storage::Storage);
+
+#[async_trait::async_trait]
+impl konsensus_core::gate::NonceStore for InviteReceipts<'_> {
+    async fn is_paid_envelope_accepted(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        if self.0.call_invite_outcome(envelope).await?.is_some() { return Ok(true); }
+        Ok(self.0.is_paid_envelope_accepted(envelope).await?)
+    }
+
+    async fn delivery_price_floor(&self, envelope: &konsensus_core::UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.0.delivery_price_floor(envelope, paid_at, now).await?)
+    }
+
+    async fn take_outstanding_web_request(&self, hash: &[u8; 32]) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self.0.take_outstanding_web_request(hash).await?)
+    }
+
+    async fn check_and_store(&self, _: &konsensus_core::Nonce, _: &konsensus_core::NodeId) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Err("receive receipt lookup does not consume replay keys".into())
+    }
+}
+
+/// Both duplicate paths use the original durable device outcome, even after
+/// withdrawal, content retention, call expiry, or a process restart.
+async fn duplicate_reply(
+    storage: &dyn konsensus_storage::Storage,
+    envelope: &konsensus_core::UkmEnvelope,
+    paid_until_ms: Option<u64>,
+) -> Option<Frame> {
+    if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
+        match storage.call_invite_outcome(envelope).await {
+            Ok(Some(konsensus_storage::CallInviteOutcome::Fetched)) => {},
+            Ok(Some(konsensus_storage::CallInviteOutcome::NotReachable)) => return Some(Frame::MessageReject { id: envelope.id, reason: konsensus_api::calls::devices::NOT_REACHABLE.into() }),
+            Ok(Some(konsensus_storage::CallInviteOutcome::Pending)) | Ok(None) => return None,
+            Err(e) => { warn!(error = %e, "call receipt unavailable for duplicate invite"); return None; }
+        }
+    }
+    Some(Frame::MessageAck { id: envelope.id, duplicate: true, paid_until_ms })
+}
+
+/// Reply to a call offer the general age limit refused. A known exact offer
+/// replays its durable outcome; an unseen one can no longer ring and is
+/// refused as not reachable, which the caller treats as terminal.
+async fn expired_offer_reply(
+    storage: &dyn konsensus_storage::Storage,
+    envelope: &konsensus_core::UkmEnvelope,
+) -> Option<Frame> {
+    match storage.call_invite_outcome(envelope).await {
+        Ok(Some(_)) => duplicate_reply(storage, envelope, None).await,
+        Ok(None) => Some(Frame::MessageReject { id: envelope.id, reason: konsensus_api::calls::devices::NOT_REACHABLE.into() }),
+        Err(e) => {
+            error!(error = %e, "cannot read call offer receipt; withholding response");
+            None
+        }
+    }
+}
+
 /// Runs the incoming message handler loop.
 ///
 /// Receives envelopes from the transport, validates them through the payment gate,
@@ -288,6 +350,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
         identity: identity_for_recv,
         plaintext_cipher,
         ws_tx: ws_tx_for_recv,
+        call_devices,
         audit_log: audit_for_recv,
         admission_mode: admission_mode_for_recv,
         relay_engine: relay_engine_for_recv,
@@ -324,6 +387,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                     Ok(envelope) => {
                         // PRINCIPLE 2: Every incoming message MUST pass the payment gate.
                         // Fail-closed: any verification failure = message rejected.
+                        let arrived_ms = konsensus_api::calls::now_ms();
                         let sender = envelope.sender;
                         let msg_id = envelope.id;
                         // Settlement verification may await a wallet or storage.
@@ -334,6 +398,14 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         let repair_generation = if repair_eligible {
                             transport_for_recv.connected_since(&sender).await
                         } else { None };
+                        if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
+                            match call_devices.sweep(storage_for_recv.as_ref(), arrived_ms).await {
+                                Ok(notices) => for (peer, frame) in notices {
+                                    let _ = transport_for_ack.enqueue_control_frame(&peer, &frame).await;
+                                },
+                                Err(e) => warn!(error = %e, "call device sweep failed"),
+                            }
+                        }
 
                         // Compute plasticity trust discount from sender's synaptic weight.
                         // Trusted peers (high weight) get lower required payment.
@@ -352,12 +424,14 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         let is_relay_control = relay_engine_for_recv.is_some()
                             && konsensus_core::kind::KindCategory::from_kind(envelope.kind)
                                 == konsensus_core::kind::KindCategory::Storage;
+                        let invite_receipts = InviteReceipts(storage_for_recv.as_ref());
+                        let receipts: &dyn konsensus_core::gate::NonceStore = if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE { &invite_receipts } else { nonce_adapter.as_ref() };
                         let mut gate_result = whitelist_then_verify(
                             &envelope,
                             audit_for_recv.membrane(),
                             peer_registry_for_recv.as_ref(),
                             gate_for_recv.as_ref(),
-                            nonce_adapter.as_ref(),
+                            receipts,
                             pricing_for_recv.as_ref(),
                             Some(verify_lightning.as_ref()),
                             trust_discount,
@@ -370,6 +444,22 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             is_relay_control,
                         )
                         .await;
+
+                        // A call offer keeps its stamp (its generation's timing), so the
+                        // general age limit can refuse an exact retry before its receipt
+                        // is seen. A known offer replays its durable outcome without
+                        // readmission; an unseen expired one is refused for good, so the
+                        // caller ends the call instead of retrying it.
+                        if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE
+                            && matches!(gate_result, Err(konsensus_core::gate::GateRejection::MessageTooOld { .. }))
+                        {
+                            if let Some(reply) = expired_offer_reply(storage_for_recv.as_ref(), &envelope).await {
+                                if let Err(e) = transport_for_ack.send_frame(&sender, &reply).await {
+                                    warn!(error = %e, "failed to answer an expired call offer");
+                                }
+                            }
+                            continue;
+                        }
 
                         if envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
                             match storage_for_recv.is_paid_envelope_rejected(&envelope).await {
@@ -390,9 +480,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     Err(e) => { error!(error = %e, "cannot recover call grant; withholding ACK"); continue; }
                                 }
                             } else { None };
-                            let ack = Frame::MessageAck { id: msg_id, duplicate: true, paid_until_ms };
-                            if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
-                                warn!(error = %e, "failed to send duplicate ACK");
+                            if let Some(reply) = duplicate_reply(storage_for_recv.as_ref(), &envelope, paid_until_ms).await {
+                                if let Err(e) = transport_for_ack.send_frame(&sender, &reply).await {
+                                    warn!(error = %e, "failed to send duplicate reply");
+                                }
                             }
                             continue;
                         }
@@ -500,12 +591,18 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // plaintext, resync and duplicate ACKs) from before its
                         // paid acceptance until its admission is final: a call
                         // signal and a candidate room chat by their admission
-                        // checks, everything else once its plaintext is produced
-                        // and kept (a file once stored). A refusal withdraws the
-                        // hold with the envelope; should that withdrawal fail, the
-                        // hold still keeps the envelope hidden and unacknowledged
-                        // until the startup/periodic sweep withdraws it (review
-                        // delta2 #4, #155).
+                        // checks, a calendar envelope once its payload passed the
+                        // inbound caps and its change committed with the release,
+                        // everything else once its plaintext is produced and kept
+                        // (a file once stored). A refusal withdraws the hold with
+                        // the envelope; should that withdrawal fail, the hold still
+                        // keeps the envelope hidden and unacknowledged until the
+                        // startup/periodic sweep withdraws it (review delta2 #4,
+                        // #155). The kinds whose admission is decided after
+                        // acceptance are accepted under their hold (below).
+                        let held_kind = konsensus_api::calls::is_call_kind(envelope.kind)
+                            || konsensus_api::room_binding::is_candidate(envelope.kind)
+                            || is_calendar_kind(envelope.kind);
                         let mut call_hold = false;
                         if gate_result.is_ok() && !is_relay_control {
                             match konsensus_api::calls::hold_incoming(storage_for_recv.as_ref(), &envelope).await {
@@ -523,9 +620,25 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
 
                         if gate_result.is_ok() && !is_relay_control {
                             use konsensus_storage::PaidAcceptance;
+                            // A held kind is accepted under its hold, inside the
+                            // acceptance transaction: if the sweep withdrew the hold
+                            // in between, nothing is accepted and the sender's retry
+                            // places a fresh hold. A status already known from the
+                            // lookup above is never a fresh acceptance (a replay, a
+                            // withdrawal or a reuse), and those need no hold.
                             let acceptance = match known_acceptance {
                                 Some(status) => Ok(status),
+                                None if held_kind => storage_for_recv.accept_held_paid_envelope(&envelope).await,
                                 None => storage_for_recv.accept_paid_envelope(&envelope).await,
+                            };
+                            // Burned replay keys: decide, fail closed, what the resend
+                            // is told BEFORE the gate's payment-reuse reason can be
+                            // produced (the sender reads that one as a legacy ACK).
+                            let burned_reply = match &acceptance {
+                                Ok(PaidAcceptance::NonceReused | PaidAcceptance::PaymentReused) => {
+                                    burned_replay_reply(storage_for_recv.as_ref(), &envelope).await
+                                }
+                                _ => None,
                             };
                             match acceptance {
                                 // A web reply the gate accepted is bound to OUR paid
@@ -536,26 +649,56 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 }
                                 Ok(PaidAcceptance::AlreadyAccepted) => {
                                     drop(incoming_block.take());
-                                    // An envelope still held was never admitted: never
-                                    // acknowledge it as delivered.
-                                    if !is_relay_control
-                                        && storage_for_recv.call_admission_held(&msg_id).await.unwrap_or(true)
-                                    {
-                                        let reason = if konsensus_api::calls::is_call_kind(envelope.kind) { "call signal withdrawn" } else { "message withdrawn" };
-                                        let reject = Frame::MessageReject { id: msg_id, reason: reason.into() };
-                                        let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    // A duplicate ACK needs POSITIVE, durable evidence of
+                                    // admission (receipt accepted and not held), read now,
+                                    // after the acceptance transaction: a still-held
+                                    // envelope was never admitted, one the sweep withdrew
+                                    // meanwhile no longer exists, and an unreadable status
+                                    // is not evidence. The absence of a hold is not proof.
+                                    if matches!(storage_for_recv.is_paid_envelope_accepted(&envelope).await, Ok(true)) {
+                                        // No second promotion, decrypt, application side effect or write.
+                                        let paid_until_ms = if envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+                                            match konsensus_api::calls::block_grant(storage_for_recv.as_ref(), &plaintext_cipher, &sender, &msg_id).await {
+                                                Ok(grant) => grant,
+                                                Err(e) => { error!(error = %e, "cannot recover call grant; withholding ACK"); continue; }
+                                            }
+                                        } else { None };
+                                        // A call offer replays its durable ring outcome; a
+                                        // pending one gets no reply yet.
+                                        if let Some(reply) = duplicate_reply(storage_for_recv.as_ref(), &envelope, paid_until_ms).await {
+                                            if let Err(e) = transport_for_ack.send_frame(&sender, &reply).await {
+                                                warn!(error = %e, "failed to send duplicate reply");
+                                            }
+                                        }
                                         continue;
                                     }
-                                    // No second promotion, decrypt, application side effect or write.
-                                    let paid_until_ms = if envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
-                                        match konsensus_api::calls::block_grant(storage_for_recv.as_ref(), &plaintext_cipher, &sender, &msg_id).await {
-                                            Ok(grant) => grant,
-                                            Err(e) => { error!(error = %e, "cannot recover call grant; withholding ACK"); continue; }
-                                        }
-                                    } else { None };
-                                    let ack = Frame::MessageAck { id: msg_id, duplicate: true, paid_until_ms };
-                                    if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
-                                        warn!(error = %e, "failed to send duplicate ACK");
+                                    let reason = if matches!(storage_for_recv.is_application_rejected(&envelope).await, Ok(true)) {
+                                        application_rejected_reason()
+                                    } else if konsensus_api::calls::is_call_kind(envelope.kind) {
+                                        "call signal withdrawn".into()
+                                    } else {
+                                        "message withdrawn".into()
+                                    };
+                                    let reject = Frame::MessageReject { id: msg_id, reason };
+                                    let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                    continue;
+                                }
+                                Ok(PaidAcceptance::NonceReused | PaidAcceptance::PaymentReused)
+                                    if burned_reply.is_some() =>
+                                {
+                                    // A resend of a paid envelope this node accepted and
+                                    // then refused at the application (a withdrawn call
+                                    // signal, room chat or calendar payload, or one the
+                                    // hold sweep withdrew), or one whose withdrawal
+                                    // status could not be read. Neither may fall through
+                                    // to the payment-reuse reason below.
+                                    drop(incoming_block.take());
+                                    if call_hold {
+                                        let _ = storage_for_recv.call_admission_release(&msg_id).await;
+                                    }
+                                    let reject = Frame::MessageReject { id: msg_id, reason: burned_reply.unwrap_or_default() };
+                                    if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
+                                        warn!(peer = %sender, error = %e, "failed to send MessageReject");
                                     }
                                     continue;
                                 }
@@ -592,10 +735,14 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 }
                                 Err(e) => {
                                     drop(incoming_block.take());
-                                    if call_hold {
-                                        let _ = storage_for_recv.call_admission_release(&msg_id).await;
-                                    }
-                                    error!(error = %e, "atomic paid acceptance failed; replay keys rolled back");
+                                    // The hold placed above is KEPT: the acceptance may
+                                    // have committed before the error (a lost commit
+                                    // response), and releasing would expose an accepted
+                                    // envelope that never had its admission, which a
+                                    // replay could then duplicate-acknowledge. Held, it
+                                    // stays hidden; a retry re-admits it (the hold is
+                                    // inherited) or the sweep withdraws it.
+                                    error!(error = %e, held = call_hold, "atomic paid acceptance failed; replay keys rolled back");
                                     audit_for_recv.membrane().refused(&envelope,
                                         &konsensus_core::gate::GateRejection::NonceCheckFailed(e.to_string()));
                                     let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
@@ -889,11 +1036,11 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             preview_plaintext,
                         ).await {
                             Ok(plaintext) => plaintext,
-                            Err(refusal) if committed_block => {
+                            Err(InboundRefusal::Receipt(refusal)) if committed_block => {
                                 error!(sender = %sender, msg_id = %msg_id, reason = %refusal, "committed call block: post-commit refusal ignored; the durable grant stands and is acknowledged");
                                 None
                             }
-                            Err(refusal) => {
+                            Err(InboundRefusal::Receipt(refusal)) => {
                                 warn!(sender = %sender, kind = envelope.kind, msg_id = %msg_id, reason = %refusal, "paid message not readable or not kept; refused, not acknowledged");
                                 if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
                                     error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused message; a held chat stays hidden until the sweep");
@@ -909,11 +1056,46 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 }
                                 continue;
                             }
+                            Err(InboundRefusal::NotCommitted) => {
+                                // The calendar envelope passed the caps but its event or
+                                // RSVP and hold release did not commit together: nothing
+                                // of it was persisted, it stays held and hidden for the
+                                // sweep, and the sender gets a transient reject, not an
+                                // ACK.
+                                let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                continue;
+                            }
+                            Err(InboundRefusal::Calendar(refusal)) => {
+                                // A calendar payload over the inbound caps is refused
+                                // before it is cached, copied, stored or expanded. Like
+                                // a refused call signal: the paid envelope is withdrawn
+                                // (payment hash and nonce stay burned) and the sender
+                                // gets a typed reason it can act on. The envelope was
+                                // held before acceptance, so if the withdrawal fails it
+                                // stays hidden and the sweep withdraws it.
+                                warn!(sender = %sender, kind = envelope.kind, reason = %refusal, "calendar payload refused; not stored");
+                                if let Err(e) = storage_for_recv.reject_accepted_envelope(&envelope).await {
+                                    error!(msg_id = %msg_id, error = %e, "failed to withdraw a refused calendar payload; it stays held until the sweep");
+                                }
+                                audit_for_recv.record(
+                                    konsensus_api::audit::events::MESSAGE_REJECTED,
+                                    &sender.to_hex(),
+                                    Some(serde_json::json!({ "reason": refusal.code(), "kind": envelope.kind })),
+                                );
+                                let reject = Frame::MessageReject { id: msg_id, reason: calendar_reject_reason(&refusal) };
+                                if let Err(e) = transport_for_ack.send_frame(&sender, &reject).await {
+                                    warn!(peer = %sender, error = %e, "failed to send MessageReject");
+                                }
+                                continue;
+                            }
                         };
 
                         // The plaintext is produced and kept (a file stored): lift
                         // the hold now, except for a call signal or a candidate
-                        // room chat, whose admission checks below lift their own.
+                        // room chat, whose admission checks below lift their own,
+                        // and a calendar envelope, whose hold was lifted in the
+                        // transaction that committed its event or RSVP.
                         // Released whether or not this attempt placed the hold: a
                         // retry can inherit one left by an earlier attempt whose
                         // acceptance rolled back and whose cleanup failed, and an
@@ -922,6 +1104,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // withdraws it: fail closed, a reject, not an ACK.
                         if !konsensus_api::calls::is_call_kind(envelope.kind)
                             && !konsensus_api::room_binding::is_candidate(envelope.kind)
+                            && !is_calendar_kind(envelope.kind)
                         {
                             if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
                                 error!(msg_id = %msg_id, error = %e, "admitted message could not be released; withheld");
@@ -937,27 +1120,15 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // sender. A refused signal never reaches the app.
                         if konsensus_api::calls::is_call_kind(envelope.kind) {
                             let admitted = match admitted_block {
+                                // A committed block's hold was lifted in its commit
+                                // transaction: nothing is left that could withhold its
+                                // grant ACK or let the sweep withdraw it (review P1).
                                 Some(signal) => Ok(signal),
-                                None => konsensus_api::calls::admit_incoming(storage_for_recv.as_ref(), identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref()).await,
-                            };
-                            // Admitted: lift the hold before the app sees it. If that
-                            // write fails the signal stays held and is withdrawn by the
-                            // sweep: fail closed, the peer gets a reject, not an ACK.
-                            // A committed block's hold was lifted in its commit
-                            // transaction: nothing is left that could withhold its
-                            // grant ACK or let the sweep withdraw it (review P1).
-                            let admitted = match admitted {
-                                Ok(signal) if committed_block => Ok(signal),
-                                Ok(signal) => match storage_for_recv.call_admission_release(&msg_id).await {
-                                    Ok(()) => Ok(signal),
-                                    Err(e) => {
-                                        error!(msg_id = %msg_id, error = %e, "admitted call signal could not be released; withheld");
-                                        let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
-                                        let _ = transport_for_ack.send_frame(&sender, &reject).await;
-                                        continue;
-                                    }
-                                },
-                                Err(refusal) => Err(refusal),
+                                // Other signals: the device registry releases the hold under
+                                // the call lock, so expiry cannot be undone by a late release.
+                                // If that write fails the signal is refused: fail closed, the
+                                // peer gets a reject, not an ACK.
+                                None => call_devices.admit(storage_for_recv.as_ref(), identity_for_recv.node_id(), &envelope, plaintext.as_deref(), arrived_ms, konsensus_api::calls::now_ms).await,
                             };
                             if let Err(refusal) = admitted {
                                 warn!(sender = %sender, kind = envelope.kind, reason = %refusal, "call signal refused; not forwarded");
@@ -993,6 +1164,9 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // can inherit one); if that write fails it stays held:
                         // fail closed.
                         let room = konsensus_api::room_binding::admit_incoming(identity_for_recv.node_id(), &sender, envelope.kind, plaintext.as_deref());
+                        // Released whether this attempt placed the hold or inherited it
+                        // from an attempt whose acceptance errored (the hold is kept
+                        // then, see above): an admitted chat must never stay held.
                         if room.is_ok() && konsensus_api::room_binding::is_candidate(envelope.kind) {
                             if let Err(e) = storage_for_recv.call_admission_release(&msg_id).await {
                                 error!(msg_id = %msg_id, error = %e, "admitted chat could not be released; withheld");
@@ -1023,6 +1197,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         // withhold the ACK of a durable grant. A duplicate
                         // replays the same boundary from storage.
                         let paid_until_ms = if committed_block { committed_until } else { None };
+                        let wait_for_device = envelope.kind == konsensus_core::kind::KIND_CALL_INVITE;
                         // Broadcast to WebSocket clients (with plaintext if decrypted)
                         if let Err(e) = ws_tx_for_recv.send(Arc::new(
                             WsMessage {
@@ -1033,6 +1208,10 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             debug!(error = %e, "no WebSocket clients connected for incoming message broadcast");
                         }
 
+                        // The call cleanup writer sends the invite outcome after
+                        // device delivery or the 15-second wait, without stalling
+                        // this receive loop or a paired device's request.
+                        if wait_for_device { continue; }
                         // Send MessageAck back to sender
                         let ack = Frame::MessageAck { id: msg_id, duplicate: false, paid_until_ms };
                         if let Err(e) = transport_for_ack.send_frame(&sender, &ack).await {
@@ -1096,10 +1275,20 @@ async fn note_unreadable_envelope(
 ///
 /// Returns the plaintext string when it was produced and kept (`Ok(None)` when
 /// it was kept but is not UTF-8 text, or for an admission proof, which carries
-/// none). Returns a [`ReceiptRefusal`] when no plaintext could be produced
-/// (no session, not a ratchet message, or a failed decryption, which also
-/// triggers session re-negotiation) or kept; the caller then withdraws the
-/// envelope and refuses it instead of acknowledging delivery.
+/// none). Returns [`InboundRefusal::Receipt`] when no plaintext could be
+/// produced (no session, not a ratchet message, or a failed decryption, which
+/// also triggers session re-negotiation) or kept; the caller then withdraws the
+/// envelope and refuses it instead of acknowledging delivery. The other
+/// [`InboundRefusal`] variants are a calendar envelope the caller must not
+/// acknowledge: a payload refused by the inbound caps (nothing of it was cached,
+/// copied or stored; the caller withdraws the envelope and tells the sender why)
+/// or an admission that did not commit (nothing was persisted; the envelope
+/// stays held for the sweep).
+///
+/// Calendar order: decode under the caps, cache the plaintext, then persist the event
+/// or RSVP and release the admission hold in one storage transaction. A refusal
+/// therefore never follows a calendar mutation, a mutation never lands on an envelope
+/// that stays held, and an accepted, unheld envelope always has its mutation.
 #[allow(clippy::too_many_arguments)]
 async fn decrypt_and_process(
     envelope: &konsensus_core::UkmEnvelope,
@@ -1118,7 +1307,7 @@ async fn decrypt_and_process(
     trust_discount: f64,
     cache_plaintext: bool,
     preview_plaintext: Option<Vec<u8>>,
-) -> Result<Option<String>, ReceiptRefusal> {
+) -> Result<Option<String>, InboundRefusal> {
     // A first-contact admission proof carries nothing to read; it is
     // acknowledged as received whether or not a session exists yet.
     if is_admission_proof(envelope) {
@@ -1139,18 +1328,18 @@ async fn decrypt_and_process(
     } else {
         if !session_mgr.has_session(sender).await {
             debug!(sender = %sender, "no E2EE session, cannot decrypt");
-            return Err(ReceiptRefusal::Undecryptable(
+            return Err(InboundRefusal::Receipt(ReceiptRefusal::Undecryptable(
                 "no E2EE session with the sender",
-            ));
+            )));
         }
 
         let ratchet_msg = match konsensus_crypto::ratchet_message_from_bytes(&envelope.ciphertext) {
             Ok(msg) => msg,
             Err(e) => {
                 debug!(sender = %sender, error = %e, "ciphertext is not a valid ratchet message");
-                return Err(ReceiptRefusal::Undecryptable(
+                return Err(InboundRefusal::Receipt(ReceiptRefusal::Undecryptable(
                     "ciphertext is not a ratchet message",
-                ));
+                )));
             }
         };
 
@@ -1159,12 +1348,33 @@ async fn decrypt_and_process(
             Err(e) => {
                 debug!(sender = %sender, error = %e, "envelope could not be decrypted");
                 note_unreadable_envelope(envelope, sender, session_mgr, transport).await;
-                return Err(ReceiptRefusal::Undecryptable(
+                return Err(InboundRefusal::Receipt(ReceiptRefusal::Undecryptable(
                     "the session could not decrypt the ciphertext",
-                ));
+                )));
             }
         };
         bytes
+    };
+
+    // Calendar payloads are bounded BEFORE the plaintext cache below and before
+    // any record is built: the transport's per-peer byte budget and the payment
+    // gate already ran on the envelope; the decode-time caps (bytes, field
+    // lengths, attendee count, implied recurrence size) run here, so an
+    // over-cap payload is refused with nothing copied, stored or expanded.
+    let calendar = match envelope.kind {
+        konsensus_core::kind::KIND_CALENDAR_EVENT | konsensus_core::kind::KIND_CALENDAR_UPDATE => {
+            Some(CalendarInbound::Event(Box::new(CalendarEventPayload::decode(&bytes).map_err(|e| {
+                debug!(sender = %sender, reason = %e, "calendar event payload refused at decode");
+                InboundRefusal::Calendar(e)
+            })?)))
+        }
+        konsensus_core::kind::KIND_RSVP => {
+            Some(CalendarInbound::Rsvp(RsvpPayload::decode(&bytes).map_err(|e| {
+                debug!(sender = %sender, reason = %e, "RSVP payload refused at decode");
+                InboundRefusal::Calendar(e)
+            })?))
+        }
+        _ => None,
     };
 
     // Cache decrypted plaintext (encrypted at rest) for API access. A paid
@@ -1178,33 +1388,48 @@ async fn decrypt_and_process(
                     .await
                 {
                     warn!(msg_id = %envelope.id, error = %e, "failed to cache plaintext");
-                    return Err(ReceiptRefusal::NotPersisted(
+                    return Err(InboundRefusal::Receipt(ReceiptRefusal::NotPersisted(
                         "the plaintext could not be stored",
-                    ));
+                    )));
                 }
             }
             Err(e) => {
                 warn!(msg_id = %envelope.id, error = %e, "failed to encrypt plaintext for cache");
-                return Err(ReceiptRefusal::NotPersisted(
+                return Err(InboundRefusal::Receipt(ReceiptRefusal::NotPersisted(
                     "the plaintext could not be stored",
-                ));
+                )));
             }
         }
+    }
+
+    // The calendar payload passed the caps: persist its event or RSVP and lift
+    // the admission hold in ONE transaction, whether this attempt placed the hold
+    // or inherited it from an attempt whose acceptance rolled back and whose
+    // cleanup failed. On any failure nothing is written: the envelope stays held
+    // and hidden for the sweep and the caller rejects. A withdrawn envelope can
+    // never leave a calendar change behind, and an accepted, unheld one always
+    // carries its change.
+    if let Some(calendar) = calendar {
+        let (admission, summary) = build_calendar_admission(calendar, sender, envelope);
+        storage
+            .commit_calendar_admission(envelope, &admission)
+            .await
+            .map_err(|e| {
+                error!(sender = %sender, msg_id = %envelope.id, error = %e, "calendar admission did not commit; envelope withheld for the sweep");
+                InboundRefusal::NotCommitted
+            })?;
+        info!(sender = %sender, msg_id = %envelope.id, summary = %summary, "calendar envelope admitted");
+        return Ok(Some(summary));
     }
 
     // Route based on message kind
     if envelope.kind == konsensus_core::kind::KIND_FILE_REF {
         return process_file_message(&bytes, sender, envelope, storage, audit)
             .await
-            .map(Some);
+            .map(Some)
+            .map_err(InboundRefusal::Receipt);
     }
-    let plaintext = if envelope.kind == konsensus_core::kind::KIND_CALENDAR_EVENT
-        || envelope.kind == konsensus_core::kind::KIND_CALENDAR_UPDATE
-    {
-        process_calendar_event(&bytes, sender, envelope, storage).await
-    } else if envelope.kind == konsensus_core::kind::KIND_RSVP {
-        process_rsvp(&bytes, sender, envelope, storage).await
-    } else if konsensus_core::is_web_service_reply(envelope) {
+    let plaintext = if konsensus_core::is_web_service_reply(envelope) {
         // 510/501 reply bound to our paid request: deliver plaintext to the
         // frontend, never treat it as a fresh manifest/page request (F3).
         match String::from_utf8(bytes) {
@@ -1282,6 +1507,78 @@ async fn decrypt_and_process(
         }
     };
     Ok(plaintext)
+}
+
+/// Why `decrypt_and_process` refused to admit an envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InboundRefusal {
+    /// No plaintext could be produced or kept (any kind, a calendar envelope
+    /// included): the caller withdraws the envelope and sends the typed
+    /// [`ReceiptRefusal`] reason, never an ACK.
+    Receipt(ReceiptRefusal),
+    /// A calendar payload failed the inbound caps: the caller withdraws the
+    /// envelope and tells the sender the typed reason.
+    Calendar(CalendarPayloadError),
+    /// A calendar envelope passed the caps but its admission did not commit:
+    /// the event or RSVP write and the hold release share one transaction and
+    /// it rolled back. Nothing was persisted; it stays held for the sweep and
+    /// the caller answers with a transient storage error.
+    NotCommitted,
+}
+
+/// Calendar kinds are held from before paid acceptance until their payload has
+/// passed the inbound caps, like call signals and room chats.
+pub(crate) fn is_calendar_kind(kind: u16) -> bool {
+    matches!(
+        kind,
+        konsensus_core::kind::KIND_CALENDAR_EVENT
+            | konsensus_core::kind::KIND_CALENDAR_UPDATE
+            | konsensus_core::kind::KIND_RSVP
+    )
+}
+
+/// Reason prefix for a resend of a paid envelope this node withdrew at the
+/// application. Terminal for the sender (`terminal_paid_rejection`): the proof
+/// is burned and nothing will be delivered.
+pub(crate) const APPLICATION_REJECTED_PREFIX: &str = "application_rejected:";
+
+pub(crate) fn application_rejected_reason() -> String {
+    format!("{APPLICATION_REJECTED_PREFIX} the recipient withdrew this message; it will not be delivered")
+}
+
+/// What a resend whose replay keys are already burned is told, before the
+/// gate's payment-reuse reason is considered. `Some` for an envelope this node
+/// withdrew at the application (terminal `application_rejected:`) and, fail
+/// closed, for a withdrawal status that could not be read (`storage error`,
+/// transient): neither may fall through to `payment proof already used`, which
+/// the sender's legacy-ACK compatibility path records as delivered. `None`
+/// only for a genuine reuse whose status read succeeded.
+pub(crate) async fn burned_replay_reply(
+    storage: &dyn konsensus_storage::Storage,
+    envelope: &konsensus_core::UkmEnvelope,
+) -> Option<String> {
+    match storage.is_application_rejected(envelope).await {
+        Ok(true) => Some(application_rejected_reason()),
+        Ok(false) => None,
+        Err(e) => {
+            error!(msg_id = %envelope.id, error = %e, "withdrawal status unreadable; replay answered as storage error, not as payment reuse");
+            Some("storage error".into())
+        }
+    }
+}
+
+/// The `MessageReject` reason for a refused calendar payload: the stable code,
+/// then the static description. The sender's `terminal_paid_rejection` matches
+/// the `<code>:` prefix, so the refusal is final there (the payment proof is
+/// consumed) and is never retried.
+pub(crate) fn calendar_reject_reason(refusal: &CalendarPayloadError) -> String {
+    format!("{}: {refusal}", refusal.code())
+}
+
+/// A calendar payload decoded under the inbound caps, ahead of the plaintext cache.
+pub(crate) enum CalendarInbound {
+    Event(Box<CalendarEventPayload>),
+    Rsvp(RsvpPayload),
 }
 
 /// Process an incoming file transfer message (KIND_FILE_REF).
@@ -1378,102 +1675,55 @@ async fn process_file_message(
     Ok(format!("[file: {}]", payload.filename))
 }
 
-/// Process an incoming calendar event (KIND_CALENDAR_EVENT or KIND_CALENDAR_UPDATE).
-async fn process_calendar_event(
-    bytes: &[u8],
+/// Build the storage mutation and the frontend summary for a decoded calendar
+/// payload. Nothing is written here: the caller commits the mutation together
+/// with the hold release.
+pub(crate) fn build_calendar_admission(
+    inbound: CalendarInbound,
     sender: &konsensus_core::types::NodeId,
     envelope: &konsensus_core::UkmEnvelope,
-    storage: &Arc<dyn konsensus_storage::Storage>,
-) -> Option<String> {
-    let payload: konsensus_core::payloads::calendar::CalendarEventPayload =
-        match konsensus_core::wire_json::from_slice(bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                debug!(sender = %sender, error = %e, "calendar event payload not valid JSON");
-                return None;
-            }
-        };
-
-    let attendees_json = serde_json::to_string(&payload.attendees).unwrap_or_else(|_| "[]".into());
-    let recurrence_json = payload
-        .recurrence
-        .as_ref()
-        .and_then(|r| serde_json::to_string(r).ok());
-
-    let record = konsensus_storage::CalendarEventRecord {
-        id: payload.event_id.clone(),
-        message_id: Some(envelope.id.to_hex()),
-        organizer: payload.organizer.clone(),
-        title: payload.title.clone(),
-        description: payload.description.clone(),
-        start_ms: payload.start_ms,
-        end_ms: payload.end_ms,
-        tz: payload.tz.clone(),
-        location: payload.location.clone(),
-        attendees_json,
-        recurrence_json,
-        color: payload.color.clone(),
-        created_at: String::new(),
-        parent_id: None,
-    };
-
-    if let Err(e) = storage.store_calendar_event(&record).await {
-        warn!(
-            sender = %sender,
-            event_id = %payload.event_id,
-            error = %e,
-            "failed to store incoming calendar event"
-        );
-    } else {
-        info!(
-            sender = %sender,
-            event_id = %payload.event_id,
-            title = %payload.title,
-            "stored incoming calendar event"
-        );
+) -> (konsensus_storage::CalendarAdmission, String) {
+    match inbound {
+        CalendarInbound::Event(payload) => {
+            let attendees_json =
+                serde_json::to_string(&payload.attendees).unwrap_or_else(|_| "[]".into());
+            let recurrence_json = payload
+                .recurrence
+                .as_ref()
+                .and_then(|r| serde_json::to_string(r).ok());
+            let summary = format!("[calendar: {}]", payload.title);
+            let record = konsensus_storage::CalendarEventRecord {
+                id: payload.event_id,
+                message_id: Some(envelope.id.to_hex()),
+                organizer: payload.organizer,
+                title: payload.title,
+                description: payload.description,
+                start_ms: payload.start_ms,
+                end_ms: payload.end_ms,
+                tz: payload.tz,
+                location: payload.location,
+                attendees_json,
+                recurrence_json,
+                color: payload.color,
+                created_at: String::new(),
+                parent_id: None,
+            };
+            (konsensus_storage::CalendarAdmission::Event(record), summary)
+        }
+        CalendarInbound::Rsvp(payload) => {
+            let response = format!("{:?}", payload.response).to_lowercase();
+            let summary = format!("[rsvp: {response}]");
+            let record = konsensus_storage::RsvpRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_id: payload.event_id,
+                responder: sender.to_hex(),
+                response,
+                comment: payload.comment,
+                created_at: String::new(),
+            };
+            (konsensus_storage::CalendarAdmission::Rsvp(record), summary)
+        }
     }
-
-    Some(format!("[calendar: {}]", payload.title))
-}
-
-/// Process an incoming RSVP (KIND_RSVP).
-async fn process_rsvp(
-    bytes: &[u8],
-    sender: &konsensus_core::types::NodeId,
-    envelope: &konsensus_core::UkmEnvelope,
-    storage: &Arc<dyn konsensus_storage::Storage>,
-) -> Option<String> {
-    let payload: konsensus_core::payloads::calendar::RsvpPayload =
-        match konsensus_core::wire_json::from_slice(bytes) {
-            Ok(p) => p,
-            Err(e) => {
-                debug!(sender = %sender, error = %e, "RSVP payload not valid JSON");
-                return None;
-            }
-        };
-
-    let response_str = format!("{:?}", payload.response).to_lowercase();
-    let record = konsensus_storage::RsvpRecord {
-        id: uuid::Uuid::new_v4().to_string(),
-        event_id: payload.event_id.clone(),
-        responder: sender.to_hex(),
-        response: response_str.clone(),
-        comment: payload.comment.clone(),
-        created_at: String::new(),
-    };
-
-    // Best-effort: the organizer stores the event locally; the attendee may not have it.
-    let _ = storage.store_rsvp(&record).await;
-
-    info!(
-        sender = %sender,
-        event_id = %payload.event_id,
-        response = %response_str,
-        msg_id = %envelope.id,
-        "received RSVP"
-    );
-
-    Some(format!("[rsvp: {}]", response_str))
 }
 
 /// Process an incoming web manifest request (KIND_WEB_MANIFEST).

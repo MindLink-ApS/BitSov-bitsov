@@ -77,10 +77,10 @@ fn make_bob_bundle(
 
 #[test]
 fn x3dh_opk_produces_different_secret_than_no_opk() {
-    let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_public = PublicKey::from(&alice_secret);
 
-    let bob_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let bob_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let bob_signing = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
     let bob_public = PublicKey::from(&bob_secret);
 
@@ -120,9 +120,9 @@ fn x3dh_opk_produces_different_secret_than_no_opk() {
 #[test]
 fn x3dh_associated_data_is_asymmetric() {
     // AD = IK_A || IK_B — order matters. Verify AD differs when roles swap.
-    let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_public = PublicKey::from(&alice_secret);
-    let bob_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let bob_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let bob_signing = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
     let (bundle, spk, opk) = make_bob_bundle(&bob_secret, &bob_signing);
 
@@ -187,10 +187,10 @@ fn x3dh_deterministic_from_same_keys() {
 #[test]
 fn x3dh_wrong_opk_causes_secret_mismatch() {
     // If Bob uses a different OPK than Alice expected, shared secrets won't match
-    let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_public = PublicKey::from(&alice_secret);
 
-    let bob_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let bob_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let bob_signing = ed25519_dalek::SigningKey::from_bytes(&[12u8; 32]);
     let (bundle, spk, _opk) = make_bob_bundle(&bob_secret, &bob_signing);
 
@@ -226,10 +226,10 @@ fn x3dh_signed_prekey_from_bytes_roundtrip() {
 
 #[test]
 fn x3dh_multiple_opk_ids() {
-    let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_public = PublicKey::from(&alice_secret);
 
-    let bob_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let bob_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let bob_signing = ed25519_dalek::SigningKey::from_bytes(&[13u8; 32]);
     let bob_public = PublicKey::from(&bob_secret);
     let spk = SignedPreKey::generate();
@@ -254,9 +254,9 @@ fn x3dh_multiple_opk_ids() {
 
 #[test]
 fn x3dh_shared_secret_debug_redacted() {
-    let alice_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let alice_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let alice_public = PublicKey::from(&alice_secret);
-    let bob_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let bob_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let bob_signing = ed25519_dalek::SigningKey::from_bytes(&[14u8; 32]);
     let (bundle, _, _) = make_bob_bundle(&bob_secret, &bob_signing);
 

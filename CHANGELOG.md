@@ -5,6 +5,82 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Pay a contact by keysend only at a Lightning key their identity signed. A
+  `LightningInfo` announcement now carries an Ed25519 signature by the node's
+  identity key over a domain-separated binding of its Lightning pubkey; the
+  receiver verifies it and trusts only verified bindings; an unsigned,
+  malformed or rejected announcement leaves the contact unpayable, also when
+  an earlier key had been verified. Message payments
+  refuse, before any dispatch, when a contact's advertised key is unsigned or
+  the keysend destination differs from the verified key (a contact that never
+  advertised a key is still paid through the invoice round-trip). A contact on
+  an older version that advertises an unsigned key is refused with the fixed
+  reason "contact must update"; the payment never falls back to an invoice to
+  the unbound node.
+- Report the node's configured Bitcoin network (`bitcoin`, `testnet`, `signet`
+  or `regtest`) as `network` in the unauthenticated `GET /api/v1/bootstrap/state`
+  response, so a client can confirm the network during remote-owner first run
+  before any identity exists. The field is absent when the lightning backend
+  does not state a network; no other field, route or authentication rule of the
+  bootstrap router changes (#443).
+- A CLN `[lightning] network` now reads the same way as an LDK one: `mainnet`
+  and `testnet3` and any letter case map to `bitcoin`, `testnet`, `signet` or
+  `regtest`, and any other text states no network. Before, CLN passed its
+  setting through unchanged, so `bootstrap/state` left `network` out for a
+  value such as `Signet`.
+- Bind device-signed relation intents to the pairing epoch (`bitsov-relation-intent-v2`; `relation_intent_v2`). v1 signatures are refused. The remote route uses the same authenticated Noise session as the other signed tunnel intents. `GET /api/v1/pair/device-keys` returns that epoch.
+- `init` and `restore` take `--network signet|regtest|bitcoin` (default
+  `signet`) and write `[lightning] network` and the matching `[lightning]` and
+  `[chain]` server URLs. The last line printed names the network.
+- `start` refuses a mainnet `[lightning] network` with `mainnet_not_approved`
+  unless `[node] allow_mainnet = true` is set by hand. `starter_hub.allow_mainnet`
+  does not count. **An existing mainnet config, including a start with no config
+  file, is refused until that key is added.**
+- `start` refuses a known public server on another network than
+  `[lightning] network` before any network I/O; the runtime source check now
+  reports `chain_network_mismatch`.
+- New owner setting `[pairing] unattended_device_approvals` (default off): a box
+  with an encrypted seed and its password in an owner-only file or a descriptor
+  can load the owner's approval verifier, so device approvals work while nobody
+  is at the keyboard. Whoever gets the disk and the password file can then
+  approve as the owner; the node says so at start. Refused for a plaintext seed,
+  a password on the command line, and a machine declared as run for someone else.
+  What an approval can authorize and all spending limits are unchanged.
+
+- Bound inbound calendar payloads before any copy or expansion: invites,
+  updates and RSVPs from peers are decoded under byte caps (64 KiB per event,
+  4 KiB per RSVP), per-field string caps, an attendee cap (100) and a
+  recurrence cap (5000 implied instances by `COUNT` or `UNTIL`), checked
+  after the transport's per-peer byte budget and the payment gate and before
+  the plaintext cache, the stored record or any recurrence expansion. An
+  over-cap payload is withdrawn and refused with a typed `calendar_*` reason
+  the sender can read; the sender records such a refusal as final
+  (`failed_paid`) and never retries it. Calendar envelopes are held from
+  before paid acceptance until the caps pass, like call signals and room
+  chats, and the event or RSVP is written and the hold released in one
+  storage transaction (`commit_calendar_admission`) that requires the hold
+  and, on PostgreSQL, locks it against the hold sweep, so a failed withdrawal
+  leaves them hidden for the hold sweep with no calendar change behind and an
+  admitted decryptable envelope never lacks its change. Held kinds (call
+  signals, room chats, calendar) are accepted under their hold inside the
+  acceptance transaction, so a hold the sweep withdrew cannot be followed by
+  an unheld acceptance. A held envelope whose paid acceptance returns an
+  error keeps its hold (the acceptance may have committed); a retry re-admits
+  it or the sweep withdraws it. A calendar envelope that cannot be decrypted
+  is refused before paid acceptance like any other unreadable envelope, and
+  is never admitted or acknowledged, and a resend is acknowledged as
+  a duplicate only on positive evidence of its durable admission, never on
+  the mere absence of a hold, so an envelope the sweep withdrew meanwhile is
+  refused. Calendar timestamps past the representable range are refused
+  (`calendar_timestamp_out_of_range`). A resend of any envelope this node
+  withdrew at the application is answered with a terminal reason
+  (`message withdrawn`, or `application_rejected:` for a withdrawal recorded
+  on the receipt) instead of a payment-reuse one, which a sender's
+  compatibility path could read as delivered. The owner
+  API refuses the same payloads before they are stored or paid for,
+  including a partial update whose retained recurrence would exceed the cap
+  from its new start.
+
 ## [0.3.0-rc24] — 2026-11-12
 
 - A paid call now ends after the callee's app connection is lost, including a
@@ -235,6 +311,11 @@ also live on the corresponding GitHub pre-release pages.
 - Deployment note: migration 035 ends every in-flight live call when upgrading
   to paid call blocks. Existing calls must be restarted after the upgrade;
   their replay tombstones are retained and no unpaid media interval is granted.
+- Callee nodes start the 60 s ring clock and the caller's ringing `MessageAck`
+  only when a paired device fetches or streams a call invite; when no device
+  takes it within 15 s the caller gets a `MessageReject` with reason
+  `call_not_reachable`, and resends or duplicates repeat the same answer
+  without a second charge (#422).
 
 - Add owner-authenticated claim-code display for app onboarding:
   `GET /api/v1/owner/claim-code` on the owner-local API only (loopback source,

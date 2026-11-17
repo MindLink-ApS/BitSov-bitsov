@@ -9,7 +9,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::audit::events;
@@ -97,7 +97,7 @@ async fn issue_challenge(
     };
 
     let mut nonce = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
 
     let now = chrono::Utc::now();
     let expires_at = now + chrono::Duration::seconds(AUTH_CHALLENGE_TTL.as_secs() as i64);

@@ -621,6 +621,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
     }
 
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.inner.accept_held_paid_envelope(&self.encrypt_envelope(envelope)?).await
+    }
+
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
         self.inner.update_message_wrapper(envelope).await
     }
@@ -874,6 +878,55 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.sweep_outstanding_web_requests(now_ms, max).await
     }
 
+    async fn call_invite_outcome(&self, envelope: &UkmEnvelope) -> Result<Option<crate::CallInviteOutcome>, StorageError> {
+        self.inner.call_invite_outcome(envelope).await
+    }
+
+    async fn call_invite_set_outcome(&self, id: &MessageId, peer: &konsensus_core::NodeId, outcome: crate::CallInviteOutcome) -> Result<(), StorageError> {
+        self.inner.call_invite_set_outcome(id, peer, outcome).await
+    }
+
+    async fn call_offer_bind(&self, peer: &konsensus_core::NodeId, call_id: &str, offer: &MessageId) -> Result<(), StorageError> {
+        self.inner.call_offer_bind(peer, call_id, offer).await
+    }
+
+    async fn call_offer(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<MessageId>, StorageError> {
+        self.inner.call_offer(peer, call_id).await
+    }
+
+    async fn call_invite_expire(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, deadline_ms: u64) -> Result<crate::CallInviteExpiry, StorageError> {
+        self.inner.call_invite_expire(id, peer, call_id, deadline_ms).await
+    }
+
+    async fn call_invite_deliver(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<bool, StorageError> {
+        // Routing metadata only, like call_put and the receipt outcome.
+        self.inner.call_invite_deliver(id, peer, call_id, entry).await
+    }
+
+    async fn call_invite_recover(&self, max: u32) -> Result<Vec<(MessageId, NodeId)>, StorageError> {
+        self.inner.call_invite_recover(max).await
+    }
+
+    async fn call_media_publish(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<u64, StorageError> {
+        self.inner.call_media_publish(peer, call_id).await
+    }
+
+    async fn call_media_generation(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<u64>, StorageError> {
+        self.inner.call_media_generation(peer, call_id).await
+    }
+
+    async fn call_media_has_pending(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<bool, StorageError> {
+        self.inner.call_media_has_pending(peer, call_id).await
+    }
+
+    async fn call_media_record_detach(&self, intent: &crate::call_media::PendingMediaDetach, completed: bool) -> Result<(), StorageError> {
+        self.inner.call_media_record_detach(intent, completed).await
+    }
+
+    async fn call_media_pending(&self, after: u64, max: u32) -> Result<Vec<crate::call_media::PendingMediaDetach>, StorageError> {
+        self.inner.call_media_pending(after, max).await
+    }
+
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
         self.inner.call_get(peer, call_id).await
     }
@@ -923,6 +976,10 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.has_call_block_invoice(peer, call_id, seq, payment_hash).await
     }
 
+    async fn call_awaiting(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        self.inner.call_awaiting().await
+    }
+
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
         self.inner.call_sweep(now_ms, max).await
     }
@@ -931,8 +988,17 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.reject_accepted_envelope(envelope).await
     }
 
+    async fn is_application_rejected(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
+        // Receipt matching uses immutable metadata, never the at-rest ciphertext.
+        self.inner.is_application_rejected(envelope).await
+    }
+
     async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
         self.inner.call_admission_hold(envelope, now_ms).await
+    }
+
+    async fn call_admission_rehold(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+        self.inner.call_admission_rehold(envelope).await
     }
 
     async fn call_admission_release(&self, id: &MessageId) -> Result<(), StorageError> {
@@ -1294,6 +1360,16 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner
             .list_fiat_rate_snapshots(from_date, to_date)
             .await
+    }
+
+    async fn commit_calendar_admission(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        admission: &crate::CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        // Calendar rows stay plaintext (as `store_calendar_event`); the envelope
+        // is matched by id and sender only.
+        self.inner.commit_calendar_admission(envelope, admission).await
     }
 
     // ── Operator hosting (pass-through — contract state contains no message plaintext) ─

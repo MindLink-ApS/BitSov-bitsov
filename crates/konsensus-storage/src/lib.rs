@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod calendar;
+pub mod call_media;
 pub mod contacts;
 pub mod encrypted;
 pub mod record_upgrade;
@@ -18,7 +19,7 @@ pub mod sqlite;
 pub mod traits;
 pub mod whitelist_backup;
 
-pub use calendar::{CalendarEventRecord, RsvpRecord};
+pub use calendar::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
 pub use contacts::{ContactRepo, ContactRow, PostgresContactRepo, SqliteContactRepo};
 pub use encrypted::EncryptedStorage;
 pub use error::StorageError;
@@ -34,7 +35,7 @@ pub use recovery::{
     RecoveryTrustee, SqliteRecoveryStore,
 };
 pub use sqlite::SqliteStorage;
-pub use traits::{PaidAcceptance, Storage, MAX_DEFERRALS_PER_PROOF, MAX_DEFERRALS_PER_SENDER, ENVELOPE_DEFERRAL_TTL_MS, DEFERRAL_CLEANUP_BATCH};
+pub use traits::{CallInviteExpiry, CallInviteOutcome, PaidAcceptance, Storage, MAX_DEFERRALS_PER_PROOF, MAX_DEFERRALS_PER_SENDER, ENVELOPE_DEFERRAL_TTL_MS, DEFERRAL_CLEANUP_BATCH};
 pub use whitelist_backup::WhitelistBackup;
 
 pub mod invites {

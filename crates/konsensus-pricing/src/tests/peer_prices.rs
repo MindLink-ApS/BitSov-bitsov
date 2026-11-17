@@ -676,3 +676,22 @@ async fn issue204_stale_kind_response_without_prior_table_is_not_a_fresh_answer(
     cache.update_kind_price(peer, 1, 2000, 850_000).await;
     assert_eq!(cache.get_fresh_peer_price(&peer, 1, 850_000, std::time::Duration::from_secs(3600)).await, Some(2000));
 }
+
+
+#[tokio::test]
+async fn call_block_quote_uses_floors_without_the_cached_trust_discount() {
+    use crate::peer_prices::ADMISSION_FLOOR_KEY;
+    for (tariff, floor, expected) in [(23_000, 30_000, 30_000), (500, 0, 1_000), (23_000, 0, 23_000)] {
+        let cache = PeerPriceCache::new();
+        let peer = NodeId::from_bytes([19; 32]);
+        cache.update(peer, std::collections::HashMap::from([
+            ("kind:404".into(), tariff), (ADMISSION_FLOOR_KEY.into(), floor),
+        ]), 850_000, 0, 0.5).await;
+        assert_eq!(cache.get_discounted_peer_price(&peer, 404).await, Some(expected));
+        // A fresh payable response replaces an old tariff; the cached trust
+        // discount must still not lower the next minute's quote.
+        cache.update_kind_price(peer, 404, expected, 850_000).await;
+        assert_eq!(cache.get_fresh_peer_price(&peer, 404, 850_000,
+            std::time::Duration::from_secs(60)).await, Some(expected));
+    }
+}

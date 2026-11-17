@@ -271,11 +271,13 @@ pub(crate) async fn list_device_keys(
             })
         })
         .collect();
-    // `node` and `client_id` are the two values a device signs into every
-    // registration proof and intent (see `pairing::device::intent_message`).
+    // `node`, `client_id` and `epoch` are the values a device copies into a
+    // relation intent (see `pairing::device::intent_message`). Registration
+    // proofs sign `node` and `client_id` only.
     Ok(Json(serde_json::json!({
         "node": svc.bound_fingerprint(),
         "client_id": binding.client_id,
+        "epoch": binding.epoch,
         "owner_control": svc.owner_control_enabled(),
         "local_owner_device": svc.local_owner_device(),
         "owner_device_count": svc.owner_device_count(),
@@ -314,13 +316,12 @@ pub struct RelationIntentRequest {
 // The error is the finished HTTP response, refusal extension included.
 // Other handlers return `ApiError`; this one cannot, and axum moves it once.
 #[allow(clippy::result_large_err)]
-pub(crate) async fn relation_intent(
-    auth: ScopedAuth<Read>,
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<RelationIntentRequest>,
+pub(super) async fn accept_relation_intent(
+    state: &AppState,
+    binding: &PairingBinding,
+    body: RelationIntentRequest,
 ) -> Result<Json<RelationIntentResponse>, axum::response::Response> {
-    let binding = binding(&auth).map_err(|e| refusal_response(e, "no_pairing"))?;
-    let accepted = service(&state)
+    let accepted = service(state)
         .map_err(|e| refusal_response(e, "pairing_unavailable"))?
         .apply_relation_intent_with_reason(
             &binding.client_id,
@@ -333,6 +334,18 @@ pub(crate) async fn relation_intent(
         envelope_id: accepted.envelope_id,
         grant: accepted.grant,
     }))
+}
+
+// The error is the finished HTTP response, refusal extension included.
+// Other handlers return `ApiError`; this one cannot, and axum moves it once.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn relation_intent(
+    auth: ScopedAuth<Read>,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RelationIntentRequest>,
+) -> Result<Json<RelationIntentResponse>, axum::response::Response> {
+    let binding = binding(&auth).map_err(|e| refusal_response(e, "no_pairing"))?;
+    accept_relation_intent(&state, binding, body).await
 }
 
 /// Wrap the router's filters too, so extractor and provisional-session refusals
@@ -372,6 +385,12 @@ pub(crate) fn log_relation_intent_status(
 ) {
     const PATH: &str = "/api/v1/pair/relation-intent";
     if path == PATH && !status.is_success() {
+        // Keep the established rate-limit code and identify its scope separately.
+        let (reason, limit_scope) = match reason {
+            "rate_limited_client" => ("rate_limited", Some("client")),
+            "rate_limited" => ("rate_limited", Some("global")),
+            reason => (reason, None),
+        };
         // This endpoint's ApiError code is the numeric HTTP status; use the
         // same code for middleware/extractor responses that have no JSON code.
         let code = status.as_u16();
@@ -380,6 +399,7 @@ pub(crate) fn log_relation_intent_status(
             status = code,
             code,
             reason,
+            limit_scope,
             "relation intent refused"
         );
     }
@@ -439,6 +459,46 @@ mod tests {
             assert!(
                 !src.contains(&forbidden),
                 "HTTP must not reach `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod refusal_scope_tests {
+    use super::log_relation_intent_status;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn refusal_logs_preserve_rate_code_and_identify_limit_scope() {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let writer = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_relation_intent_status(
+                "/api/v1/pair/relation-intent",
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+            );
+            log_relation_intent_status(
+                "/api/v1/pair/relation-intent",
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited_client",
+            );
+        });
+        let captured = std::fs::read_to_string(log.path()).unwrap();
+        for scope in ["global", "client"] {
+            assert!(
+                captured
+                    .lines()
+                    .any(|line| line.contains("reason=\"rate_limited\"")
+                        && line.contains(&format!("limit_scope=\"{scope}\""))),
+                "{captured}"
             );
         }
     }

@@ -1043,7 +1043,7 @@ async fn an_accepted_session_is_proven_only_by_a_message_under_it() {
     let init = mgr_a.initiate_session(&node_b, &mgr_b.prekey_bundle().await).await.unwrap();
     mgr_b.accept_session(&node_a, &init).await.unwrap();
 
-    let key = hex::encode(*X25519Public::from(&x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng())).as_bytes());
+    let key = hex::encode(*X25519Public::from(&x25519_dalek::StaticSecret::random_from_rng(aes_gcm::aead::OsRng)).as_bytes());
     let unproven = SerializableSessionInit { identity_key: key.clone(), ephemeral_key: key.clone(), one_time_prekey_id: None, ratchet_key: key };
     mgr_b.reaccept_session(&node_a, &unproven).await.unwrap();
     assert!(!mgr_b.confirm_session(&node_a).await, "an ack proves nothing here");

@@ -38,7 +38,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 mod calls;
@@ -454,7 +454,7 @@ impl GrantBudget {
         expires_at: i64,
     ) -> String {
         let mut random_id = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut random_id);
+        rand::rng().fill_bytes(&mut random_id);
         let envelope_id = hex::encode(random_id);
         self.envelope_id_by_recipient
             .insert(recipient.to_string(), envelope_id.clone());
@@ -932,7 +932,7 @@ impl Reservation {
 pub enum BudgetRefusal {
     #[error("call reservation requires {required_msat} msat but outbound liquidity has {available_msat} msat available; nothing was dispatched")]
     CallLiquidity { required_msat: u64, available_msat: u64 },
-    #[error("call block price or routing fee exceeds the reserved ceiling; nothing was dispatched")]
+    #[error("call block price changed or routing fee exceeds the reserved ceiling; nothing was dispatched")]
     CallPriceChanged,
     /// The callee's quoted closing signal, with its routing allowance, is
     /// above what one payment of this call may carry.

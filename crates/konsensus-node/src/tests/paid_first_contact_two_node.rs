@@ -45,6 +45,8 @@ use crate::msg_handler::{run as run_msg_handler, MsgHandlerDeps};
 
 const JWT_SECRET: &str = "paid-first-contact-regression-jwt-secret";
 const CHAT_MSAT: u64 = 2_000;
+/// The owner's total cap on each compose: above every price used here.
+const OWNER_TOTAL_CAP_MSAT: u64 = 1_000_000;
 
 /// Longest a session may take to form: one self-heal tick (15 s) plus round
 /// trips, inside compose's own 25 s session wait.
@@ -490,7 +492,9 @@ struct Node {
     wallet: Arc<SharedMockProvider>,
     routing: Arc<konsensus_routing::RoutingTable>,
     peer_prices: Arc<konsensus_pricing::PeerPriceCache>,
-    peer_ln_pubkeys: Arc<tokio::sync::Mutex<HashMap<NodeId, String>>>,
+    peer_ln_pubkeys: Arc<
+        tokio::sync::Mutex<HashMap<NodeId, konsensus_core::lightning_binding::PeerLightningKey>>,
+    >,
     router: axum::Router,
     auth: String,
     front_door: konsensus_api::handlers::front_door::FrontDoorStore,
@@ -616,6 +620,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: ws_broadcast.clone(),
+        call_devices: Default::default(),
         ws_delivery_broadcast: ws_delivery_tx.clone(),
         rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(
@@ -669,6 +674,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
         plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::new(
             identity.aes_key(),
         )),
+        call_devices: state.call_devices.clone(),
         ws_tx: ws_broadcast.clone(),
         audit_log: Arc::clone(&audit),
         admission_mode: ReachabilityMode::PriceOpen,
@@ -783,7 +789,9 @@ impl Node {
         )
     }
 
-    /// The owner's uncapped chat to `to`, through the real compose route.
+    /// The owner's chat to `to`, through the real compose route, under a total
+    /// cap above every price these tests use (a payment to a peer without an
+    /// open session needs one), so the cap never decides an outcome here.
     async fn compose(&self, to: &NodeId, text: &str) -> (StatusCode, serde_json::Value) {
         self.post(
             "/api/v1/messages/compose",
@@ -791,6 +799,7 @@ impl Node {
                 "recipient": to.to_hex(),
                 "kind": konsensus_core::kind::KIND_CHAT,
                 "plaintext": text,
+                "max_total_msat": OWNER_TOTAL_CAP_MSAT,
             }),
         )
         .await
@@ -1408,6 +1417,7 @@ async fn m8_paid_payee_gets_no_peer_exchange_lightning_or_gossip() {
             &Frame::LightningInfo {
                 ln_pubkey: "02".repeat(33),
                 ln_addr: None,
+                identity_sig: vec![],
             },
         )
         .await

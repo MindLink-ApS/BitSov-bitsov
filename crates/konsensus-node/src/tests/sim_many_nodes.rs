@@ -371,11 +371,13 @@ async fn start_node(spec: Spec<'_>) -> SimNode {
         recovery_dir: None,
         gossip_validator: None,
         file_staging: Default::default(),
+        call_devices: Default::default(),
     });
 
     let span = tracing::info_span!("node", n = idx);
     tokio::spawn(tracing::Instrument::instrument(run_msg_handler(MsgHandlerDeps {
         transport: Arc::clone(&transport),
+        call_devices: state.call_devices.clone(),
         transport_ack: Arc::clone(&transport),
         storage: Arc::clone(&storage),
         gate,

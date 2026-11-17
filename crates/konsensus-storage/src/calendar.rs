@@ -54,3 +54,20 @@ pub struct RsvpRecord {
     /// ISO 8601 creation timestamp.
     pub created_at: String,
 }
+
+/// The application mutation an admitted inbound calendar envelope carries:
+/// committed together with the release of the envelope's admission hold, so an
+/// accepted, unheld envelope always has its mutation and a held one never does.
+#[derive(Debug, Clone)]
+pub enum CalendarAdmission {
+    /// An invite or update (`KIND_CALENDAR_EVENT`, `KIND_CALENDAR_UPDATE`).
+    Event(CalendarEventRecord),
+    /// An attendee's answer (`KIND_RSVP`).
+    Rsvp(RsvpRecord),
+    /// No calendar mutation: the envelope could not be decrypted (no session or
+    /// an unreadable ciphertext) and is admitted as an opaque message. The
+    /// commit still requires the live hold and the stored sender-bound
+    /// envelope and consumes exactly one hold, so an envelope the sweep
+    /// withdrew meanwhile is never acknowledged.
+    Opaque,
+}
