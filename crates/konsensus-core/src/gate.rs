@@ -34,6 +34,14 @@ pub fn price_with_floor_msat(discounted: u64, min_admission_cost_msat: u64) -> u
     discounted.max(min_admission_cost_msat).max(1_000)
 }
 
+/// The payable price of one paid call minute (kind 404): the callee's raw
+/// minute tariff with the admission floors, and never a trust discount.
+/// The callee mints and answers with this; the caller quotes with it, so the
+/// two sides cannot disagree on a minute invoice amount.
+pub fn call_minute_price_msat(tariff_msat: u64, min_admission_cost_msat: u64) -> u64 {
+    price_with_floor_msat(tariff_msat, min_admission_cost_msat)
+}
+
 /// Invoice-request purpose naming the service (message kind) being paid for,
 /// so the recipient prices it locally rather than trusting the requested
 /// amount against its highest price. Older recipients treat it as a generic
@@ -3619,5 +3627,16 @@ mod tests {
         let record = stored(PaymentStatus::Settled, PaymentDirection::Incoming);
         let result = gate_with(NotReadyBackend { record: Some(record), funding: true }).await;
         assert!(matches!(result, Err(GateRejection::PaymentSettlementMismatch(_))), "{result:?}");
+    }
+
+    #[test]
+    fn call_minute_price_is_the_floored_tariff_without_a_discount() {
+        // A tariff above the floor stays whole, even where a trust discount
+        // (50_000 at 0.5 is 25_000) would have been lifted only to the floor.
+        assert_eq!(call_minute_price_msat(50_000, 30_000), 50_000);
+        assert_eq!(price_with_floor_msat(25_000, 30_000), 30_000);
+        assert_eq!(call_minute_price_msat(23_000, 30_000), 30_000);
+        assert_eq!(call_minute_price_msat(500, 0), 1_000);
+        assert_eq!(call_minute_price_msat(u64::MAX, 30_000), u64::MAX);
     }
 }

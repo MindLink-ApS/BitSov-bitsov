@@ -210,6 +210,224 @@ async fn known_ln_peer_call_block_uses_undiscounted_bound_invoice_and_is_admitte
     assert!(calls::call_media_admitted(callee_store.as_ref(), &caller_id, ID, now + 1).await);
 }
 
+const ADMISSION_FLOOR_MSAT: u64 = 30_000;
+/// Callee tariff below its admission floor: the minute is payable at the floor.
+const FLOORED_TARIFF_MSAT: u64 = 23_000;
+/// Callee tariff above its admission floor. The caller's cached trust discount
+/// would take it below the floor, so a discounted quote would be the floor
+/// (30_000) while the callee mints only the undiscounted tariff (50_000).
+const ABOVE_FLOOR_TARIFF_MSAT: u64 = 50_000;
+/// The trust discount on the caller's cached price table for the callee.
+const TABLE_TRUST_DISCOUNT: f64 = 0.5;
+
+/// What the callee's mint check accepts for a minute at this tariff: the
+/// tariff raised to the floor, with no trust discount.
+fn callee_minute_price(tariff: u64) -> u64 {
+    let payable = tariff.max(ADMISSION_FLOOR_MSAT);
+    assert_eq!(konsensus_core::gate::call_minute_price_msat(tariff, ADMISSION_FLOOR_MSAT), payable,
+        "the mint check must price a minute at the floored tariff");
+    payable
+}
+
+/// The price a trust-discounted path would quote for a minute at this tariff.
+fn discounted_minute_price(tariff: u64) -> u64 {
+    konsensus_core::gate::price_with_floor_msat(
+        konsensus_pricing::peer_prices::apply_trust_discount(tariff, TABLE_TRUST_DISCOUNT),
+        ADMISSION_FLOOR_MSAT,
+    )
+}
+
+/// A raw table a callee may announce: a per-kind minute tariff, or only the
+/// realtime category a minute falls back to. Both carry the admission floor.
+fn floored_minute_table(category_fallback: bool, tariff: u64) -> std::collections::HashMap<String, u64> {
+    use konsensus_pricing::peer_prices::ADMISSION_FLOOR_KEY;
+    if category_fallback {
+        return std::collections::HashMap::from([
+            ("realtime_signaling".into(), tariff),
+            (ADMISSION_FLOOR_KEY.into(), ADMISSION_FLOOR_MSAT),
+        ]);
+    }
+    std::collections::HashMap::from([
+        ("kind:404".into(), tariff), ("realtime_signaling".into(), 1_000),
+        (ADMISSION_FLOOR_KEY.into(), ADMISSION_FLOOR_MSAT),
+    ])
+}
+
+/// The callee answers the minute query (already floored), then a full price
+/// table replaces the cached entry before the caller reads its quote.
+async fn answer_then_replace_table(
+    state: &konsensus_api::state::AppState,
+    transport: &common::ConnectedStubTransport,
+    peer: NodeId,
+    category_fallback: bool,
+    tariff: u64,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !transport.raw_frames.lock().unwrap().iter().any(|bytes| matches!(
+            konsensus_message::wire::Frame::from_bytes(bytes).unwrap(),
+            konsensus_message::wire::Frame::PriceQuery { kind: 404 }
+        )) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the caller must ask for the minute price");
+    state.peer_prices.update_kind_price(peer, 404, callee_minute_price(tariff), 850_000).await;
+    let table = floored_minute_table(category_fallback, tariff);
+    state.peer_prices.update(peer, table, 850_000, 0, TABLE_TRUST_DISCOUNT).await;
+}
+
+#[tokio::test]
+async fn table_backed_minute_quote_equals_the_callee_floored_price() {
+    floored_minute_quote(false, FLOORED_TARIFF_MSAT).await;
+}
+
+#[tokio::test]
+async fn category_fallback_minute_quote_equals_the_callee_floored_price() {
+    floored_minute_quote(true, FLOORED_TARIFF_MSAT).await;
+}
+
+// A tariff above the floor that a trust discount would lower to the floor:
+// the minute quote must stay at the undiscounted tariff the callee mints.
+#[tokio::test]
+async fn table_backed_minute_quote_above_the_floor_ignores_the_trust_discount() {
+    assert_ne!(discounted_minute_price(ABOVE_FLOOR_TARIFF_MSAT), callee_minute_price(ABOVE_FLOOR_TARIFF_MSAT));
+    assert_eq!(callee_minute_price(ABOVE_FLOOR_TARIFF_MSAT), ABOVE_FLOOR_TARIFF_MSAT);
+    floored_minute_quote(false, ABOVE_FLOOR_TARIFF_MSAT).await;
+}
+
+#[tokio::test]
+async fn category_fallback_minute_quote_above_the_floor_ignores_the_trust_discount() {
+    assert_ne!(discounted_minute_price(ABOVE_FLOOR_TARIFF_MSAT), callee_minute_price(ABOVE_FLOOR_TARIFF_MSAT));
+    floored_minute_quote(true, ABOVE_FLOOR_TARIFF_MSAT).await;
+}
+
+async fn floored_minute_quote(category_fallback: bool, tariff: u64) {
+    let mut state = common::test_state();
+    let (_, identity) = konsensus_core::NodeIdentity::generate().unwrap();
+    let peer = *identity.node_id();
+    let transport = std::sync::Arc::new(common::ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
+    std::sync::Arc::get_mut(&mut state).unwrap().transport = transport.clone();
+    let (price, ()) = tokio::join!(
+        calls::peer_call_kind_price(&state, &peer, 404),
+        answer_then_replace_table(&state, &transport, peer, category_fallback, tariff),
+    );
+    assert_eq!(price.unwrap(), callee_minute_price(tariff));
+}
+
+// A floor above the minute tariff must not make the caller ask for less than
+// the callee mints, which would end a live call with call_price_changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_backed_floored_minute_is_paid_without_price_change() {
+    floored_minute_invoice_is_paid(false, FLOORED_TARIFF_MSAT).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn category_fallback_floored_minute_is_paid_without_price_change() {
+    floored_minute_invoice_is_paid(true, FLOORED_TARIFF_MSAT).await;
+}
+
+// A trust-discounted quote would be the floor, below the tariff the callee
+// mints: the caller must request and pay the undiscounted tariff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_backed_minute_above_the_floor_is_paid_without_the_trust_discount() {
+    floored_minute_invoice_is_paid(false, ABOVE_FLOOR_TARIFF_MSAT).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn category_fallback_minute_above_the_floor_is_paid_without_the_trust_discount() {
+    floored_minute_invoice_is_paid(true, ABOVE_FLOOR_TARIFF_MSAT).await;
+}
+
+async fn floored_minute_invoice_is_paid(category_fallback: bool, tariff: u64) {
+    use axum::{body::Body, http::Request};
+    use konsensus_core::traits::lightning::LightningProvider;
+    use konsensus_lightning::MockLightningProvider;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    let case = format!("{} at tariff {tariff}", if category_fallback { "category fallback" } else { "table-backed" });
+    let payable = callee_minute_price(tariff);
+    let payer = Arc::new(MockLightningProvider::new());
+    let payee = Arc::new(MockLightningProvider::new());
+    let initial_balance = payer.get_balance_msat().await.unwrap();
+    let mut state = common::test_state_with_lightning(payer.clone());
+    let (_, identity) = konsensus_core::NodeIdentity::generate().unwrap();
+    let peer = *identity.node_id();
+    let caller_id = *state.identity.node_id();
+    let callee_store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let invoice_store = callee_store.clone();
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let observed = requested.clone();
+    let identity_invoice = payee.create_invoice(1_000, "identity", 60).await.unwrap();
+    let ln_pubkey = identity_invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>()
+        .unwrap().recover_payee_pub_key().to_string();
+    let requests = state.invoice_requests.clone();
+    let transport = Arc::new(
+        common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone())
+            .with_invoice_responder(move |id, amount| {
+                observed.lock().unwrap().push(amount);
+                // The callee's mint check: only the current floored minute price.
+                if amount != payable {
+                    let requests = requests.clone();
+                    tokio::spawn(async move {
+                        if let Some(tx) = requests.lock().await.remove(&id) {
+                            let _ = tx.send(Err(konsensus_api::state::InvoiceResponseError {
+                                recipient: peer, reason: "konsensus:call_price_changed".into(),
+                            }));
+                        }
+                    });
+                    return None;
+                }
+                let invoice = futures::executor::block_on(async {
+                    let entry = invoice_store.call_get(&caller_id, ID).await.unwrap().unwrap();
+                    let invoice = payee.create_invoice(amount, "call block", rules::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.unwrap();
+                    invoice_store.record_call_block_invoice(&caller_id, ID, 0,
+                        &hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
+                        entry.deadline_ms + rules::CALL_BLOCK_RESUME_MS).await.unwrap();
+                    invoice
+                });
+                Some(konsensus_api::state::InvoiceResponseData {
+                    recipient: peer, bolt11: invoice.bolt11, payment_hash: invoice.payment_hash,
+                })
+            }),
+    );
+    let mutable = Arc::get_mut(&mut state).unwrap();
+    mutable.transport = transport.clone();
+    mutable.storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(ln_pubkey),
+    );
+    let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
+    state.session_manager.initiate_session(&peer, &target.prekey_bundle().await).await.unwrap();
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let caller = rules::receive(Some(rules::commit(
+        rules::reserve(None, 400, "offer", "hash", now).unwrap(), "offer", now,
+    ).unwrap()), 401, None, now).unwrap();
+    callee_store.call_put(&caller_id, ID, &rules::CallEntry { side: rules::Side::Callee, ..caller.clone() }).await.unwrap();
+    state.storage.call_put(&peer, ID, &caller).await.unwrap();
+    let plaintext = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
+    let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"operation_id":uuid::Uuid::new_v4().to_string(),"recipient":peer.to_hex(),"kind":404,"plaintext":plaintext,"wait_ack_ms":0}).to_string())).unwrap();
+    let (response, ()) = tokio::join!(common::test_router(state.clone()).oneshot(request),
+        answer_then_replace_table(&state, &transport, peer, category_fallback, tariff));
+    let response = response.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(!body.contains("call_price_changed"), "{case}: {body}");
+    assert_eq!(status, axum::http::StatusCode::OK, "{case}: {body}");
+    assert_eq!(*requested.lock().unwrap(), vec![payable], "{case}");
+    assert_eq!(initial_balance - payer.get_balance_msat().await.unwrap(), payable, "{case}");
+    let entry = state.storage.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(entry.phase, Phase::Live, "{case}");
+}
+
 #[tokio::test]
 async fn owner_call_block_price_refusal_ends_the_call_without_payment_or_retry() {
     use axum::{body::Body, http::{Request, StatusCode}};

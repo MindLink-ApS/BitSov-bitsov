@@ -1924,7 +1924,7 @@ async fn handle_price_query(
             };
             // A minute quote is the current payable tariff, without a trust discount.
             let price_msat = if kind == konsensus_core::kind::KIND_CALL_BLOCK {
-                konsensus_core::gate::price_with_floor_msat(price_msat, min_admission_cost_msat)
+                konsensus_core::gate::call_minute_price_msat(price_msat, min_admission_cost_msat)
             } else {
                 price_msat
             };
@@ -3191,7 +3191,7 @@ async fn prepare_call_block_invoice(
         .await
         .map_err(|_| REFUSED)?;
     let current_price =
-        konsensus_core::gate::price_with_floor_msat(current_price, min_admission_cost_msat);
+        konsensus_core::gate::call_minute_price_msat(current_price, min_admission_cost_msat);
     if amount_msat != current_price {
         return Err(konsensus_api::invoice_refusal::CALL_PRICE_CHANGED);
     }
