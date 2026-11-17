@@ -31,9 +31,12 @@ Invariants checked after the traffic settles:
   I2 no sim plaintext appears that was not sent;
   I4 the ledger conserves money; no compose reports more than its cap; per
      (payer, payee), settled msat <= what the compose responses reported + one
-     admission per connection epoch;
-  I5 no compose hangs past the deadline or loses its connection (unless its
-     own node was restarted under it); no node process exits or panics.
+     admission per connection epoch, and never more than the sum of those
+     composes' all-in caps (admission is inside the cap);
+  I5 no compose hangs past the deadline or loses its connection, unless its
+     own node was restarted under it: the connection was lost (not timed out)
+     and the request was in flight while the restart ran; no node process
+     exits or panics.
 
 Every compose states max_total_msat (MAX_TOTAL_MSAT) and max_routing_fee_msat:
 first contact and re-admission need an explicit aggregate cap. The controller talks to the
@@ -167,19 +170,25 @@ content_dir = "{root}/pages"
             f"http://127.0.0.1:{self.ports[i]['api']}/api/v1{path}", method=method,
             data=json.dumps(body).encode() if body is not None else None,
             headers={"Authorization": f"Bearer {self.token(i)}", "Content-Type": "application/json"})
+        # The outer handlers also cover reading an error body: a restarting
+        # node can send error headers and close mid body.
         try:
-            with OPENER.open(req, timeout=timeout) as r:
-                text = r.read().decode()
-                return r.status, (json.loads(text) if text else None)
-        except urllib.error.HTTPError as e:
-            text = e.read().decode()
             try:
-                return e.code, json.loads(text)
-            except ValueError:
-                return e.code, text
+                with OPENER.open(req, timeout=timeout) as r:
+                    text = r.read().decode()
+                    return r.status, (json.loads(text) if text else None)
+            except urllib.error.HTTPError as e:
+                with e:
+                    text = e.read().decode()
+                try:
+                    return e.code, json.loads(text)
+                except ValueError:
+                    return e.code, text
         except (TimeoutError, socket.timeout):
             return None, "timeout"
         except urllib.error.URLError as e:
+            if isinstance(e.reason, (TimeoutError, socket.timeout)):
+                return None, "timeout"  # a connect timeout, wrapped
             return None, f"unreachable: {e.reason}"
         except (http.client.HTTPException, ConnectionError) as e:
             # The node closed or reset the connection mid-request (restart chaos).
@@ -275,14 +284,15 @@ def simulate(args, workdir, sandbox):
 
         def compose(job):
             step, a, b, text = job
-            t0 = time.time()
+            t0 = time.monotonic()
             st, body = net.api(a, "POST", "/messages/compose",
                                {"recipient": net.ids[b], "kind": 0, "plaintext": text,
                                 "max_routing_fee_msat": ROUTING_FEE_MSAT, "max_total_msat": MAX_TOTAL_MSAT},
                                timeout=COMPOSE_TIMEOUT_S)
+            t1 = time.monotonic()
             return {"step": step, "from": a, "to": b, "text": text, "status": st,
-                    "body": body if isinstance(body, dict) else {"raw": body}, "secs": time.time() - t0,
-                    "interrupted": False}
+                    "body": body if isinstance(body, dict) else {"raw": body}, "secs": t1 - t0,
+                    "began": t0, "ended": t1, "interrupted": False}
 
         for step in range(args.steps):
             senders, jobs = set(), []
@@ -302,20 +312,28 @@ def simulate(args, workdir, sandbox):
             # Chaos: restart one node mid-step.
             victim = rng.randrange(args.nodes) if rng.random() < args.restart else None
             delay = rng.uniform(0.05, 1.5)
+            down = None  # (stop began, start finished) of the deliberate restart
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs) + 1) as pool:
                 futs = [pool.submit(compose, j) for j in jobs]
                 if victim is not None:
                     time.sleep(delay)
                     log(f"step {step}: restarting n{victim}")
+                    stop_at = time.monotonic()
                     net.stop(victim)
                     net.start(victim)
+                    down = (stop_at, time.monotonic())
                 results = [f.result() for f in futs]
             for r in results:
                 # The sender's own process went away under this compose: the
                 # outcome is unknown, not a hang. It may still have paid (up
-                # to its cap) and may still be delivered (at most once).
+                # to its cap) and may still be delivered (at most once). Only
+                # a lost connection (never a timeout) of a request still in
+                # flight when the restart began; a compose that had already
+                # failed before it keeps its I5 violation.
                 raw = str(r["body"].get("raw", ""))
-                if r["status"] is None and r["from"] == victim and raw.startswith(("dropped", "unreachable")):
+                if (down is not None and r["status"] is None and r["from"] == victim
+                        and raw.startswith(("dropped", "unreachable"))
+                        and r["ended"] >= down[0] and r["began"] <= down[1]):
                     r["interrupted"] = True
                     notes.append(f"interrupted n{r['from']}->n{r['to']} by its restart: {raw[:120]}")
             sent += results
@@ -385,9 +403,10 @@ def simulate(args, workdir, sandbox):
             if payer in idx and recipient in idx:
                 k = (idx[payer], idx[recipient])
                 paid[k] = (paid.get(k, (0, 0))[0] + 1, paid.get(k, (0, 0))[1] + amount)
-        reported = {}
+        reported, caps = {}, {}
         for r in sent:
             k = (r["from"], r["to"])
+            caps[k] = caps.get(k, 0) + MAX_TOTAL_MSAT
             if r["interrupted"]:
                 amt = MAX_TOTAL_MSAT  # unknown outcome: at most its cap
             else:
@@ -398,8 +417,14 @@ def simulate(args, workdir, sandbox):
         for (p, q), (count, msat) in sorted(paid.items()):
             sends = reported.get((p, q), (0, 0))
             ep = max(1, epochs.get((min(p, q), max(p, q)), 0))
+            # Each compose's cap is all-in (admission included): the pair can
+            # never settle more than the sum of its caps, however its
+            # composes ended.
+            cap = caps.get((p, q), 0)
             if sends[0] == 0:
                 violations.append(f"I4 n{p} paid n{q} {count}x/{msat} msat but never sent to it")
+            elif msat > cap:
+                violations.append(f"I4 over cap n{p}->n{q}: ledger {count}/{msat} msat > {sends[0]} compose(s) x max_total_msat = {cap}")
             elif msat > sends[1] + ep * CHAT_MSAT:
                 violations.append(f"I4 overcharge n{p}->n{q}: ledger {count}/{msat} msat > reported {sends[1]} + {ep} admission(s)")
 

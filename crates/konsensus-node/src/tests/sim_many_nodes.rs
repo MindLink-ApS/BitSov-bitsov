@@ -985,7 +985,9 @@ impl Net {
 
         // I4: money. Balances are conserved; every settled payment between two
         // sim nodes is explained by a send between them: at most the reported
-        // amounts plus one admission per connection epoch (both directions).
+        // amounts plus one admission per connection epoch (both directions),
+        // and never more than the sum of those composes' all-in caps (the
+        // admission is inside each cap).
         let balances = self.balances();
         let total: i64 = balances.values().sum();
         let expected = (self.cfg.nodes as i64) * START_BALANCE_MSAT as i64;
@@ -1017,9 +1019,13 @@ impl Net {
         for (&(p, r), &(count, msat)) in &paid {
             let sends = reported.get(&(p, r)).copied().unwrap_or((0, 0));
             let epochs = u64::from(self.epochs.get(&edge(p, r)).copied().unwrap_or(0)).max(1);
-            let allowance = sends.1 + epochs * CHAT_MSAT;
+            let cap = sends.0 * MAX_TOTAL_MSAT;
+            let allowance = (sends.1 + epochs * CHAT_MSAT).min(cap);
             if sends.0 == 0 {
                 v.push(format!("I4 n{p} paid n{r} {count}x/{msat} msat but never sent to it"));
+            } else if msat > cap {
+                unexplained += msat - allowance;
+                v.push(format!("I4 over cap n{p}->n{r}: ledger {count} payments/{msat} msat > {} compose(s) x max_total_msat = {cap}", sends.0));
             } else if msat > allowance {
                 unexplained += msat - allowance;
                 v.push(format!(
