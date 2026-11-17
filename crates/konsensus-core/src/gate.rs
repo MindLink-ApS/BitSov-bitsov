@@ -3628,4 +3628,15 @@ mod tests {
         let result = gate_with(NotReadyBackend { record: Some(record), funding: true }).await;
         assert!(matches!(result, Err(GateRejection::PaymentSettlementMismatch(_))), "{result:?}");
     }
+
+    #[test]
+    fn call_minute_price_is_the_floored_tariff_without_a_discount() {
+        // A tariff above the floor stays whole, even where a trust discount
+        // (50_000 at 0.5 is 25_000) would have been lifted only to the floor.
+        assert_eq!(call_minute_price_msat(50_000, 30_000), 50_000);
+        assert_eq!(price_with_floor_msat(25_000, 30_000), 30_000);
+        assert_eq!(call_minute_price_msat(23_000, 30_000), 30_000);
+        assert_eq!(call_minute_price_msat(500, 0), 1_000);
+        assert_eq!(call_minute_price_msat(u64::MAX, 30_000), u64::MAX);
+    }
 }
