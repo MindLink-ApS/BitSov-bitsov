@@ -73,7 +73,7 @@ pub(crate) async fn send_price_frame(
                                     } else {
                                         format!("category:{category}")
                                     },
-                                    advertised_price(*price, discount, min_admission_cost_msat),
+                                    advertised_price(*price, if category == "kind:404" { 0.0 } else { discount }, min_admission_cost_msat),
                                 )
                             }),
                     );
@@ -89,12 +89,12 @@ pub(crate) async fn send_price_frame(
                     kind, price_msat, ..
                 } = frame
                 {
-                    // Keep the wire price raw: PeerPriceCache retains the table discount
-                    // and applies it once, then the admission floor. The durable offer
-                    // stores that same final price.
+                    // Ordinary responses are raw: the cache applies their table
+                    // discount and floor once. Minute responses already carry the
+                    // payable tariff and must never receive a trust discount.
                     prices.push((
                         format!("kind:{kind}"),
-                        advertised_price(*price_msat, discount, min_admission_cost_msat),
+                        advertised_price(*price_msat, if *kind == konsensus_core::kind::KIND_CALL_BLOCK { 0.0 } else { discount }, min_admission_cost_msat),
                     ));
                 }
                 let now = std::time::SystemTime::now()
@@ -192,7 +192,7 @@ mod tests {
                             assert!((700..900).contains(&kind), "missing advert for kind={kind}");
                             continue; // Reserved kinds have no advertised price.
                         };
-                        let offered = advertised_price(base, discount, admission);
+                        let offered = advertised_price(base, if kind == konsensus_core::kind::KIND_CALL_BLOCK { 0.0 } else { discount }, admission);
                         assert_eq!(cached, offered, "kind={kind}, base={base}, discount={discount}, admission={admission}");
                         assert!(offered >= 1000 && offered >= admission);
                         if kind > 1000 && kind < u16::MAX && kind % 64 != 0 {

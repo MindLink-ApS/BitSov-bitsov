@@ -45,6 +45,9 @@ pub const PRICE_CHANGED: &str = "konsensus:price_changed";
 /// No block invoice was issued: wrong call/sequence or too close to its deadline.
 pub const CALL_BLOCK_UNPAYABLE: &str = "konsensus:call_block_unpayable";
 
+/// No block invoice was created: the amount differs from the current kind-404 price.
+pub const CALL_PRICE_CHANGED: &str = "konsensus:call_price_changed";
+
 /// The recipient is completing its E2EE recovery handover. No invoice was issued.
 pub const SESSION_HANDOVER: &str = "konsensus:session_handover";
 

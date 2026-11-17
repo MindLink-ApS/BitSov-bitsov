@@ -932,7 +932,7 @@ impl Reservation {
 pub enum BudgetRefusal {
     #[error("call reservation requires {required_msat} msat but outbound liquidity has {available_msat} msat available; nothing was dispatched")]
     CallLiquidity { required_msat: u64, available_msat: u64 },
-    #[error("call block price or routing fee exceeds the reserved ceiling; nothing was dispatched")]
+    #[error("call block price changed or routing fee exceeds the reserved ceiling; nothing was dispatched")]
     CallPriceChanged,
     /// The callee's quoted closing signal, with its routing allowance, is
     /// above what one payment of this call may carry.
