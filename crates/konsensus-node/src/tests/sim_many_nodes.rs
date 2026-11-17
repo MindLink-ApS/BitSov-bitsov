@@ -63,6 +63,15 @@ use crate::msg_handler::{run as run_msg_handler, MsgHandlerDeps};
 
 const JWT_SECRET: &str = "sim-many-nodes-jwt-secret";
 const CHAT_MSAT: u64 = 2_000;
+/// Routing-fee allowance every compose states per payment
+/// (`max_routing_fee_msat`; the shared mock ledger charges no fee).
+const ROUTING_FEE_MSAT: u64 = 1_000;
+/// Aggregate all-in cap every compose states (`max_total_msat`): the message
+/// plus a first-contact admission or a re-admission after a reconnect, each
+/// one chat price under static pricing, each with its routing-fee allowance.
+/// Compose refuses a payment to a peer without an open session when no cap
+/// is given.
+const MAX_TOTAL_MSAT: u64 = 3 * (CHAT_MSAT + ROUTING_FEE_MSAT);
 const START_BALANCE_MSAT: u64 = 50_000_000;
 const BASE_HEIGHT: u64 = 900_000;
 /// Longer than compose's own session wait (25 s) plus its ack wait.
@@ -524,6 +533,8 @@ impl SimNode {
             "recipient": to.to_hex(),
             "kind": konsensus_core::kind::KIND_CHAT,
             "plaintext": text,
+            "max_routing_fee_msat": ROUTING_FEE_MSAT,
+            "max_total_msat": MAX_TOTAL_MSAT,
         });
         tokio::time::timeout(COMPOSE_DEADLINE, self.request("POST", "/api/v1/messages/compose", Some(body))).await.ok()
     }
@@ -619,6 +630,67 @@ struct Net {
 
 fn edge(a: usize, b: usize) -> (usize, usize) {
     (a.min(b), a.max(b))
+}
+
+/// I1 and the sim-plaintext half of I3 over what every node delivered to its
+/// owner. Each sim plaintext is unique, so each observed delivery maps to the
+/// one send that carries it; the delivery must be at that send's recipient,
+/// from its sender, and counts toward that send's exactly-once budget across
+/// ALL nodes (the sender's own copy of what it sent is not a delivery).
+/// Returns the violations and how many failed sends were
+/// delivered (once, at their recipient).
+fn delivery_violations(sent: &[Sent], deliveries: &[Delivery], ids: &[NodeId]) -> (Vec<String>, usize) {
+    let sends: HashMap<&str, &Sent> = sent.iter().map(|s| (s.text.as_str(), s)).collect();
+    let mut observed: HashMap<&str, usize> = HashMap::new();
+    let mut v = Vec::new();
+
+    // I3: nothing the owner sees came from nowhere: every sim plaintext was
+    // sent. I1: every observed delivery of a send is at its recipient and
+    // from its sender.
+    for d in deliveries {
+        let Some(p) = d.plaintext.as_deref().filter(|p| p.starts_with("sim:")) else { continue };
+        let Some(s) = sends.get(p) else {
+            v.push(format!("I3 unsent plaintext delivered at n{}: {p:?}", d.at));
+            continue;
+        };
+        // The sender's node also shows its owner the message it sent.
+        if d.at == s.from && d.sender == ids[s.from] {
+            continue;
+        }
+        *observed.entry(p).or_default() += 1;
+        if d.at != s.to {
+            v.push(format!("I1 recipient: step {} n{}->n{} {p:?} delivered at n{}", s.step, s.from, s.to, d.at));
+        }
+        if d.sender != ids[s.from] {
+            v.push(format!("I1 sender: {p:?} delivered at n{} as from {}, sent by n{}", d.at, d.sender, s.from));
+        }
+    }
+
+    // I1: a send reported delivered is delivered exactly once network-wide; a
+    // failed send at most once.
+    let mut failed_but_delivered = 0;
+    for s in sent {
+        let got = observed.get(s.text.as_str()).copied().unwrap_or(0);
+        if s.claims_delivery() && got != 1 {
+            let from = ids[s.from];
+            let other: Vec<String> = deliveries
+                .iter()
+                .filter(|d| d.at == s.to && d.sender == from && d.plaintext.as_deref().is_none_or(|p| !p.starts_with("sim:")))
+                .map(|d| format!("kind={} plaintext={:?} id={}", d.kind, d.plaintext.as_deref().map(|p| p.chars().take(40).collect::<String>()), d.envelope_id))
+                .collect();
+            v.push(format!(
+                "I1 exactly-once: step {} n{}->n{} {:?} delivered {got} times across all nodes (op {}, message_id {}); other deliveries from sender there: {other:?}",
+                s.step, s.from, s.to, s.text, s.operation_id, s.body["message_id"]
+            ));
+        }
+        if !s.claims_delivery() && got > 1 {
+            v.push(format!("I1 exactly-once: failed send step {} n{}->n{} {:?} delivered {got} times across all nodes", s.step, s.from, s.to, s.text));
+        }
+        if !s.claims_delivery() && got == 1 {
+            failed_but_delivered += 1;
+        }
+    }
+    (v, failed_but_delivered)
 }
 
 impl Net {
@@ -903,55 +975,9 @@ impl Net {
         tokio::time::sleep(Duration::from_secs(6)).await;
 
         let deliveries = self.deliveries.lock().unwrap().clone();
-        let mut by_text: HashMap<(usize, String), Vec<&Delivery>> = HashMap::new();
+        let ids: Vec<NodeId> = self.identities.iter().map(|i| *i.node_id()).collect();
+        let (mut v, failed_but_delivered) = delivery_violations(&self.sent, &deliveries, &ids);
         for d in &deliveries {
-            if let Some(p) = &d.plaintext {
-                by_text.entry((d.at, p.clone())).or_default().push(d);
-            }
-        }
-        let sent_texts: HashMap<String, &Sent> = self.sent.iter().map(|s| (s.text.clone(), s)).collect();
-        let mut v = Vec::new();
-
-        // I1: every send reported delivered reaches its recipient exactly once,
-        // from its sender.
-        // I2: a failed send is not delivered (or, if it is, it is accounted for).
-        let mut failed_but_delivered = 0;
-        for s in &self.sent {
-            let got = by_text.get(&(s.to, s.text.clone())).map(|v| v.len()).unwrap_or(0);
-            if s.claims_delivery() && got != 1 {
-                let from = *self.identities[s.from].node_id();
-                let other: Vec<String> = deliveries
-                    .iter()
-                    .filter(|d| d.at == s.to && d.sender == from && d.plaintext.as_deref().is_none_or(|p| !p.starts_with("sim:")))
-                    .map(|d| format!("kind={} plaintext={:?} id={}", d.kind, d.plaintext.as_deref().map(|p| p.chars().take(40).collect::<String>()), d.envelope_id))
-                    .collect();
-                v.push(format!(
-                    "I1 exactly-once: step {} n{}->n{} {:?} delivered {got} times (op {}, message_id {}); other deliveries from sender there: {other:?}",
-                    s.step, s.from, s.to, s.text, s.operation_id, s.body["message_id"]
-                ));
-            }
-            if !s.claims_delivery() && got > 1 {
-                v.push(format!("I1 exactly-once: failed send step {} n{}->n{} {:?} delivered {got} times", s.step, s.from, s.to, s.text));
-            }
-            if !s.claims_delivery() && got == 1 {
-                failed_but_delivered += 1;
-            }
-            if let Some(ds) = by_text.get(&(s.to, s.text.clone())) {
-                for d in ds {
-                    if d.sender != *self.identities[s.from].node_id() {
-                        v.push(format!("I1 sender: {:?} delivered at n{} as from {}", s.text, s.to, d.sender));
-                    }
-                }
-            }
-        }
-        // I3: nothing the owner sees came from nowhere: every sim plaintext was
-        // sent, every adversarial envelope was dropped before the owner.
-        for d in &deliveries {
-            if let Some(p) = &d.plaintext {
-                if p.starts_with("sim:") && !sent_texts.contains_key(p) {
-                    v.push(format!("I3 unsent plaintext delivered at n{}: {p:?}", d.at));
-                }
-            }
             if adversarial_ids.contains(&d.envelope_id) {
                 v.push(format!("I3 adversarial envelope {} (kind {}) reached n{}'s owner", d.envelope_id, d.kind, d.at));
             }
@@ -980,6 +1006,9 @@ impl Net {
         }
         let mut reported: HashMap<(usize, usize), (u64, u64)> = HashMap::new();
         for s in &self.sent {
+            if s.reported_msat() > MAX_TOTAL_MSAT {
+                v.push(format!("I4 cap: step {} n{}->n{} reported {} msat over its max_total_msat {MAX_TOTAL_MSAT}", s.step, s.from, s.to, s.reported_msat()));
+            }
             let e = reported.entry((s.from, s.to)).or_default();
             e.0 += 1;
             e.1 += s.reported_msat();
@@ -1020,6 +1049,18 @@ impl Net {
                         self.notes.push(format!("op {} (n{}->n{}, failed {:?}) left in state {} attempts={} err={:?}", op.operation_id, s.from, s.to, s.status, op.state, op.attempts, op.last_error));
                     }
                 }
+            }
+        }
+
+        // I0: the run exercised paid traffic: some send was acked, and every
+        // acked (sender, recipient) pair settled at least one payment.
+        let acked_pairs: HashSet<(usize, usize)> = self.sent.iter().filter(|s| s.ok()).map(|s| (s.from, s.to)).collect();
+        if !self.sent.is_empty() && acked_pairs.is_empty() {
+            v.push(format!("I0 no paid traffic: none of {} sends was acked", self.sent.len()));
+        }
+        for &(p, r) in &acked_pairs {
+            if paid.get(&(p, r)).is_none_or(|x| x.0 == 0) {
+                v.push(format!("I0 n{p}->n{r} acked without a settled payment"));
             }
         }
 
@@ -1449,6 +1490,14 @@ async fn run_skew(cfg: SimConfig) {
         let last = &net.sent[net.sent.len().saturating_sub(cfg.per_step)..];
         println!("sim: step {step}: {} sends, {} ok, t={:.1}s", last.len(), last.iter().filter(|s| s.ok()).count(), net.started.elapsed().as_secs_f64());
     }
+    // Calm: once every tip is sane, every pair delivers. This round runs
+    // before the common and price checks so they cover its traffic too.
+    for i in 0..cfg.nodes {
+        net.node(i).chain.set(BASE_HEIGHT + 10_000);
+    }
+    let pairs = net.pick_pairs(cfg.per_step);
+    net.step_calm(cfg.steps, pairs).await;
+    let calm: Vec<_> = net.sent.iter().filter(|s| s.step == cfg.steps && !s.ok()).map(|s| format!("n{}->n{} {:?} {}", s.from, s.to, s.status, s.body)).collect();
     net.check_common(&HashSet::new()).await;
     // S4: no node caches a height-0 price table; every ok send paid the
     // recipient's real price (not a stale or skewed one).
@@ -1464,13 +1513,6 @@ async fn run_skew(cfg: SimConfig) {
             net.violation(format!("S4 {payer}->{recipient} paid {amount} msat (price {CHAT_MSAT}) memo={memo:?}"));
         }
     }
-    // Calm: once every tip is sane, every pair delivers.
-    for i in 0..cfg.nodes {
-        net.node(i).chain.set(BASE_HEIGHT + 10_000);
-    }
-    let pairs = net.pick_pairs(cfg.per_step);
-    net.step_calm(cfg.steps, pairs).await;
-    let calm: Vec<_> = net.sent.iter().filter(|s| s.step == cfg.steps && !s.ok()).map(|s| format!("n{}->n{} {:?} {}", s.from, s.to, s.status, s.body)).collect();
     for c in calm {
         net.violation(format!("S4 send after tips recovered failed: {c}"));
     }
@@ -1545,6 +1587,48 @@ async fn sim_many_singleton_two_senders_one_recipient() {
         }
     }
     net.finish();
+}
+
+/// The delivery oracle itself: a correct run passes, and a missing delivery,
+/// a duplicate, a delivery at a node that was not the recipient, a wrong
+/// sender and an unsent plaintext each produce a violation.
+#[test]
+fn sim_delivery_oracle_checks_every_observed_delivery() {
+    let ids: Vec<NodeId> = (0..3).map(|i| *sim_identity(7, i).node_id()).collect();
+    let send = |from: usize, to: usize, text: &str| Sent {
+        step: 0,
+        from,
+        to,
+        text: text.into(),
+        operation_id: format!("op-{text}"),
+        status: Some(200),
+        body: serde_json::json!({"accepted": true, "delivered": true, "state": "acked"}),
+    };
+    let delivery = |at: usize, sender: usize, text: &str| Delivery {
+        at,
+        sender: ids[sender],
+        envelope_id: format!("env-{text}-{at}"),
+        kind: konsensus_core::kind::KIND_CHAT,
+        plaintext: Some(text.into()),
+    };
+    let sent = vec![send(0, 2, "sim:7:0:a"), send(1, 0, "sim:7:0:b")];
+    // Each sender's node also shows its owner the sent message.
+    let good = vec![delivery(0, 0, "sim:7:0:a"), delivery(2, 0, "sim:7:0:a"), delivery(1, 1, "sim:7:0:b"), delivery(0, 1, "sim:7:0:b")];
+    assert_eq!(delivery_violations(&sent, &good, &ids).0, Vec::<String>::new());
+
+    let cases: Vec<(&str, Vec<Delivery>)> = vec![
+        ("missing", vec![delivery(2, 0, "sim:7:0:a")]),
+        ("duplicate at recipient", [good.clone(), vec![delivery(0, 1, "sim:7:0:b")]].concat()),
+        ("also delivered at another node", [good.clone(), vec![delivery(1, 0, "sim:7:0:a")]].concat()),
+        ("delivered only at another node", vec![delivery(1, 0, "sim:7:0:a"), delivery(0, 1, "sim:7:0:b")]),
+        ("wrong sender", vec![delivery(2, 1, "sim:7:0:a"), delivery(0, 1, "sim:7:0:b")]),
+        ("own copy at a node that did not send it", [good.clone(), vec![delivery(1, 1, "sim:7:0:a")]].concat()),
+        ("unsent plaintext", [good.clone(), vec![delivery(1, 2, "sim:7:0:z")]].concat()),
+    ];
+    for (name, observed) in cases {
+        let (v, _) = delivery_violations(&sent, &observed, &ids);
+        assert!(!v.is_empty(), "{name}: the oracle accepted {observed:?}");
+    }
 }
 
 #[test]

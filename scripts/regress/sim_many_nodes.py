@@ -23,21 +23,36 @@ payment_settled_send_incomplete (the admission is disclosed and a retry does
 not pay it again); that cause is tracked separately.
 
 Invariants checked after the traffic settles:
-  I1 every compose that returned 200 delivered=true is in the recipient's
-     message list exactly once, with its plaintext, from its sender;
+  I0 paid traffic happened: at least one compose was acked and every acked
+     (sender, recipient) pair settled at least one payment;
+  I1 every compose that returned 200 delivered=true is delivered exactly once
+     across all nodes, at its recipient, from its sender; a failed compose is
+     delivered at most once, and never at another node;
   I2 no sim plaintext appears that was not sent;
-  I4 the ledger conserves money; per (payer, payee), settled msat <= what the
-     compose responses reported + one admission per connection epoch;
-  I5 no compose hangs past the deadline; no node process exits or panics.
+  I4 the ledger conserves money; no compose reports more than its cap; per
+     (payer, payee), settled msat <= what the compose responses reported + one
+     admission per connection epoch;
+  I5 no compose hangs past the deadline or loses its connection (unless its
+     own node was restarted under it); no node process exits or panics.
+
+Every compose states max_total_msat (MAX_TOTAL_MSAT) and max_routing_fee_msat:
+first contact and re-admission need an explicit aggregate cap. The controller talks to the
+nodes through an opener with no proxies, so requests stay on loopback.
 
 Usage:
   scripts/regress/sim_many_nodes.py --bin target/debug/konsensus --nodes 10 --steps 6 --seed 1
   scripts/regress/sim_many_nodes.py --bin ./konsensus --nodes 20 --restart 0.3 --keep ./sim-out
 """
-import argparse, base64, concurrent.futures, hashlib, hmac, json, os, random, shutil, socket, sqlite3
+import argparse, base64, concurrent.futures, hashlib, hmac, http.client, json, os, random, shutil, socket, sqlite3
 import subprocess, sys, tempfile, time, urllib.error, urllib.request
 
 CHAT_MSAT = 2_000
+# Routing-fee allowance per payment (the shared mock ledger charges no fee).
+ROUTING_FEE_MSAT = 1_000
+# All-in aggregate cap per compose: the message, plus a first-contact admission
+# or a re-admission after a reconnect (each one chat price under static
+# pricing), each with its routing-fee allowance.
+MAX_TOTAL_MSAT = 3 * (CHAT_MSAT + ROUTING_FEE_MSAT)
 START_MSAT = 50_000_000
 COMPOSE_TIMEOUT_S = 75
 SANDBOX = ('(version 1)\n(allow default)\n(deny network*)\n'
@@ -45,6 +60,16 @@ SANDBOX = ('(version 1)\n(allow default)\n(deny network*)\n'
            '(allow network-outbound (remote ip "localhost:*"))\n'
            '(allow network-bind (local ip "localhost:*"))\n'
            '(allow network* (local unix-socket) (remote unix-socket))\n')
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+# Never an inherited HTTP proxy, never a redirect: the controller only talks
+# to the loopback nodes it started.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
 def log(*a):
@@ -143,7 +168,7 @@ content_dir = "{root}/pages"
             data=json.dumps(body).encode() if body is not None else None,
             headers={"Authorization": f"Bearer {self.token(i)}", "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with OPENER.open(req, timeout=timeout) as r:
                 text = r.read().decode()
                 return r.status, (json.loads(text) if text else None)
         except urllib.error.HTTPError as e:
@@ -156,6 +181,9 @@ content_dir = "{root}/pages"
             return None, "timeout"
         except urllib.error.URLError as e:
             return None, f"unreachable: {e.reason}"
+        except (http.client.HTTPException, ConnectionError) as e:
+            # The node closed or reset the connection mid-request (restart chaos).
+            return None, f"dropped: {type(e).__name__}: {e}"
 
     def start(self, i):
         out = open(f"{self.run}/node-{i}.log", "ab")
@@ -166,7 +194,7 @@ content_dir = "{root}/pages"
                                          env={**os.environ, "RUST_LOG": os.environ.get("SIM_RUST_LOG", "info")})
         for _ in range(240):
             try:
-                urllib.request.urlopen(f"http://127.0.0.1:{self.ports[i]['api']}/api/v1/health", timeout=1)
+                OPENER.open(f"http://127.0.0.1:{self.ports[i]['api']}/api/v1/health", timeout=1).close()
                 return
             except Exception:
                 time.sleep(0.25)
@@ -228,8 +256,10 @@ def simulate(args, workdir, sandbox):
     violations, notes, sent = [], [], []
     epochs = {}
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.nodes) as pool:
-            list(pool.map(net.start, range(args.nodes)))
+        # One at a time: nodes funding the shared mock ledger at once can
+        # fail to start with "database is locked".
+        for i in range(args.nodes):
+            net.start(i)
         time.sleep(2)
         edges = set()
         for a in range(args.nodes):
@@ -247,9 +277,12 @@ def simulate(args, workdir, sandbox):
             step, a, b, text = job
             t0 = time.time()
             st, body = net.api(a, "POST", "/messages/compose",
-                               {"recipient": net.ids[b], "kind": 0, "plaintext": text}, timeout=COMPOSE_TIMEOUT_S)
+                               {"recipient": net.ids[b], "kind": 0, "plaintext": text,
+                                "max_routing_fee_msat": ROUTING_FEE_MSAT, "max_total_msat": MAX_TOTAL_MSAT},
+                               timeout=COMPOSE_TIMEOUT_S)
             return {"step": step, "from": a, "to": b, "text": text, "status": st,
-                    "body": body if isinstance(body, dict) else {"raw": body}, "secs": time.time() - t0}
+                    "body": body if isinstance(body, dict) else {"raw": body}, "secs": time.time() - t0,
+                    "interrupted": False}
 
         for step in range(args.steps):
             senders, jobs = set(), []
@@ -277,6 +310,14 @@ def simulate(args, workdir, sandbox):
                     net.stop(victim)
                     net.start(victim)
                 results = [f.result() for f in futs]
+            for r in results:
+                # The sender's own process went away under this compose: the
+                # outcome is unknown, not a hang. It may still have paid (up
+                # to its cap) and may still be delivered (at most once).
+                raw = str(r["body"].get("raw", ""))
+                if r["status"] is None and r["from"] == victim and raw.startswith(("dropped", "unreachable")):
+                    r["interrupted"] = True
+                    notes.append(f"interrupted n{r['from']}->n{r['to']} by its restart: {raw[:120]}")
             sent += results
             if victim is not None:
                 for e in list(edges):
@@ -301,28 +342,37 @@ def simulate(args, workdir, sandbox):
         refresh()
 
         texts = {r["text"]: r for r in sent}
-        for r in sent:
-            ok = claims_delivery(r)
-            hits = [m for m in inbox.get(r["to"], []) if m.get("plaintext") == r["text"]]
-            if ok and len(hits) != 1:
-                undecrypted = [m["id"][:16] for m in inbox.get(r["to"], [])
-                               if m.get("sender") == net.ids[r["from"]] and not m.get("plaintext")]
-                violations.append(f"I1 n{r['from']}->n{r['to']} {r['text']!r} delivered {len(hits)}x "
-                                  f"(message_id {r['body'].get('message_id')}; undecrypted from sender: {undecrypted})")
-            if not ok and len(hits) > 1:
-                violations.append(f"I1 failed send n{r['from']}->n{r['to']} delivered {len(hits)}x")
-            for m in hits:
-                if m.get("sender") != net.ids[r["from"]]:
-                    violations.append(f"I1 {r['text']!r} at n{r['to']} from {m.get('sender')}")
-            if r["status"] is None:
-                violations.append(f"I5 compose n{r['from']}->n{r['to']} {r['body']}")
-            if not acked(r):
-                notes.append(f"failed n{r['from']}->n{r['to']} {r['status']} {json.dumps(r['body'])[:220]}")
+        seen = {}
         for i, ms in inbox.items():
             for m in ms:
                 p = m.get("plaintext") or ""
-                if p.startswith("sim:") and p not in texts:
+                if not p.startswith("sim:"):
+                    continue
+                r = texts.get(p)
+                if r is None:
                     violations.append(f"I2 unsent plaintext at n{i}: {p!r}")
+                    continue
+                if i == r["from"] and m.get("sender") == net.ids[i]:
+                    continue  # the sender's own copy of what it sent
+                seen.setdefault(p, []).append(i)
+                if i != r["to"]:
+                    violations.append(f"I1 {p!r} (n{r['from']}->n{r['to']}) delivered at n{i}")
+                if m.get("sender") != net.ids[r["from"]]:
+                    violations.append(f"I1 {p!r} at n{i} from {m.get('sender')}, sent by n{r['from']}")
+        for r in sent:
+            ok = claims_delivery(r)
+            hits = len(seen.get(r["text"], []))
+            if ok and hits != 1:
+                undecrypted = [m["id"][:16] for m in inbox.get(r["to"], [])
+                               if m.get("sender") == net.ids[r["from"]] and not m.get("plaintext")]
+                violations.append(f"I1 n{r['from']}->n{r['to']} {r['text']!r} delivered {hits}x across nodes "
+                                  f"(message_id {r['body'].get('message_id')}; undecrypted from sender: {undecrypted})")
+            if not ok and hits > 1:
+                violations.append(f"I1 failed send n{r['from']}->n{r['to']} delivered {hits}x across nodes")
+            if r["status"] is None and not r["interrupted"]:
+                violations.append(f"I5 compose n{r['from']}->n{r['to']} {r['body']}")
+            if not acked(r):
+                notes.append(f"failed n{r['from']}->n{r['to']} {r['status']} {json.dumps(r['body'])[:220]}")
 
         db = sqlite3.connect(net.ledger())
         balances = dict(db.execute("SELECT owner, balance FROM accounts"))
@@ -338,7 +388,12 @@ def simulate(args, workdir, sandbox):
         reported = {}
         for r in sent:
             k = (r["from"], r["to"])
-            amt = (r["body"].get("amount_msat") or 0) + (r["body"].get("readmission_msat") or 0)
+            if r["interrupted"]:
+                amt = MAX_TOTAL_MSAT  # unknown outcome: at most its cap
+            else:
+                amt = (r["body"].get("amount_msat") or 0) + (r["body"].get("readmission_msat") or 0)
+                if amt > MAX_TOTAL_MSAT:
+                    violations.append(f"I4 cap: n{r['from']}->n{r['to']} reported {amt} msat over its max_total_msat {MAX_TOTAL_MSAT}")
             reported[k] = (reported.get(k, (0, 0))[0] + 1, reported.get(k, (0, 0))[1] + amt)
         for (p, q), (count, msat) in sorted(paid.items()):
             sends = reported.get((p, q), (0, 0))
@@ -347,6 +402,13 @@ def simulate(args, workdir, sandbox):
                 violations.append(f"I4 n{p} paid n{q} {count}x/{msat} msat but never sent to it")
             elif msat > sends[1] + ep * CHAT_MSAT:
                 violations.append(f"I4 overcharge n{p}->n{q}: ledger {count}/{msat} msat > reported {sends[1]} + {ep} admission(s)")
+
+        acked_pairs = {(r["from"], r["to"]) for r in sent if acked(r)}
+        if not acked_pairs:
+            violations.append(f"I0 no paid traffic: none of {len(sent)} composes was acked")
+        for (p, q) in sorted(acked_pairs):
+            if paid.get((p, q), (0, 0))[0] == 0:
+                violations.append(f"I0 n{p}->n{q} acked without a settled payment")
 
         for i in range(args.nodes):
             p = net.procs.get(i)
