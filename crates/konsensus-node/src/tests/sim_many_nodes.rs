@@ -623,6 +623,10 @@ struct Net {
     sender_of: Vec<usize>,
     violations: Vec<String>,
     notes: Vec<String>,
+    /// Honest composes of the current `run_jobs` call not yet returned. Set
+    /// before any compose or chaos future is polled, so chaos can tell
+    /// whether it ran while honest traffic was in flight.
+    inflight: AtomicUsize,
     _root: tempfile::TempDir,
     started: Instant,
     panic_mark: usize,
@@ -747,6 +751,7 @@ impl Net {
             edges: HashSet::new(),
             violations: Vec::new(),
             notes: Vec::new(),
+            inflight: AtomicUsize::new(0),
             _root: root,
             started: Instant::now(),
             panic_mark,
@@ -871,9 +876,12 @@ impl Net {
 
     /// Run every compose concurrently, alongside `chaos`.
     async fn run_jobs(&self, jobs: &[Job], chaos: impl std::future::Future<Output = ()>) -> Vec<Option<(StatusCode, serde_json::Value)>> {
+        self.inflight.store(jobs.len(), Ordering::SeqCst);
         let composes = futures::future::join_all(jobs.iter().map(|j| async move {
             let to = self.node(j.to).id;
-            self.node(j.from).compose(&to, &j.text, &j.operation_id).await
+            let result = self.node(j.from).compose(&to, &j.text, &j.operation_id).await;
+            self.inflight.fetch_sub(1, Ordering::SeqCst);
+            result
         }));
         let (results, ()) = tokio::join!(composes, chaos);
         results
@@ -1244,11 +1252,16 @@ struct Adversary {
 }
 
 fn adversary(seed: u64, k: usize) -> Adversary {
+    adversary_at(seed, k, SocketAddr::from(([127, 0, 0, 1], 0)))
+}
+
+/// An adversary whose listener, if started, binds `listen_addr`.
+fn adversary_at(seed: u64, k: usize, listen_addr: SocketAddr) -> Adversary {
     let identity = sim_identity(seed ^ 0xADD5_0000, 10_000 + k);
     let transport = Arc::new(NoiseTransport::new(
         Arc::clone(&identity),
         TransportConfig {
-            listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            listen_addr,
             admission_mode: ReachabilityMode::PriceOpen,
             ..Default::default()
         },
@@ -1308,17 +1321,27 @@ enum Attack {
     /// A message with a ciphertext near/over the frame cap.
     Oversized,
     /// RequestInvoice flood of well-formed first-contact quote attempts.
-    /// Runs in its own phase after the honest steps (see `run_adversarial`).
+    /// Runs alongside the honest steps from a second loopback source, and
+    /// again in its own phase after them from the honest nodes' source (see
+    /// `run_adversarial`).
     InvoiceFlood,
 }
 
-/// Attacks that run alongside honest traffic.
+/// Attacks the step adversaries pick from. `InvoiceFlood` also runs
+/// alongside honest traffic, from dedicated flooders (see `run_adversarial`).
 const ATTACKS: [Attack; 5] = [Attack::UnpaidProof, Attack::RandomHash, Attack::Replay, Attack::Malformed, Attack::Oversized];
 
 /// The recipient allows one first-contact quote per source address per 10 s
 /// window (`admission_quotes.rs`). Waiting this long before the flood phase
 /// means the flood's first attempt at each target is quotable.
 const QUOTE_WINDOW_WAIT: Duration = Duration::from_secs(11);
+
+/// Frames in one invoice flood (`Attack::InvoiceFlood`).
+const FLOOD_FRAMES: usize = 300;
+
+/// Where the concurrent flooders listen: a loopback source other than the
+/// honest nodes' 127.0.0.1 (see `run_adversarial`).
+const FLOOD_SOURCE: SocketAddr = SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
 
 async fn attack(adv: &Adversary, target: &SimNode, kind: Attack, rng: &mut SimRng, ids: &Mutex<HashSet<String>>) -> usize {
     let to = target.id;
@@ -1375,7 +1398,7 @@ async fn attack(adv: &Adversary, target: &SimNode, kind: Attack, rng: &mut SimRn
             // sender builds them, so the flood reaches quoting and its limit.
             use konsensus_core::admission_quote;
             let me = *adv.identity.node_id();
-            for _ in 0..300 {
+            for _ in 0..FLOOD_FRAMES {
                 let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
                 let frame = Frame::RequestInvoice {
                     request_id: admission_quote::request_id(&to, &me, now),
@@ -1407,67 +1430,157 @@ async fn run_adversarial(cfg: SimConfig, adversaries: usize) {
         }
         targets.push(t);
     }
+    // Invoice floods each adversary ran; a flood earns at most one quote.
+    let mut floods_by: Vec<usize> = vec![0; adversaries];
+
+    // Concurrent flooders: a valid invoice flood runs during every honest
+    // step, from a source address other than the honest nodes'.
+    //
+    // First-contact quoting is limited per source address, and every
+    // in-process node dials from 127.0.0.1, so a flood from 127.0.0.1 would
+    // also rate-limit honest first contact (the limit working as designed,
+    // not a liveness failure). The flood needs its own source. macOS only
+    // configures 127.0.0.1 on lo0 (127.0.0.2.. need an `ifconfig` alias and
+    // root), so the second source is the IPv6 loopback ::1. The nodes listen
+    // on 127.0.0.1 only, which ::1 cannot reach, so each target dials its
+    // flooder instead: the recipient keys the limit on the connection's
+    // remote address whichever side dialed, and treats the flooder as an
+    // unprivileged stranger either way. Limit: this concurrent flood reaches
+    // the recipient over a connection the recipient opened; flooding the
+    // listener inbound is covered by the phase after the steps, which shares
+    // the honest source and so cannot overlap honest first contact.
+    let mut concurrent: Vec<usize> = Vec::new();
+    for k in 0..adversaries {
+        let c = advs.len();
+        let flooder = adversary_at(cfg.seed, adversaries + k, FLOOD_SOURCE);
+        let mut t = Vec::new();
+        let mut failed = Vec::new();
+        match flooder.transport.start_listener().await.map(|()| flooder.transport.listen_addr()) {
+            Ok(Some(addr)) if addr.ip() != std::net::IpAddr::from([127, 0, 0, 1]) => {
+                let fid = *flooder.identity.node_id();
+                let mut seen = HashSet::new();
+                for &i in &targets[k] {
+                    if !seen.insert(i) {
+                        continue;
+                    }
+                    let node = net.node(i);
+                    let ok = node.transport.connect(&fid, &addr.to_string()).await.is_ok()
+                        && wait_for(Duration::from_secs(5), || async { flooder.transport.is_connected(&node.id).await }).await;
+                    if ok {
+                        t.push(i);
+                    } else {
+                        failed.push(format!("S3 concurrent flood: n{i} could not connect to flooder a{c} at {addr}"));
+                    }
+                }
+            }
+            other => failed.push(format!("S3 concurrent flooder a{c} has no listener on a second loopback source ({FLOOD_SOURCE}): {other:?}")),
+        }
+        for f in failed {
+            net.violation(f);
+        }
+        advs.push(flooder);
+        targets.push(t);
+        floods_by.push(0);
+        concurrent.push(c);
+    }
+
     let mut attack_log: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut concurrent_pairs, mut concurrent_frames) = (0usize, 0usize);
     for step in 0..cfg.steps {
         let pairs = net.pick_pairs(cfg.per_step);
-        let plan: Vec<(usize, usize, Attack, u64)> = advs
-            .iter()
-            .enumerate()
-            .flat_map(|(k, _)| {
+        let plan: Vec<(usize, usize, Attack, u64)> = (0..adversaries)
+            .flat_map(|k| {
                 let t = targets[k].clone();
                 let picks: Vec<_> = t.iter().map(|&i| (i, ATTACKS[net.rng.below(ATTACKS.len())], net.rng.next())).collect();
                 picks.into_iter().map(move |(i, a, s)| (k, i, a, s))
             })
             .collect();
+        let floods: Vec<(usize, usize)> = concurrent.iter().flat_map(|&k| targets[k].iter().map(move |&i| (k, i))).collect();
+        let floods: Vec<(usize, usize, u64)> = floods.into_iter().map(|(k, i)| (k, i, net.rng.next())).collect();
         for (_, _, a, _) in &plan {
             *attack_log.entry(format!("{a:?}")).or_default() += 1;
         }
+        *attack_log.entry(format!("{:?}", Attack::InvoiceFlood)).or_default() += floods.len();
         let jobs = net.prepare(step, pairs).await;
+        // (flooder, target, frames sent, honest composes still in flight when it ended)
+        let flood_results: Mutex<Vec<(usize, usize, usize, bool)>> = Mutex::new(Vec::new());
         let chaos = {
-            let (net, advs, ids) = (&net, &advs, &ids);
+            let (net, advs, ids, flood_results) = (&net, &advs, &ids, &flood_results);
             async move {
-                futures::future::join_all(plan.into_iter().map(|(k, i, a, s)| async move {
+                let attacks = futures::future::join_all(plan.into_iter().map(|(k, i, a, s)| async move {
                     if !net.up(i) {
                         return;
                     }
                     let mut rng = SimRng::new(s);
                     attack(&advs[k], net.node(i), a, &mut rng, ids).await;
-                }))
-                .await;
+                }));
+                let floods = futures::future::join_all(floods.into_iter().map(|(k, i, s)| async move {
+                    let mut rng = SimRng::new(s);
+                    let sent = attack(&advs[k], net.node(i), Attack::InvoiceFlood, &mut rng, ids).await;
+                    // `inflight` only falls during `run_jobs`, so a nonzero
+                    // count here means the whole flood ran during honest composes.
+                    let overlapped = net.inflight.load(Ordering::SeqCst) > 0;
+                    flood_results.lock().unwrap().push((k, i, sent, overlapped));
+                }));
+                futures::future::join(attacks, floods).await;
             }
         };
         let results = net.run_jobs(&jobs, chaos).await;
         net.record(jobs, results);
+        for (k, i, sent, overlapped) in flood_results.into_inner().unwrap() {
+            floods_by[k] += 1;
+            concurrent_pairs += 1;
+            concurrent_frames += sent;
+            if sent < FLOOD_FRAMES {
+                net.violation(format!("S3 step {step}: concurrent flood a{k}->n{i} sent only {sent} of {FLOOD_FRAMES} frames"));
+            }
+            if !overlapped {
+                net.violation(format!("S3 step {step}: concurrent flood a{k}->n{i} did not overlap the step's honest composes"));
+            }
+        }
         let last = &net.sent[net.sent.len().saturating_sub(cfg.per_step)..];
         println!("sim: step {step}: {} sends, {} ok, t={:.1}s", last.len(), last.iter().filter(|s| s.ok()).count(), net.started.elapsed().as_secs_f64());
     }
-    // Invoice flood phase. In-process every node and adversary shares
-    // 127.0.0.1, and first-contact quoting is limited per source address, so
-    // a flood overlapping the honest steps would also limit honest first
-    // contact from that same address. It runs here instead, after the quote
-    // window has passed. The step attackers are banned by now for invalid
-    // frames, so each one floods its targets under a fresh identity from
-    // the same address (identity rotation), all at once.
+    if concurrent_pairs == 0 {
+        net.violation("S3 no invoice flood ran alongside honest traffic (0 concurrent flood pairs)".into());
+    }
+
+    // Invoice flood phase from the honest nodes' own source, 127.0.0.1. A
+    // flood there overlapping the honest steps would also limit honest first
+    // contact from that same address, so it runs here, after the quote window
+    // has passed. The step attackers are banned by now for invalid frames, so
+    // each one floods its targets under a fresh identity from the same
+    // address (identity rotation), all at once.
     tokio::time::sleep(QUOTE_WINDOW_WAIT).await;
-    let stepped = advs.len();
+    let mut phase: Vec<usize> = Vec::new();
     let mut flooded: HashSet<usize> = HashSet::new();
     let mut flood_plan = Vec::new();
-    for k in 0..stepped {
-        let flooder = adversary(cfg.seed, stepped + k);
+    let mut failed = Vec::new();
+    for k in 0..adversaries {
+        let p = advs.len();
+        let flooder = adversary(cfg.seed, 2 * adversaries + k);
         let mut t = Vec::new();
         for &i in &targets[k] {
             let node = net.node(i);
-            if net.up(i) && flooder.transport.connect(&node.id, &node.addr()).await.is_ok() {
-                t.push(i);
-                flooded.insert(i);
-                flood_plan.push((advs.len(), i, net.rng.next()));
+            match flooder.transport.connect(&node.id, &node.addr()).await {
+                Ok(()) => {
+                    t.push(i);
+                    flooded.insert(i);
+                    flood_plan.push((p, i, net.rng.next()));
+                }
+                Err(e) => failed.push(format!("S3 invoice flood phase: flooder a{p} could not connect to n{i}: {e}")),
             }
         }
         advs.push(flooder);
+        floods_by.push(t.len());
         targets.push(t);
+        phase.push(p);
     }
-    let floods_by: Vec<usize> = (0..advs.len()).map(|k| if k < stepped { 0 } else { targets[k].len() }).collect();
-    *attack_log.entry(format!("{:?}", Attack::InvoiceFlood)).or_default() += flood_plan.len();
+    for f in failed {
+        net.violation(f);
+    }
+    let flood_pairs = flood_plan.len();
+    *attack_log.entry(format!("{:?}", Attack::InvoiceFlood)).or_default() += flood_pairs;
     let flood_sent: usize = {
         let (net, advs, ids) = (&net, &advs, &ids);
         futures::future::join_all(flood_plan.into_iter().map(|(k, i, s)| async move {
@@ -1478,9 +1591,13 @@ async fn run_adversarial(cfg: SimConfig, adversaries: usize) {
         .into_iter()
         .sum()
     };
-    let flood_pairs: usize = floods_by.iter().sum();
-    if flood_sent < 300 * flood_pairs {
-        net.violation(format!("S3 invoice flood sent only {flood_sent} of {} frames", 300 * flood_pairs));
+    // An empty plan must not pass for a flood: the quote and rate-limit
+    // checks below need at least one executed pair with its full workload.
+    if flood_pairs == 0 {
+        net.violation("S3 invoice flood phase executed no flood pair".into());
+    }
+    if flood_sent < FLOOD_FRAMES * flood_pairs {
+        net.violation(format!("S3 invoice flood sent only {flood_sent} of {} frames", FLOOD_FRAMES * flood_pairs));
     }
     // Replies arrive on the adversaries' control channels; wait until they stop.
     let replies = |advs: &[Adversary]| -> usize {
@@ -1499,14 +1616,15 @@ async fn run_adversarial(cfg: SimConfig, adversaries: usize) {
     }
     let adv_ids = ids.lock().unwrap().clone();
     net.check_common(&adv_ids).await;
-    // S3: honest traffic still flows.
+    // S3: honest traffic still flows, including the composes that ran
+    // alongside the concurrent flood.
     let failed: Vec<_> = net.sent.iter().filter(|s| !s.ok()).map(|s| format!("step {} n{}->n{} {:?} {}", s.step, s.from, s.to, s.status, s.body)).collect();
     for f in failed {
         net.violation(format!("S3 honest send failed under attack: {f}"));
     }
     // S3: unpaid adversaries got no session, no privilege, no cached prices,
     // and the invoice flood was bounded.
-    let (mut quotes, mut rate_limited) = (0, 0);
+    let (mut quotes, mut rate_limited) = (vec![0usize; advs.len()], vec![0usize; advs.len()]);
     for (k, adv) in advs.iter().enumerate() {
         let aid = *adv.identity.node_id();
         for &i in &targets[k] {
@@ -1532,33 +1650,45 @@ async fn run_adversarial(cfg: SimConfig, adversaries: usize) {
             floods_by[k],
             adv.other_replies.load(Ordering::SeqCst)
         );
-        quotes += inv;
-        rate_limited += refused.get(konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED).copied().unwrap_or(0);
-        // Only floods request invoices. Each flood is 300 fresh first-contact
-        // attempts from one source in well under the quote window, so a
-        // recipient quotes at most once per flood.
+        quotes[k] = inv;
+        rate_limited[k] = refused.get(konsensus_api::invoice_refusal::ADMISSION_RATE_LIMITED).copied().unwrap_or(0);
+        // Only floods request invoices. Each flood is FLOOD_FRAMES fresh
+        // first-contact attempts from one source in well under the quote
+        // window, so a recipient quotes at most once per flood.
         if inv > floods_by[k] {
             net.violation(format!("S3 a{k} got {inv} admission quotes from {} floods", floods_by[k]));
         }
         adv.transport.shutdown();
     }
-    // The flood must reach the real first-contact quote path (a stranger
+    // Each flood must reach the real first-contact quote path (a stranger
     // gets one quote) and then the recipient's quote rate limit. A purpose or
     // request id the node does not accept would be refused before either.
-    if !flooded.is_empty() {
-        // All adversaries share one source address, so each flooded
-        // recipient quotes at most once in the whole phase.
-        if quotes > flooded.len() {
-            net.violation(format!("S3 invoice flood got {quotes} admission quotes from {} recipients", flooded.len()));
-        }
-        if quotes == 0 {
-            net.violation("S3 invoice flood never reached admission quoting (0 quotes)".into());
-        }
-        if rate_limited == 0 {
-            net.violation("S3 invoice flood never hit the admission quote rate limit (0 rate-limited refusals)".into());
-        }
+    // Both are required unconditionally: a flood that never ran fails above
+    // and here, rather than skipping these checks.
+    let sum = |group: &[usize], of: &[usize]| -> usize { group.iter().map(|&k| of[k]).sum() };
+    let (concurrent_quotes, concurrent_limited) = (sum(&concurrent, &quotes), sum(&concurrent, &rate_limited));
+    let (phase_quotes, phase_limited) = (sum(&phase, &quotes), sum(&phase, &rate_limited));
+    if concurrent_quotes == 0 {
+        net.violation("S3 concurrent invoice flood never reached admission quoting (0 quotes)".into());
     }
-    println!("sim: attacks {attack_log:?} flood_frames={flood_sent} flooded={} quotes={quotes} rate_limited={rate_limited}", flooded.len());
+    if concurrent_limited == 0 {
+        net.violation("S3 concurrent invoice flood never hit the admission quote rate limit (0 rate-limited refusals)".into());
+    }
+    // The phase flooders share one source address, so each flooded
+    // recipient quotes at most once in the whole phase.
+    if phase_quotes > flooded.len() {
+        net.violation(format!("S3 invoice flood got {phase_quotes} admission quotes from {} recipients", flooded.len()));
+    }
+    if phase_quotes == 0 {
+        net.violation("S3 invoice flood never reached admission quoting (0 quotes)".into());
+    }
+    if phase_limited == 0 {
+        net.violation("S3 invoice flood never hit the admission quote rate limit (0 rate-limited refusals)".into());
+    }
+    println!(
+        "sim: attacks {attack_log:?} concurrent_pairs={concurrent_pairs} concurrent_frames={concurrent_frames} concurrent_quotes={concurrent_quotes} concurrent_rate_limited={concurrent_limited} flood_frames={flood_sent} flooded={} quotes={phase_quotes} rate_limited={phase_limited}",
+        flooded.len()
+    );
     net.finish();
 }
 
