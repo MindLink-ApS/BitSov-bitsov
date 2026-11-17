@@ -588,33 +588,66 @@ pub fn evaluate(bytes: &[u8], current: &ReadContext) -> Readiness {
             }
         }
         let can_prepare = failures.is_empty();
-        let authority = envelope.prerequisites.get("stage_authority");
-        let can_attempt_stage = stage != "setup"
-            && can_prepare
-            && envelope.context.requested_stage.label() == stage
-            && envelope.context.operation_id.is_some()
-            && !envelope.authority_refs.is_empty()
-            && envelope
-                .context
-                .terms_revision
-                .as_deref()
-                .is_some_and(|s| !s.is_empty())
-            && authority.is_some_and(|p| {
-                p.state == ReadinessState::Ready
-                    && p.expires_at_ms
+        if stage != "setup" && can_prepare {
+            if envelope.context.requested_stage.label() != stage
+                || envelope.context.operation_id.is_none()
+            {
+                failures.push((
+                    ReadinessState::Unknown,
+                    blocker(Some(stage), Reason::BindingChanged, None),
+                ));
+            }
+            match envelope.prerequisites.get("stage_authority") {
+                None => failures.push((
+                    ReadinessState::Unknown,
+                    blocker(
+                        Some(stage),
+                        Reason::PrerequisiteUnknown,
+                        Some("stage_authority"),
+                    ),
+                )),
+                Some(p) if p.state != ReadinessState::Ready => failures.push((
+                    p.state,
+                    blocker(Some(stage), p.reason, Some("stage_authority")),
+                )),
+                Some(p) => {
+                    if envelope.authority_refs.is_empty() {
+                        failures.push((
+                            ReadinessState::Unknown,
+                            blocker(
+                                Some(stage),
+                                Reason::PrerequisiteUnknown,
+                                Some("authority_consent"),
+                            ),
+                        ));
+                    }
+                    let expiry = p
+                        .expires_at_ms
+                        .into_iter()
+                        .chain(p.parent_expires_at_ms)
+                        .min();
+                    if expiry
                         .zip(current.now_ms)
-                        .is_some_and(|(expiry, now)| now < expiry)
-                    && p.parent_expires_at_ms
-                        .zip(current.now_ms)
-                        .is_none_or(|(expiry, now)| now < expiry)
-            });
-        if stage != "setup" && can_prepare && !can_attempt_stage {
-            let (state, reason) = authority
-                .filter(|p| p.state != ReadinessState::Ready)
-                .map(|p| (p.state, p.reason))
-                .unwrap_or((ReadinessState::NeedsOwner, Reason::ConsentRequired));
-            failures.push((state, blocker(Some(stage), reason, Some("stage_authority"))));
+                        .is_some_and(|(expiry, now)| now >= expiry)
+                    {
+                        failures.push((
+                            ReadinessState::Refused,
+                            blocker(Some(stage), Reason::Expired, Some("stage_authority")),
+                        ));
+                    } else if p.expires_at_ms.zip(current.now_ms).is_none() {
+                        failures.push((
+                            ReadinessState::Unknown,
+                            blocker(
+                                Some(stage),
+                                Reason::FreshnessUnknown,
+                                Some("stage_authority"),
+                            ),
+                        ));
+                    }
+                }
+            }
         }
+        let can_attempt_stage = stage != "setup" && can_prepare && failures.is_empty();
         let state = [
             ReadinessState::Refused,
             ReadinessState::Unknown,

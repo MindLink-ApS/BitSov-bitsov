@@ -626,3 +626,267 @@ fn positional_arrays_cannot_replace_named_contract_groups() {
         blocked(&r, "invalid_envelope");
     }
 }
+
+const ATTEMPT_STAGES: &[&str] = &["introduction", "reply", "call", "answer"];
+
+fn attempt_ready(stage: &str) -> Value {
+    let mut v = if stage == "call" {
+        call_ready()
+    } else {
+        compatible()
+    };
+    v["context"]["requested_stage"] = json!(stage);
+    if ["reply", "answer"].contains(&stage) {
+        v["context"]["role"] = json!("callee");
+    }
+    if stage == "reply" {
+        v["stage_result_refs"]["reply"] = json!({"state":"not_attempted","reference":null});
+    }
+    v["authority_refs"] = json!(["stage-authority"]);
+    v["prerequisites"]["stage_authority"]["expires_at_ms"] = json!(500);
+    v
+}
+
+fn assert_attempt_blocker(
+    v: &Value,
+    stage: &str,
+    state: &str,
+    reason: &str,
+    dependency: Option<&str>,
+    next_action: &str,
+    can_request_approval: bool,
+) {
+    let r = report(v);
+    assert_eq!(r["implemented"], true);
+    assert_eq!(r["stages"][stage]["can_prepare"], true);
+    assert_eq!(r["stages"][stage]["can_attempt_stage"], false);
+    assert_eq!(r["stages"][stage]["state"], state);
+    assert_eq!(
+        r["stages"][stage]["can_request_approval"],
+        can_request_approval
+    );
+    let blockers: Vec<_> = r["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["stage"] == stage)
+        .cloned()
+        .collect();
+    assert_eq!(
+        blockers,
+        vec![
+            json!({"stage":stage,"reason":reason,"dependency":dependency,"next_action":next_action})
+        ]
+    );
+    assert_eq!(r["authorizes_dispatch"], false);
+    assert_eq!(r["revalidation_required"], true);
+}
+
+#[test]
+fn attempt_ready_authority_keeps_each_selected_stage_eligible() {
+    for stage in ATTEMPT_STAGES {
+        let r = report(&attempt_ready(stage));
+        assert_eq!(r["stages"][stage]["state"], "ready");
+        assert_eq!(r["stages"][stage]["can_prepare"], true);
+        assert_eq!(r["stages"][stage]["can_request_approval"], true);
+        assert_eq!(r["stages"][stage]["can_attempt_stage"], true);
+        assert_eq!(r["authorizes_dispatch"], false);
+        assert_eq!(r["revalidation_required"], true);
+    }
+}
+
+#[test]
+fn attempt_expired_authority_requests_refresh() {
+    for stage in ATTEMPT_STAGES {
+        for expiry in [99, 100] {
+            let mut v = attempt_ready(stage);
+            v["prerequisites"]["stage_authority"]["expires_at_ms"] = json!(expiry);
+            assert_attempt_blocker(
+                &v,
+                stage,
+                "refused",
+                "expired",
+                Some("stage_authority"),
+                "refresh",
+                true,
+            );
+        }
+    }
+}
+
+#[test]
+fn attempt_expired_parent_authority_requests_refresh() {
+    for stage in ATTEMPT_STAGES {
+        for expiry in [99, 100] {
+            let mut v = attempt_ready(stage);
+            v["prerequisites"]["stage_authority"]["parent_expires_at_ms"] = json!(expiry);
+            assert_attempt_blocker(
+                &v,
+                stage,
+                "refused",
+                "expired",
+                Some("stage_authority"),
+                "refresh",
+                true,
+            );
+        }
+    }
+}
+
+#[test]
+fn attempt_untimed_authority_requests_freshness() {
+    for stage in ATTEMPT_STAGES {
+        for parent in [Value::Null, json!(500)] {
+            let mut v = attempt_ready(stage);
+            v["prerequisites"]["stage_authority"]["expires_at_ms"] = Value::Null;
+            v["prerequisites"]["stage_authority"]["parent_expires_at_ms"] = parent;
+            assert_attempt_blocker(
+                &v,
+                stage,
+                "unknown",
+                "freshness_unknown",
+                Some("stage_authority"),
+                "refresh",
+                true,
+            );
+        }
+    }
+}
+
+#[test]
+fn attempt_missing_authority_remains_unknown() {
+    for stage in ATTEMPT_STAGES {
+        let mut v = attempt_ready(stage);
+        v["prerequisites"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stage_authority");
+        assert_attempt_blocker(
+            &v,
+            stage,
+            "unknown",
+            "prerequisite_unknown",
+            Some("stage_authority"),
+            "check_compatibility",
+            true,
+        );
+    }
+}
+
+#[test]
+fn attempt_missing_authority_references_remains_unknown() {
+    for stage in ATTEMPT_STAGES {
+        let mut v = attempt_ready(stage);
+        v["authority_refs"] = json!([]);
+        assert_attempt_blocker(
+            &v,
+            stage,
+            "unknown",
+            "prerequisite_unknown",
+            Some("authority_consent"),
+            "check_compatibility",
+            true,
+        );
+    }
+}
+
+#[test]
+fn attempt_missing_operation_identity_reports_context_change() {
+    for stage in ATTEMPT_STAGES {
+        let mut v = attempt_ready(stage);
+        v["context"]["operation_id"] = Value::Null;
+        assert_attempt_blocker(
+            &v,
+            stage,
+            "unknown",
+            "binding_changed",
+            None,
+            "reconnect",
+            false,
+        );
+    }
+}
+
+#[test]
+fn attempt_unselected_stage_reports_context_change() {
+    for stage in ATTEMPT_STAGES {
+        let mut v = attempt_ready(stage);
+        v["context"]["requested_stage"] = json!("setup");
+        assert_attempt_blocker(
+            &v,
+            stage,
+            "unknown",
+            "binding_changed",
+            None,
+            "reconnect",
+            false,
+        );
+    }
+}
+
+#[test]
+fn attempt_explicit_consent_requirement_preserves_owner_action() {
+    for stage in ATTEMPT_STAGES {
+        let mut v = attempt_ready(stage);
+        set_check(&mut v, "stage_authority", "needs_owner", "consent_required");
+        v["authority_refs"] = json!([]);
+        v["prerequisites"]["stage_authority"]["expires_at_ms"] = Value::Null;
+        assert_attempt_blocker(
+            &v,
+            stage,
+            "needs_owner",
+            "consent_required",
+            Some("stage_authority"),
+            "request_owner",
+            true,
+        );
+    }
+}
+
+#[test]
+fn attempt_observed_authority_failure_preserves_its_reason() {
+    for stage in ATTEMPT_STAGES {
+        for (state, reason, action) in [
+            ("pending", "admission_pending", "wait"),
+            ("refused", "revoked", "check_compatibility"),
+            ("unknown", "prerequisite_unknown", "check_compatibility"),
+        ] {
+            let mut v = attempt_ready(stage);
+            set_check(&mut v, "stage_authority", state, reason);
+            assert_attempt_blocker(
+                &v,
+                stage,
+                state,
+                reason,
+                Some("stage_authority"),
+                action,
+                true,
+            );
+        }
+    }
+}
+
+#[test]
+fn attempt_independent_failures_keep_each_reason() {
+    let mut v = attempt_ready("introduction");
+    v["context"]["operation_id"] = Value::Null;
+    v["authority_refs"] = json!([]);
+    v["prerequisites"]["stage_authority"]["expires_at_ms"] = json!(100);
+    let r = report(&v);
+    assert_eq!(r["stages"]["introduction"]["state"], "refused");
+    assert_eq!(r["stages"]["introduction"]["can_prepare"], true);
+    assert_eq!(r["stages"]["introduction"]["can_request_approval"], false);
+    assert_eq!(r["stages"]["introduction"]["can_attempt_stage"], false);
+    let reasons: Vec<_> = r["blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|b| b["stage"] == "introduction")
+        .map(|b| b["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec!["binding_changed", "prerequisite_unknown", "expired"]
+    );
+    assert_eq!(r["authorizes_dispatch"], false);
+}
