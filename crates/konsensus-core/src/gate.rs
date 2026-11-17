@@ -34,6 +34,14 @@ pub fn price_with_floor_msat(discounted: u64, min_admission_cost_msat: u64) -> u
     discounted.max(min_admission_cost_msat).max(1_000)
 }
 
+/// The payable price of one paid call minute (kind 404): the callee's raw
+/// minute tariff with the admission floors, and never a trust discount.
+/// The callee mints and answers with this; the caller quotes with it, so the
+/// two sides cannot disagree on a minute invoice amount.
+pub fn call_minute_price_msat(tariff_msat: u64, min_admission_cost_msat: u64) -> u64 {
+    price_with_floor_msat(tariff_msat, min_admission_cost_msat)
+}
+
 /// Invoice-request purpose naming the service (message kind) being paid for,
 /// so the recipient prices it locally rather than trusting the requested
 /// amount against its highest price. Older recipients treat it as a generic
