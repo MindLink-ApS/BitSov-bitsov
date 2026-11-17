@@ -681,7 +681,11 @@ async fn issue204_stale_kind_response_without_prior_table_is_not_a_fresh_answer(
 #[tokio::test]
 async fn call_block_quote_uses_floors_without_the_cached_trust_discount() {
     use crate::peer_prices::ADMISSION_FLOOR_KEY;
-    for (tariff, floor, expected) in [(23_000, 30_000, 30_000), (500, 0, 1_000), (23_000, 0, 23_000)] {
+    // 50_000 at the 0.5 discount would be 25_000, floored to 30_000; the quote
+    // must keep the undiscounted tariff above the floor.
+    for (tariff, floor, expected) in [
+        (23_000, 30_000, 30_000), (500, 0, 1_000), (23_000, 0, 23_000), (50_000, 30_000, 50_000),
+    ] {
         let cache = PeerPriceCache::new();
         let peer = NodeId::from_bytes([19; 32]);
         cache.update(peer, std::collections::HashMap::from([
