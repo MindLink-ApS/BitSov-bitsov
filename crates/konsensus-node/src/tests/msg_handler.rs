@@ -1048,12 +1048,14 @@ async fn web_reply_is_bound_to_request_payment_not_self_minted() {
         konsensus_core::kind::KIND_PAGE_REQUEST,
         b"enc".to_vec(),
     );
-    assert!(request.payment_proof.amount_msat > 0);
+    assert!(request.payment_proof.amount_msat() > 0);
 
-    let bound = konsensus_core::reply_bound_proof(&request.payment_proof);
+    let bound = konsensus_core::reply_bound_proof(
+        request.payment_proof.lightning().expect("lightning proof"),
+    );
     assert_eq!(bound.amount_msat, 0);
-    assert_eq!(bound.payment_hash, request.payment_proof.payment_hash);
-    assert_eq!(bound.preimage, request.payment_proof.preimage);
+    assert_eq!(bound.payment_hash, request.payment_proof.lightning().expect("lightning proof").payment_hash);
+    assert_eq!(bound.preimage, request.payment_proof.lightning().expect("lightning proof").preimage);
 
     let reply = UkmEnvelopeBuilder::new(
         konsensus_core::kind::KIND_PAGE_RESPONSE,
@@ -1068,8 +1070,8 @@ async fn web_reply_is_bound_to_request_payment_not_self_minted() {
     assert_eq!(reply.references, vec![request.id]);
     // A self-minted priced proof would have a different hash or non-zero amount.
     assert_ne!(
-        reply.payment_proof.amount_msat,
-        request.payment_proof.amount_msat
+        reply.payment_proof.amount_msat(),
+        request.payment_proof.amount_msat()
     );
 }
 
@@ -1879,7 +1881,7 @@ async fn membrane_observes_unpaid_insufficient_stale_and_first_contact_decisions
         }
         let mut env = make_envelope(&alice, *bob.node_id(), 100, vec![1]);
         if case == "unpaid" {
-            env.payment_proof = make_valid_proof(0);
+            env.payment_proof = make_valid_proof(0).into();
         }
         if case == "stale" {
             env.timestamp = 1;
@@ -2084,7 +2086,7 @@ async fn paid_acceptance_retry_case(
         pricing.0.store(10_000, std::sync::atomic::Ordering::SeqCst);
     }
     if legacy {
-        db.store_payment_receipt(&env.payment_proof.payment_hash, &env.sender, &env.id)
+        db.store_payment_receipt(&env.payment_proof.lightning().expect("lightning proof").payment_hash, &env.sender, &env.id)
             .await
             .unwrap();
         db.store_nonce(&env.nonce, &env.sender).await.unwrap();
@@ -2391,11 +2393,11 @@ async fn queued_paid_proof_honours_offered_price_before_acceptance() {
     ] {
         let mut invalid = env.clone();
         match case {
-            "underpaid" => invalid.payment_proof.amount_msat = 1,
+            "underpaid" => invalid.payment_proof.lightning_mut().expect("lightning proof").amount_msat = 1,
             "wrong_kind" => invalid.kind = 200,
             "wrong_sender" => invalid.sender = *bob.node_id(),
             "wrong_recipient" => invalid.recipient = Recipient::Node(*alice.node_id()),
-            _ => invalid.payment_proof = make_valid_proof(1_000),
+            _ => invalid.payment_proof = make_valid_proof(1_000).into(),
         }
         let signer = if case == "wrong_sender" { &bob } else { &alice };
         invalid.signature = Signature::from_ed25519(&signer.sign(&invalid.signable_bytes()));
@@ -3187,7 +3189,7 @@ async fn journal_dispatched_block(store: &konsensus_storage::SqliteStorage, env:
     op.state = "sent".into();
     op.message_id = Some(env.id.to_hex());
     op.recovery = serde_json::to_vec(&serde_json::json!({
-        "call_block": [call_id, seq], "dispatched": true, "expected_msat": env.payment_proof.amount_msat,
+        "call_block": [call_id, seq], "dispatched": true, "expected_msat": env.payment_proof.amount_msat(),
         "fee_ceiling_msat": 0, "admission_msat": 0,
     })).unwrap();
     store.insert_outbox_operation(&op).await.unwrap();
@@ -3470,7 +3472,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     let mut generic = signal(404, 10_000, block(0)).await;
     generic.payment_proof = PaymentProof::new(
         hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
-        hex::decode(payment.preimage.unwrap()).unwrap().try_into().unwrap(), 10_000);
+        hex::decode(payment.preimage.unwrap()).unwrap().try_into().unwrap(), 10_000).into();
     generic.signature = Signature::from_ed25519(&alice.sign(&generic.signable_bytes()));
     source.send(bob.node_id(), &generic).await.unwrap();
     assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
@@ -3531,7 +3533,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         .filter(|event: &serde_json::Value| event["event"] == "call.block_overpayment"
             && event["detail"]["message_id"] == in_flight.id.to_hex()).collect();
     assert_eq!(records.len(), 1, "one reconciliation record on replay");
-    assert_eq!(records[0]["detail"]["payment_hash"], hex::encode(in_flight.payment_proof.payment_hash));
+    assert_eq!(records[0]["detail"]["payment_hash"], hex::encode(in_flight.payment_proof.lightning().expect("lightning proof").payment_hash));
     assert_eq!(records[0]["detail"]["amount_msat"], 10_000);
     assert_eq!(records[0]["detail"]["reconciliation_required"], true);
 
@@ -3575,7 +3577,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         .filter(|event: &serde_json::Value| event["event"] == "call.block_overpayment"
             && event["detail"]["message_id"] == settled.id.to_hex()).collect();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0]["detail"]["payment_hash"], hex::encode(settled.payment_proof.payment_hash));
+    assert_eq!(records[0]["detail"]["payment_hash"], hex::encode(settled.payment_proof.lightning().expect("lightning proof").payment_hash));
     assert_eq!(records[0]["detail"]["amount_msat"], 10_000);
     assert_eq!(records[0]["detail"]["reconciliation_required"], true);
 
@@ -3629,7 +3631,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
                 && event["detail"]["message_id"] == settled.id.to_hex()).collect();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0]["detail"]["reconciliation_required"], true);
-        assert_eq!(records[0]["detail"]["payment_hash"], hex::encode(settled.payment_proof.payment_hash));
+        assert_eq!(records[0]["detail"]["payment_hash"], hex::encode(settled.payment_proof.lightning().expect("lightning proof").payment_hash));
         drop(attachment);
     }
 
@@ -3647,7 +3649,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     assert!(!db.is_paid_envelope_accepted(&env).await.unwrap());
     source.send(bob.node_id(), &env).await.unwrap();
     assert_eq!(outcome(source.clone()).await, Err("call_block_overpayment".into()));
-    assert!(!db.store_payment_receipt(&env.payment_proof.payment_hash, alice.node_id(), &env.id).await.unwrap());
+    assert!(!db.store_payment_receipt(&env.payment_proof.lightning().expect("lightning proof").payment_hash, alice.node_id(), &env.id).await.unwrap());
     assert!(ws_rx.try_recv().is_err());
     assert!(!konsensus_api::calls::call_media_admitted(db.as_ref(), alice.node_id(), &late_id, now).await);
     let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
@@ -3657,7 +3659,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     assert_eq!(overpayment["detail"]["call_id"], late_id);
     assert_eq!(overpayment["detail"]["seq"], 0);
     assert_eq!(overpayment["detail"]["amount_msat"], 10_000);
-    assert_eq!(overpayment["detail"]["payment_hash"], hex::encode(env.payment_proof.payment_hash));
+    assert_eq!(overpayment["detail"]["payment_hash"], hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash));
     assert_eq!(overpayment["detail"]["reconciliation_required"], true);
     assert_eq!(events.iter().filter(|event| event["event"] == "call.block_overpayment"
         && event["detail"]["message_id"] == env.id.to_hex()).count(), 1);
@@ -3692,7 +3694,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     assert!(db.get_message(&failed.id).await.unwrap().is_none());
     assert!(db.get_message_plaintext(&failed.id).await.unwrap().is_none());
     let receipt: (String, i64, i32) = sqlx::query_as("SELECT message_id, amount_msat, accepted FROM payment_receipts WHERE payment_hash = ?")
-        .bind(hex::encode(failed.payment_proof.payment_hash)).fetch_one(db.pool()).await.unwrap();
+        .bind(hex::encode(failed.payment_proof.lightning().expect("lightning proof").payment_hash)).fetch_one(db.pool()).await.unwrap();
     assert_eq!(receipt, (failed.id.to_hex(), 10_000, -1));
     let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
     let reconciliation = audit_entries.lines().map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -3848,7 +3850,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     // One payment each, kept accepted; no withdrawal and no reconciliation event.
     for env in [&env0, &env1] {
         let receipts: Vec<(String, i32)> = sqlx::query_as("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
-            .bind(hex::encode(env.payment_proof.payment_hash)).fetch_all(db.pool()).await.unwrap();
+            .bind(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash)).fetch_all(db.pool()).await.unwrap();
         assert_eq!(receipts, vec![(env.id.to_hex(), 1)]);
     }
     let audit_entries = std::fs::read_to_string(dir.path().join("audit.jsonl")).unwrap();
@@ -3866,7 +3868,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
     // retry under the same fault can withdraw it; a retry re-ACKs the same
     // boundary and never grants twice.
     let receipts = |env: &konsensus_core::UkmEnvelope| {
-        let (pool, hash) = (db.pool().clone(), hex::encode(env.payment_proof.payment_hash));
+        let (pool, hash) = (db.pool().clone(), hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash));
         async move {
             sqlx::query_as::<_, (String, i32)>("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
                 .bind(hash).fetch_all(&pool).await.unwrap()
@@ -4409,7 +4411,7 @@ async fn duplicate_after_not_reachable_repeats_the_reject_without_readmitting() 
     let pricing = konsensus_pricing::StaticPricingEngine::new(Default::default());
     assert!(gate.validate_received_paid_envelope(&env, &InviteReceipts(&db), &pricing, None, None, 0.0, Some(bob.node_id())).await.unwrap(), "the existing receipt avoids another price or settlement check");
     let mut changed = env.clone();
-    changed.payment_proof.amount_msat += 1;
+    changed.payment_proof.lightning_mut().expect("lightning proof").amount_msat += 1;
     changed.signature = Signature::from_ed25519(&alice_identity().sign(&changed.signable_bytes()));
     assert!(db.call_invite_outcome(&changed).await.unwrap().is_none(), "a changed payment cannot borrow this outcome");
     assert!(gate.validate_received_paid_envelope(&changed, &InviteReceipts(&db), &pricing, None, None, 0.0, Some(bob.node_id())).await.is_err());
@@ -7012,7 +7014,7 @@ async fn recovery_handover_stale_high_counter_chat_reencrypts_without_repaying()
     assert!(net.ws_rx.try_recv().is_err(), "exactly one delivery");
     let receipts: Vec<(String, i32)> =
         sqlx::query_as("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
-            .bind(hex::encode(old.payment_proof.payment_hash))
+            .bind(hex::encode(old.payment_proof.lightning().expect("lightning proof").payment_hash))
             .fetch_all(net.db.pool())
             .await
             .unwrap();
@@ -7233,7 +7235,7 @@ async fn recovery_handover_lower_id_block_keeps_one_grant_after_reencryption() {
     );
     let receipts: Vec<(String, i32)> =
         sqlx::query_as("SELECT message_id, accepted FROM payment_receipts WHERE payment_hash = ?")
-            .bind(hex::encode(old.payment_proof.payment_hash))
+            .bind(hex::encode(old.payment_proof.lightning().expect("lightning proof").payment_hash))
             .fetch_all(net.db.pool())
             .await
             .unwrap();
@@ -7714,8 +7716,8 @@ async fn recovery_reconnect_journal_paid(
     let mut op = konsensus_storage::OutboxOperation::prepared(id.clone(), peer.to_hex(), env.kind, "same request".into());
     op.state = "paid".into();
     op.message_id = Some(env.id.to_hex());
-    op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
-    op.settled_msat = i64::try_from(env.payment_proof.amount_msat).unwrap();
+    op.payment_hash = Some(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash));
+    op.settled_msat = i64::try_from(env.payment_proof.amount_msat()).unwrap();
     op.accounting_pending = false;
     assert!(db.insert_outbox_operation(&op).await.unwrap());
     assert!(db.commit_outbox_envelope(&op, env).await.unwrap());
@@ -7937,7 +7939,7 @@ async fn media_state_read_failure_keeps_paid_block_retryable() {
             net.alice.node_id(),
             call_id,
             1,
-            &env.payment_proof.payment_hash,
+            &env.payment_proof.lightning().expect("lightning proof").payment_hash,
             now + 60_000,
         )
         .await
@@ -8011,7 +8013,7 @@ async fn failed_media_publication_keeps_paid_block_retryable() {
             net.alice.node_id(),
             call_id,
             1,
-            &env.payment_proof.payment_hash,
+            &env.payment_proof.lightning().expect("lightning proof").payment_hash,
             now + 60_000,
         )
         .await
@@ -8078,4 +8080,43 @@ async fn failed_media_publication_keeps_paid_block_retryable() {
         Some(renewed)
     );
     net.stop().await;
+}
+
+#[test]
+fn reused_blvm_chat_names_the_session_receipt() {
+    let sender = NodeId::from_bytes([1u8; 32]);
+    let recipient = NodeId::from_bytes([2u8; 32]);
+    let lightning = UkmEnvelopeBuilder::new(
+        0,
+        sender,
+        Recipient::Node(recipient),
+        vec![1],
+        PaymentProof::new([9u8; 32], [8u8; 32], 1000),
+    )
+    .build();
+    assert_eq!(reused_proof_hash(&lightning), hex::encode([9u8; 32]));
+
+    let session = UkmEnvelopeBuilder::new(
+        konsensus_core::kind::KIND_CHAT,
+        sender,
+        Recipient::Node(recipient),
+        vec![1],
+        konsensus_core::GatePaymentProof::BlvmOnChainSession {
+            payment_request_id: "req-open".into(),
+            tx_hash: [0x22; 32],
+            amount_sats: 2,
+            timestamp: 1,
+            session_debit_seq: Some(0),
+        },
+    )
+    .build();
+    let named = reused_proof_hash(&session);
+    assert_eq!(
+        named,
+        konsensus_storage::paid_identity::paid_identity(&session)
+            .unwrap()
+            .payment_hash
+    );
+    assert!(!named.is_empty());
+    assert!(session.payment_proof.as_lightning().is_none());
 }

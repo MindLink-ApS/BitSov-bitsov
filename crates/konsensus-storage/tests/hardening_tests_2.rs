@@ -770,9 +770,9 @@ async fn payment_proof_fields_roundtrip() {
     db.store_message(&env).await.unwrap();
     let loaded = db.get_message(&env.id).await.unwrap().unwrap();
 
-    assert_eq!(loaded.payment_proof.payment_hash, hash);
-    assert_eq!(loaded.payment_proof.preimage, preimage);
-    assert_eq!(loaded.payment_proof.amount_msat, 25_000);
+    assert_eq!(loaded.payment_proof.lightning().expect("lightning proof").payment_hash, hash);
+    assert_eq!(loaded.payment_proof.lightning().expect("lightning proof").preimage, preimage);
+    assert_eq!(loaded.payment_proof.amount_msat(), 25_000);
     assert_eq!(loaded.signature.as_bytes(), &[0xCC; 64]);
     assert_eq!(loaded.nonce.as_bytes(), &[0xDD; 24]);
 }
@@ -864,7 +864,7 @@ mod replay_e2e {
         // Sanity: fresh nonce, but identical economic proof (payment hash).
         assert_ne!(first.nonce, second.nonce, "envelopes must have distinct nonces");
         assert_eq!(
-            first.payment_proof.payment_hash, second.payment_proof.payment_hash,
+            first.payment_proof.lightning().expect("lightning proof").payment_hash, second.payment_proof.lightning().expect("lightning proof").payment_hash,
             "envelopes must reuse the same payment hash for this test to mean anything"
         );
 
@@ -893,7 +893,7 @@ mod replay_e2e {
         // And the receipt is durably persisted: a direct re-check returns false.
         assert!(
             !db.store_payment_receipt(
-                &second.payment_proof.payment_hash,
+                &second.payment_proof.lightning().expect("lightning proof").payment_hash,
                 &second.sender,
                 &second.id,
             )

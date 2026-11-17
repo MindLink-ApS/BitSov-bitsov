@@ -84,7 +84,8 @@ impl Fixture {
                     .try_into()
                     .unwrap(),
                 amount_msat: paid.amount_msat,
-            },
+            }
+            .into(),
             signature: Signature::from_bytes([0; 64]),
             nonce,
             references: vec![],

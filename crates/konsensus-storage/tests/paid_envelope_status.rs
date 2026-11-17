@@ -133,7 +133,7 @@ async fn paid_envelope_status_heals_legacy_metadata_without_replaying_message() 
         let store: &dyn Storage = if encrypted { &wrapper } else { wrapper.inner() };
         let env = envelope(4);
         store
-            .store_payment_receipt(&env.payment_proof.payment_hash, &env.sender, &env.id)
+            .store_payment_receipt(&env.payment_proof.lightning().expect("lightning proof").payment_hash, &env.sender, &env.id)
             .await
             .unwrap();
         store.store_message(&env).await.unwrap();
@@ -178,7 +178,7 @@ async fn paid_envelope_status_leaves_legacy_limbo_available_for_readable_retry()
             let store: &dyn Storage = if encrypted { &wrapper } else { wrapper.inner() };
             let env = envelope(4);
             store
-                .store_payment_receipt(&env.payment_proof.payment_hash, &env.sender, &env.id)
+                .store_payment_receipt(&env.payment_proof.lightning().expect("lightning proof").payment_hash, &env.sender, &env.id)
                 .await
                 .unwrap();
             if nonce_present {
@@ -219,11 +219,11 @@ async fn paid_envelope_status_preserves_exact_immutable_binding_checks() {
                 1 => changed.sender = NodeId::from_bytes([9; 32]),
                 2 => changed.kind = 2,
                 3 => changed.recipient = Recipient::Node(NodeId::from_bytes([9; 32])),
-                4 => changed.payment_proof.preimage[0] ^= 1,
-                5 => changed.payment_proof.amount_msat += 1,
+                4 => changed.payment_proof.lightning_mut().expect("lightning proof").preimage[0] ^= 1,
+                5 => changed.payment_proof.lightning_mut().expect("lightning proof").amount_msat += 1,
                 6 => changed.nonce = Nonce::from_bytes([9; 24]),
                 7 => changed.references.push(MessageId::from_bytes([9; 32])),
-                _ => changed.payment_proof.payment_hash[0] ^= 1,
+                _ => changed.payment_proof.lightning_mut().expect("lightning proof").payment_hash[0] ^= 1,
             }
             let expected = if mutation == 8 {
                 NonceReused
@@ -253,7 +253,7 @@ async fn paid_envelope_status_faults_roll_back_receipt_and_metadata_changes() {
         .execute(db.pool())
         .await
         .unwrap();
-    db.store_payment_receipt(&env.payment_proof.payment_hash, &env.sender, &env.id)
+    db.store_payment_receipt(&env.payment_proof.lightning().expect("lightning proof").payment_hash, &env.sender, &env.id)
         .await
         .unwrap();
     db.store_message(&env).await.unwrap();

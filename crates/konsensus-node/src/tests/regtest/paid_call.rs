@@ -434,10 +434,10 @@ async fn one_call(lane: Lane, max_minutes: u16, paid_blocks: u32, reason: Hangup
         assert_eq!(status, StatusCode::OK, "block {seq}: {body}");
         assert_eq!(body["amount_msat"], PRICE);
         let received = recv_kind(&mut callee, &aid, 404).await;
-        assert_eq!(received.envelope.payment_proof.amount_msat, PRICE);
+        assert_eq!(received.envelope.payment_proof.amount_msat(), PRICE);
         let hash = body["payment_hash"].as_str().unwrap();
         assert_eq!(
-            hex::encode(received.envelope.payment_proof.payment_hash),
+            hex::encode(received.envelope.payment_proof.lightning().expect("lightning proof").payment_hash),
             hash
         );
         assert!(
@@ -583,7 +583,7 @@ async fn one_call(lane: Lane, max_minutes: u16, paid_blocks: u32, reason: Hangup
         reason.as_str(),
         "real paid terminal notification"
     );
-    let terminal_hash = hex::encode(notice.envelope.payment_proof.payment_hash);
+    let terminal_hash = hex::encode(notice.envelope.payment_proof.lightning().expect("lightning proof").payment_hash);
     for wallet in [&a, &b] {
         settle(wallet, &terminal_hash).await;
         assert_eq!(
@@ -797,7 +797,7 @@ async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
     })
     .await;
     let notice = recv_kind(caller, &bid, 403).await;
-    settle(a, &hex::encode(notice.envelope.payment_proof.payment_hash)).await;
+    settle(a, &hex::encode(notice.envelope.payment_proof.lightning().expect("lightning proof").payment_hash)).await;
     wait("its reservation closes", || async {
         caller.service.call_spend_status(&bid.to_hex(), LOST).unwrap().closed
     })

@@ -176,12 +176,17 @@ pub(crate) async fn redeem(
         .bolt11
         .parse::<lightning_invoice::Bolt11Invoice>()
         .map_err(|_| "invalid_invoice")?;
+    let paid_hash = envelope
+        .payment_proof
+        .as_lightning()
+        .map(|proof| hex::encode(proof.payment_hash));
+    let invoice_hash = invoice.payment_hash().to_string();
     if envelope.kind != KIND_PEER_EXCHANGE
         || envelope.sender != *peer
         || envelope.recipient != Recipient::Node(*identity.node_id())
         || envelope.ciphertext != quote.signature.as_bytes()
-        || envelope.payment_proof.amount_msat != quote.amount_msat
-        || hex::encode(envelope.payment_proof.payment_hash) != invoice.payment_hash().to_string()
+        || envelope.payment_proof.amount_msat() != quote.amount_msat
+        || paid_hash.as_deref() != Some(invoice_hash.as_str())
         || invoice.amount_milli_satoshis() != Some(quote.amount_msat)
         || invoice.description().to_string() != description(&quote.snapshot)
     {

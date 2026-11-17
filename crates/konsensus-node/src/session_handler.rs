@@ -1646,6 +1646,7 @@ pub(crate) fn terminal_paid_rejection(reason: &str) -> bool {
         "file_corrupted:",
         "message withdrawn",
         "call signal withdrawn",
+        "blvm session balance exhausted",
     ]
     .iter()
     .any(|prefix| reason.starts_with(prefix))
@@ -1776,6 +1777,9 @@ async fn handle_delivery_confirmation(
                 Some(serde_json::json!({"message_id": id.to_hex()})),
             );
         }
+        if let Err(e) = storage.commit_blvm_outbound_debit(id).await {
+            warn!(msg_id = %id, error = %e, "blvm outbound debit not committed");
+        }
         handle_message_acked(
             peer,
             id,
@@ -1801,6 +1805,15 @@ async fn handle_delivery_confirmation(
                     .pre_payment_refused(PrePaymentReason::DeliveryBeforePayment);
             }
             return false;
+        }
+        if terminal {
+            match storage.rollback_blvm_outbound_debit(id).await {
+                Ok(true) => {
+                    metrics::counter!(konsensus_api::metrics::BLVM_STALE_DEBIT_CLEANUP).increment(1);
+                }
+                Ok(false) => {}
+                Err(e) => warn!(msg_id = %id, error = %e, "blvm outbound debit not rolled back"),
+            }
         }
         if reason == konsensus_api::calls::devices::NOT_REACHABLE {
             // Validated refusal of our pending offer: the call can never ring.
@@ -1844,7 +1857,7 @@ async fn handle_message_acked(
 
     // Look up payment amount from stored envelope for routing weight.
     let payment_msat = match storage.get_message(message_id).await {
-        Ok(Some(env)) => env.payment_proof.amount_msat,
+        Ok(Some(env)) => env.payment_proof.amount_msat(),
         _ => 0,
     };
 

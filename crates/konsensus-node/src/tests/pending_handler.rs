@@ -418,7 +418,7 @@ async fn six_minute_queue_and_eleven_failures_preserve_paid_identity_until_ack()
     let hash = wallet.inject_inbound_keysend(10_000, None).await;
     let details = wallet.get_payment_status(&hash).await.unwrap();
     env.payment_proof = PaymentProof::new(hex::decode(&hash).unwrap().try_into().unwrap(),
-        hex::decode(details.preimage.unwrap()).unwrap().try_into().unwrap(), 10_000);
+        hex::decode(details.preimage.unwrap()).unwrap().try_into().unwrap(), 10_000).into();
     env.timestamp -= 360_000;
     env.signature = Signature::from_ed25519(&alice.sign(&env.signable_bytes()));
     db.store_message(&env).await.unwrap();

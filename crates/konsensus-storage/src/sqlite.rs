@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use konsensus_core::{
     HostingContractState, MessageId, NodeId, Nonce, OperatorHostingContract,
-    OperatorHostingPayment, OperatorHostingPaymentDirection, PaymentProof, Recipient,
+    OperatorHostingPayment, OperatorHostingPaymentDirection, Recipient,
     RoomId, Signature, UkmEnvelope,
 };
 
@@ -74,9 +74,11 @@ impl SqliteStorage {
             String,  // signature
             String,  // nonce
             String,  // references_json
+            Option<String>, // payment_proof_json
         )>(
             "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, \
+             payment_proof_json \
              FROM messages WHERE id = ? AND (? OR id NOT IN (SELECT message_id FROM call_admission_hold))",
         )
         .bind(&id_hex)
@@ -88,7 +90,7 @@ impl SqliteStorage {
             Some(r) => {
                 let envelope = row_to_envelope(
                     &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
+                    &r.12, r.13.as_deref(),
                 )?;
                 Ok(Some(envelope))
             }
@@ -251,6 +253,26 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (39, "envelope deferral expiry", include_str!("../migrations/039_envelope_deferral_expiry.sql")),
     (40, "call media detach intents", include_str!("../migrations/040_call_media_detach_intents.sql")),
     (41, "call offer binding", include_str!("../migrations/041_call_offer_binding.sql")),
+    (
+        42,
+        "payment proof json",
+        include_str!("../migrations/042_payment_proof_json.sql"),
+    ),
+    (
+        43,
+        "blvm session debits",
+        include_str!("../migrations/043_blvm_session_debits.sql"),
+    ),
+    (
+        44,
+        "blvm on chain sessions",
+        include_str!("../migrations/044_blvm_on_chain_sessions.sql"),
+    ),
+    (
+        45,
+        "blvm pending outbound debits",
+        include_str!("../migrations/045_blvm_pending_outbound_debits.sql"),
+    ),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -400,22 +422,18 @@ fn row_to_envelope(
     signature: &str,
     nonce: &str,
     references_json: &str,
+    proof_json: Option<&str>,
 ) -> Result<UkmEnvelope, StorageError> {
     let sender_id =
         NodeId::from_hex(sender).map_err(|e| StorageError::Conversion(format!("sender: {e}")))?;
     let recipient = recipient_from_parts(recipient_type, recipient_id)?;
 
-    let ph_bytes: [u8; 32] = hex::decode(payment_hash)
-        .map_err(|e| StorageError::Conversion(format!("payment_hash: {e}")))?
-        .try_into()
-        .map_err(|_| StorageError::Conversion("payment_hash: wrong length".into()))?;
-    let pi_bytes: [u8; 32] = hex::decode(preimage)
-        .map_err(|e| StorageError::Conversion(format!("preimage: {e}")))?
-        .try_into()
-        .map_err(|_| StorageError::Conversion("preimage: wrong length".into()))?;
-    let amount_u64 = u64::try_from(amount_msat)
-        .map_err(|_| StorageError::Conversion(format!("amount_msat negative: {amount_msat}")))?;
-    let proof = PaymentProof::new(ph_bytes, pi_bytes, amount_u64);
+    let proof = crate::paid_identity::proof_from_columns(
+        payment_hash,
+        preimage,
+        amount_msat,
+        proof_json,
+    )?;
 
     let sig_bytes: [u8; 64] = hex::decode(signature)
         .map_err(|e| StorageError::Conversion(format!("signature: {e}")))?
@@ -450,7 +468,7 @@ fn row_to_envelope(
         recipient,
         timestamp: timestamp_u64,
         ciphertext: ciphertext.to_vec(),
-        payment_proof: proof,
+        payment_proof: proof.into(),
         signature: sig,
         nonce,
         references,
@@ -680,6 +698,7 @@ impl SqliteStorage {
         if op.state != "paid" || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str()) || envelope.recipient != Recipient::Node(NodeId::from_hex(&op.recipient).map_err(|e| StorageError::Conversion(e.to_string()))?) {
             return Err(StorageError::Conversion("invalid paid operation binding".into()));
         }
+        let identity = crate::paid_identity::paid_identity(envelope)?;
         let mut tx = self.pool.begin().await?;
 
         if let Some(previous) = previous {
@@ -694,8 +713,8 @@ impl SqliteStorage {
             let refs: Vec<String> = envelope.references.iter().map(|id| id.to_hex()).collect();
             let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages m JOIN pending_deliveries p ON p.message_id = m.id WHERE m.id = ? AND m.sender = ? AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = ? AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ? AND p.recipient_id = ? AND p.dispatched = 1 AND p.state != 'failed_paid' AND p.rejection_reason = ?")
                 .bind(previous.to_hex()).bind(envelope.sender.to_hex()).bind(i64::from(envelope.kind))
-                .bind(rtype).bind(&rid).bind(hex::encode(envelope.payment_proof.payment_hash))
-                .bind(hex::encode(envelope.payment_proof.preimage)).bind(op.settled_msat)
+                .bind(rtype).bind(&rid).bind(&identity.payment_hash)
+                .bind(&identity.preimage).bind(identity.amount_msat)
                 .bind(hex::encode(envelope.nonce.as_bytes()))
                 .bind(serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?)
                 .bind(&op.recipient).bind(&current.last_error).fetch_one(&mut *tx).await?;
@@ -731,10 +750,9 @@ impl SqliteStorage {
         let ts = i64::try_from(envelope.timestamp)
             .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
         let ciphertext = &envelope.ciphertext;
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let ph = identity.payment_hash.clone();
+        let pi = identity.preimage.clone();
+        let amt = identity.amount_msat;
         let sig = hex::encode(envelope.signature.as_bytes());
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
@@ -743,8 +761,8 @@ impl SqliteStorage {
 
         sqlx::query(
             "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, plaintext_enc) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, plaintext_enc, payment_proof_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(kind)
@@ -760,6 +778,7 @@ impl SqliteStorage {
         .bind(&nonce)
         .bind(&refs_json)
         .bind(plaintext_enc)
+        .bind(&identity.proof_json)
         .execute(&mut *tx)
         .await?;
 
@@ -787,7 +806,7 @@ impl SqliteStorage {
     /// calendar) is accepted fresh only while its admission hold exists,
     /// checked under the writer lock this transaction holds from its first
     /// INSERT. Only `readable` acceptance may require the hold.
-    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool, require_hold: bool) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool, require_hold: bool, blvm_price_msat: Option<u64>) -> Result<Option<crate::PaidAcceptance>, StorageError> {
         use crate::PaidAcceptance::*;
         let id = envelope.id.to_hex();
         let kind = i64::from(envelope.kind);
@@ -796,10 +815,11 @@ impl SqliteStorage {
         let ts = i64::try_from(envelope.timestamp)
             .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
         let ciphertext = &envelope.ciphertext;
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let identity = crate::paid_identity::paid_identity(envelope)?;
+        let ph = identity.payment_hash;
+        let pi = identity.preimage;
+        let amt = identity.amount_msat;
+        let proof_json = identity.proof_json;
         let sig = hex::encode(envelope.signature.as_bytes());
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
@@ -890,10 +910,19 @@ impl SqliteStorage {
                 return Err(StorageError::NotFound(format!("admission hold for {id}")));
             }
         }
+        if let Some(debit) = &identity.debit {
+            if let Err(error) = reserve_sqlite_debit(&mut tx, debit, blvm_price_msat).await {
+                tx.rollback().await?;
+                return match error {
+                    StorageError::AlreadyExists(_) => Ok(Some(PaymentReused)),
+                    other => Err(other),
+                };
+            }
+        }
         sqlx::query(
             "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, payment_proof_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(kind)
@@ -908,6 +937,7 @@ impl SqliteStorage {
         .bind(&sig)
         .bind(&nonce)
         .bind(&refs_json)
+        .bind(&proof_json)
         .execute(&mut *tx)
         .await?;
 
@@ -923,6 +953,40 @@ impl SqliteStorage {
 
 #[async_trait]
 impl Storage for SqliteStorage {
+    async fn record_blvm_inbound_debit(
+        &self,
+        payment_request_id: &str,
+        tx_hash: &[u8; 32],
+        session_debit_seq: u64,
+        debit_msat: u64,
+    ) -> Result<(), StorageError> {
+        let seq = i64::try_from(session_debit_seq)
+            .map_err(|_| StorageError::Conversion("blvm debit sequence".into()))?;
+        let debit = i64::try_from(debit_msat)
+            .map_err(|_| StorageError::Conversion("blvm debit amount".into()))?;
+        let recorded_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|_| "0".into());
+        let result = sqlx::query(
+            "INSERT INTO blvm_session_debits (payment_request_id, tx_hash, session_debit_seq, debit_msat, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(payment_request_id)
+        .bind(hex::encode(tx_hash))
+        .bind(seq)
+        .bind(debit)
+        .bind(recorded_at)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                Err(StorageError::AlreadyExists("blvm session debit".into()))
+            }
+            Err(e) => Err(StorageError::Database(e)),
+        }
+    }
+
     async fn record_upgrade_rows(&self, table: crate::record_upgrade::RecordTable, after: Option<&str>, limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
         crate::record_upgrade::sqlite::rows(&self.pool, table, after, limit).await
     }
@@ -1104,10 +1168,11 @@ impl Storage for SqliteStorage {
         let ts = i64::try_from(envelope.timestamp)
             .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
         let ciphertext = &envelope.ciphertext;
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let identity = crate::paid_identity::paid_identity(envelope)?;
+        let ph = identity.payment_hash;
+        let pi = identity.preimage;
+        let amt = identity.amount_msat;
+        let proof_json = identity.proof_json;
         let sig = hex::encode(envelope.signature.as_bytes());
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
@@ -1116,8 +1181,8 @@ impl Storage for SqliteStorage {
 
         sqlx::query(
             "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, payment_proof_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(kind)
@@ -1132,6 +1197,7 @@ impl Storage for SqliteStorage {
         .bind(&sig)
         .bind(&nonce)
         .bind(&refs_json)
+        .bind(&proof_json)
         .execute(&self.pool)
         .await?;
 
@@ -1172,10 +1238,10 @@ impl Storage for SqliteStorage {
         let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let identity = crate::paid_identity::paid_identity(envelope)?;
+        let ph = identity.payment_hash;
+        let pi = identity.preimage;
+        let amt = identity.amount_msat;
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
         let refs_json =
@@ -1194,10 +1260,10 @@ impl Storage for SqliteStorage {
         let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let ph = hex::encode(envelope.payment_proof.lightning().map_err(|e| StorageError::Serialization(e.to_string()))?.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.lightning().map_err(|e| StorageError::Serialization(e.to_string()))?.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat())
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat())))?;
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
         let refs_json =
@@ -1238,10 +1304,10 @@ impl Storage for SqliteStorage {
         let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let identity = crate::paid_identity::paid_identity(envelope)?;
+        let ph = identity.payment_hash;
+        let pi = identity.preimage;
+        let amt = identity.amount_msat;
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
         let refs_json =
@@ -1276,9 +1342,9 @@ impl Storage for SqliteStorage {
         use crate::traits::{deferral_now_ms, DEFERRAL_CLEANUP_BATCH, ENVELOPE_DEFERRAL_TTL_MS, MAX_DEFERRALS_PER_PROOF, MAX_DEFERRALS_PER_SENDER};
         let id = envelope.id.to_hex();
         let sender = envelope.sender.to_hex();
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let ph = crate::paid_identity::paid_identity(envelope)?.payment_hash;
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let amount = i64::try_from(envelope.payment_proof.amount_msat)
+        let amount = i64::try_from(envelope.payment_proof.amount_msat())
             .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
         let now = deferral_now_ms();
         let expires = now.saturating_add(ENVELOPE_DEFERRAL_TTL_MS).min(
@@ -1307,11 +1373,11 @@ impl Storage for SqliteStorage {
 
     async fn is_envelope_deferred(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let amount = i64::try_from(envelope.payment_proof.amount_msat)
+        let amount = i64::try_from(envelope.payment_proof.amount_msat())
             .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = ?1 AND sender = ?2 AND payment_hash = ?3 AND recipient_type = ?4 AND recipient_id = ?5 AND amount_msat = ?6 AND expires_at_ms > ?7)")
-            .bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
-            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(rtype).bind(&rid).bind(amount)
+            .bind(envelope.id.to_hex())            .bind(envelope.sender.to_hex())
+            .bind(crate::paid_identity::paid_identity(envelope)?.payment_hash).bind(rtype).bind(&rid).bind(amount)
             .bind(crate::traits::deferral_now_ms())
             .fetch_one(&self.pool).await.map_err(Into::into)
     }
@@ -1331,16 +1397,54 @@ impl Storage for SqliteStorage {
     }
 
     async fn paid_envelope_status(&self, envelope: &UkmEnvelope) -> Result<Option<crate::PaidAcceptance>, StorageError> {
-        self.accept_paid_envelope_inner(envelope, false, false).await
+        self.accept_paid_envelope_inner(envelope, false, false, None).await
     }
 
     async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        self.accept_paid_envelope_inner(envelope, true, false).await?
+        self.accept_paid_envelope_inner(envelope, true, false, None).await?
             .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
     }
 
+    async fn accept_blvm_chat(&self, envelope: &UkmEnvelope, price_msat: u64) -> Result<crate::PaidAcceptance, StorageError> {
+        self.accept_paid_envelope_inner(envelope, true, false, Some(price_msat)).await?
+            .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
+    }
+
+    async fn upsert_blvm_outbound_session(&self, session: &crate::BlvmOutboundSession) -> Result<(), StorageError> {
+        crate::blvm_outbound::upsert_sqlite(self.pool(), session).await
+    }
+
+    async fn reserve_blvm_outbound_debit(
+        &self,
+        recipient: &NodeId,
+        message_id: &MessageId,
+        debit_msat: u64,
+    ) -> Result<Option<crate::BlvmOutboundReservation>, StorageError> {
+        crate::blvm_outbound::reserve_sqlite(self.pool(), recipient, message_id, debit_msat).await
+    }
+
+    async fn commit_blvm_outbound_debit(&self, message_id: &MessageId) -> Result<bool, StorageError> {
+        crate::blvm_outbound::commit_sqlite(self.pool(), message_id).await
+    }
+
+    async fn rollback_blvm_outbound_debit(&self, message_id: &MessageId) -> Result<bool, StorageError> {
+        crate::blvm_outbound::rollback_sqlite(self.pool(), message_id).await
+    }
+
+    async fn rollback_stale_blvm_outbound_debits(&self, older_than_ms: i64) -> Result<u64, StorageError> {
+        crate::blvm_outbound::rollback_stale_sqlite(self.pool(), older_than_ms).await
+    }
+
+    async fn get_blvm_outbound_session(&self, recipient: &NodeId) -> Result<Option<crate::BlvmOutboundSession>, StorageError> {
+        crate::blvm_outbound::get_sqlite(self.pool(), recipient).await
+    }
+
+    async fn delete_blvm_outbound_session(&self, recipient: &NodeId) -> Result<bool, StorageError> {
+        crate::blvm_outbound::delete_sqlite(self.pool(), recipient).await
+    }
+
     async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        self.accept_paid_envelope_inner(envelope, true, true).await?
+        self.accept_paid_envelope_inner(envelope, true, true, None).await?
             .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
     }
 
@@ -1348,7 +1452,7 @@ impl Storage for SqliteStorage {
         let ts = i64::try_from(envelope.timestamp).map_err(|_| StorageError::Conversion("timestamp overflow".into()))?;
         let result = sqlx::query("UPDATE messages SET timestamp_ms = ?, signature = ? WHERE id = ? AND sender = ? AND payment_hash = ?")
             .bind(ts).bind(hex::encode(envelope.signature.as_bytes())).bind(envelope.id.to_hex())
-            .bind(envelope.sender.to_hex()).bind(hex::encode(envelope.payment_proof.payment_hash))
+            .bind(envelope.sender.to_hex()).bind(crate::paid_identity::paid_identity(envelope)?.payment_hash)
             .execute(&self.pool).await?;
         if result.rows_affected() != 1 { return Err(StorageError::Conversion("missing paid envelope".into())); }
         Ok(())
@@ -1433,7 +1537,7 @@ impl Storage for SqliteStorage {
 
     async fn message_page(&self, scope: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<Vec<UkmEnvelope>, StorageError> {
         let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND "
+            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, payment_proof_json FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND "
         );
         match scope {
             crate::MessageListQuery::Recipient(recipient) => {
@@ -1462,10 +1566,10 @@ impl Storage for SqliteStorage {
         }
         query.push(" ORDER BY timestamp_ms DESC, id DESC LIMIT ").push_bind(i64::from(limit));
         let rows = query.build_query_as::<(
-            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String, String, String,
+            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String, String, String, Option<String>,
         )>().fetch_all(&self.pool).await?;
         rows.into_iter().map(|r| row_to_envelope(
-            &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11, &r.12,
+            &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11, &r.12, r.13.as_deref(),
         )).collect()
     }
 
@@ -2138,7 +2242,7 @@ impl Storage for SqliteStorage {
         sqlx::query("DELETE FROM messages WHERE id = ? AND sender = ?")
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
         sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) OR kind = 400 THEN -3 ELSE -1 END WHERE payment_hash = ? AND message_id = ?")
-            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
+            .bind(crate::paid_identity::paid_identity(envelope)?.payment_hash).bind(&id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
             .bind(&id).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -2147,7 +2251,7 @@ impl Storage for SqliteStorage {
 
     async fn is_application_rejected(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = -1")
-            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
+            .bind(crate::paid_identity::paid_identity(envelope)?.payment_hash).bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
             .fetch_one(&self.pool).await?;
         Ok(n > 0)
     }
@@ -4216,4 +4320,225 @@ async fn call_invite_locked(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, id: &M
 /// on to ringing or live. Never the receipt alone.
 fn call_invite_delivered(phase: Option<&str>, accepted: Option<i32>) -> bool {
     accepted == Some(1) && matches!(phase, Some("ringing" | "live"))
+}
+
+async fn reserve_sqlite_debit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    debit: &crate::paid_identity::SessionDebit,
+    price_msat: Option<u64>,
+) -> Result<(), StorageError> {
+    let price = price_msat
+        .ok_or_else(|| StorageError::Conversion("blvm chat acceptance requires a price".into()))?;
+    let price = i64::try_from(price)
+        .map_err(|_| StorageError::Conversion("blvm debit amount".into()))?;
+    if price <= 0 || price > debit.prepaid_msat {
+        return Err(StorageError::Conversion(
+            "blvm session balance exhausted".into(),
+        ));
+    }
+    let recorded_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".into());
+    let inserted = sqlx::query(
+        "INSERT INTO blvm_session_debits (payment_request_id, tx_hash, session_debit_seq, debit_msat, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(&debit.payment_request_id)
+    .bind(&debit.tx_hash_hex)
+    .bind(debit.seq)
+    .bind(price)
+    .bind(&recorded_at)
+    .execute(&mut **tx)
+    .await;
+    if let Err(sqlx::Error::Database(err)) = &inserted {
+        if err.is_unique_violation() {
+            return Err(StorageError::AlreadyExists("blvm session debit".into()));
+        }
+    }
+    inserted?;
+    let spent: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(debit_msat), 0) FROM blvm_session_debits WHERE tx_hash = ?1 AND payment_request_id = ?2",
+    )
+    .bind(&debit.tx_hash_hex)
+    .bind(&debit.payment_request_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if spent > debit.prepaid_msat {
+        return Err(StorageError::Conversion(
+            "blvm session balance exhausted".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod blvm_schema_tests {
+    use super::*;
+    use crate::traits::Storage;
+
+    #[test]
+    fn blvm_migrations_are_42_through_45_and_skip_34() {
+        let versions = embedded_migration_versions();
+        assert!(!versions.contains(&34), "migration 34 stays unused");
+        for version in [42, 43, 44, 45] {
+            assert!(versions.contains(&version), "missing migration {version}");
+        }
+        for sql in [
+            include_str!("../migrations/042_payment_proof_json.sql"),
+            include_str!("../migrations/043_blvm_session_debits.sql"),
+            include_str!("../migrations/044_blvm_on_chain_sessions.sql"),
+            include_str!("../migrations/045_blvm_pending_outbound_debits.sql"),
+        ] {
+            assert!(
+                !sql.to_ascii_lowercase().contains("strftime"),
+                "BLVM SQL must not use SQLite-only strftime defaults"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_debit_is_single_use_after_migrations() {
+        let db = SqliteStorage::in_memory().await.expect("migrate");
+        let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(applied as usize, embedded_migration_versions().len());
+        let tx = [7u8; 32];
+        db.record_blvm_inbound_debit("req", &tx, 1, 1000)
+            .await
+            .expect("first debit");
+        let replay = db.record_blvm_inbound_debit("req", &tx, 1, 1000).await;
+        assert!(matches!(replay, Err(StorageError::AlreadyExists(_))));
+        db.record_blvm_inbound_debit("req", &tx, 2, 1000)
+            .await
+            .expect("next sequence");
+    }
+
+    #[tokio::test]
+    async fn chat_accept_debits_the_price_and_stops_at_the_prepay() {
+        use crate::PaidAcceptance;
+        use konsensus_core::kind::KIND_CHAT;
+        use konsensus_core::{GatePaymentProof, NodeId, Nonce, Recipient, UkmEnvelopeBuilder};
+
+        let db = SqliteStorage::in_memory().await.expect("migrate");
+        let sender = NodeId::from_bytes([1; 32]);
+        let peer = NodeId::from_bytes([2; 32]);
+        let chat = |seq: u64, n: u8| {
+            let proof = GatePaymentProof::BlvmOnChainSession {
+                payment_request_id: "req".into(),
+                tx_hash: [9; 32],
+                amount_sats: 2,
+                timestamp: 1,
+                session_debit_seq: Some(seq),
+            };
+            UkmEnvelopeBuilder::new(KIND_CHAT, sender, Recipient::Node(peer), vec![n], proof)
+                .nonce(Nonce::from_bytes([n; 24]))
+                .timestamp(1_700_000_000_000)
+                .build()
+        };
+        let first = chat(0, 1);
+        assert_eq!(
+            db.accept_blvm_chat(&first, 1_000).await.unwrap(),
+            PaidAcceptance::Accepted
+        );
+        assert_eq!(
+            db.accept_blvm_chat(&first, 1_000).await.unwrap(),
+            PaidAcceptance::AlreadyAccepted
+        );
+        let stored = db.get_message(&first.id).await.unwrap().unwrap();
+        assert_eq!(stored.payment_proof, first.payment_proof);
+        assert_eq!(
+            db.accept_blvm_chat(&chat(1, 2), 1_000).await.unwrap(),
+            PaidAcceptance::Accepted
+        );
+        let exhausted = db.accept_blvm_chat(&chat(2, 3), 1_000).await.unwrap_err();
+        assert!(
+            exhausted.to_string().contains("blvm session balance exhausted"),
+            "{exhausted}"
+        );
+        assert_eq!(
+            db.accept_blvm_chat(&chat(0, 4), 1_000).await.unwrap(),
+            PaidAcceptance::PaymentReused
+        );
+        let spent: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(debit_msat), 0) FROM blvm_session_debits",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(spent, 2_000);
+    }
+
+    #[tokio::test]
+    async fn outbound_reserve_commits_on_ack_and_rolls_back_when_never_acked() {
+        use konsensus_core::{MessageId, NodeId};
+
+        let db = SqliteStorage::in_memory().await.expect("migrate");
+        let peer = NodeId::from_bytes([4; 32]);
+        db.upsert_blvm_outbound_session(&crate::BlvmOutboundSession {
+            recipient: peer,
+            payment_request_id: "req".into(),
+            tx_hash: [9; 32],
+            amount_sats: 2,
+            debit_counter: 0,
+            spent_msat: 0,
+        })
+        .await
+        .unwrap();
+        let first = MessageId::from_bytes([1; 32]);
+        let reserved = db
+            .reserve_blvm_outbound_debit(&peer, &first, 1_000)
+            .await
+            .unwrap()
+            .expect("session");
+        assert_eq!(reserved.session_debit_seq, 0);
+        assert_eq!(spent(&db).await, 1_000);
+        assert!(db.rollback_blvm_outbound_debit(&first).await.unwrap());
+        assert_eq!(spent(&db).await, 0);
+        assert!(!db.rollback_blvm_outbound_debit(&first).await.unwrap());
+
+        let second = MessageId::from_bytes([2; 32]);
+        let reserved = db
+            .reserve_blvm_outbound_debit(&peer, &second, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reserved.session_debit_seq, 1);
+        assert!(db.commit_blvm_outbound_debit(&second).await.unwrap());
+        assert_eq!(spent(&db).await, 1_000);
+        assert!(!db.commit_blvm_outbound_debit(&second).await.unwrap());
+
+        let third = MessageId::from_bytes([3; 32]);
+        db.reserve_blvm_outbound_debit(&peer, &third, 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        let fourth = MessageId::from_bytes([4; 32]);
+        let exhausted = db.reserve_blvm_outbound_debit(&peer, &fourth, 1_000).await.unwrap_err();
+        assert!(
+            exhausted.to_string().contains("blvm session balance exhausted"),
+            "{exhausted}"
+        );
+        sqlx::query("UPDATE blvm_pending_outbound_debits SET recorded_at = '0' WHERE message_id = ?")
+            .bind(third.to_hex())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(db.rollback_stale_blvm_outbound_debits(1).await.unwrap(), 1);
+        assert_eq!(spent(&db).await, 1_000);
+        assert_eq!(db.rollback_stale_blvm_outbound_debits(i64::MAX).await.unwrap(), 0);
+        let loaded = db.get_blvm_outbound_session(&peer).await.unwrap().unwrap();
+        assert_eq!(loaded.spent_msat, 1_000);
+        assert_eq!(loaded.debit_counter, 3);
+        let blocked = db.delete_blvm_outbound_session(&peer).await.unwrap_err();
+        assert!(blocked.to_string().contains("already spending"), "{blocked}");
+    }
+
+    async fn spent(db: &SqliteStorage) -> i64 {
+        sqlx::query_scalar("SELECT spent_msat FROM blvm_on_chain_sessions")
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
 }

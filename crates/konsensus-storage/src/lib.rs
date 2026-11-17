@@ -10,6 +10,8 @@ pub mod record_upgrade;
 pub mod error;
 pub mod fiat_snapshots;
 pub mod models;
+pub mod blvm_outbound;
+pub mod paid_identity;
 pub mod postgres;
 pub mod reactions;
 pub mod recovery;
@@ -22,6 +24,7 @@ pub mod whitelist_backup;
 pub use calendar::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
 pub use contacts::{ContactRepo, ContactRow, PostgresContactRepo, SqliteContactRepo};
 pub use encrypted::EncryptedStorage;
+pub use blvm_outbound::{BlvmOutboundReservation, BlvmOutboundSession};
 pub use error::StorageError;
 pub use fiat_snapshots::FiatRateSnapshot;
 pub use invites::{
@@ -307,7 +310,13 @@ pub(crate) fn outstanding_web_request_row(
     let expires = i64::try_from(now_ms.saturating_add(konsensus_core::OUTSTANDING_TTL_MS))
         .map_err(|_| StorageError::Conversion("web request expiry overflow".into()))?;
     Ok(Some(OutstandingWebRequestRow {
-        payment_hash: hex::encode(envelope.payment_proof.payment_hash),
+        payment_hash: hex::encode(
+            envelope
+                .payment_proof
+                .lightning()
+                .map_err(|e| StorageError::Serialization(e.to_string()))?
+                .payment_hash,
+        ),
         request_id: envelope.id.to_hex(),
         peer: peer.to_hex(),
         expected_reply_kind: i64::from(expected),

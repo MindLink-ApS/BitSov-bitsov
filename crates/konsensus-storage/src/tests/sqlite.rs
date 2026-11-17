@@ -1,4 +1,5 @@
 use super::*;
+use konsensus_core::PaymentProof;
 use konsensus_core::UkmEnvelopeBuilder;
 use konsensus_core::kind::KIND_CHAT;
 use sha2::{Digest, Sha256};

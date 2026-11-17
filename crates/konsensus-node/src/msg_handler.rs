@@ -28,6 +28,14 @@ use konsensus_routing::RoutingTable;
 use crate::content_server::ContentServer;
 use crate::relay::RelayEngine;
 
+/// Receipt hash named when a proof is reused. Lightning keeps its payment hash.
+/// A BLVM chat names the session receipt `paid_identity` stored.
+pub(crate) fn reused_proof_hash(envelope: &konsensus_core::UkmEnvelope) -> String {
+    konsensus_storage::paid_identity::paid_identity(envelope)
+        .map(|identity| identity.payment_hash)
+        .unwrap_or_default()
+}
+
 /// All dependencies needed by the incoming message handler task.
 pub(crate) struct MsgHandlerDeps {
     pub transport: Arc<NoiseTransport>,
@@ -392,7 +400,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         let msg_id = envelope.id;
                         // Settlement verification may await a wallet or storage.
                         // Its result can open repair only on this same generation.
-                        let repair_eligible = envelope.payment_proof.amount_msat > 0
+                        let repair_eligible = envelope.payment_proof.amount_msat() > 0
                             && envelope.recipient == konsensus_core::Recipient::Node(*identity_for_recv.node_id())
                             && !konsensus_core::is_web_service_reply(&envelope);
                         let repair_generation = if repair_eligible {
@@ -566,8 +574,21 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                         let mut incoming_block = None;
                         if gate_result.is_ok() && known_acceptance.is_none() && envelope.kind == konsensus_core::kind::KIND_CALL_BLOCK {
                             let block_plaintext = preview_plaintext.as_ref().and_then(|bytes| std::str::from_utf8(bytes).ok());
+                            let Some(payment_hash) = envelope.payment_proof.as_lightning().map(|proof| proof.payment_hash) else {
+                                let reason = "call block requires a lightning proof";
+                                audit_for_recv.record(
+                                    konsensus_api::audit::events::MESSAGE_REJECTED,
+                                    &sender.to_hex(),
+                                    Some(serde_json::json!({
+                                        "reason": reason, "kind": envelope.kind,
+                                    })),
+                                );
+                                let reject = Frame::MessageReject { id: msg_id, reason: reason.into() };
+                                let _ = transport_for_ack.send_frame(&sender, &reject).await;
+                                continue;
+                            };
                             match konsensus_api::calls::prepare_incoming_block(
-                                storage_for_recv.as_ref(), &sender, block_plaintext, &envelope.payment_proof.payment_hash,
+                                storage_for_recv.as_ref(), &sender, block_plaintext, &payment_hash,
                             ).await {
                                 Ok(block) => incoming_block = Some(block),
                                 Err(refusal) => {
@@ -626,10 +647,26 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             // places a fresh hold. A status already known from the
                             // lookup above is never a fresh acceptance (a replay, a
                             // withdrawal or a reuse), and those need no hold.
-                            let acceptance = match known_acceptance {
-                                Some(status) => Ok(status),
-                                None if held_kind => storage_for_recv.accept_held_paid_envelope(&envelope).await,
-                                None => storage_for_recv.accept_paid_envelope(&envelope).await,
+                            let blvm_price = if envelope.payment_proof.as_lightning().is_none() {
+                                match gate_for_recv.admission_price_msat(&envelope, pricing_for_recv.as_ref(), trust_discount).await {
+                                    Ok(price) => Some(price),
+                                    Err(rejection) => {
+                                        gate_result = Err(rejection);
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let acceptance = if gate_result.is_err() {
+                                Err(konsensus_storage::StorageError::Conversion("blvm price refused".into()))
+                            } else {
+                                match (known_acceptance, blvm_price) {
+                                (Some(status), _) => Ok(status),
+                                (None, _) if held_kind => storage_for_recv.accept_held_paid_envelope(&envelope).await,
+                                (None, Some(price)) => storage_for_recv.accept_blvm_chat(&envelope, price).await,
+                                (None, None) => storage_for_recv.accept_paid_envelope(&envelope).await,
+                                }
                             };
                             // Burned replay keys: decide, fail closed, what the resend
                             // is told BEFORE the gate's payment-reuse reason can be
@@ -728,11 +765,12 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 }
                                 Ok(PaidAcceptance::PaymentReused) => {
                                     let rejection = konsensus_core::gate::GateRejection::PaymentProofReused {
-                                        payment_hash: hex::encode(envelope.payment_proof.payment_hash),
+                                        payment_hash: reused_proof_hash(&envelope),
                                     };
                                     audit_for_recv.membrane().refused(&envelope, &rejection);
                                     gate_result = Err(rejection);
                                 }
+                                Err(_) if blvm_price.is_none() && envelope.payment_proof.as_lightning().is_none() => {}
                                 Err(e) => {
                                     drop(incoming_block.take());
                                     // The hold placed above is KEPT: the acceptance may
@@ -742,10 +780,16 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                     // replay could then duplicate-acknowledge. Held, it
                                     // stays hidden; a retry re-admits it (the hold is
                                     // inherited) or the sweep withdraws it.
+                                    let exhausted = e.to_string().contains("blvm session balance exhausted");
+                                    let rejection = if exhausted {
+                                        konsensus_core::gate::GateRejection::BlvmRejected("session balance exhausted".into())
+                                    } else {
+                                        konsensus_core::gate::GateRejection::NonceCheckFailed(e.to_string())
+                                    };
                                     error!(error = %e, held = call_hold, "atomic paid acceptance failed; replay keys rolled back");
-                                    audit_for_recv.membrane().refused(&envelope,
-                                        &konsensus_core::gate::GateRejection::NonceCheckFailed(e.to_string()));
-                                    let reject = Frame::MessageReject { id: msg_id, reason: "storage error".into() };
+                                    audit_for_recv.membrane().refused(&envelope, &rejection);
+                                    let reason = if exhausted { "blvm session balance exhausted" } else { "storage error" };
+                                    let reject = Frame::MessageReject { id: msg_id, reason: reason.into() };
                                     let _ = transport_for_ack.send_frame(&sender, &reject).await;
                                     continue;
                                 }
@@ -870,8 +914,8 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         konsensus_api::audit::events::CALL_BLOCK_OVERPAYMENT,
                                         &sender.to_hex(), serde_json::json!({
                                             "message_id": msg_id.to_hex(), "call_id": identity.call_id,
-                                            "seq": identity.seq, "amount_msat": envelope.payment_proof.amount_msat,
-                                            "payment_hash": hex::encode(envelope.payment_proof.payment_hash),
+                                            "seq": identity.seq, "amount_msat": envelope.payment_proof.amount_msat(),
+                                            "payment_hash": envelope.payment_proof.as_lightning().map(|proof| hex::encode(proof.payment_hash)).unwrap_or_default(),
                                             "reason": refusal.to_string(), "reconciliation_required": true,
                                         }));
                                     let audit_failed = recorded.is_err();
@@ -883,8 +927,8 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                         error!(msg_id = %msg_id, error = %e, "overpayment receipt could not be marked rejected");
                                         if audit_failed {
                                             error!(msg_id = %msg_id, call_id = %identity.call_id, seq = ?identity.seq,
-                                                amount_msat = envelope.payment_proof.amount_msat,
-                                                payment_hash = %hex::encode(envelope.payment_proof.payment_hash),
+                                                amount_msat = envelope.payment_proof.amount_msat(),
+                                                payment_hash = %envelope.payment_proof.as_lightning().map(|proof| hex::encode(proof.payment_hash)).unwrap_or_default(),
                                                 "CRITICAL: OVERPAYMENT AUDIT AND REJECT MARKING BOTH FAILED; manual reconciliation required");
                                         }
                                     }
@@ -916,7 +960,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                                 "message_id": msg_id.to_hex(),
                                                 "call_id": identity.call_id,
                                                 "seq": identity.seq,
-                                                "amount_msat": envelope.payment_proof.amount_msat,
+                                                "amount_msat": envelope.payment_proof.amount_msat(),
                                                 "reconciliation_required": true,
                                             })),
                                         );
@@ -1886,7 +1930,11 @@ async fn send_encrypted_response<T: serde::Serialize>(
 
     let ciphertext = konsensus_crypto::ratchet_message_to_bytes(&ratchet_msg);
     let our_id = *identity.node_id();
-    let proof = konsensus_core::reply_bound_proof(&request.payment_proof);
+    let Some(request_proof) = request.payment_proof.as_lightning() else {
+        warn!(peer = %peer_id, "web reply requires a lightning request proof");
+        return;
+    };
+    let proof = konsensus_core::reply_bound_proof(request_proof);
     let mut resp_envelope = konsensus_core::UkmEnvelopeBuilder::new(
         kind,
         our_id,

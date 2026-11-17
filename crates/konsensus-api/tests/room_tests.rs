@@ -1073,7 +1073,7 @@ async fn room_fanout_charges_single_discounted_price_per_member() {
             panic!("envelope sent to an unexpected peer: {}", peer.to_hex());
         };
         assert_eq!(
-            envelope.payment_proof.amount_msat, want,
+            envelope.payment_proof.amount_msat(), want,
             "member {} must be charged its single-discounted price",
             peer.to_hex()
         );

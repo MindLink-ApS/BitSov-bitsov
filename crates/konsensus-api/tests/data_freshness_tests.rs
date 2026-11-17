@@ -791,3 +791,58 @@ async fn status_sync_failure_preserves_readiness_and_event_history() {
     assert_eq!(response.json["readiness"]["events"][0]["state"], "ready");
     assert_eq!(response.json["readiness"]["events"][0]["money_ready"], true);
 }
+
+struct IdleBlvmSessions;
+
+#[async_trait]
+impl konsensus_core::BlvmSessionControl for IdleBlvmSessions {
+    async fn create_chat_payment_request(&self, _: u64, _: &str) -> Result<String, String> {
+        Err("unused".into())
+    }
+
+    async fn confirm_chat_session(
+        &self,
+        _: &konsensus_core::NodeId,
+        _: &str,
+        _: &str,
+    ) -> Result<konsensus_core::BlvmOutboundSessionView, String> {
+        Err("unused".into())
+    }
+
+    async fn chat_session(
+        &self,
+        _: &konsensus_core::NodeId,
+    ) -> Result<Option<konsensus_core::BlvmOutboundSessionView>, String> {
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn owner_status_reports_blvm_chat_only_when_the_opener_is_attached() {
+    let off = get(test_state(), "/api/v1/status", true).await;
+    assert_eq!(off.json["blvm_chat"], false);
+    let public = get(test_state(), "/api/v1/health", false).await;
+    assert!(public.json.get("blvm_chat").is_none());
+
+    let mut policy_only = test_state();
+    {
+        let s = Arc::get_mut(&mut policy_only).unwrap();
+        s.gate = Arc::new(
+            konsensus_core::PaymentGate::new().with_blvm_policy(
+                konsensus_core::gate::BlvmChatPolicy::lightning_only().enabled(true),
+            ),
+        );
+    }
+    assert_eq!(get(policy_only, "/api/v1/status", true).await.json["blvm_chat"], false);
+
+    let mut ready = test_state();
+    {
+        let s = Arc::get_mut(&mut ready).unwrap();
+        s.gate = Arc::new(
+            konsensus_core::PaymentGate::new()
+                .with_blvm_policy(konsensus_core::gate::BlvmChatPolicy::lightning_only().enabled(true))
+                .with_blvm_sessions(Arc::new(IdleBlvmSessions)),
+        );
+    }
+    assert_eq!(get(ready, "/api/v1/status", true).await.json["blvm_chat"], true);
+}

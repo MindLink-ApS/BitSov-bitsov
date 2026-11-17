@@ -153,7 +153,7 @@ async fn energy_response_carries_no_payment_secret_or_payload() {
     let text = body.to_string();
     for secret in [
         hex::encode(PREIMAGE),
-        hex::encode(env.payment_proof.payment_hash),
+        hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash),
         hex::encode(&env.ciphertext),
         "SEALED".to_string(),
         env.id.to_hex(),
@@ -257,7 +257,7 @@ async fn membrane_reads_the_bounded_ring_newest_first() {
     let text = body.to_string();
     for secret in [
         hex::encode(PREIMAGE),
-        hex::encode(paid.payment_proof.payment_hash),
+        hex::encode(paid.payment_proof.lightning().expect("lightning proof").payment_hash),
         "SEALED".to_string(),
     ] {
         assert!(!text.contains(&secret), "membrane leaked {secret}");

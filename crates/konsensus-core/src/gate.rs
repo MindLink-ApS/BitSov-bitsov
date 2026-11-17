@@ -16,11 +16,14 @@
 //! configurable. Principle 2 is not negotiable.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
 use crate::envelope::UkmEnvelope;
+use crate::gate_payment::{GatePaymentProof, PaymentPath};
+use crate::traits::blvm_payment::{BlvmPaymentVerifier, SessionDebitStore};
 use crate::traits::lightning::{LightningProvider, PaymentDirection, PaymentStatus};
 use crate::traits::pricing::{PricingEngine, PricingError};
 use crate::types::{MessageId, NodeId, Nonce, Recipient};
@@ -118,10 +121,11 @@ pub enum GateRejection {
     #[error("payment settlement mismatch: {0}")]
     PaymentSettlementMismatch(String),
 
-    /// The same settled Lightning payment hash was already accepted.
+    /// The same settled receipt was already accepted.
     #[error("payment proof already used: {payment_hash}")]
     PaymentProofReused {
-        /// Hex-encoded Lightning payment hash.
+        /// Hex-encoded stored receipt. Lightning uses the payment hash.
+        /// A BLVM chat uses the session receipt hash.
         payment_hash: String,
     },
 
@@ -148,6 +152,14 @@ pub enum GateRejection {
     /// this node made — self-minted or unbound replies are rejected.
     #[error("web reply not bound to a paid request we made")]
     WebReplyUnbound,
+
+    /// BLVM is off, the path is not opted in, or the kind is not chat.
+    #[error("payment path not allowed: {0}")]
+    PaymentPathNotAllowed(String),
+
+    /// BLVM settlement or the session debit was refused.
+    #[error("blvm payment rejected: {0}")]
+    BlvmRejected(String),
 }
 
 /// Trait for nonce replay protection storage.
@@ -311,12 +323,57 @@ impl Default for GateConfig {
     }
 }
 
+/// Which BLVM chat paths this node admits. Lightning admission does not consult this.
+///
+/// Default: disabled, and the only listed path is Lightning, so a BLVM proof is
+/// `payment_path_not_allowed`.
+#[derive(Debug, Clone)]
+pub struct BlvmChatPolicy {
+    pub enabled: bool,
+    allowed: HashSet<PaymentPath>,
+}
+
+impl Default for BlvmChatPolicy {
+    fn default() -> Self {
+        Self::lightning_only()
+    }
+}
+
+impl BlvmChatPolicy {
+    pub fn lightning_only() -> Self {
+        let mut allowed = HashSet::new();
+        allowed.insert(PaymentPath::Lightning);
+        Self {
+            enabled: false,
+            allowed,
+        }
+    }
+
+    pub fn allow_path(mut self, path: PaymentPath) -> Self {
+        self.allowed.insert(path);
+        self
+    }
+
+    pub fn enabled(mut self, on: bool) -> Self {
+        self.enabled = on;
+        self
+    }
+
+    pub fn allows(&self, path: PaymentPath) -> bool {
+        self.allowed.contains(&path)
+    }
+}
+
 /// The payment gate — Principle 2 enforcement.
 ///
 /// Verifies every incoming UKM envelope against a sequence of checks.
 /// Any failure results in rejection. No exceptions, no fallbacks, no bypasses.
 pub struct PaymentGate {
     config: GateConfig,
+    blvm: BlvmChatPolicy,
+    blvm_verifier: Option<Arc<dyn BlvmPaymentVerifier>>,
+    debits: Option<Arc<dyn SessionDebitStore>>,
+    sessions: Option<Arc<dyn crate::blvm_session::BlvmSessionControl>>,
 }
 
 impl PaymentGate {
@@ -324,12 +381,55 @@ impl PaymentGate {
     pub fn new() -> Self {
         Self {
             config: GateConfig::default(),
+            blvm: BlvmChatPolicy::default(),
+            blvm_verifier: None,
+            debits: None,
+            sessions: None,
         }
     }
 
     /// Create a payment gate with custom configuration.
     pub fn with_config(config: GateConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            blvm: BlvmChatPolicy::default(),
+            blvm_verifier: None,
+            debits: None,
+            sessions: None,
+        }
+    }
+
+    /// Owner calls that open a path-3 chat session. Absent when `[blvm]` is off.
+    pub fn with_blvm_sessions(mut self, sessions: Arc<dyn crate::blvm_session::BlvmSessionControl>) -> Self {
+        self.sessions = Some(sessions);
+        self
+    }
+
+    pub fn blvm_sessions(&self) -> Option<Arc<dyn crate::blvm_session::BlvmSessionControl>> {
+        self.sessions.clone()
+    }
+
+    pub fn blvm_chat_enabled(&self) -> bool {
+        self.blvm.enabled
+    }
+
+    /// Admit chat on the opted-in BLVM paths. Lightning verification is unchanged.
+    pub fn with_blvm_chat(
+        mut self,
+        policy: BlvmChatPolicy,
+        verifier: Arc<dyn BlvmPaymentVerifier>,
+        debits: Arc<dyn SessionDebitStore>,
+    ) -> Self {
+        self.blvm = policy;
+        self.blvm_verifier = Some(verifier);
+        self.debits = Some(debits);
+        self
+    }
+
+    /// Policy is on, but no verifier was attached. Settlement fails closed.
+    pub fn with_blvm_policy(mut self, policy: BlvmChatPolicy) -> Self {
+        self.blvm = policy;
+        self
     }
 
     /// Verify an incoming UKM envelope.
@@ -362,6 +462,18 @@ impl PaymentGate {
         // envelope is legitimately addressed to a peer.
         our_node_id: Option<&NodeId>,
     ) -> Result<(), GateRejection> {
+        if envelope.payment_proof.as_lightning().is_none() {
+            return self
+                .verify_blvm_chat(
+                    envelope,
+                    nonce_store,
+                    pricing,
+                    whitelist,
+                    trust_discount,
+                    our_node_id,
+                )
+                .await;
+        }
         self.validate_paid_envelope_inner(
             envelope,
             pricing,
@@ -381,7 +493,7 @@ impl PaymentGate {
         match nonce_store
             .check_and_store_paid(
                 &envelope.nonce,
-                &envelope.payment_proof.payment_hash,
+                &envelope.payment_proof.lightning().map_err(|e| GateRejection::InvalidEnvelope(e.to_string()))?.payment_hash,
                 &envelope.sender,
                 &envelope.id,
             )
@@ -392,7 +504,7 @@ impl PaymentGate {
             PaidReplay::NonceReused => return Err(GateRejection::ReplayDetected),
             PaidReplay::PaymentReused => {
                 return Err(GateRejection::PaymentProofReused {
-                    payment_hash: hex::encode(envelope.payment_proof.payment_hash),
+                    payment_hash: hex::encode(envelope.payment_proof.lightning().map_err(|e| GateRejection::InvalidEnvelope(e.to_string()))?.payment_hash),
                 })
             }
         }
@@ -457,7 +569,7 @@ impl PaymentGate {
         .await
     }
 
-    #[instrument(skip_all, fields(sender = %envelope.sender, kind = envelope.kind, amount_msat = envelope.payment_proof.amount_msat))]
+    #[instrument(skip_all, fields(sender = %envelope.sender, kind = envelope.kind, amount_msat = envelope.payment_proof.amount_msat()))]
     #[allow(clippy::too_many_arguments)]
     async fn validate_paid_envelope_inner(
         &self,
@@ -588,7 +700,9 @@ impl PaymentGate {
         let required_msat = match self.verify_price(envelope, pricing, trust_discount).await {
             Ok(required) => required,
             Err(rejection @ GateRejection::InsufficientPayment { .. }) => {
-                if envelope.payment_proof.amount_msat == 0 {
+                if envelope.payment_proof.as_lightning().is_none()
+                    || envelope.payment_proof.amount_msat() == 0
+                {
                     return Err(rejection);
                 }
                 let (Some(receipts), Some(ln), true) =
@@ -606,7 +720,7 @@ impl PaymentGate {
                 let Some(required) = quoted.map(|price| self.price_with_floor_msat(price)) else {
                     return Err(rejection);
                 };
-                if envelope.payment_proof.amount_msat < required || settled.amount_msat < required {
+                if envelope.payment_proof.amount_msat() < required || settled.amount_msat < required {
                     return Err(rejection);
                 }
                 settlement_checked = true;
@@ -616,6 +730,22 @@ impl PaymentGate {
         };
 
         debug!("price verification: OK");
+
+        if envelope.payment_proof.as_lightning().is_none() {
+            self.settle_blvm_chat(envelope)?;
+            self.blvm_verifier
+                .as_ref()
+                .ok_or_else(|| {
+                    GateRejection::BlvmRejected(
+                        "blvm-payment module is not loaded: Method not found".into(),
+                    )
+                })?
+                .verify_gate_proof(&envelope.payment_proof)
+                .await
+                .map_err(blvm_rejection)?;
+            debug!("blvm settlement: OK");
+            return Ok(false);
+        }
 
         // ── Step 6: Lightning settlement verification (optional) ───────
         // If configured, verify the payment is actually settled on the
@@ -667,7 +797,7 @@ impl PaymentGate {
         now_ms: u64,
     ) -> Result<bool, GateRejection> {
         let outstanding = nonce_store
-            .take_outstanding_web_request(&envelope.payment_proof.payment_hash)
+            .take_outstanding_web_request(&envelope.payment_proof.lightning().map_err(|e| GateRejection::InvalidEnvelope(e.to_string()))?.payment_hash)
             .await
             .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
         let Some(outstanding) = outstanding else {
@@ -692,7 +822,7 @@ impl PaymentGate {
                 "web reply binding requires Lightning when settlement verification is on".into(),
             ));
         };
-        let payment_hash = hex::encode(envelope.payment_proof.payment_hash);
+        let payment_hash = hex::encode(envelope.payment_proof.lightning().map_err(|e| GateRejection::InvalidEnvelope(e.to_string()))?.payment_hash);
         let details = ln
             .get_payment_status(&payment_hash)
             .await
@@ -714,7 +844,7 @@ impl PaymentGate {
             ));
         };
         let returned_preimage = decode_hex_32("preimage", preimage_hex)?;
-        if returned_preimage != envelope.payment_proof.preimage {
+        if returned_preimage != envelope.payment_proof.lightning().map_err(|e| GateRejection::InvalidEnvelope(e.to_string()))?.preimage {
             return Err(GateRejection::PaymentSettlementMismatch(
                 "web reply preimage does not match our outgoing payment".into(),
             ));
@@ -730,6 +860,16 @@ impl PaymentGate {
     /// Admission floor carried in peer price tables without a trust discount.
     pub fn min_admission_cost_msat(&self) -> u64 {
         self.config.min_admission_cost_msat
+    }
+
+    /// Resolved admission price for this envelope, after the trust discount and floors.
+    pub async fn admission_price_msat(
+        &self,
+        envelope: &UkmEnvelope,
+        pricing: &dyn PricingEngine,
+        trust_discount: f64,
+    ) -> Result<u64, GateRejection> {
+        self.verify_price(envelope, pricing, trust_discount).await
     }
 
     /// Verify the payment amount meets the required price.
@@ -810,7 +950,7 @@ impl PaymentGate {
             );
         }
 
-        let paid_msat = envelope.payment_proof.amount_msat;
+        let paid_msat = envelope.payment_proof.amount_msat();
 
         if paid_msat < required_msat {
             warn!(
@@ -846,7 +986,7 @@ impl PaymentGate {
         required_msat: u64,
         our_node_id: Option<&NodeId>,
     ) -> Result<crate::traits::lightning::PaymentDetails, GateRejection> {
-        let payment_hash = hex::encode(envelope.payment_proof.payment_hash);
+        let payment_hash = hex::encode(envelope.payment_proof.lightning().map_err(|e| GateRejection::InvalidEnvelope(e.to_string()))?.payment_hash);
 
         if lightning
             .is_funding_payment(&payment_hash)
@@ -871,7 +1011,7 @@ impl PaymentGate {
         }
 
         let returned_hash = decode_hex_32("payment_hash", &details.payment_hash)?;
-        if returned_hash != envelope.payment_proof.payment_hash {
+        if returned_hash != envelope.payment_proof.lightning().map_err(|e| GateRejection::InvalidEnvelope(e.to_string()))?.payment_hash {
             return Err(GateRejection::PaymentSettlementMismatch(
                 "backend returned a different payment hash".into(),
             ));
@@ -923,10 +1063,10 @@ impl PaymentGate {
             }
         }
 
-        if details.amount_msat < envelope.payment_proof.amount_msat {
+        if details.amount_msat < envelope.payment_proof.amount_msat() {
             return Err(GateRejection::PaymentSettlementMismatch(format!(
                 "settled amount {} msat is below envelope claim {} msat",
-                details.amount_msat, envelope.payment_proof.amount_msat
+                details.amount_msat, envelope.payment_proof.amount_msat()
             )));
         }
 
@@ -955,13 +1095,148 @@ impl PaymentGate {
             ));
         };
         let returned_preimage = decode_hex_32("preimage", preimage_hex)?;
-        if returned_preimage != envelope.payment_proof.preimage {
+        if returned_preimage != envelope.payment_proof.lightning().map_err(|e| GateRejection::InvalidEnvelope(e.to_string()))?.preimage {
             return Err(GateRejection::PaymentSettlementMismatch(
                 "backend preimage does not match envelope proof".into(),
             ));
         }
 
         Ok(details)
+    }
+}
+
+fn blvm_rejection(err: impl std::fmt::Display) -> GateRejection {
+    let msg = err.to_string();
+    if msg.contains("Method not found") {
+        GateRejection::BlvmRejected(format!(
+            "blvm-payment module is not loaded: Method not found ({msg})"
+        ))
+    } else {
+        GateRejection::BlvmRejected(msg)
+    }
+}
+
+impl PaymentGate {
+    /// Chat-only BLVM admission. Settlement runs in `validate_paid_envelope_inner`.
+    /// The debit is recorded next. The nonce is consumed last. Validation alone
+    /// does not record either.
+    async fn verify_blvm_chat(
+        &self,
+        envelope: &UkmEnvelope,
+        nonce_store: &dyn NonceStore,
+        pricing: &dyn PricingEngine,
+        whitelist: Option<&HashSet<NodeId>>,
+        trust_discount: f64,
+        our_node_id: Option<&NodeId>,
+    ) -> Result<(), GateRejection> {
+        self.settle_blvm_chat(envelope)?;
+        self.validate_paid_envelope_inner(
+            envelope,
+            pricing,
+            whitelist,
+            None,
+            trust_discount,
+            our_node_id,
+            Some(nonce_store),
+        )
+        .await
+        .map(|_| ())?;
+
+        let (payment_request_id, tx_hash, seq, debit_msat) = inbound_debit_key(&envelope.payment_proof)?;
+        let debits = self.debits.as_ref().ok_or_else(|| {
+            GateRejection::BlvmRejected("session debit store is not configured".into())
+        })?;
+        debits
+            .record_inbound_debit(&payment_request_id, &tx_hash, seq, debit_msat)
+            .await
+            .map_err(|e| match e {
+                crate::traits::blvm_payment::SessionDebitError::Replay => {
+                    GateRejection::BlvmRejected("session debit sequence replayed".into())
+                }
+                crate::traits::blvm_payment::SessionDebitError::Store(msg) => {
+                    GateRejection::BlvmRejected(msg)
+                }
+            })?;
+
+        let fresh = nonce_store
+            .check_and_store(&envelope.nonce, &envelope.sender)
+            .await
+            .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?;
+        if !fresh {
+            return Err(GateRejection::ReplayDetected);
+        }
+        debug!("gate: BLVM CHAT CHECKS PASSED — message accepted");
+        Ok(())
+    }
+
+    fn settle_blvm_chat(&self, envelope: &UkmEnvelope) -> Result<(), GateRejection> {
+        if !self.blvm.enabled {
+            return Err(GateRejection::PaymentPathNotAllowed(
+                "blvm is disabled".into(),
+            ));
+        }
+        if envelope.kind != crate::kind::KIND_CHAT {
+            return Err(GateRejection::PaymentPathNotAllowed(
+                "blvm admission is chat only".into(),
+            ));
+        }
+        let path = envelope.payment_proof.path();
+        if !self.blvm.allows(path) {
+            return Err(GateRejection::PaymentPathNotAllowed(format!("{path:?}")));
+        }
+        if let GatePaymentProof::BlvmOnChainSession {
+            session_debit_seq: None,
+            ..
+        } = &envelope.payment_proof
+        {
+            return Err(GateRejection::PaymentPathNotAllowed(
+                "chat requires a session debit sequence".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn inbound_debit_key(
+    proof: &GatePaymentProof,
+) -> Result<(String, [u8; 32], u64, u64), GateRejection> {
+    match proof {
+        GatePaymentProof::Lightning(_) => Err(GateRejection::PaymentPathNotAllowed(
+            "lightning proofs use the lightning gate".into(),
+        )),
+        GatePaymentProof::BlvmCovenant {
+            covenant_proof,
+            amount_sats,
+            ..
+        } => {
+            use sha2::{Digest, Sha256};
+            let tx_hash: [u8; 32] = Sha256::digest(covenant_proof).into();
+            Ok((
+                "covenant".into(),
+                tx_hash,
+                0,
+                amount_sats.saturating_mul(1000),
+            ))
+        }
+        GatePaymentProof::BlvmOnChainSession {
+            payment_request_id,
+            tx_hash,
+            amount_sats,
+            session_debit_seq,
+            ..
+        } => {
+            let seq = session_debit_seq.ok_or_else(|| {
+                GateRejection::PaymentPathNotAllowed(
+                    "chat requires a session debit sequence".into(),
+                )
+            })?;
+            Ok((
+                payment_request_id.clone(),
+                *tx_hash,
+                seq,
+                amount_sats.saturating_mul(1000),
+            ))
+        }
     }
 }
 
@@ -990,7 +1265,7 @@ mod tests {
     use crate::web_reply::{is_web_service_reply, reply_bound_proof};
     use crate::UkmEnvelopeBuilder;
     use sha2::{Digest, Sha256};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
          abandon abandon abandon abandon abandon abandon abandon abandon \
@@ -1824,8 +2099,8 @@ mod tests {
             "test needs a fresh envelope nonce"
         );
         assert_eq!(
-            first.payment_proof.payment_hash,
-            second.payment_proof.payment_hash
+            first.payment_proof.lightning().expect("lightning proof").payment_hash,
+            second.payment_proof.lightning().expect("lightning proof").payment_hash
         );
 
         let gate = PaymentGate::with_config(GateConfig {
@@ -1878,8 +2153,8 @@ mod tests {
             "test needs a fresh envelope nonce"
         );
         assert_eq!(
-            first.payment_proof.payment_hash,
-            second.payment_proof.payment_hash
+            first.payment_proof.lightning().expect("lightning proof").payment_hash,
+            second.payment_proof.lightning().expect("lightning proof").payment_hash
         );
 
         let gate = PaymentGate::with_config(GateConfig {
@@ -2056,7 +2331,7 @@ mod tests {
                     *server.node_id(),
                     Recipient::Node(*requester.node_id()),
                     b"page-body".to_vec(),
-                    reply_bound_proof(&request.payment_proof),
+                    reply_bound_proof(request.payment_proof.lightning().expect("lightning proof")),
                 )
                 .references(vec![request.id])
                 .timestamp(now_ms())
@@ -2075,7 +2350,7 @@ mod tests {
                 let nonce_store = MockNonceStore::new();
                 nonce_store
                     .record_outgoing_web_request(
-                        &request.payment_proof.payment_hash,
+                        &request.payment_proof.lightning().expect("lightning proof").payment_hash,
                         crate::web_reply::OutstandingWebRequest {
                             request_id: request.id,
                             peer: *server.node_id(),
@@ -2129,7 +2404,7 @@ mod tests {
             *server.node_id(),
             Recipient::Node(*requester.node_id()),
             b"page-body".to_vec(),
-            reply_bound_proof(&request.payment_proof),
+            reply_bound_proof(request.payment_proof.lightning().expect("lightning proof")),
         )
         .references(vec![request.id])
         .timestamp(now_ms())
@@ -2144,7 +2419,7 @@ mod tests {
         let nonce_store = MockNonceStore::new();
         nonce_store
             .record_outgoing_web_request(
-                &request.payment_proof.payment_hash,
+                &request.payment_proof.lightning().expect("lightning proof").payment_hash,
                 crate::web_reply::OutstandingWebRequest {
                     request_id: request.id,
                     peer: *server.node_id(),
@@ -2161,7 +2436,7 @@ mod tests {
             settled: true,
             amount_msat: 5_000,
             direction: PaymentDirection::Incoming,
-            preimage: Some(request.payment_proof.preimage),
+            preimage: Some(request.payment_proof.lightning().expect("lightning proof").preimage),
             payment_hash_override: None,
         };
         let result = gate
@@ -3144,7 +3419,7 @@ mod tests {
                         .unwrap(),
                     expected
                 );
-                envelope.payment_proof.amount_msat = expected - 1;
+                envelope.payment_proof.lightning_mut().expect("lightning proof").amount_msat = expected - 1;
                 assert!(matches!(
                     gate.verify_price(&envelope, &pricing, discount).await,
                     Err(GateRejection::InsufficientPayment { required_msat, paid_msat })
@@ -3258,7 +3533,7 @@ mod tests {
             let required = gate.verify_price(&envelope, &pricing, 0.5).await.unwrap();
             // An internally consistent sub-sat settlement must still fail on
             // the resolved floor, independently of the envelope's claim.
-            envelope.payment_proof.amount_msat = 999;
+            envelope.payment_proof.lightning_mut().expect("lightning proof").amount_msat = 999;
             let result = gate
                 .verify_settlement(&envelope, &MockLightning::settled(999), required, None)
                 .await;
@@ -3615,5 +3890,213 @@ mod tests {
         let record = stored(PaymentStatus::Settled, PaymentDirection::Incoming);
         let result = gate_with(NotReadyBackend { record: Some(record), funding: true }).await;
         assert!(matches!(result, Err(GateRejection::PaymentSettlementMismatch(_))), "{result:?}");
+    }
+
+    struct MemDebits {
+        rows: Mutex<HashSet<([u8; 32], u64)>>,
+    }
+
+    impl MemDebits {
+        fn new() -> Self {
+            Self {
+                rows: Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn len(&self) -> usize {
+            self.rows.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::blvm_payment::SessionDebitStore for MemDebits {
+        async fn record_inbound_debit(
+            &self,
+            _payment_request_id: &str,
+            tx_hash: &[u8; 32],
+            session_debit_seq: u64,
+            _debit_msat: u64,
+        ) -> Result<(), crate::traits::blvm_payment::SessionDebitError> {
+            let mut rows = self.rows.lock().unwrap();
+            if !rows.insert((*tx_hash, session_debit_seq)) {
+                return Err(crate::traits::blvm_payment::SessionDebitError::Replay);
+            }
+            Ok(())
+        }
+    }
+
+    struct ScriptVerifier {
+        err: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::blvm_payment::BlvmPaymentVerifier for ScriptVerifier {
+        async fn verify_gate_proof(
+            &self,
+            _proof: &crate::gate_payment::GatePaymentProof,
+        ) -> Result<(), crate::traits::blvm_payment::BlvmPaymentError> {
+            match &self.err {
+                None => Ok(()),
+                Some(msg) if msg.contains("Method not found") => {
+                    Err(crate::traits::blvm_payment::BlvmPaymentError::Unavailable(msg.clone()))
+                }
+                Some(msg) => Err(crate::traits::blvm_payment::BlvmPaymentError::OnChainRejected(
+                    msg.clone(),
+                )),
+            }
+        }
+    }
+
+    fn blvm_chat_gate(
+        policy: BlvmChatPolicy,
+        err: Option<String>,
+        debits: Arc<MemDebits>,
+    ) -> PaymentGate {
+        PaymentGate::new().with_blvm_chat(
+            policy,
+            Arc::new(ScriptVerifier { err }),
+            debits,
+        )
+    }
+
+    fn signed_blvm_chat(
+        identity: &NodeIdentity,
+        recipient: NodeId,
+        kind: u16,
+        amount_sats: u64,
+        seq: Option<u64>,
+    ) -> UkmEnvelope {
+        let proof = crate::gate_payment::GatePaymentProof::BlvmOnChainSession {
+            payment_request_id: "req-chat".into(),
+            tx_hash: [4u8; 32],
+            amount_sats,
+            timestamp: now_ms(),
+            session_debit_seq: seq,
+        };
+        let mut envelope = UkmEnvelopeBuilder::new(
+            kind,
+            *identity.node_id(),
+            Recipient::Node(recipient),
+            b"chat".to_vec(),
+            proof,
+        )
+        .timestamp(now_ms())
+        .build();
+        let sig = identity.sign(&envelope.signable_bytes());
+        envelope.signature = crate::types::Signature::from_ed25519(&sig);
+        envelope
+    }
+
+    fn chat_policy() -> BlvmChatPolicy {
+        BlvmChatPolicy::lightning_only()
+            .enabled(true)
+            .allow_path(PaymentPath::BlvmOnChainSession)
+    }
+
+    #[tokio::test]
+    async fn blvm_chat_records_debit_then_nonce_and_replay_fails() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "alice").unwrap();
+        let recipient = NodeId::from_bytes([9u8; 32]);
+        let debits = Arc::new(MemDebits::new());
+        let gate = blvm_chat_gate(chat_policy(), None, Arc::clone(&debits));
+        let pricing = MockPricing { price_msat: 1000 };
+        let nonces = MockNonceStore::new();
+        let envelope = signed_blvm_chat(&identity, recipient, KIND_CHAT, 5, Some(1));
+
+        gate.validate_paid_envelope(&envelope, &pricing, None, None, 0.0, Some(&recipient))
+            .await
+            .unwrap();
+        assert_eq!(debits.len(), 0, "validation must not record the debit");
+
+        gate.verify(&envelope, &nonces, &pricing, None, None, 0.0, Some(&recipient))
+            .await
+            .unwrap();
+        assert_eq!(debits.len(), 1);
+
+        let replay = signed_blvm_chat(&identity, recipient, KIND_CHAT, 5, Some(1));
+        let err = gate
+            .verify(&replay, &nonces, &pricing, None, None, 0.0, Some(&recipient))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GateRejection::BlvmRejected(ref msg) if msg.contains("replayed")),
+            "{err:?}"
+        );
+        assert_eq!(debits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blvm_disabled_and_non_chat_are_path_not_allowed() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "alice").unwrap();
+        let recipient = NodeId::from_bytes([9u8; 32]);
+        let debits = Arc::new(MemDebits::new());
+        let pricing = MockPricing { price_msat: 1000 };
+        let nonces = MockNonceStore::new();
+
+        let off = blvm_chat_gate(BlvmChatPolicy::lightning_only(), None, Arc::clone(&debits));
+        let chat = signed_blvm_chat(&identity, recipient, KIND_CHAT, 5, Some(1));
+        let err = off
+            .verify(&chat, &nonces, &pricing, None, None, 0.0, Some(&recipient))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GateRejection::PaymentPathNotAllowed(_)), "{err:?}");
+
+        let gate = blvm_chat_gate(chat_policy(), None, Arc::clone(&debits));
+        for kind in [
+            crate::kind::KIND_CALL_INVITE,
+            crate::kind::KIND_FILE_REF,
+            crate::kind::KIND_ROOM_CREATE,
+        ] {
+            let envelope = signed_blvm_chat(&identity, recipient, kind, 5, Some(1));
+            let err = gate
+                .verify(&envelope, &nonces, &pricing, None, None, 0.0, Some(&recipient))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, GateRejection::PaymentPathNotAllowed(_)),
+                "kind {kind}: {err:?}"
+            );
+        }
+        assert_eq!(debits.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn blvm_underpay_reorg_and_missing_module_do_not_debit() {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "alice").unwrap();
+        let recipient = NodeId::from_bytes([9u8; 32]);
+        let debits = Arc::new(MemDebits::new());
+        let pricing = MockPricing { price_msat: 5000 };
+        let nonces = MockNonceStore::new();
+        let gate = blvm_chat_gate(chat_policy(), None, Arc::clone(&debits));
+        let short = signed_blvm_chat(&identity, recipient, KIND_CHAT, 1, Some(1));
+        let err = gate
+            .verify(&short, &nonces, &pricing, None, None, 0.0, Some(&recipient))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GateRejection::InsufficientPayment { .. }), "{err:?}");
+
+        let pricing = MockPricing { price_msat: 1000 };
+        let reorg = blvm_chat_gate(
+            chat_policy(),
+            Some("reorg_pending".into()),
+            Arc::clone(&debits),
+        );
+        let paid = signed_blvm_chat(&identity, recipient, KIND_CHAT, 5, Some(2));
+        let err = reorg
+            .verify(&paid, &nonces, &pricing, None, None, 0.0, Some(&recipient))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GateRejection::BlvmRejected(ref msg) if msg.contains("reorg_pending")), "{err:?}");
+
+        let opened = PaymentGate::new().with_blvm_policy(chat_policy());
+        let err = opened
+            .verify(&paid, &nonces, &pricing, None, None, 0.0, Some(&recipient))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GateRejection::BlvmRejected(ref msg) if msg.contains("Method not found")),
+            "{err:?}"
+        );
+        assert_eq!(debits.len(), 0);
     }
 }

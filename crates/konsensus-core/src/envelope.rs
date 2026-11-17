@@ -9,7 +9,8 @@ use serde::de::{self, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
-use crate::types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, Signature};
+use crate::gate_payment::GatePaymentProof;
+use crate::types::{MessageId, NodeId, Nonce, Recipient, Signature};
 
 /// Max number of message references (threading / replies / reactions) carried
 /// in a UKM envelope. A handful is all any legitimate thread needs; the cap
@@ -106,8 +107,9 @@ pub struct UkmEnvelope {
     /// E2EE encrypted payload (PQXDH for 1:1, MLS for groups).
     #[serde(deserialize_with = "bounded_ciphertext")]
     pub ciphertext: Vec<u8>,
-    /// Lightning payment proof — MANDATORY. Principle 2: no payment = rejected.
-    pub payment_proof: PaymentProof,
+    /// Payment proof — mandatory. Lightning stays the untagged rc24 object.
+    /// BLVM paths carry a `type` tag and do not deserialize as Lightning.
+    pub payment_proof: GatePaymentProof,
     /// Ed25519 signature over the signable fields.
     pub signature: Signature,
     /// Random nonce for replay protection.
@@ -166,10 +168,9 @@ impl UkmEnvelope {
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
         buf.extend_from_slice(&self.ciphertext);
         buf.extend_from_slice(self.nonce.as_bytes());
-        // Payment proof fields — binds the proof to this specific envelope
-        buf.extend_from_slice(&self.payment_proof.payment_hash);
-        buf.extend_from_slice(&self.payment_proof.preimage);
-        buf.extend_from_slice(&self.payment_proof.amount_msat.to_be_bytes());
+        // Lightning appends hash || preimage || amount with no path byte.
+        // BLVM paths append their own prefix inside `append_signable_bytes`.
+        self.payment_proof.append_signable_bytes(&mut buf);
         buf
     }
 
@@ -197,8 +198,9 @@ impl UkmEnvelope {
             ));
         }
 
-        // 3. Payment proof must be valid (Principle 2)
-        self.payment_proof.verify_preimage()?;
+        // 3. Payment proof must be structurally valid (Principle 2).
+        // Lightning still checks preimage == sha256(preimage). BLVM checks its own fields.
+        self.payment_proof.validate()?;
 
         // 4. References list must be bounded (defense-in-depth: the wire decoder
         //    caps this too, but validate() is the gate-side enforcement before
@@ -224,7 +226,7 @@ pub struct UkmEnvelopeBuilder {
     recipient: Recipient,
     timestamp: u64,
     ciphertext: Vec<u8>,
-    payment_proof: PaymentProof,
+    payment_proof: GatePaymentProof,
     signature: Signature,
     nonce: Nonce,
     references: Vec<MessageId>,
@@ -232,12 +234,15 @@ pub struct UkmEnvelopeBuilder {
 
 impl UkmEnvelopeBuilder {
     /// Start building a new envelope.
+    ///
+    /// A [`PaymentProof`] becomes the Lightning path. BLVM proofs pass a
+    /// [`GatePaymentProof`] directly.
     pub fn new(
         kind: u16,
         sender: NodeId,
         recipient: Recipient,
         ciphertext: Vec<u8>,
-        payment_proof: PaymentProof,
+        payment_proof: impl Into<GatePaymentProof>,
     ) -> Self {
         let now_ms_u128 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -252,7 +257,7 @@ impl UkmEnvelopeBuilder {
             recipient,
             timestamp: now_ms,
             ciphertext,
-            payment_proof,
+            payment_proof: payment_proof.into(),
             signature: Signature::from_bytes([0u8; 64]),
             nonce: Nonce::generate(),
             references: Vec::new(),
@@ -307,7 +312,7 @@ mod tests {
 
     use super::*;
     use crate::kind::KIND_CHAT;
-    use crate::types::RoomId;
+    use crate::types::{PaymentProof, RoomId};
 
     fn make_valid_proof() -> PaymentProof {
         let preimage = [42u8; 32];
@@ -696,5 +701,35 @@ mod tests {
 
         // Different amounts must produce different signable bytes
         assert_ne!(env1.signable_bytes(), env2.signable_bytes());
+    }
+
+    #[test]
+    fn lightning_json_and_signable_bytes_match_rc24() {
+        let proof = make_valid_proof();
+        let lightning = GatePaymentProof::Lightning(proof.clone());
+        let json = serde_json::to_value(&lightning).unwrap();
+        assert!(json.get("type").is_none(), "lightning stays an untagged object");
+        let decoded: PaymentProof = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(decoded, proof);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&proof.payment_hash);
+        expected.extend_from_slice(&proof.preimage);
+        expected.extend_from_slice(&proof.amount_msat.to_be_bytes());
+        let mut actual = Vec::new();
+        lightning.append_signable_bytes(&mut actual);
+        assert_eq!(actual, expected);
+        assert_ne!(actual.first().copied(), Some(0x02));
+        assert_ne!(actual.first().copied(), Some(0x03));
+
+        let session = serde_json::json!({
+            "type": "blvm_on_chain_session",
+            "payment_request_id": "req",
+            "tx_hash": hex::encode([7u8; 32]),
+            "amount_sats": 5,
+            "timestamp": 1,
+            "session_debit_seq": 1
+        });
+        assert!(serde_json::from_value::<PaymentProof>(session).is_err());
     }
 }

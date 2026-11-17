@@ -190,6 +190,8 @@ pub fn classify(rejection: &GateRejection) -> (Code, Option<u64>, bool) {
         GateRejection::LightningUnavailable(_) => (Code::SettlementUnavailable, None, true),
         GateRejection::PaymentProofReused { .. } => (Code::ProofReused, None, true),
         GateRejection::WebReplyUnbound => (Code::SettlementMismatch, None, true),
+        GateRejection::PaymentPathNotAllowed(_) => (Code::NotSettled, None, true),
+        GateRejection::BlvmRejected(_) => (Code::SettlementUnavailable, None, true),
     }
 }
 
@@ -287,7 +289,7 @@ impl Membrane {
             counterparty: Some(sender_hex(envelope)),
             first_contact,
             required_msat: None,
-            paid_msat: Some(envelope.payment_proof.amount_msat),
+            paid_msat: Some(envelope.payment_proof.amount_msat()),
             cap_msat: None,
         })
     }
@@ -306,7 +308,7 @@ impl Membrane {
             counterparty: sender_verified.then(|| sender_hex(envelope)),
             first_contact: false,
             required_msat,
-            paid_msat: Some(envelope.payment_proof.amount_msat),
+            paid_msat: Some(envelope.payment_proof.amount_msat()),
             cap_msat: None,
         })
     }
@@ -592,14 +594,14 @@ mod tests {
             m.refused(
                 &env,
                 &GateRejection::PaymentProofReused {
-                    payment_hash: hex::encode(env.payment_proof.payment_hash),
+                    payment_hash: hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash),
                 },
             ),
             m.refused(&env, &GateRejection::ReplayDetected),
         ];
         let forbidden = [
             hex::encode(PREIMAGE),
-            hex::encode(env.payment_proof.payment_hash),
+            hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash),
             hex::encode(&env.ciphertext),
             "SECRET-CIPHERTEXT".to_string(),
             hex::encode(env.signature.to_ed25519().to_bytes()),

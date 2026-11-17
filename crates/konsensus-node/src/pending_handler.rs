@@ -154,8 +154,12 @@ async fn flush_peer(
                 expected_reply_kind: expected,
                 expires_at_ms: now_ms.saturating_add(konsensus_core::OUTSTANDING_TTL_MS),
             };
+            let Some(payment_hash) = envelope.payment_proof.as_lightning().map(|proof| proof.payment_hash) else {
+                warn!(msg_id = %message_id, "web request reply binding requires a lightning proof; not sending");
+                continue;
+            };
             if let Err(e) = storage
-                .record_outgoing_web_request(&envelope.payment_proof.payment_hash, outstanding)
+                .record_outgoing_web_request(&payment_hash, outstanding)
                 .await
             {
                 warn!(error = %e, msg_id = %message_id, "cannot restore web request reply binding; not sending");

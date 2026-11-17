@@ -321,8 +321,8 @@ async fn different_nonces_both_accepted() {
     assert_ne!(env1.nonce.as_bytes(), env2.nonce.as_bytes());
     // Different payment hashes (distinct Lightning proofs)
     assert_ne!(
-        env1.payment_proof.payment_hash,
-        env2.payment_proof.payment_hash
+        env1.payment_proof.lightning().expect("lightning proof").payment_hash,
+        env2.payment_proof.lightning().expect("lightning proof").payment_hash
     );
 
     let gate = PaymentGate::new();

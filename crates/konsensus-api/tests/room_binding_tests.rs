@@ -153,7 +153,7 @@ async fn a_bound_room_pays_each_member_its_own_price_on_an_envelope_to_that_memb
     for (peer, env) in &sent {
         assert_eq!(env.recipient, Recipient::Node(*peer), "addressed to the member, never Recipient::Room");
         assert_eq!(env.kind, 0, "ordinary chat: no new kind");
-        assert_eq!(env.payment_proof.amount_msat, f.price(peer));
+        assert_eq!(env.payment_proof.amount_msat(), f.price(peer));
     }
 }
 
@@ -528,5 +528,5 @@ async fn issue204_sender_proceeds_with_cached_good_price_after_bad_table() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["amount_msat"], 2_000, "must pay the still-valid recipient offer");
     assert_eq!(f.sent().len(), 1);
-    assert_eq!(f.sent()[0].1.payment_proof.amount_msat, 2_000);
+    assert_eq!(f.sent()[0].1.payment_proof.amount_msat(), 2_000);
 }

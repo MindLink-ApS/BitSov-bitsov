@@ -28,7 +28,7 @@ async fn deferred_outgoing(store: &dyn Storage, own: NodeId, peer: NodeId) -> Uk
         "request".into(),
     );
     op.state = "paid".into();
-    op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
+    op.payment_hash = Some(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash));
     op.message_id = Some(env.id.to_hex());
     op.settled_msat = 1_000;
     assert!(store.insert_outbox_operation(&op).await.unwrap());
@@ -71,7 +71,7 @@ async fn session_repair_pending_requires_an_unconsumed_positive_direct_deferral(
         // Any durable receipt consumes this proof; a retained deferral alone
         // must not keep authorizing reconnection after that point.
         store
-            .store_payment_receipt(&env.payment_proof.payment_hash, &env.sender, &env.id)
+            .store_payment_receipt(&env.payment_proof.lightning().expect("lightning proof").payment_hash, &env.sender, &env.id)
             .await
             .unwrap();
         assert!(!store.session_repair_pending(&own, &peer).await.unwrap());
@@ -112,7 +112,7 @@ async fn session_repair_pending_conflicting_deferral_terms_cannot_widen_authorit
             assert!(store.defer_unreadable_envelope(&original).await.unwrap());
             let mut changed = original.clone();
             changed.recipient = Recipient::Node(own);
-            changed.payment_proof.amount_msat = 1_000;
+            changed.payment_proof.lightning_mut().expect("lightning proof").amount_msat = 1_000;
             // ID covers ciphertext and nonce, not these signed terms.
             assert_eq!(changed.id, original.id);
             assert!(!store.defer_unreadable_envelope(&changed).await.unwrap());
@@ -265,7 +265,7 @@ async fn deferral_limits_fifty_envelopes_per_proof_and_sender() {
             let mut env = original.clone();
             env.ciphertext = vec![n];
             env.id = MessageId::compute(&env.ciphertext, &env.nonce);
-            env.payment_proof = PaymentProof::new(Sha256::digest([n; 32]).into(), [n; 32], 1_000);
+            env.payment_proof = PaymentProof::new(Sha256::digest([n; 32]).into(), [n; 32], 1_000).into();
             let _ = store.defer_unreadable_envelope(&env).await.unwrap();
         }
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM envelope_deferrals")
@@ -367,7 +367,7 @@ async fn deferral_caps_hold_for_concurrent_writers() {
                 env.ciphertext = vec![n];
                 env.id = MessageId::compute(&env.ciphertext, &env.nonce);
                 if !same_proof {
-                    env.payment_proof = PaymentProof::new(Sha256::digest([n; 32]).into(), [n; 32], 1_000);
+                    env.payment_proof = PaymentProof::new(Sha256::digest([n; 32]).into(), [n; 32], 1_000).into();
                 }
                 store.defer_unreadable_envelope(&env).await.unwrap()
             });
@@ -408,7 +408,7 @@ async fn deferral_expired_backlog_does_not_take_active_slots() {
     let peer = NodeId::from_bytes([1; 32]);
     let env = envelope(peer, Recipient::Node(own), 1_000);
     sqlx::query("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 513) INSERT INTO envelope_deferrals (message_id, sender, payment_hash, recipient_type, recipient_id, amount_msat) SELECT CAST(i AS TEXT), ?1, ?2, 'node', ?3, 1000 FROM n")
-        .bind(peer.to_hex()).bind(hex::encode(env.payment_proof.payment_hash)).bind(own.to_hex())
+        .bind(peer.to_hex()).bind(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash)).bind(own.to_hex())
         .execute(store.pool()).await.unwrap();
     assert!(store.defer_unreadable_envelope(&env).await.unwrap());
     assert!(store.session_repair_pending(&own, &peer).await.unwrap());

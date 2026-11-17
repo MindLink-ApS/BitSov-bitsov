@@ -3,6 +3,7 @@
 //! Entry point for `konsensus init` and `konsensus start`.
 
 mod admission_quotes;
+mod blvm_sessions;
 mod call_media;
 mod chain_tip;
 #[path = "cli/chain_tip.rs"]

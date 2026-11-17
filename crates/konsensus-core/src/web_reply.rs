@@ -54,7 +54,7 @@ pub fn is_web_service_reply(envelope: &UkmEnvelope) -> bool {
     matches!(
         envelope.kind,
         KIND_PAGE_RESPONSE | KIND_WEB_MANIFEST
-    ) && envelope.payment_proof.amount_msat == 0
+    ) && envelope.payment_proof.amount_msat() == 0
         && !envelope.references.is_empty()
 }
 
@@ -118,7 +118,7 @@ mod tests {
             peer,
             Recipient::Node(sender),
             b"page".to_vec(),
-            reply_bound_proof(&request.payment_proof),
+            reply_bound_proof(request.payment_proof.lightning().expect("lightning proof")),
         )
         .references(vec![request.id])
         .build();
@@ -128,7 +128,7 @@ mod tests {
         assert!(!is_web_service_reply(&reply));
 
         reply.references.push(request.id);
-        reply.payment_proof.amount_msat = 50;
+        reply.payment_proof.lightning_mut().expect("lightning proof").amount_msat = 50;
         assert!(!is_web_service_reply(&reply));
     }
 

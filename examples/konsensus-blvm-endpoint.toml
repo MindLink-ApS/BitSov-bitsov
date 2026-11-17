@@ -1,0 +1,9 @@
+# Relay endpoint. Path 3 mesh hop matches blvm-mesh 070645f (OnChainSettlement,
+# bincode variant 1). Path 2 is off unless mesh_ctv is true.
+
+[blvm]
+enabled = true
+rpc_url = "http://127.0.0.1:8332/"
+mesh_enabled = true
+mesh_ctv = false
+allowed_paths = ["lightning", "blvm_on_chain_session"]

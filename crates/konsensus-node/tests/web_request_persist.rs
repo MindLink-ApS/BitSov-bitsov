@@ -47,7 +47,7 @@ fn request(requester: &NodeIdentity, server: &NodeIdentity, kind: u16) -> UkmEnv
 /// `from`'s zero-amount reply bound to `req`.
 fn reply(from: &NodeIdentity, requester: &NodeIdentity, req: &UkmEnvelope, kind: u16) -> UkmEnvelope {
     signed(
-        konsensus_core::UkmEnvelopeBuilder::new(kind, *from.node_id(), Recipient::Node(*requester.node_id()), b"body".to_vec(), reply_bound_proof(&req.payment_proof))
+        konsensus_core::UkmEnvelopeBuilder::new(kind, *from.node_id(), Recipient::Node(*requester.node_id()), b"body".to_vec(), reply_bound_proof(req.payment_proof.lightning().expect("lightning proof")))
             .references(vec![req.id])
             .timestamp(now_ms())
             .build(),
@@ -79,8 +79,8 @@ async fn an_honest_reply_after_a_restart_is_still_bound_once() {
     let manifest = request(&requester, &server, KIND_WEB_MANIFEST);
     {
         let db = open(&path).await;
-        db.record_outgoing_web_request(&page.payment_proof.payment_hash, outstanding(&page, &server, KIND_PAGE_RESPONSE, now_ms() + OUTSTANDING_TTL_MS)).await.unwrap();
-        db.record_outgoing_web_request(&manifest.payment_proof.payment_hash, outstanding(&manifest, &server, KIND_WEB_MANIFEST, now_ms() + OUTSTANDING_TTL_MS)).await.unwrap();
+        db.record_outgoing_web_request(&page.payment_proof.lightning().expect("lightning proof").payment_hash, outstanding(&page, &server, KIND_PAGE_RESPONSE, now_ms() + OUTSTANDING_TTL_MS)).await.unwrap();
+        db.record_outgoing_web_request(&manifest.payment_proof.lightning().expect("lightning proof").payment_hash, outstanding(&manifest, &server, KIND_WEB_MANIFEST, now_ms() + OUTSTANDING_TTL_MS)).await.unwrap();
         db.pool().close().await;
     }
     // Node restarts between paying and the replies.
@@ -90,7 +90,7 @@ async fn an_honest_reply_after_a_restart_is_still_bound_once() {
     // One-shot: a fresh envelope on the same hash is back at the price floor.
     let again = reply(&server, &requester, &page, KIND_PAGE_RESPONSE);
     assert!(matches!(verify(&db, &again, &requester).await, Err(GateRejection::InsufficientPayment { .. })));
-    assert!(db.take_outstanding_web_request(&page.payment_proof.payment_hash).await.unwrap().is_none());
+    assert!(db.take_outstanding_web_request(&page.payment_proof.lightning().expect("lightning proof").payment_hash).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -102,7 +102,7 @@ async fn prior_probes_still_refuse_after_a_restart() {
     {
         let db = open(&path).await;
         for (req, expires) in [(&wrong_kind, now_ms() + OUTSTANDING_TTL_MS), (&wrong_peer, now_ms() + OUTSTANDING_TTL_MS), (&expired, now_ms() - 1)] {
-            db.record_outgoing_web_request(&req.payment_proof.payment_hash, outstanding(req, &server, KIND_PAGE_RESPONSE, expires)).await.unwrap();
+            db.record_outgoing_web_request(&req.payment_proof.lightning().expect("lightning proof").payment_hash, outstanding(req, &server, KIND_PAGE_RESPONSE, expires)).await.unwrap();
         }
         db.pool().close().await;
     }
@@ -127,19 +127,19 @@ async fn expired_entries_are_swept_with_a_bound_and_live_ones_survive() {
     let now = now_ms();
     let expired: Vec<_> = (0..5).map(|_| request(&requester, &server, KIND_PAGE_REQUEST)).collect();
     for (i, req) in expired.iter().enumerate() {
-        db.record_outgoing_web_request(&req.payment_proof.payment_hash, outstanding(req, &server, KIND_PAGE_RESPONSE, now - 1000 + i as u64)).await.unwrap();
+        db.record_outgoing_web_request(&req.payment_proof.lightning().expect("lightning proof").payment_hash, outstanding(req, &server, KIND_PAGE_RESPONSE, now - 1000 + i as u64)).await.unwrap();
     }
     let live = request(&requester, &server, KIND_PAGE_REQUEST);
-    db.record_outgoing_web_request(&live.payment_proof.payment_hash, outstanding(&live, &server, KIND_PAGE_RESPONSE, now + OUTSTANDING_TTL_MS)).await.unwrap();
+    db.record_outgoing_web_request(&live.payment_proof.lightning().expect("lightning proof").payment_hash, outstanding(&live, &server, KIND_PAGE_RESPONSE, now + OUTSTANDING_TTL_MS)).await.unwrap();
     // Bounded: at most `max` per sweep, oldest first.
     assert_eq!(db.sweep_outstanding_web_requests(now, 3).await.unwrap(), 3);
-    assert!(db.take_outstanding_web_request(&expired[0].payment_proof.payment_hash).await.unwrap().is_none());
+    assert!(db.take_outstanding_web_request(&expired[0].payment_proof.lightning().expect("lightning proof").payment_hash).await.unwrap().is_none());
     assert_eq!(db.sweep_outstanding_web_requests(now, 3).await.unwrap(), 2);
     assert_eq!(db.sweep_outstanding_web_requests(now, 3).await.unwrap(), 0);
-    let kept = db.take_outstanding_web_request(&live.payment_proof.payment_hash).await.unwrap().unwrap();
+    let kept = db.take_outstanding_web_request(&live.payment_proof.lightning().expect("lightning proof").payment_hash).await.unwrap().unwrap();
     assert_eq!(kept, outstanding(&live, &server, KIND_PAGE_RESPONSE, now + OUTSTANDING_TTL_MS));
     // Re-recording the same hash replaces the row rather than failing.
-    db.record_outgoing_web_request(&live.payment_proof.payment_hash, outstanding(&live, &server, KIND_PAGE_RESPONSE, now + 1)).await.unwrap();
-    db.record_outgoing_web_request(&live.payment_proof.payment_hash, outstanding(&live, &server, KIND_PAGE_RESPONSE, now + 2)).await.unwrap();
-    assert_eq!(db.take_outstanding_web_request(&live.payment_proof.payment_hash).await.unwrap().unwrap().expires_at_ms, now + 2);
+    db.record_outgoing_web_request(&live.payment_proof.lightning().expect("lightning proof").payment_hash, outstanding(&live, &server, KIND_PAGE_RESPONSE, now + 1)).await.unwrap();
+    db.record_outgoing_web_request(&live.payment_proof.lightning().expect("lightning proof").payment_hash, outstanding(&live, &server, KIND_PAGE_RESPONSE, now + 2)).await.unwrap();
+    assert_eq!(db.take_outstanding_web_request(&live.payment_proof.lightning().expect("lightning proof").payment_hash).await.unwrap().unwrap().expires_at_ms, now + 2);
 }

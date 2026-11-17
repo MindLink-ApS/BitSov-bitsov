@@ -59,6 +59,8 @@ pub struct HealthResponse {
     pub pending_deliveries: u64,
     /// Whether Lightning provider is available (backend reachable).
     pub lightning_available: bool,
+    /// Owner-only. True when this node can open a BLVM on-chain chat session.
+    pub blvm_chat: bool,
     /// Whether this node can send outbound Lightning payments.
     ///
     /// `false` when the wallet is a VoidWallet, has no channels, or a
@@ -434,6 +436,7 @@ async fn status(
         e2ee_sessions: session_count,
         pending_deliveries: pending,
         lightning_available: ln_available,
+        blvm_chat: state.gate.blvm_chat_enabled() && state.gate.blvm_sessions().is_some(),
         lightning_payment_capable: ln_payment_capable,
         lightning_balance_msat: ln_balance,
         uptime_secs: uptime,

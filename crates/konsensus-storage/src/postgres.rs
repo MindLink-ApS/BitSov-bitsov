@@ -7,9 +7,11 @@ use async_trait::async_trait;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::str::FromStr;
 
+#[cfg(test)]
+use konsensus_core::PaymentProof;
 use konsensus_core::{
     HostingContractState, MessageId, NodeId, Nonce, OperatorHostingContract,
-    OperatorHostingPayment, OperatorHostingPaymentDirection, PaymentProof, Recipient,
+    OperatorHostingPayment, OperatorHostingPaymentDirection, Recipient,
     RoomId, Signature, UkmEnvelope,
 };
 
@@ -36,10 +38,11 @@ impl PostgresStorage {
 
         let row = sqlx::query_as::<_, (
             String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
-            String, String,
+            String, String, Option<String>,
         )>(
             "SELECT id, kind::BIGINT, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, \
+             payment_proof_json \
              FROM messages WHERE id = $1 AND ($2 OR id NOT IN (SELECT message_id FROM call_admission_hold))",
         )
         .bind(&id_hex)
@@ -51,7 +54,7 @@ impl PostgresStorage {
             Some(r) => {
                 let envelope = row_to_envelope(
                     &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
+                    &r.12, r.13.as_deref(),
                 )?;
                 Ok(Some(envelope))
             }
@@ -534,6 +537,26 @@ impl PostgresStorage {
     (39, "envelope deferral expiry", include_str!("../migrations/039_envelope_deferral_expiry.sql")),
     (40, "call media detach intents", include_str!("../migrations/postgres/040_call_media_detach_intents.sql")),
     (41, "call offer binding", include_str!("../migrations/041_call_offer_binding.sql")),
+    (
+        42,
+        "payment proof json",
+        include_str!("../migrations/042_payment_proof_json.sql"),
+    ),
+    (
+        43,
+        "blvm session debits",
+        include_str!("../migrations/043_blvm_session_debits.sql"),
+    ),
+    (
+        44,
+        "blvm on chain sessions",
+        include_str!("../migrations/044_blvm_on_chain_sessions.sql"),
+    ),
+    (
+        45,
+        "blvm pending outbound debits",
+        include_str!("../migrations/045_blvm_pending_outbound_debits.sql"),
+    ),
         ]
     }
 
@@ -586,22 +609,18 @@ fn row_to_envelope(
     signature: &str,
     nonce: &str,
     references_json: &str,
+    proof_json: Option<&str>,
 ) -> Result<UkmEnvelope, StorageError> {
     let sender_id =
         NodeId::from_hex(sender).map_err(|e| StorageError::Conversion(format!("sender: {e}")))?;
     let recipient = recipient_from_parts(recipient_type, recipient_id)?;
 
-    let ph_bytes: [u8; 32] = hex::decode(payment_hash)
-        .map_err(|e| StorageError::Conversion(format!("payment_hash: {e}")))?
-        .try_into()
-        .map_err(|_| StorageError::Conversion("payment_hash: wrong length".into()))?;
-    let pi_bytes: [u8; 32] = hex::decode(preimage)
-        .map_err(|e| StorageError::Conversion(format!("preimage: {e}")))?
-        .try_into()
-        .map_err(|_| StorageError::Conversion("preimage: wrong length".into()))?;
-    let amount_u64 = u64::try_from(amount_msat)
-        .map_err(|_| StorageError::Conversion(format!("amount_msat negative: {amount_msat}")))?;
-    let proof = PaymentProof::new(ph_bytes, pi_bytes, amount_u64);
+    let proof = crate::paid_identity::proof_from_columns(
+        payment_hash,
+        preimage,
+        amount_msat,
+        proof_json,
+    )?;
 
     let sig_bytes: [u8; 64] = hex::decode(signature)
         .map_err(|e| StorageError::Conversion(format!("signature: {e}")))?
@@ -636,7 +655,7 @@ fn row_to_envelope(
         recipient,
         timestamp: timestamp_u64,
         ciphertext: ciphertext.to_vec(),
-        payment_proof: proof,
+        payment_proof: proof.into(),
         signature: sig,
         nonce,
         references,
@@ -851,6 +870,7 @@ impl PostgresStorage {
         if op.state != "paid" || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str()) || envelope.recipient != Recipient::Node(NodeId::from_hex(&op.recipient).map_err(|e| StorageError::Conversion(e.to_string()))?) {
             return Err(StorageError::Conversion("invalid paid operation binding".into()));
         }
+        let identity = crate::paid_identity::paid_identity(envelope)?;
         let mut tx = self.pool.begin().await?;
 
         if let Some(previous) = previous {
@@ -865,8 +885,8 @@ impl PostgresStorage {
             let refs: Vec<String> = envelope.references.iter().map(|id| id.to_hex()).collect();
             let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages m JOIN pending_deliveries p ON p.message_id = m.id WHERE m.id = $1 AND m.sender = $2 AND m.kind = $3 AND m.recipient_type = $4 AND m.recipient_id = $5 AND m.payment_hash = $6 AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10 AND p.recipient_id = $11 AND p.dispatched = 1 AND p.state != 'failed_paid' AND p.rejection_reason = $12")
                 .bind(previous.to_hex()).bind(envelope.sender.to_hex()).bind(i64::from(envelope.kind))
-                .bind(rtype).bind(&rid).bind(hex::encode(envelope.payment_proof.payment_hash))
-                .bind(hex::encode(envelope.payment_proof.preimage)).bind(op.settled_msat)
+                .bind(rtype).bind(&rid).bind(&identity.payment_hash)
+                .bind(&identity.preimage).bind(identity.amount_msat)
                 .bind(hex::encode(envelope.nonce.as_bytes()))
                 .bind(serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?)
                 .bind(&op.recipient).bind(&current.last_error).fetch_one(&mut *tx).await?;
@@ -902,10 +922,9 @@ impl PostgresStorage {
         let ts = i64::try_from(envelope.timestamp)
             .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
         let ciphertext = &envelope.ciphertext;
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let ph = identity.payment_hash.clone();
+        let pi = identity.preimage.clone();
+        let amt = identity.amount_msat;
         let sig = hex::encode(envelope.signature.as_bytes());
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
@@ -914,8 +933,8 @@ impl PostgresStorage {
 
         sqlx::query(
             "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, plaintext_enc) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, plaintext_enc, payment_proof_json) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(&id)
         .bind(kind)
@@ -931,6 +950,7 @@ impl PostgresStorage {
         .bind(&nonce)
         .bind(&refs_json)
         .bind(plaintext_enc)
+        .bind(&identity.proof_json)
         .execute(&mut *tx)
         .await?;
 
@@ -959,7 +979,7 @@ impl PostgresStorage {
     /// hold row is locked first, before the paid-identity advisory lock, the
     /// same hold-first order as the hold sweep, the withdrawal and the
     /// calendar admission. Only `readable` acceptance may require the hold.
-    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool, require_hold: bool) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool, require_hold: bool, blvm_price_msat: Option<u64>) -> Result<Option<crate::PaidAcceptance>, StorageError> {
         use crate::PaidAcceptance::*;
         let id = envelope.id.to_hex();
         let kind = i64::from(envelope.kind);
@@ -968,10 +988,11 @@ impl PostgresStorage {
         let ts = i64::try_from(envelope.timestamp)
             .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
         let ciphertext = &envelope.ciphertext;
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let identity = crate::paid_identity::paid_identity(envelope)?;
+        let ph = identity.payment_hash.clone();
+        let pi = identity.preimage.clone();
+        let amt = identity.amount_msat;
+        let proof_json = identity.proof_json.clone();
         let sig = hex::encode(envelope.signature.as_bytes());
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
@@ -1068,10 +1089,19 @@ impl PostgresStorage {
             tx.rollback().await?;
             return Err(StorageError::NotFound(format!("admission hold for {id}")));
         }
+        if let Some(debit) = &identity.debit {
+            if let Err(error) = reserve_postgres_debit(&mut tx, debit, blvm_price_msat).await {
+                tx.rollback().await?;
+                return match error {
+                    StorageError::AlreadyExists(_) => Ok(Some(PaymentReused)),
+                    other => Err(other),
+                };
+            }
+        }
         sqlx::query(
             "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, payment_proof_json) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(&id)
         .bind(kind)
@@ -1086,6 +1116,7 @@ impl PostgresStorage {
         .bind(&sig)
         .bind(&nonce)
         .bind(&refs_json)
+        .bind(&proof_json)
         .execute(&mut *tx)
         .await?;
 
@@ -1101,6 +1132,40 @@ impl PostgresStorage {
 
 #[async_trait]
 impl Storage for PostgresStorage {
+    async fn record_blvm_inbound_debit(
+        &self,
+        payment_request_id: &str,
+        tx_hash: &[u8; 32],
+        session_debit_seq: u64,
+        debit_msat: u64,
+    ) -> Result<(), StorageError> {
+        let seq = i64::try_from(session_debit_seq)
+            .map_err(|_| StorageError::Conversion("blvm debit sequence".into()))?;
+        let debit = i64::try_from(debit_msat)
+            .map_err(|_| StorageError::Conversion("blvm debit amount".into()))?;
+        let recorded_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|_| "0".into());
+        let result = sqlx::query(
+            "INSERT INTO blvm_session_debits (payment_request_id, tx_hash, session_debit_seq, debit_msat, recorded_at) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(payment_request_id)
+        .bind(hex::encode(tx_hash))
+        .bind(seq)
+        .bind(debit)
+        .bind(recorded_at)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                Err(StorageError::AlreadyExists("blvm session debit".into()))
+            }
+            Err(e) => Err(StorageError::Database(e)),
+        }
+    }
+
     async fn record_upgrade_rows(&self, table: crate::record_upgrade::RecordTable, after: Option<&str>, limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
         crate::record_upgrade::postgres::rows(&self.pool, table, after, limit).await
     }
@@ -1278,10 +1343,11 @@ impl Storage for PostgresStorage {
         let ts = i64::try_from(envelope.timestamp)
             .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
         let ciphertext = &envelope.ciphertext;
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let identity = crate::paid_identity::paid_identity(envelope)?;
+        let ph = identity.payment_hash;
+        let pi = identity.preimage;
+        let amt = identity.amount_msat;
+        let proof_json = identity.proof_json;
         let sig = hex::encode(envelope.signature.as_bytes());
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
@@ -1290,8 +1356,8 @@ impl Storage for PostgresStorage {
 
         sqlx::query(
             "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, payment_proof_json) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(&id)
         .bind(kind)
@@ -1306,6 +1372,7 @@ impl Storage for PostgresStorage {
         .bind(&sig)
         .bind(&nonce)
         .bind(&refs_json)
+        .bind(&proof_json)
         .execute(&self.pool)
         .await?;
 
@@ -1346,10 +1413,10 @@ impl Storage for PostgresStorage {
         let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let identity = crate::paid_identity::paid_identity(envelope)?;
+        let ph = identity.payment_hash;
+        let pi = identity.preimage;
+        let amt = identity.amount_msat;
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
         let refs_json =
@@ -1368,10 +1435,10 @@ impl Storage for PostgresStorage {
         let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let ph = hex::encode(envelope.payment_proof.lightning().map_err(|e| StorageError::Serialization(e.to_string()))?.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.lightning().map_err(|e| StorageError::Serialization(e.to_string()))?.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat())
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat())))?;
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
         let refs_json =
@@ -1412,10 +1479,10 @@ impl Storage for PostgresStorage {
         let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let identity = crate::paid_identity::paid_identity(envelope)?;
+        let ph = identity.payment_hash;
+        let pi = identity.preimage;
+        let amt = identity.amount_msat;
         let nonce = hex::encode(envelope.nonce.as_bytes());
         let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
         let refs_json =
@@ -1450,9 +1517,9 @@ impl Storage for PostgresStorage {
         use crate::traits::{deferral_now_ms, DEFERRAL_CLEANUP_BATCH, ENVELOPE_DEFERRAL_TTL_MS, MAX_DEFERRALS_PER_PROOF, MAX_DEFERRALS_PER_SENDER};
         let id = envelope.id.to_hex();
         let sender = envelope.sender.to_hex();
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let ph = crate::paid_identity::paid_identity(envelope)?.payment_hash;
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let amount = i64::try_from(envelope.payment_proof.amount_msat)
+        let amount = i64::try_from(envelope.payment_proof.amount_msat())
             .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
         let now = deferral_now_ms();
         let expires = now.saturating_add(ENVELOPE_DEFERRAL_TTL_MS).min(
@@ -1487,11 +1554,11 @@ impl Storage for PostgresStorage {
 
     async fn is_envelope_deferred(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let amount = i64::try_from(envelope.payment_proof.amount_msat)
+        let amount = i64::try_from(envelope.payment_proof.amount_msat())
             .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = $1 AND sender = $2 AND payment_hash = $3 AND recipient_type = $4 AND recipient_id = $5 AND amount_msat = $6 AND expires_at_ms > $7)")
             .bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
-            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(rtype).bind(&rid).bind(amount)
+            .bind(crate::paid_identity::paid_identity(envelope)?.payment_hash).bind(rtype).bind(&rid).bind(amount)
             .bind(crate::traits::deferral_now_ms())
             .fetch_one(&self.pool).await.map_err(Into::into)
     }
@@ -1511,16 +1578,54 @@ impl Storage for PostgresStorage {
     }
 
     async fn paid_envelope_status(&self, envelope: &UkmEnvelope) -> Result<Option<crate::PaidAcceptance>, StorageError> {
-        self.accept_paid_envelope_inner(envelope, false, false).await
+        self.accept_paid_envelope_inner(envelope, false, false, None).await
     }
 
     async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        self.accept_paid_envelope_inner(envelope, true, false).await?
+        self.accept_paid_envelope_inner(envelope, true, false, None).await?
             .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
     }
 
+    async fn accept_blvm_chat(&self, envelope: &UkmEnvelope, price_msat: u64) -> Result<crate::PaidAcceptance, StorageError> {
+        self.accept_paid_envelope_inner(envelope, true, false, Some(price_msat)).await?
+            .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
+    }
+
+    async fn upsert_blvm_outbound_session(&self, session: &crate::BlvmOutboundSession) -> Result<(), StorageError> {
+        crate::blvm_outbound::upsert_postgres(self.pool(), session).await
+    }
+
+    async fn reserve_blvm_outbound_debit(
+        &self,
+        recipient: &NodeId,
+        message_id: &MessageId,
+        debit_msat: u64,
+    ) -> Result<Option<crate::BlvmOutboundReservation>, StorageError> {
+        crate::blvm_outbound::reserve_postgres(self.pool(), recipient, message_id, debit_msat).await
+    }
+
+    async fn commit_blvm_outbound_debit(&self, message_id: &MessageId) -> Result<bool, StorageError> {
+        crate::blvm_outbound::commit_postgres(self.pool(), message_id).await
+    }
+
+    async fn rollback_blvm_outbound_debit(&self, message_id: &MessageId) -> Result<bool, StorageError> {
+        crate::blvm_outbound::rollback_postgres(self.pool(), message_id).await
+    }
+
+    async fn rollback_stale_blvm_outbound_debits(&self, older_than_ms: i64) -> Result<u64, StorageError> {
+        crate::blvm_outbound::rollback_stale_postgres(self.pool(), older_than_ms).await
+    }
+
+    async fn get_blvm_outbound_session(&self, recipient: &NodeId) -> Result<Option<crate::BlvmOutboundSession>, StorageError> {
+        crate::blvm_outbound::get_postgres(self.pool(), recipient).await
+    }
+
+    async fn delete_blvm_outbound_session(&self, recipient: &NodeId) -> Result<bool, StorageError> {
+        crate::blvm_outbound::delete_postgres(self.pool(), recipient).await
+    }
+
     async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        self.accept_paid_envelope_inner(envelope, true, true).await?
+        self.accept_paid_envelope_inner(envelope, true, true, None).await?
             .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
     }
 
@@ -1528,7 +1633,7 @@ impl Storage for PostgresStorage {
         let ts = i64::try_from(envelope.timestamp).map_err(|_| StorageError::Conversion("timestamp overflow".into()))?;
         let result = sqlx::query("UPDATE messages SET timestamp_ms = $1, signature = $2 WHERE id = $3 AND sender = $4 AND payment_hash = $5")
             .bind(ts).bind(hex::encode(envelope.signature.as_bytes())).bind(envelope.id.to_hex())
-            .bind(envelope.sender.to_hex()).bind(hex::encode(envelope.payment_proof.payment_hash))
+            .bind(envelope.sender.to_hex()).bind(crate::paid_identity::paid_identity(envelope)?.payment_hash)
             .execute(&self.pool).await?;
         if result.rows_affected() != 1 { return Err(StorageError::Conversion("missing paid envelope".into())); }
         Ok(())
@@ -1613,7 +1718,7 @@ impl Storage for PostgresStorage {
 
     async fn message_page(&self, scope: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<Vec<UkmEnvelope>, StorageError> {
         let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-            "SELECT id, kind::BIGINT, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND "
+            "SELECT id, kind::BIGINT, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, payment_proof_json FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND "
         );
         match scope {
             crate::MessageListQuery::Recipient(recipient) => {
@@ -1642,10 +1747,10 @@ impl Storage for PostgresStorage {
         }
         query.push(" ORDER BY timestamp_ms DESC, id DESC LIMIT ").push_bind(i64::from(limit));
         let rows = query.build_query_as::<(
-            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String, String, String,
+            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String, String, String, Option<String>,
         )>().fetch_all(&self.pool).await?;
         rows.into_iter().map(|r| row_to_envelope(
-            &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11, &r.12,
+            &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11, &r.12, r.13.as_deref(),
         )).collect()
     }
 
@@ -2333,7 +2438,7 @@ impl Storage for PostgresStorage {
         sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
         sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) OR kind = 400 THEN -3 ELSE -1 END WHERE payment_hash = $1 AND message_id = $2")
-            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
+            .bind(crate::paid_identity::paid_identity(envelope)?.payment_hash).bind(&id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
             .bind(&id).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -2342,7 +2447,7 @@ impl Storage for PostgresStorage {
 
     async fn is_application_rejected(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = -1")
-            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
+            .bind(crate::paid_identity::paid_identity(envelope)?.payment_hash).bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
             .fetch_one(&self.pool).await?;
         Ok(n > 0)
     }
@@ -4166,6 +4271,59 @@ impl konsensus_core::gate::NonceStore for PostgresStorage {
     }
 }
 
+async fn reserve_postgres_debit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    debit: &crate::paid_identity::SessionDebit,
+    price_msat: Option<u64>,
+) -> Result<(), StorageError> {
+    let price = price_msat
+        .ok_or_else(|| StorageError::Conversion("blvm chat acceptance requires a price".into()))?;
+    let price = i64::try_from(price)
+        .map_err(|_| StorageError::Conversion("blvm debit amount".into()))?;
+    if price <= 0 || price > debit.prepaid_msat {
+        return Err(StorageError::Conversion(
+            "blvm session balance exhausted".into(),
+        ));
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))")
+        .bind(&debit.tx_hash_hex)
+        .execute(&mut **tx)
+        .await?;
+    let recorded_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "0".into());
+    let inserted = sqlx::query(
+        "INSERT INTO blvm_session_debits (payment_request_id, tx_hash, session_debit_seq, debit_msat, recorded_at) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&debit.payment_request_id)
+    .bind(&debit.tx_hash_hex)
+    .bind(debit.seq)
+    .bind(price)
+    .bind(&recorded_at)
+    .execute(&mut **tx)
+    .await;
+    if let Err(sqlx::Error::Database(err)) = &inserted {
+        if err.is_unique_violation() {
+            return Err(StorageError::AlreadyExists("blvm session debit".into()));
+        }
+    }
+    inserted?;
+    let spent: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(debit_msat), 0) FROM blvm_session_debits WHERE tx_hash = $1 AND payment_request_id = $2",
+    )
+    .bind(&debit.tx_hash_hex)
+    .bind(&debit.payment_request_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if spent > debit.prepaid_msat {
+        return Err(StorageError::Conversion(
+            "blvm session balance exhausted".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod dbh2_guard {
     /// DBH2: the Postgres sibling authority-listing queries
@@ -4287,10 +4445,22 @@ mod migration_recovery_tests {
             .map(|(version, _, _)| *version)
             .collect();
         let max_known = known.iter().copied().max().unwrap();
-        for version in [35, 36, 37, 38] {
+        for version in [35, 36, 37, 38, 42, 43, 44, 45] {
             assert!(
                 known.contains(&version),
                 "migration {version} must be inside the downgrade fence"
+            );
+        }
+        assert!(
+            !known.contains(&34),
+            "migration 34 stays unused"
+        );
+        assert!(max_known >= 45, "BLVM schema is versions 42–45");
+        if max_known < 46 {
+            let future = PostgresStorage::refuse_future_schema(&[46]).unwrap_err();
+            assert!(
+                matches!(future, StorageError::FutureSchema { .. }),
+                "version 46 must hit the future-schema refusal, got {future}"
             );
         }
         assert!(PostgresStorage::unknown_applied_migrations(&known, &known).is_empty());
@@ -4750,10 +4920,10 @@ mod migration_recovery_tests {
                 assert_eq!(db.accept_paid_envelope(&env).await.unwrap(), crate::PaidAcceptance::Accepted);
                 db.prepare_delivery(&env.id, &peer).await.unwrap();
                 assert!(!db.acknowledge_pending_payment(&env.id, &peer, &sender, &[8; 32]).await.unwrap());
-                assert!(db.acknowledge_pending_payment(&env.id, &peer, &sender, &env.payment_proof.payment_hash).await.unwrap());
+                assert!(db.acknowledge_pending_payment(&env.id, &peer, &sender, &env.payment_proof.lightning().expect("lightning proof").payment_hash).await.unwrap());
                 // Exercise the read-only fast path and legacy metadata upgrade.
                 sqlx::query("UPDATE payment_receipts SET accepted = 0, kind = NULL WHERE payment_hash = $1")
-                    .bind(hex::encode(env.payment_proof.payment_hash)).execute(&db.pool).await.unwrap();
+                    .bind(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash)).execute(&db.pool).await.unwrap();
                 assert!(db.is_paid_envelope_accepted(&env).await.unwrap());
                 db.record_delivery_prices(&sender, &[("kind:0".into(), 1000)], &[1], 1000, 4600).await.unwrap();
                 assert_eq!(db.delivery_price_floor(&env, 2000, 5600).await.unwrap(), Some(1000));
@@ -4789,7 +4959,7 @@ mod schema_parity_tests {
             .collect();
         assert_eq!(
             versions,
-            (1..=41).filter(|v| !matches!(v, 7..=9 | 34)).collect::<Vec<_>>()
+            (1..=45).filter(|v| !matches!(v, 7..=9 | 34)).collect::<Vec<_>>()
         );
         let sql = include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql");
         assert!(
@@ -4821,6 +4991,49 @@ mod schema_parity_tests {
             .execute(admin)
             .await
             .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn blvm_outbound_session_reserves_on_postgres() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("blvm_out");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            let db = PostgresStorage::connect(&db_url).await.unwrap();
+            let peer = NodeId::from_bytes([4; 32]);
+            db.upsert_blvm_outbound_session(&crate::BlvmOutboundSession {
+                recipient: peer,
+                payment_request_id: "req".into(),
+                tx_hash: [9; 32],
+                amount_sats: 2,
+                debit_counter: 0,
+                spent_msat: 0,
+            })
+            .await
+            .unwrap();
+            let first = MessageId::from_bytes([1; 32]);
+            let reserved = db
+                .reserve_blvm_outbound_debit(&peer, &first, 1_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reserved.session_debit_seq, 0);
+            assert!(db.commit_blvm_outbound_debit(&first).await.unwrap());
+            let second = MessageId::from_bytes([2; 32]);
+            db.reserve_blvm_outbound_debit(&peer, &second, 1_000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(db.rollback_blvm_outbound_debit(&second).await.unwrap());
+            let loaded = db.get_blvm_outbound_session(&peer).await.unwrap().unwrap();
+            assert_eq!(loaded.spent_msat, 1_000);
+            assert_eq!(loaded.debit_counter, 2);
+            db.pool().close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        result
     }
 
     #[tokio::test]

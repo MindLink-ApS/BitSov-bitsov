@@ -7,6 +7,7 @@
 //! - [`MessageTransport`] — Noise_XX encrypted P2P messaging
 //! - [`MediaTransport`] — Voice/video (WebRTC) — **deferred**
 
+pub mod blvm_payment;
 pub mod chain;
 pub mod lightning;
 pub mod media;

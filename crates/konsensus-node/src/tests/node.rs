@@ -40,6 +40,7 @@ fn test_config(dir: &std::path::Path) -> NodeConfig {
         chain: ChainConfig::Mock,
         pricing: PricingConfig::default(),
         payment_gate: PaymentGateConfig::default(),
+        blvm: Default::default(),
         storage: StorageConfig::Sqlite {
             path: dir.join("konsensus.db").to_string_lossy().into_owned(),
             encrypted: false,
@@ -86,6 +87,7 @@ fn snapshot_config(storage: StorageConfig) -> NodeConfig {
         chain: ChainConfig::Mock,
         pricing: PricingConfig::default(),
         payment_gate: PaymentGateConfig::default(),
+        blvm: Default::default(),
         storage,
         backup: BackupConfig::default(),
         api: ApiConfig::default(),

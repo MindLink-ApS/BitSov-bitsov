@@ -1243,7 +1243,7 @@ async fn cap_hangup_is_reserved_at_admission_and_paid_by_the_calls_grant() {
     assert!(budget.pending.is_empty());
     let hangups = fx.state.storage.get_node_messages_of_kind(&fx.state.identity.node_id().to_hex(), 403, 10, None).await.unwrap();
     assert_eq!(hangups.len(), 1);
-    assert_eq!(hangups[0].payment_proof.amount_msat, 1_000);
+    assert_eq!(hangups[0].payment_proof.amount_msat(), 1_000);
 }
 
 #[tokio::test]

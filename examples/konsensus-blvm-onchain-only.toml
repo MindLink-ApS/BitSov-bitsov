@@ -1,0 +1,11 @@
+# Path 3 chat on BLVM. Lightning stays on for calls, files, rooms, web replies, and grants.
+# The receiver's blvm-node must have blvm-payment loaded, and must already store
+# the BIP70 outputs for each payment request. A request that exists only on the
+# sender's node does not verify.
+
+[blvm]
+enabled = true
+rpc_url = "http://127.0.0.1:8332/"
+mesh_enabled = false
+mesh_ctv = false
+allowed_paths = ["lightning", "blvm_on_chain_session"]

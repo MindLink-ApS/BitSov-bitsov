@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 use konsensus_chain::{EsploraConfig, EsploraProvider, MockChainProvider};
 use konsensus_core::gate::{GateConfig, PaymentGate};
+use konsensus_core::traits::blvm_payment::{SessionDebitError, SessionDebitStore};
 use konsensus_core::identity::NodeIdentity;
 use konsensus_core::traits::chain::ChainProvider;
 use konsensus_core::traits::lightning::LightningProvider;
@@ -599,7 +600,50 @@ impl KonsensusNode {
             verify_lightning_settlement = gate_config.verify_lightning_settlement,
             "payment gate configured"
         );
-        let gate = Arc::new(PaymentGate::with_config(gate_config));
+        let mut gate = PaymentGate::with_config(gate_config);
+        if config.blvm.enabled {
+            config.blvm.validate()?;
+            let rpc = konsensus_blvm_payment::HttpBlvmNodeRpc::new(
+                config.blvm.rpc_url.clone(),
+                config.blvm.rpc_token.clone(),
+            );
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                konsensus_blvm_payment::probe_payment_module(&rpc),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => anyhow::bail!("[blvm] {e}"),
+                Err(_) => anyhow::bail!(
+                    "[blvm] startup probe timed out; blvm-payment did not answer getpaymentstate"
+                ),
+            }
+            info!(
+                mesh_ctv = config.blvm.mesh_ctv,
+                paths = ?config.blvm.allowed_paths,
+                "blvm chat gate configured"
+            );
+            gate = gate.with_blvm_chat(
+                config.blvm.chat_policy(),
+                Arc::new(konsensus_blvm_payment::BlvmGateVerifier::new(rpc)),
+                Arc::new(StorageBlvmDebits(Arc::clone(&storage))),
+            );
+            let sessions = Arc::new(crate::blvm_sessions::StorageOnChainSessions::new(Arc::clone(
+                &storage,
+            )));
+            let opener = konsensus_blvm_payment::BlvmOnChainSessionManager::new(
+                Arc::new(konsensus_blvm_payment::HttpBlvmNodeRpc::new(
+                    config.blvm.rpc_url.clone(),
+                    config.blvm.rpc_token.clone(),
+                )),
+                sessions,
+            );
+            gate = gate.with_blvm_sessions(Arc::new(crate::blvm_sessions::NodeBlvmSessions::new(
+                opener,
+            )));
+        }
+        let gate = Arc::new(gate);
 
         // ── 9. Build routing table ─────────────────────────────────────
         let routing = Arc::new(RoutingTable::with_defaults());
@@ -934,6 +978,34 @@ pub(crate) fn default_advertised_capabilities(relay_enabled: bool) -> Vec<Capabi
         caps.push(Capability::Relay);
     }
     caps
+}
+
+struct StorageBlvmDebits(Arc<dyn konsensus_storage::Storage>);
+
+#[async_trait::async_trait]
+impl SessionDebitStore for StorageBlvmDebits {
+    async fn record_inbound_debit(
+        &self,
+        payment_request_id: &str,
+        tx_hash: &[u8; 32],
+        session_debit_seq: u64,
+        debit_msat: u64,
+    ) -> Result<(), SessionDebitError> {
+        match self
+            .0
+            .record_blvm_inbound_debit(
+                payment_request_id,
+                tx_hash,
+                session_debit_seq,
+                debit_msat,
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(konsensus_storage::StorageError::AlreadyExists(_)) => Err(SessionDebitError::Replay),
+            Err(e) => Err(SessionDebitError::Store(e.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]

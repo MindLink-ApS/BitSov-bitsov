@@ -1998,7 +1998,7 @@ async fn compose_happy_path_keysend() {
             "ciphertext should not be empty"
         );
         assert!(
-            envelope.payment_proof.amount_msat > 0,
+            envelope.payment_proof.amount_msat() > 0,
             "payment proof should have amount"
         );
         envelope.id

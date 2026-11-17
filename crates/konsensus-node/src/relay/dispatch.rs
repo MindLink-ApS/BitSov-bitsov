@@ -400,10 +400,18 @@ pub(crate) async fn handle_relay_control(
                 // payment IS the storage rent — one settled HTLC, one durable
                 // replay store (the message gate's). `validate_deposit` enforces
                 // the byte-day floor against this gate-cross-checked amount.
-                None => DepositAuth::GateSettled {
-                    amount_msat: envelope.payment_proof.amount_msat,
-                    payment_hash: envelope.payment_proof.payment_hash,
-                },
+                None => {
+                    let Some(payment_hash) = envelope.payment_proof.as_lightning().map(|proof| proof.payment_hash) else {
+                        return reply(
+                            sender,
+                            reject(id, "relay deposit requires a lightning proof".into()),
+                        );
+                    };
+                    DepositAuth::GateSettled {
+                        amount_msat: envelope.payment_proof.amount_msat(),
+                        payment_hash,
+                    }
+                }
             };
             match engine
                 .handle_deposit(

@@ -1477,7 +1477,7 @@ async fn real_ldk_regtest_room() {
             konsensus_core::Recipient::Node(*app.state.identity.node_id()),
             "addressed to the member"
         );
-        assert_eq!(got.envelope.payment_proof.amount_msat, chat_msat);
+        assert_eq!(got.envelope.payment_proof.amount_msat(), chat_msat);
     }
     steps.pass("A -> {B, C, D}: 3 paid envelopes, 2001 msat each, all delivered");
 

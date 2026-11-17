@@ -130,8 +130,12 @@ impl MessageResponse {
             recipient: recipient_str,
             timestamp: env.timestamp,
             ciphertext: hex::encode(&env.ciphertext),
-            payment_amount_msat: env.payment_proof.amount_msat,
-            payment_hash: hex::encode(env.payment_proof.payment_hash),
+            payment_amount_msat: env.payment_proof.amount_msat(),
+            payment_hash: env
+                .payment_proof
+                .as_lightning()
+                .map(|proof| hex::encode(proof.payment_hash))
+                .unwrap_or_default(),
             plaintext: None,
             references: env.references.iter().map(|r| r.to_hex()).collect(),
             room: None,

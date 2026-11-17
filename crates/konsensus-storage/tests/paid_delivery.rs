@@ -57,7 +57,7 @@ async fn paid_duplicates_bind_immutable_metadata_after_content_deletion() {
     let peer = NodeId::from_bytes([2; 32]);
     db.prepare_delivery(&env.id, &peer).await.unwrap();
     assert!(!db.acknowledge_pending_payment(&env.id, &peer, &env.sender, &[8; 32]).await.unwrap());
-    assert!(db.acknowledge_pending_payment(&env.id, &peer, &env.sender, &env.payment_proof.payment_hash).await.unwrap());
+    assert!(db.acknowledge_pending_payment(&env.id, &peer, &env.sender, &env.payment_proof.lightning().expect("lightning proof").payment_hash).await.unwrap());
     db.delete_message(&env.id).await.unwrap();
     assert_eq!(db.accept_paid_envelope(&renewed).await.unwrap(), AlreadyAccepted);
     assert!(db.get_message(&env.id).await.unwrap().is_none());
@@ -113,7 +113,7 @@ async fn encrypted_storage_acceptance_and_rewrap_preserve_ciphertext() {
     let peer = NodeId::from_bytes([2; 32]);
     db.prepare_delivery(&env.id, &peer).await.unwrap();
     assert!(!db.acknowledge_pending_payment(&env.id, &peer, &env.sender, &[8; 32]).await.unwrap());
-    assert!(db.acknowledge_pending_payment(&env.id, &peer, &env.sender, &env.payment_proof.payment_hash).await.unwrap());
+    assert!(db.acknowledge_pending_payment(&env.id, &peer, &env.sender, &env.payment_proof.lightning().expect("lightning proof").payment_hash).await.unwrap());
     db.delete_message(&env.id).await.unwrap();
     assert_eq!(db.accept_paid_envelope(&renewed).await.unwrap(), AlreadyAccepted);
     assert!(db.get_message(&env.id).await.unwrap().is_none());
@@ -141,7 +141,7 @@ async fn crash_before_commit_worker() {
     let env = envelope();
     let mut tx = db.pool().begin().await.unwrap();
     sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES (?, ?, ?)")
-        .bind(hex::encode(env.payment_proof.payment_hash)).bind(env.id.to_hex()).bind(env.sender.to_hex())
+        .bind(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash)).bind(env.id.to_hex()).bind(env.sender.to_hex())
         .execute(&mut *tx).await.unwrap();
     sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES (?, ?)")
         .bind(hex::encode(env.nonce.as_bytes())).bind(env.sender.to_hex()).execute(&mut *tx).await.unwrap();
@@ -170,7 +170,7 @@ async fn legacy_limbo_heals_only_the_bound_sender_and_id_and_rolls_back_on_failu
     use konsensus_storage::PaidAcceptance::*;
     let db = SqliteStorage::in_memory().await.unwrap();
     let env = envelope();
-    db.store_payment_receipt(&env.payment_proof.payment_hash, &env.sender, &env.id).await.unwrap();
+    db.store_payment_receipt(&env.payment_proof.lightning().expect("lightning proof").payment_hash, &env.sender, &env.id).await.unwrap();
     db.store_nonce(&env.nonce, &env.sender).await.unwrap();
     for change_sender in [true, false] {
         let mut other = env.clone();
@@ -234,10 +234,10 @@ async fn upgrade_from_original_slice_one_preserves_checksums_and_spent_receipts(
     // Build a real pre-021 accepted message plus an offline pending row.
     sqlx::query("INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) VALUES (?, 1, ?, 'node', ?, 1, ?, ?, ?, 1000, ?, ?, '[]')")
         .bind(env.id.to_hex()).bind(env.sender.to_hex()).bind(NodeId::from_bytes([2; 32]).to_hex())
-        .bind(&env.ciphertext).bind(hex::encode(env.payment_proof.payment_hash)).bind(hex::encode(env.payment_proof.preimage))
+        .bind(&env.ciphertext).bind(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash)).bind(hex::encode(env.payment_proof.lightning().expect("lightning proof").preimage))
         .bind(hex::encode(env.signature.as_bytes())).bind(hex::encode(env.nonce.as_bytes())).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES (?, ?, ?)")
-        .bind(hex::encode(env.payment_proof.payment_hash)).bind(env.id.to_hex()).bind(env.sender.to_hex()).execute(&pool).await.unwrap();
+        .bind(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash)).bind(env.id.to_hex()).bind(env.sender.to_hex()).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id, dispatched) VALUES (?, ?, 1)")
         .bind(env.id.to_hex()).bind(NodeId::from_bytes([2; 32]).to_hex()).execute(&pool).await.unwrap();
     pool.close().await;
@@ -285,8 +285,8 @@ async fn retained_receipt_matches_all_immutable_fields_after_content_deletion() 
             3 => other.recipient = Recipient::Node(NodeId::from_bytes([9; 32])),
             4 => other.nonce = Nonce::from_bytes([9; 24]),
             5 => other.references.push(konsensus_core::MessageId::from_bytes([9; 32])),
-            6 => other.payment_proof.amount_msat += 1,
-            _ => other.payment_proof.preimage = [9; 32],
+            6 => other.payment_proof.lightning_mut().expect("lightning proof").amount_msat += 1,
+            _ => other.payment_proof.lightning_mut().expect("lightning proof").preimage = [9; 32],
         }
         assert!(!db.is_paid_envelope_accepted(&other).await.unwrap(), "read-only binding variant {variant}");
         assert_eq!(db.accept_paid_envelope(&other).await.unwrap(), konsensus_storage::PaidAcceptance::PaymentReused, "variant {variant}");
@@ -329,7 +329,7 @@ async fn delivery_quotes_survive_restart_and_cannot_be_extended_by_the_wrapper()
 async fn legacy_duplicate_receipt_lookup_preserves_binding_before_retention() {
     let db = SqliteStorage::in_memory().await.unwrap(); let env = envelope();
     db.store_message(&env).await.unwrap();
-    db.store_payment_receipt(&env.payment_proof.payment_hash, &env.sender, &env.id).await.unwrap();
+    db.store_payment_receipt(&env.payment_proof.lightning().expect("lightning proof").payment_hash, &env.sender, &env.id).await.unwrap();
     assert!(db.is_paid_envelope_accepted(&env).await.unwrap());
     db.delete_messages_older_than(10).await.unwrap();
     assert!(db.is_paid_envelope_accepted(&env).await.unwrap(), "a lost duplicate ACK must remain recoverable after retention");

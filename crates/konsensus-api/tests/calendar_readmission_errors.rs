@@ -254,7 +254,7 @@ async fn calendar_readmission_queue_error_reports_all_settled_principal() {
                 .unwrap();
             assert_eq!(envelopes.len(), 1);
             assert_eq!(
-                envelopes[0].payment_proof.amount_msat, 1000,
+                envelopes[0].payment_proof.amount_msat(), 1000,
                 "admission cannot inflate the message proof"
             );
             assert!(json["error"]

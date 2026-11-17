@@ -222,6 +222,7 @@ fn build_router_with_options(
         .merge(handlers::rooms::routes())
         .merge(handlers::peers::routes())
         .merge(handlers::payments::routes())
+        .merge(handlers::blvm::routes())
         .merge(handlers::identity::routes(
             state.sensitive_identity_routes_enabled,
         ))

@@ -69,6 +69,12 @@ pub const MEMORY_RSS: &str = "bitsov_memory_rss_bytes";
 /// Prometheus / Grafana a post-mortem signal for on-call teams.
 pub const PLAINTEXT_DETECTED: &str = "bitsov_plaintext_detected_total";
 
+/// Counter: outbound BLVM chat debits released because the peer never acknowledged them.
+///
+/// Incremented when a reserved session debit is rolled back on a terminal
+/// refusal, or when housekeeping releases one that is still unacked past the cutoff.
+pub const BLVM_STALE_DEBIT_CLEANUP: &str = "bitsov_blvm_stale_debit_cleanup_total";
+
 // ── Global Prometheus handle ───────────────────────────────────────────────
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();

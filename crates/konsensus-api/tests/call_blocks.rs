@@ -199,7 +199,7 @@ async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
     let envelopes = transport.sent_envelopes.lock().unwrap().clone();
     let blocks: Vec<_> = envelopes.iter().filter(|(_, envelope)| envelope.kind == 404).collect();
     assert_eq!(blocks.len(), 1);
-    let hash = &blocks[0].1.payment_proof.payment_hash;
+    let hash = &blocks[0].1.payment_proof.lightning().expect("lightning proof").payment_hash;
     assert!(callee_store.has_call_block_invoice(&caller_id, ID, 0, hash).await.unwrap());
     calls::prepare_incoming_block(callee_store.as_ref(), &caller_id, Some(&plaintext), hash)
         .await.unwrap().commit(&konsensus_core::MessageId::from_bytes([0; 32])).await.unwrap();

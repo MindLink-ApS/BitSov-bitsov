@@ -4,7 +4,7 @@ use super::{bounded, bounded_json};
 use konsensus_core::{
     envelope::{MAX_CIPHERTEXT_BYTES, MAX_MESSAGE_REFERENCES},
     types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, RoomId, Signature},
-    UkmEnvelope,
+    GatePaymentProof, UkmEnvelope,
 };
 use serde::{
     de::{self, SeqAccess, Visitor},
@@ -25,8 +25,8 @@ struct WireEnvelope {
     timestamp: u64,
     #[serde(deserialize_with = "bounded::vec_u8::<_, MAX_CIPHERTEXT_BYTES>")]
     ciphertext: Vec<u8>,
-    #[serde(deserialize_with = "WirePaymentProof::deserialize")]
-    payment_proof: PaymentProof,
+    #[serde(deserialize_with = "gate_proof")]
+    payment_proof: GatePaymentProof,
     #[serde(deserialize_with = "bounded::hex_64")]
     signature: Signature,
     #[serde(deserialize_with = "bounded::hex_24")]
@@ -51,6 +51,10 @@ enum WireRecipient {
     Node(#[serde(deserialize_with = "bounded::hex_32")] NodeId),
     Room(#[serde(deserialize_with = "bounded_json::string_value::<_, _, 45>")] RoomId),
     Broadcast,
+}
+
+fn gate_proof<'de, D: Deserializer<'de>>(deserializer: D) -> Result<GatePaymentProof, D::Error> {
+    GatePaymentProof::deserialize(deserializer)
 }
 
 fn recipient<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Recipient, D::Error> {

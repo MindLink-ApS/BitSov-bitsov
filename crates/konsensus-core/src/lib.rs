@@ -15,7 +15,9 @@ pub mod error;
 pub mod federation;
 pub mod fee_rate;
 pub mod front_door;
+pub mod blvm_session;
 pub mod gate;
+pub mod gate_payment;
 pub mod identity;
 pub mod introduction;
 pub mod sponsor;
@@ -42,7 +44,9 @@ pub use kind::KindCategory;
 pub use types::{MessageId, NodeId, Nonce, PaymentProof, Recipient, RoomId, Signature};
 
 // Re-export core traits.
+pub use blvm_session::{BlvmOutboundSessionView, BlvmSessionControl};
 pub use gate::{GateConfig, GateRejection, NonceStore, PaymentGate};
+pub use gate_payment::{GatePaymentProof, PaymentPath};
 pub use invite::{BitSovInvite, InviteError, InviteToken};
 pub use web_reply::{
     expected_reply_kind, is_web_service_reply, reply_bound_proof, reply_matches_outstanding,

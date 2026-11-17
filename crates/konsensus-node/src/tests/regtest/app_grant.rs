@@ -458,7 +458,7 @@ async fn paid_call_and_unused_hold_release() {
         receipt(&pair, &body, 10_000, true).await;
         let received = recv_kind(&mut pair.callee, &aid, 404).await;
         assert_eq!(
-            hex::encode(received.envelope.payment_proof.payment_hash),
+            hex::encode(received.envelope.payment_proof.lightning().expect("lightning proof").payment_hash),
             body["payment_hash"]
         );
         assert!(hashes.insert(body["payment_hash"].as_str().unwrap().to_owned()));

@@ -543,7 +543,7 @@ impl Storage for MemStorage {
         let msgs = self.messages.lock().unwrap();
         let mut rows: Vec<_> = msgs
             .values()
-            .filter(|env| env.timestamp >= since_ms && env.payment_proof.amount_msat > 0)
+            .filter(|env| env.timestamp >= since_ms && env.payment_proof.amount_msat() > 0)
             .filter_map(|env| {
                 let (recipient_type, recipient_id) = match &env.recipient {
                     Recipient::Node(id) => ("node", id.to_hex()),
@@ -555,7 +555,7 @@ impl Storage for MemStorage {
                     recipient_type: recipient_type.into(),
                     recipient_id,
                     timestamp_ms: env.timestamp,
-                    amount_msat: env.payment_proof.amount_msat,
+                    amount_msat: env.payment_proof.amount_msat(),
                 })
             })
             .collect();

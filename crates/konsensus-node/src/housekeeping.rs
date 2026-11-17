@@ -37,6 +37,33 @@ pub(crate) async fn sweep_outstanding_web_requests(storage: &dyn konsensus_stora
     }
 }
 
+/// A reserved chat debit the peer has not acknowledged within a day is not a spend.
+const BLVM_OUTBOUND_DEBIT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Roll back outbound BLVM debits that were reserved and never acknowledged.
+/// An acknowledged debit is committed by the same sweep if its ACK was missed.
+pub(crate) async fn sweep_stale_blvm_debits(storage: &dyn konsensus_storage::Storage) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let cutoff = now.saturating_sub(BLVM_OUTBOUND_DEBIT_TTL_MS);
+    match storage.rollback_stale_blvm_outbound_debits(cutoff).await {
+        Ok(rolled_back) => {
+            if rolled_back > 0 {
+                metrics::counter!(konsensus_api::metrics::BLVM_STALE_DEBIT_CLEANUP).increment(rolled_back);
+                debug!(rolled_back, "rolled back unacked blvm outbound debits");
+            }
+            rolled_back
+        }
+        Err(konsensus_storage::StorageError::Unsupported(_)) => 0,
+        Err(e) => {
+            warn!(error = %e, "blvm outbound debit sweep failed");
+            0
+        }
+    }
+}
+
 /// Reclaim a bounded batch; permission expires independently of this sweep.
 pub(crate) async fn sweep_envelope_deferrals(storage: &dyn konsensus_storage::Storage) -> u64 {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -61,11 +88,13 @@ pub(crate) async fn run_nonce_cleanup(
     // Expired paid web requests (#129 R2): once at startup, then every tick.
     sweep_outstanding_web_requests(storage.as_ref()).await;
     sweep_envelope_deferrals(storage.as_ref()).await;
+    sweep_stale_blvm_debits(storage.as_ref()).await;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(cleanup_interval) => {
                 sweep_outstanding_web_requests(storage.as_ref()).await;
                 sweep_envelope_deferrals(storage.as_ref()).await;
+                sweep_stale_blvm_debits(storage.as_ref()).await;
                 // Held call signals whose handler never finished: fail closed.
                 if let Err(e) = konsensus_api::calls::withdraw_held(storage.as_ref(), false).await {
                     warn!(error = %e, "held call signal sweep failed; they stay invisible");

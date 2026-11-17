@@ -7,6 +7,7 @@ use konsensus_core::{
     OperatorHostingPayment, Recipient, RoomId, UkmEnvelope,
 };
 
+use crate::blvm_outbound::{BlvmOutboundReservation, BlvmOutboundSession};
 use crate::calendar::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
 use crate::error::StorageError;
 use crate::invites::{
@@ -83,6 +84,18 @@ pub trait Storage: Send + Sync {
     }
     async fn record_upgrade_replace(&self, _table: crate::record_upgrade::RecordTable, _old: &crate::record_upgrade::RecordRow, _new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
         Err(StorageError::Unsupported("record format upgrade".into()))
+    }
+
+    /// Record one inbound BLVM chat debit. The primary key is `(tx_hash, session_debit_seq)`.
+    /// A second insert of the same key is [`StorageError::AlreadyExists`].
+    async fn record_blvm_inbound_debit(
+        &self,
+        _payment_request_id: &str,
+        _tx_hash: &[u8; 32],
+        _session_debit_seq: u64,
+        _debit_msat: u64,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("blvm session debit".into()))
     }
 
     /// Exact immutable receipt binding; timestamp/signature renewal is allowed.
@@ -415,6 +428,55 @@ pub trait Storage: Send + Sync {
     /// ciphertext; backends compare the validated ID and immutable metadata.
     async fn accept_paid_envelope(&self, _envelope: &UkmEnvelope) -> Result<PaidAcceptance, StorageError> {
         Err(StorageError::Unsupported("accept_paid_envelope".into()))
+    }
+
+    /// Accept one BLVM chat message, debiting `price_msat` against the prepaid
+    /// session in the same transaction as the receipt and the nonce.
+    async fn accept_blvm_chat(&self, _envelope: &UkmEnvelope, _price_msat: u64) -> Result<PaidAcceptance, StorageError> {
+        Err(StorageError::Unsupported("blvm chat acceptance".into()))
+    }
+
+    /// Record an open path-3 session for one recipient. Refuses while that
+    /// recipient still has a pending debit or a non-zero spend.
+    async fn upsert_blvm_outbound_session(&self, _session: &BlvmOutboundSession) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported("blvm outbound session".into()))
+    }
+
+    /// Reserve `debit_msat` against the recipient's open session.
+    /// `Ok(None)` means there is no session, so the caller stays on Lightning.
+    async fn reserve_blvm_outbound_debit(
+        &self,
+        _recipient: &NodeId,
+        _message_id: &MessageId,
+        _debit_msat: u64,
+    ) -> Result<Option<BlvmOutboundReservation>, StorageError> {
+        Err(StorageError::Unsupported("blvm outbound debit".into()))
+    }
+
+    /// Peer ACK. The spend stays; the pending row goes. `false` means there was nothing pending.
+    async fn commit_blvm_outbound_debit(&self, _message_id: &MessageId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("blvm outbound debit".into()))
+    }
+
+    /// Peer never accepted. Return the price to the session. `false` means there was nothing pending.
+    async fn rollback_blvm_outbound_debit(&self, _message_id: &MessageId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("blvm outbound debit".into()))
+    }
+
+    /// Release pending debits recorded before `older_than_ms` that were never acknowledged.
+    /// An acknowledged debit is committed instead. Returns how many were rolled back.
+    async fn rollback_stale_blvm_outbound_debits(&self, _older_than_ms: i64) -> Result<u64, StorageError> {
+        Err(StorageError::Unsupported("blvm outbound debit".into()))
+    }
+
+    async fn get_blvm_outbound_session(&self, _recipient: &NodeId) -> Result<Option<BlvmOutboundSession>, StorageError> {
+        Err(StorageError::Unsupported("blvm outbound session".into()))
+    }
+
+    /// Delete a session that has not spent and has no pending debit.
+    /// `false` means there was no row.
+    async fn delete_blvm_outbound_session(&self, _recipient: &NodeId) -> Result<bool, StorageError> {
+        Err(StorageError::Unsupported("blvm outbound session".into()))
     }
 
     /// Paid acceptance for a kind that is held before acceptance (call

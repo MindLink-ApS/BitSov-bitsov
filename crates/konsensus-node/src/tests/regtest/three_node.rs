@@ -381,7 +381,7 @@ async fn paid(from: &app::App, to: &mut app::App, text: &str, incident: &str) ->
         "{incident}: E2EE on the wire"
     );
     assert_eq!(
-        got.envelope.payment_proof.amount_msat, 2_001,
+        got.envelope.payment_proof.amount_msat(), 2_001,
         "{incident}: recipient-bound payment"
     );
     assert_eq!(
@@ -1246,7 +1246,7 @@ async fn three_node_paid_e2e() {
             konsensus_core::Recipient::Node(*recipient.state.identity.node_id()),
             "{ROOM}"
         );
-        assert_eq!(got.envelope.payment_proof.amount_msat, 2_001, "{ROOM}");
+        assert_eq!(got.envelope.payment_proof.amount_msat(), 2_001, "{ROOM}");
     }
     steps.pass("TEST5 room: B+C each receive a recipient-bound paid E2EE message");
     alice.stop().await;

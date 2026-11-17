@@ -429,6 +429,18 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.record_upgrade_replace(table, old, new).await
     }
 
+    async fn record_blvm_inbound_debit(
+        &self,
+        payment_request_id: &str,
+        tx_hash: &[u8; 32],
+        session_debit_seq: u64,
+        debit_msat: u64,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .record_blvm_inbound_debit(payment_request_id, tx_hash, session_debit_seq, debit_msat)
+            .await
+    }
+
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         self.inner.starter_request_get(id).await
     }
@@ -619,6 +631,43 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
 
     async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
         self.inner.accept_paid_envelope(&self.encrypt_envelope(envelope)?).await
+    }
+
+    async fn accept_blvm_chat(&self, envelope: &UkmEnvelope, price_msat: u64) -> Result<crate::PaidAcceptance, StorageError> {
+        self.inner.accept_blvm_chat(&self.encrypt_envelope(envelope)?, price_msat).await
+    }
+
+    async fn upsert_blvm_outbound_session(&self, session: &crate::BlvmOutboundSession) -> Result<(), StorageError> {
+        self.inner.upsert_blvm_outbound_session(session).await
+    }
+
+    async fn reserve_blvm_outbound_debit(
+        &self,
+        recipient: &NodeId,
+        message_id: &MessageId,
+        debit_msat: u64,
+    ) -> Result<Option<crate::BlvmOutboundReservation>, StorageError> {
+        self.inner.reserve_blvm_outbound_debit(recipient, message_id, debit_msat).await
+    }
+
+    async fn commit_blvm_outbound_debit(&self, message_id: &MessageId) -> Result<bool, StorageError> {
+        self.inner.commit_blvm_outbound_debit(message_id).await
+    }
+
+    async fn rollback_blvm_outbound_debit(&self, message_id: &MessageId) -> Result<bool, StorageError> {
+        self.inner.rollback_blvm_outbound_debit(message_id).await
+    }
+
+    async fn rollback_stale_blvm_outbound_debits(&self, older_than_ms: i64) -> Result<u64, StorageError> {
+        self.inner.rollback_stale_blvm_outbound_debits(older_than_ms).await
+    }
+
+    async fn get_blvm_outbound_session(&self, recipient: &NodeId) -> Result<Option<crate::BlvmOutboundSession>, StorageError> {
+        self.inner.get_blvm_outbound_session(recipient).await
+    }
+
+    async fn delete_blvm_outbound_session(&self, recipient: &NodeId) -> Result<bool, StorageError> {
+        self.inner.delete_blvm_outbound_session(recipient).await
     }
 
     async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {

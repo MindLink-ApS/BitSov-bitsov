@@ -104,8 +104,9 @@ pub(crate) fn validate_handover_replacement(
         || current.admission_payment_hash != next.admission_payment_hash
         || current.settled_msat != next.settled_msat || current.readmission_msat != next.readmission_msat
         || next.kind != i64::from(envelope.kind)
-        || next.payment_hash.as_deref() != Some(hex::encode(envelope.payment_proof.payment_hash).as_str())
-        || u64::try_from(next.settled_msat).ok() != Some(envelope.payment_proof.amount_msat)
+        || next.payment_hash.as_deref() != Some(crate::paid_identity::paid_identity(envelope)?.payment_hash.as_str())
+        || (envelope.payment_proof.as_lightning().is_some()
+            && u64::try_from(next.settled_msat).ok() != Some(envelope.payment_proof.amount_msat()))
         || previous == &envelope.id
     {
         return Err(crate::StorageError::Conversion("invalid deferred envelope replacement".into()));
@@ -138,7 +139,7 @@ mod handover_tests {
         let mut op = OutboxOperation::prepared("retry-handover".into(), peer.to_hex(), 1, "request".into());
         op.state = "paid".into();
         op.message_id = Some(env.id.to_hex());
-        op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
+        op.payment_hash = Some(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash));
         op.settled_msat = 10;
         op.recovery = b"encrypted recovery evidence".to_vec();
         assert!(store.insert_outbox_operation(&op).await.unwrap());
@@ -190,7 +191,7 @@ mod handover_tests {
             stale.version -= 1;
             assert!(!store.replace_outbox_envelope(&stale, &old.id, &new, None).await.unwrap());
             let (mut changed, mut invalid) = replacement(&old_op, &old);
-            invalid.payment_proof.amount_msat = 20;
+            invalid.payment_proof.lightning_mut().expect("lightning proof").amount_msat = 20;
             changed.settled_msat = 20;
             assert!(store.replace_outbox_envelope(&changed, &old.id, &invalid, None).await.is_err());
             assert!(store.get_message(&old.id).await.unwrap().is_some());
@@ -210,9 +211,9 @@ mod handover_tests {
                     0 => env.sender = NodeId::from_bytes([8; 32]),
                     1 => env.kind = 2,
                     2 => { env.recipient = Recipient::Node(NodeId::from_bytes([8; 32])); next.recipient = NodeId::from_bytes([8; 32]).to_hex(); },
-                    3 => { env.payment_proof.payment_hash[0] ^= 1; next.payment_hash = Some(hex::encode(env.payment_proof.payment_hash)); },
-                    4 => env.payment_proof.preimage[0] ^= 1,
-                    5 => { env.payment_proof.amount_msat = 20; next.settled_msat = 20; },
+                    3 => { env.payment_proof.lightning_mut().expect("lightning proof").payment_hash[0] ^= 1; next.payment_hash = Some(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash)); },
+                    4 => env.payment_proof.lightning_mut().expect("lightning proof").preimage[0] ^= 1,
+                    5 => { env.payment_proof.lightning_mut().expect("lightning proof").amount_msat = 20; next.settled_msat = 20; },
                     6 => { env.nonce = konsensus_core::Nonce::from_bytes([8; 24]); env.id = MessageId::compute(&env.ciphertext, &env.nonce); next.message_id = Some(env.id.to_hex()); },
                     7 => env.references.push(MessageId::from_bytes([8; 32])),
                     8 => next.request_hash = "other request".into(),
@@ -318,7 +319,7 @@ mod handover_tests {
                 assert!(!store.is_envelope_deferred(&other_sender).await.unwrap());
                 assert!(!store.defer_unreadable_envelope(&other_sender).await.unwrap());
                 let mut other_proof = env.clone();
-                other_proof.payment_proof.payment_hash[0] ^= 1;
+                other_proof.payment_proof.lightning_mut().expect("lightning proof").payment_hash[0] ^= 1;
                 assert!(!store.is_envelope_deferred(&other_proof).await.unwrap());
                 assert!(!store.defer_unreadable_envelope(&other_proof).await.unwrap());
             }

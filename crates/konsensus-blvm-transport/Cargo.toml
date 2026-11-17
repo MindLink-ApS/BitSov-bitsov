@@ -1,0 +1,26 @@
+[package]
+name = "konsensus-blvm-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hybrid BitSov transport: direct Noise with blvm-mesh fallback"
+
+[dependencies]
+konsensus-core = { path = "../konsensus-core" }
+konsensus-blvm-payment = { path = "../konsensus-blvm-payment" }
+konsensus-message = { path = "../konsensus-message" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+blake3.workspace = true
+x25519-dalek.workspace = true
+aes-gcm.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+konsensus-blvm-payment = { path = "../konsensus-blvm-payment" }
+konsensus-lightning = { path = "../konsensus-lightning" }

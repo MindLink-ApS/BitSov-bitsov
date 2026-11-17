@@ -441,9 +441,10 @@ impl Operation {
     }
     pub(crate) async fn settled_envelope(
         &self,
-        proof: PaymentProof,
+        proof: impl Into<konsensus_core::GatePaymentProof>,
         fee_ceiling_msat: u64,
     ) -> Result<UkmEnvelope, ApiError> {
+        let proof = proof.into();
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
         data.fee_ceiling_msat = fee_ceiling_msat;
@@ -451,16 +452,18 @@ impl Operation {
             .draft
             .clone()
             .ok_or_else(|| storage("missing encrypted draft"))?;
-        if data.expected_msat > 0
-            && (op.payment_hash.as_deref() != Some(hex::encode(proof.payment_hash).as_str())
-                || !data.settlement.as_ref().is_some_and(|p| {
-                    p.status == PaymentStatus::Settled && p.amount_msat == proof.amount_msat
-                }))
-        {
-            return Err(ApiError::PaymentProofUnavailable {
-                amount_msat: data.expected_msat,
-                reason: "settled operation proof identity mismatch".into(),
-            });
+        if let konsensus_core::GatePaymentProof::Lightning(lightning) = &proof {
+            if data.expected_msat > 0
+                && (op.payment_hash.as_deref() != Some(hex::encode(lightning.payment_hash).as_str())
+                    || !data.settlement.as_ref().is_some_and(|p| {
+                        p.status == PaymentStatus::Settled && p.amount_msat == lightning.amount_msat
+                    }))
+            {
+                return Err(ApiError::PaymentProofUnavailable {
+                    amount_msat: data.expected_msat,
+                    reason: "settled operation proof identity mismatch".into(),
+                });
+            }
         }
         env.payment_proof = proof;
         env.signature = konsensus_core::Signature::from_ed25519(
@@ -469,8 +472,15 @@ impl Operation {
         // Save the proof before either messages or pending_deliveries is written.
         data.draft = Some(env.clone());
         data.envelope_ready = true;
-        op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
-        op.settled_msat = i64::try_from(env.payment_proof.amount_msat).map_err(storage)?;
+        let identity = konsensus_storage::paid_identity::paid_identity(&env).map_err(storage)?;
+        op.payment_hash = Some(identity.payment_hash);
+        // Lightning settled the proof amount. A BLVM chat debits the quoted price,
+        // which is smaller than the prepaid session total on the proof.
+        op.settled_msat = if env.payment_proof.as_lightning().is_some() {
+            identity.amount_msat
+        } else {
+            i64::try_from(data.expected_msat).map_err(storage)?
+        };
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await?;
         materialize(&self.state, &mut op, &env).await?;
@@ -832,7 +842,7 @@ pub(crate) async fn restore_outstanding_web_request(
     state
         .storage
         .record_outgoing_web_request(
-            &env.payment_proof.payment_hash,
+            &env.payment_proof.lightning().map_err(storage)?.payment_hash,
             konsensus_core::OutstandingWebRequest {
                 request_id: env.id,
                 peer,
@@ -1299,7 +1309,7 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
                 return Ok(());
             };
             let hash: [u8; 32] = Sha256::digest(preimage).into();
-            env.payment_proof = PaymentProof::new(hash, preimage, details.amount_msat);
+            env.payment_proof = PaymentProof::new(hash, preimage, details.amount_msat).into();
             env.signature = konsensus_core::Signature::from_ed25519(
                 &state.identity.sign(&env.signable_bytes()),
             );
@@ -1706,7 +1716,7 @@ async fn recover_budget(state: &AppState, op: &mut OutboxOperation) -> Result<()
     } else if op.state == "released"
         || (!data.dispatched && !data.admission_pending && !data.envelope_ready)
         || (data.envelope_ready && !data.dispatched && data.expected_msat == 0
-            && data.draft.as_ref().is_some_and(|env| env.payment_proof.amount_msat == 0))
+            && data.draft.as_ref().is_some_and(|env| env.payment_proof.amount_msat() == 0))
     {
         queue_message_resolution(&mut data, 0, Some(0));
     }
@@ -2025,9 +2035,9 @@ mod handover_retry_tests {
         let retry = reencrypt_paid_envelope(&b, &b_identity, &env, b"first user message").await.unwrap();
         assert_eq!(a.decrypt(&bid, &ratchet_message_from_bytes(&retry.ciphertext).unwrap()).await.unwrap(), b"first user message");
         assert_ne!(retry.id, env.id);
-        assert_eq!(retry.payment_proof.payment_hash, env.payment_proof.payment_hash);
-        assert_eq!(retry.payment_proof.preimage, env.payment_proof.preimage);
-        assert_eq!(retry.payment_proof.amount_msat, 10);
+        assert_eq!(retry.payment_proof.lightning().expect("lightning proof").payment_hash, env.payment_proof.lightning().expect("lightning proof").payment_hash);
+        assert_eq!(retry.payment_proof.lightning().expect("lightning proof").preimage, env.payment_proof.lightning().expect("lightning proof").preimage);
+        assert_eq!(retry.payment_proof.amount_msat(), 10);
         assert_eq!(retry.nonce, env.nonce);
         retry.validate().unwrap();
         b_identity.verify(&retry.signable_bytes(), &retry.signature.to_ed25519()).unwrap();

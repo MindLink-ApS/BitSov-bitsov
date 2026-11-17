@@ -297,6 +297,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub payment_gate: PaymentGateConfig,
 
+    /// BLVM chat admission. Off unless the operator sets `enabled`.
+    #[serde(default)]
+    pub blvm: BlvmConfig,
+
     /// Storage backend configuration.
     pub storage: StorageConfig,
 
@@ -1247,6 +1251,77 @@ pub struct PaymentGateConfig {
     pub min_admission_cost_msat: Option<u64>,
 }
 
+/// BLVM chat payments. Default is Lightning-only: the RPC client is not built
+/// and a BLVM proof is `payment_path_not_allowed`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BlvmConfig {
+    /// Master switch. `false` does not construct the node RPC client.
+    pub enabled: bool,
+    /// blvm-node JSON-RPC URL. Required when `enabled` is true.
+    pub rpc_url: String,
+    /// Optional bearer token for the node RPC.
+    pub rpc_token: Option<String>,
+    /// Mesh hop is in use. Path 2 then requires `mesh_ctv`.
+    pub mesh_enabled: bool,
+    /// Operator opted into a blvm-mesh build with the `ctv` feature.
+    /// Path 2 (`InstantSettlement`) is sent only when this is true.
+    pub mesh_ctv: bool,
+    /// `lightning`, `blvm_on_chain_session`, and `blvm_covenant`.
+    /// Lightning chat stays on the Lightning gate. The extra names opt chat into BLVM.
+    pub allowed_paths: Vec<String>,
+}
+
+fn default_blvm_paths() -> Vec<String> {
+    vec!["lightning".into()]
+}
+
+impl Default for BlvmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rpc_url: String::new(),
+            rpc_token: None,
+            mesh_enabled: false,
+            mesh_ctv: false,
+            allowed_paths: default_blvm_paths(),
+        }
+    }
+}
+
+impl BlvmConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.enabled && self.rpc_url.trim().is_empty() {
+            anyhow::bail!("[blvm] enabled requires rpc_url");
+        }
+        let mut covenant = false;
+        for path in &self.allowed_paths {
+            match path.as_str() {
+                "lightning" => {}
+                "blvm_on_chain_session" => {}
+                "blvm_covenant" => covenant = true,
+                other => anyhow::bail!("[blvm] unknown allowed_paths entry {other}"),
+            }
+        }
+        if self.mesh_enabled && covenant && !self.mesh_ctv {
+            anyhow::bail!(
+                "[blvm] path 2 mesh requires mesh_ctv = true; a default blvm-mesh build has no InstantSettlement"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn chat_policy(&self) -> konsensus_core::gate::BlvmChatPolicy {
+        let mut policy = konsensus_core::gate::BlvmChatPolicy::lightning_only().enabled(self.enabled);
+        for name in &self.allowed_paths {
+            if let Some(path) = konsensus_core::gate_payment::PaymentPath::from_config_name(name) {
+                policy = policy.allow_path(path);
+            }
+        }
+        policy
+    }
+}
+
 /// Onboarding channel-open subsidy policy (R1-a). OFF by default — see the doc
 /// on [`NodeConfig::onboarding_subsidy`].
 ///
@@ -1955,6 +2030,7 @@ impl NodeConfig {
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        self.blvm.validate()?;
         // `[network].tier` is what peers see; it must not contradict `tier`.
         let expected_tier = self.tier.to_sovereignty_tier();
         if self.network.tier != expected_tier {
@@ -2456,6 +2532,7 @@ impl NodeConfig {
                 verify_lightning_settlement: Some(verify_lightning_settlement),
                 min_admission_cost_msat: None,
             },
+            blvm: BlvmConfig::default(),
             storage,
             backup: BackupConfig {
                 scb_dir: backup_path.to_string_lossy().into_owned(),
@@ -2771,4 +2848,28 @@ impl SponsorConfig {
 
 fn default_disk_free_floor_bytes() -> u64 {
     2 * 1024 * 1024 * 1024
+}
+
+#[cfg(test)]
+mod blvm_config_tests {
+    use super::BlvmConfig;
+
+    #[test]
+    fn path_2_mesh_without_ctv_refuses_to_start() {
+        let mut cfg = BlvmConfig {
+            mesh_enabled: true,
+            allowed_paths: vec!["lightning".into(), "blvm_covenant".into()],
+            mesh_ctv: false,
+            ..BlvmConfig::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("mesh_ctv"), "{err}");
+        cfg.mesh_ctv = true;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn disabled_blvm_does_not_require_rpc() {
+        BlvmConfig::default().validate().unwrap();
+    }
 }

@@ -47,8 +47,8 @@ async fn bound_invoice_accounting(overpayment: bool) {
     assert_eq!(status, StatusCode::OK, "{body}");
     let id = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
     let envelope = fx.state.storage.get_message(&id).await.unwrap().unwrap();
-    envelope.payment_proof.verify_preimage().unwrap();
-    assert!(callee.has_call_block_invoice(&caller, CALL, 0, &envelope.payment_proof.payment_hash).await.unwrap());
+    envelope.payment_proof.lightning().expect("lightning proof").verify_preimage().unwrap();
+    assert!(callee.has_call_block_invoice(&caller, CALL, 0, &envelope.payment_proof.lightning().expect("lightning proof").payment_hash).await.unwrap());
     let purposes: Vec<_> = transport.raw_frames.lock().unwrap().iter().filter_map(|bytes| {
         match konsensus_message::wire::Frame::from_bytes(bytes).unwrap() {
             konsensus_message::wire::Frame::RequestInvoice { purpose, .. } => Some(purpose),
@@ -66,7 +66,7 @@ async fn bound_invoice_accounting(overpayment: bool) {
     }
     let plaintext = json!({"v": 1, "call_id": CALL, "seq": 0}).to_string();
     let incoming = konsensus_api::calls::prepare_incoming_block(callee.as_ref(), &caller,
-        Some(&plaintext), &envelope.payment_proof.payment_hash).await.unwrap();
+        Some(&plaintext), &envelope.payment_proof.lightning().expect("lightning proof").payment_hash).await.unwrap();
     assert_eq!(incoming.refusal().is_some(), overpayment);
     if overpayment {
         drop(incoming);

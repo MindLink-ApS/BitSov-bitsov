@@ -3521,7 +3521,7 @@ async fn legacy_lost_ack_recovers_after_nonce_expiry_and_sender_restart() {
         reason,
         format!(
             "payment proof already used: {}",
-            hex::encode(env.payment_proof.payment_hash)
+            hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash)
         )
     );
     for case in ["exact", "peer", "id", "sender", "unsent", "hash", "suffix"] {
@@ -6680,7 +6680,7 @@ async fn recovery_reconnect_blocked_offer_does_not_renew_standing() {
     let mut op = konsensus_storage::OutboxOperation::prepared(uuid::Uuid::new_v4().to_string(), peer.to_hex(), 0, "request".into());
     op.state = "paid".into();
     op.message_id = Some(env.id.to_hex());
-    op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
+    op.payment_hash = Some(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash));
     op.settled_msat = 1000;
     op.accounting_pending = false;
     assert!(storage.insert_outbox_operation(&op).await.unwrap());
@@ -7678,7 +7678,7 @@ async fn legacy_unreadable_recovery_fixture(
     let mut op = konsensus_storage::OutboxOperation::prepared(id.clone(), make_peer_id(92).to_hex(), 0, "request".into());
     op.state = "paid".into();
     op.message_id = Some(env.id.to_hex());
-    op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
+    op.payment_hash = Some(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash));
     op.settled_msat = 1000;
     op.accounting_pending = false;
     assert!(storage.insert_outbox_operation(&op).await.unwrap());
@@ -7711,7 +7711,7 @@ async fn legacy_unreadable_paid_rejections_never_terminalize_or_become_compatibi
         assert!(!handle_delivery_confirmation(&peer, &env.id, Some(initial), false, &own,
             &storage, &timestamps, &routing, &ws, &audit, &mut budget, None).await);
         assert_eq!(updates.try_recv().unwrap().status, "rejected");
-        let hash_replay = format!("payment proof already used: {}", hex::encode(env.payment_proof.payment_hash));
+        let hash_replay = format!("payment proof already used: {}", hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash));
         for reason in ["storage error", "message withdrawn", "call signal withdrawn", hash_replay.as_str(),
             "replay detected: nonce already used", "session_handover: retry with new ciphertext", "invalid signature: refused"] {
             legacy_unreadable_recovery_redispatch(storage.as_ref(), &pool, &env).await;
@@ -7726,7 +7726,7 @@ async fn legacy_unreadable_paid_rejections_never_terminalize_or_become_compatibi
             let op = storage.get_outbox_operation(&operation).await.unwrap().unwrap();
             assert_eq!(op.state, "rejected_retryable", "{reason}");
             assert_eq!(op.settled_msat, 1000);
-            assert_eq!(op.payment_hash, Some(hex::encode(env.payment_proof.payment_hash)));
+            assert_eq!(op.payment_hash, Some(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash)));
             assert_eq!(op.message_id, Some(env.id.to_hex()));
             assert_eq!(storage.count_pending_deliveries().await.unwrap(), 1);
             assert_eq!(storage.get_message(&env.id).await.unwrap().unwrap().ciphertext, env.ciphertext);

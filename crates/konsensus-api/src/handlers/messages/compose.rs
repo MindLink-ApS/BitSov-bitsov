@@ -3027,8 +3027,8 @@ async fn first_contact_admission_at(
                     state, peer_id, kind, cap, charge, debit, readmit, reclassify - 1,
                 )).await;
             }
-            report_readmission_settlement(state, peer_id, envelope.payment_proof.amount_msat)?;
-            charge.prior_settled_msat = envelope.payment_proof.amount_msat;
+            report_readmission_settlement(state, peer_id, envelope.payment_proof.amount_msat())?;
+            charge.prior_settled_msat = envelope.payment_proof.amount_msat();
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
             envelope.refresh_for_resend(&state.identity, now)
@@ -4266,6 +4266,7 @@ pub(super) async fn compose_peer(
             req.kind, sender, recipient, ciphertext,
             konsensus_core::PaymentProof::new([0; 32], [0; 32], 0),
         ).references(references).build();
+        let blvm_message_id = draft.id;
         operation.draft(draft, price_msat,
             debit.fee_limit(&state, price_msat).saturating_add(admission.fee_ceiling_msat),
             admission.settled_msat.saturating_sub(admission.readmission_msat),
@@ -4283,6 +4284,54 @@ pub(super) async fn compose_peer(
             }
         }
         admission.current_dispatch = true;
+        let blvm_reservation = if req.kind == konsensus_core::kind::KIND_CHAT && price_msat > 0 {
+            match state.storage.reserve_blvm_outbound_debit(&peer_id, &blvm_message_id, price_msat).await {
+                Ok(reserved) => reserved,
+                Err(konsensus_storage::StorageError::Unsupported(_)) => None,
+                Err(e) => {
+                    return Err(ApiError::PaymentProofUnavailable {
+                        amount_msat: price_msat,
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        let blvm_envelope = if let Some(reservation) = blvm_reservation {
+            let proof = konsensus_core::GatePaymentProof::BlvmOnChainSession {
+                payment_request_id: reservation.payment_request_id,
+                tx_hash: reservation.tx_hash,
+                amount_sats: reservation.amount_sats,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                session_debit_seq: Some(reservation.session_debit_seq),
+            };
+            admission.message_settled = price_msat;
+            match operation.settled_envelope(proof, 0).await {
+                Ok(envelope) => Some(envelope),
+                Err(e) => {
+                    let _ = state.storage.rollback_blvm_outbound_debit(&blvm_message_id).await;
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
+        // An open on-chain session pays this chat. Otherwise the Lightning path below runs.
+        let (envelope, payment_hash, amount_msat, readmission_paid) = if let Some(envelope) = blvm_envelope {
+            let mut hash = [0u8; 32];
+            if let Ok(identity) = konsensus_storage::paid_identity::paid_identity(&envelope) {
+                if let Ok(bytes) = hex::decode(identity.payment_hash) {
+                    if bytes.len() == 32 {
+                        hash.copy_from_slice(&bytes);
+                    }
+                }
+            }
+            (envelope, hash, price_msat, None)
+        } else {
         // Quoted capped re-admission is priced only for single-recipient chat.
         // Other kinds keep Some(0) refuse-before-quote when a cap is present.
         let readmission_cap = if !policy.allow_readmission || req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
@@ -4310,6 +4359,8 @@ pub(super) async fn compose_peer(
                 .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
         }
         let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
+            (envelope, payment_hash, amount_msat, readmission.paid_msat())
+        };
 
         // A paid web request's outstanding-reply row was committed by
         // `settled_envelope` in the same transaction as the envelope, and every
@@ -4380,7 +4431,7 @@ pub(super) async fn compose_peer(
             message_id: envelope.id.to_hex(),
             delivered,
             amount_msat: admission.settled_msat.saturating_sub(admission.readmission_msat) + amount_msat,
-            readmission_msat: readmission.paid_msat(),
+            readmission_msat: readmission_paid,
         }))
         }.await;
         // Told apart here: `admission.error` turns this into the settled class below,

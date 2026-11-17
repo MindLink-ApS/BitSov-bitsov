@@ -833,7 +833,7 @@ async fn recover_paid_missing_envelope_moves_to_payment_unknown() {
     );
     op.state = "paid".into();
     op.message_id = Some(env.id.to_hex());
-    op.payment_hash = Some(hex::encode(env.payment_proof.payment_hash));
+    op.payment_hash = Some(hex::encode(env.payment_proof.lightning().expect("lightning proof").payment_hash));
     op.settled_msat = 1000;
     op.accounting_pending = false;
     op.recovery = serde_json::to_vec(&serde_json::json!({
