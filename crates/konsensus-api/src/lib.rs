@@ -67,6 +67,7 @@ pub mod auth_challenge;
 pub mod bootstrap;
 pub mod call_media;
 pub mod calls;
+pub mod compound_readiness;
 pub mod control;
 pub mod custody;
 pub mod error;
