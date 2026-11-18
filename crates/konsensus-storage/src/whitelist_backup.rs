@@ -49,9 +49,8 @@ pub struct WhitelistBackup {
 impl WhitelistBackup {
     /// Collect the current whitelist state from storage.
     ///
-    /// Accepted invites are best-effort: a backend that does not implement the
-    /// table yields an empty list rather than failing the whole backup (the
-    /// `peers` rows are the load-bearing whitelist authority).
+    /// Both peer and accepted-invite reads must complete successfully before
+    /// a replacement backup can be produced.
     pub async fn collect(storage: &dyn Storage, now_unix: u64) -> Result<Self, StorageError> {
         let peers = storage.list_peers_with_diagnostics().await?;
         // A partial UI list is useful; a partial replacement backup is data loss.
@@ -62,8 +61,7 @@ impl WhitelistBackup {
         }
         let accepted_invites = storage
             .list_active_accepted_invites(now_unix)
-            .await
-            .unwrap_or_default();
+            .await?;
         Ok(Self {
             version: BACKUP_VERSION,
             peers: peers.items,
