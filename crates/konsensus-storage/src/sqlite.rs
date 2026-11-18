@@ -4005,6 +4005,10 @@ mod tests;
 mod schema_parity_tests;
 
 #[cfg(test)]
+#[path = "tests/migration_matrix.rs"]
+mod migration_matrix_tests;
+
+#[cfg(test)]
 mod dbh2_guard {
     /// DBH2: the sibling authority-listing queries that DBH1 missed
     /// (`list_sessions`, `get_pending_peers`, `get_room_members`) must never
