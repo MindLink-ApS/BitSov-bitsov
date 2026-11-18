@@ -614,8 +614,6 @@ struct Net {
     persistent: bool,
     deliveries: Deliveries,
     sent: Vec<Sent>,
-    /// Unordered pair -> how many times a connection was established.
-    epochs: HashMap<(usize, usize), u32>,
     /// Current intended topology (edges that should be up).
     edges: HashSet<(usize, usize)>,
     /// The one node that may pay `r`'s admission in this process (see
@@ -697,6 +695,105 @@ fn delivery_violations(sent: &[Sent], deliveries: &[Delivery], ids: &[NodeId]) -
     (v, failed_but_delivered)
 }
 
+/// One settled ledger payment between two sim nodes.
+#[derive(Clone, Debug)]
+struct Payment {
+    payer: usize,
+    payee: usize,
+    amount: u64,
+    hash: String,
+}
+
+/// I4 per (payer, payee): every settled payment is explained exactly by what
+/// a compose reported. Compose reports `amount_msat` (its message payment
+/// plus any first-contact admission) and `readmission_msat`; its message
+/// payment is the ledger row with the `payment_hash` it reported. What it
+/// reported beyond that payment is an admission or re-admission, and consumes
+/// settled payments of exactly that amount; reported money that never settled
+/// is a violation, and so is every payment left over. No connection-epoch or
+/// other blanket allowance: this in-process sim has no compose cut by a
+/// restart (restarts run between steps), so every outcome is known, and a
+/// hung compose (already I5) explains nothing either. Returns the violations,
+/// the unexplained msat, and how many message payments were found by hash.
+fn money_violations(sent: &[Sent], payments: &[Payment]) -> (Vec<String>, u64, usize) {
+    type PairLedger<'a> = (Vec<&'a Sent>, Vec<&'a Payment>);
+    let mut v = Vec::new();
+    let mut unexplained = 0u64;
+    let mut by_hash = 0usize;
+    let mut pairs: BTreeMap<(usize, usize), PairLedger<'_>> = BTreeMap::new();
+    for s in sent {
+        pairs.entry((s.from, s.to)).or_default().0.push(s);
+    }
+    for p in payments {
+        pairs.entry((p.payer, p.payee)).or_default().1.push(p);
+    }
+    for (&(p, r), (sends, rows)) in &pairs {
+        let total: u64 = rows.iter().map(|x| x.amount).sum();
+        if sends.is_empty() {
+            unexplained += total;
+            v.push(format!("I4 n{p} paid n{r} {}x/{total} msat but never sent to it", rows.len()));
+            continue;
+        }
+        let cap = sends.len() as u64 * MAX_TOTAL_MSAT;
+        if total > cap {
+            v.push(format!("I4 over cap n{p}->n{r}: ledger {} payments/{total} msat > {} compose(s) x max_total_msat = {cap}", rows.len(), sends.len()));
+        }
+        let mut left: Vec<&Payment> = rows.clone();
+        let mut admissions: Vec<(&Sent, u64)> = Vec::new();
+        for s in sends {
+            let reported = s.reported_msat();
+            if reported > MAX_TOTAL_MSAT {
+                v.push(format!("I4 cap: step {} n{p}->n{r} reported {reported} msat over its max_total_msat {MAX_TOTAL_MSAT}", s.step));
+            }
+            let message = s.body["payment_hash"]
+                .as_str()
+                .and_then(|h| left.iter().position(|x| x.hash == h))
+                .map_or(0, |i| {
+                    by_hash += 1;
+                    left.swap_remove(i).amount
+                });
+            match reported.checked_sub(message) {
+                Some(0) => {}
+                Some(admission) => admissions.push((s, admission)),
+                None => v.push(format!(
+                    "I4 under-reported: step {} n{p}->n{r} op {} reported {reported} msat, its message payment settled {message}",
+                    s.step, s.operation_id
+                )),
+            }
+        }
+        left.sort_by_key(|x| std::cmp::Reverse(x.amount));
+        for (s, want) in admissions {
+            let mut need = want;
+            let mut i = 0;
+            while need > 0 && i < left.len() {
+                if left[i].amount <= need {
+                    need -= left.remove(i).amount;
+                } else {
+                    i += 1;
+                }
+            }
+            if need > 0 {
+                v.push(format!(
+                    "I4 unsettled: step {} n{p}->n{r} op {} reported {want} msat of admission/re-admission, {need} msat of it has no settled payment",
+                    s.step, s.operation_id
+                ));
+            }
+        }
+        if !left.is_empty() {
+            let extra: u64 = left.iter().map(|x| x.amount).sum();
+            unexplained += extra;
+            v.push(format!(
+                "I4 unexplained n{p}->n{r}: {} payment(s)/{extra} msat match no reported message, admission or re-admission (hashes {:?}; {} sends, {} ok)",
+                left.len(),
+                left.iter().map(|x| x.hash.chars().take(16).collect::<String>()).collect::<Vec<_>>(),
+                sends.len(),
+                sends.iter().filter(|s| s.ok()).count()
+            ));
+        }
+    }
+    (v, unexplained, by_hash)
+}
+
 impl Net {
     async fn start(cfg: SimConfig, persistent: bool) -> Self {
         quiet_logs();
@@ -747,7 +844,6 @@ impl Net {
             persistent,
             deliveries,
             sent: Vec::new(),
-            epochs: HashMap::new(),
             edges: HashSet::new(),
             violations: Vec::new(),
             notes: Vec::new(),
@@ -799,7 +895,6 @@ impl Net {
         }
         let ok = wait_for(Duration::from_secs(5), || self.connected(a, b)).await;
         if ok {
-            *self.epochs.entry(edge(a, b)).or_default() += 1;
             self.edges.insert(edge(a, b));
         } else {
             self.notes.push(format!("dial n{a}->n{b}: both sides never saw the connection"));
@@ -970,6 +1065,21 @@ impl Net {
             .unwrap()
     }
 
+    /// Settled payments between sim nodes, with their payment hashes.
+    fn ledger_payments(&self) -> Vec<Payment> {
+        let db = rusqlite::Connection::open(self.ledger()).unwrap();
+        let mut stmt = db.prepare("SELECT payer, recipient, amount, hash FROM invoices WHERE payer IS NOT NULL").unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as u64, r.get::<_, String>(3)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let idx = |name: &str| name.strip_prefix('n').and_then(|x| x.parse().ok());
+        rows.into_iter()
+            .filter_map(|(payer, payee, amount, hash)| Some(Payment { payer: idx(&payer)?, payee: idx(&payee)?, amount, hash }))
+            .collect()
+    }
+
     fn balances(&self) -> BTreeMap<String, i64> {
         let db = rusqlite::Connection::open(self.ledger()).unwrap();
         let mut stmt = db.prepare("SELECT owner, balance FROM accounts").unwrap();
@@ -992,10 +1102,9 @@ impl Net {
         }
 
         // I4: money. Balances are conserved; every settled payment between two
-        // sim nodes is explained by a send between them: at most the reported
-        // amounts plus one admission per connection epoch (both directions),
-        // and never more than the sum of those composes' all-in caps (the
-        // admission is inside each cap).
+        // sim nodes maps exactly to a message, admission or re-admission a
+        // send between them reported (`money_violations`), and never more
+        // than the sum of those composes' all-in caps.
         let balances = self.balances();
         let total: i64 = balances.values().sum();
         let expected = (self.cfg.nodes as i64) * START_BALANCE_MSAT as i64;
@@ -1007,41 +1116,15 @@ impl Net {
                 v.push(format!("I4 negative balance {owner}={bal}"));
             }
         }
+        let payments = self.ledger_payments();
         let mut paid: HashMap<(usize, usize), (u64, u64)> = HashMap::new();
-        for (payer, recipient, amount, _memo) in self.ledger_rows() {
-            let (Some(p), Some(r)) = (payer.strip_prefix('n').and_then(|x| x.parse().ok()), recipient.strip_prefix('n').and_then(|x| x.parse().ok())) else { continue };
-            let e = paid.entry((p, r)).or_default();
+        for x in &payments {
+            let e = paid.entry((x.payer, x.payee)).or_default();
             e.0 += 1;
-            e.1 += amount;
+            e.1 += x.amount;
         }
-        let mut reported: HashMap<(usize, usize), (u64, u64)> = HashMap::new();
-        for s in &self.sent {
-            if s.reported_msat() > MAX_TOTAL_MSAT {
-                v.push(format!("I4 cap: step {} n{}->n{} reported {} msat over its max_total_msat {MAX_TOTAL_MSAT}", s.step, s.from, s.to, s.reported_msat()));
-            }
-            let e = reported.entry((s.from, s.to)).or_default();
-            e.0 += 1;
-            e.1 += s.reported_msat();
-        }
-        let mut unexplained = 0u64;
-        for (&(p, r), &(count, msat)) in &paid {
-            let sends = reported.get(&(p, r)).copied().unwrap_or((0, 0));
-            let epochs = u64::from(self.epochs.get(&edge(p, r)).copied().unwrap_or(0)).max(1);
-            let cap = sends.0 * MAX_TOTAL_MSAT;
-            let allowance = (sends.1 + epochs * CHAT_MSAT).min(cap);
-            if sends.0 == 0 {
-                v.push(format!("I4 n{p} paid n{r} {count}x/{msat} msat but never sent to it"));
-            } else if msat > cap {
-                unexplained += msat - allowance;
-                v.push(format!("I4 over cap n{p}->n{r}: ledger {count} payments/{msat} msat > {} compose(s) x max_total_msat = {cap}", sends.0));
-            } else if msat > allowance {
-                unexplained += msat - allowance;
-                v.push(format!(
-                    "I4 overcharge n{p}->n{r}: ledger {count} payments/{msat} msat > reported {} msat + {epochs} admission(s) ({} sends, {} ok)",
-                    sends.1, sends.0, self.sent.iter().filter(|s| s.from == p && s.to == r && s.ok()).count()
-                ));
-            }
-        }
+        let (money, unexplained, by_hash) = money_violations(&self.sent, &payments);
+        v.extend(money);
 
         // I5: no compose hangs; outbox operations of finished sends are terminal.
         let hung: Vec<_> = self.sent.iter().filter(|s| s.status.is_none()).collect();
@@ -1097,7 +1180,7 @@ impl Net {
         }
         let paid_total: u64 = paid.values().map(|x| x.1).sum();
         println!(
-            "sim: report seed={} nodes={} sends={} ok={} failed_but_delivered={failed_but_delivered} payments={} msat_paid={paid_total} unexplained_msat={unexplained} stuck_ops={stuck} runtime={:.1}s",
+            "sim: report seed={} nodes={} sends={} ok={} failed_but_delivered={failed_but_delivered} payments={} msat_paid={paid_total} message_payments_by_hash={by_hash} unexplained_msat={unexplained} stuck_ops={stuck} runtime={:.1}s",
             self.cfg.seed, self.cfg.nodes, self.sent.len(), ok, paid.values().map(|x| x.0).sum::<u64>(), self.started.elapsed().as_secs_f64()
         );
         println!("sim: outcomes {statuses:?}");
@@ -1873,6 +1956,60 @@ fn sim_delivery_oracle_checks_every_observed_delivery() {
     for (name, observed) in cases {
         let (v, _) = delivery_violations(&sent, &observed, &ids);
         assert!(!v.is_empty(), "{name}: the oracle accepted {observed:?}");
+    }
+}
+
+/// The money oracle itself: every admission payment maps to an admission or
+/// re-admission a compose reported, exactly; an extra one is a violation.
+#[test]
+fn sim_money_oracle_accounts_for_every_admission_payment() {
+    let send = |from: usize, to: usize, amount: u64, readmission: Option<u64>, hash: &str| Sent {
+        step: 0,
+        from,
+        to,
+        text: format!("sim:7:0:{hash}"),
+        operation_id: format!("op-{hash}"),
+        status: Some(200),
+        body: serde_json::json!({"accepted": true, "delivered": true, "state": "acked",
+            "amount_msat": amount, "readmission_msat": readmission, "payment_hash": hash}),
+    };
+    let pay = |payer: usize, payee: usize, amount: u64, hash: &str| Payment { payer, payee, amount, hash: hash.into() };
+    // First contact (admission + message), then a plain send, then a send
+    // after a reconnect (re-admission reported separately).
+    let sent = vec![
+        send(0, 1, 2 * CHAT_MSAT, None, "m1"),
+        send(0, 1, CHAT_MSAT, None, "m2"),
+        send(0, 1, CHAT_MSAT, Some(CHAT_MSAT), "m3"),
+    ];
+    let good = vec![
+        pay(0, 1, CHAT_MSAT, "adm1"),
+        pay(0, 1, CHAT_MSAT, "m1"),
+        pay(0, 1, CHAT_MSAT, "m2"),
+        pay(0, 1, CHAT_MSAT, "readm1"),
+        pay(0, 1, CHAT_MSAT, "m3"),
+    ];
+    let (v, unexplained, by_hash) = money_violations(&sent, &good);
+    assert_eq!((v, unexplained, by_hash), (Vec::<String>::new(), 0, 3));
+
+    let cases: Vec<(&str, Vec<Sent>, Vec<Payment>)> = vec![
+        ("extra admission-sized payment", sent.clone(), [good.clone(), vec![pay(0, 1, CHAT_MSAT, "extra")]].concat()),
+        ("message paid twice", sent.clone(), [good.clone(), vec![pay(0, 1, CHAT_MSAT, "m2-again")]].concat()),
+        ("reported admission never settled", sent.clone(), good.iter().filter(|p| p.hash != "adm1").cloned().collect()),
+        ("payment with no send", sent.clone(), [good.clone(), vec![pay(1, 0, CHAT_MSAT, "back")]].concat()),
+        (
+            "a failed compose that paid but reported nothing",
+            [sent.clone(), vec![Sent { status: Some(502), body: serde_json::json!({"accepted": false, "code": 502}), ..send(0, 1, 0, None, "m4") }]].concat(),
+            [good.clone(), vec![pay(0, 1, CHAT_MSAT, "adm-of-failed")]].concat(),
+        ),
+        (
+            "a hung compose explains nothing",
+            [sent.clone(), vec![Sent { status: None, body: serde_json::Value::Null, ..send(0, 1, 0, None, "m5") }]].concat(),
+            [good.clone(), vec![pay(0, 1, CHAT_MSAT, "m5")]].concat(),
+        ),
+    ];
+    for (name, sent, payments) in cases {
+        let (v, _, _) = money_violations(&sent, &payments);
+        assert!(!v.is_empty(), "{name}: the money oracle accepted {payments:?}");
     }
 }
 
