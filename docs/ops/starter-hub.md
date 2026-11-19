@@ -78,7 +78,7 @@ Starter tables retain the LN key for uniqueness and recovery, but no IP/socket a
 
 Set `enabled = false` and restart to stop the worker and capability advertisement. Existing channels remain intact. The Admin charged-resolution endpoint remains available for previously created uncertain grants.
 
-PR-2 implements C3 with durable negotiated initial-push evidence and F4 with bounded, persisted retry successors. Timeouts reuse the same UUID; only an explicit retryable refusal permits a successor UUID. See [newcomer operations](starter-newcomer.md) for bounds, backoff and status. Mainnet still requires an explicit policy decision and idle reclaim.
+PR-2 implements durable negotiated initial-push evidence and bounded, persisted retry successors. Timeouts reuse the same UUID; only an explicit retryable refusal permits a successor UUID. See [newcomer operations](starter-newcomer.md) for bounds, backoff and status. Mainnet still requires an explicit policy decision and idle reclaim.
 
 ## Confirmation policy and before-mainnet checklist
 

@@ -5,7 +5,7 @@ PR #78 (`factory/data-staleness-headers`). The authoritative description of
 the shipped behaviour is [`../API_DATA_FRESHNESS.md`](../API_DATA_FRESHNESS.md);
 this file records the problem, the original proposal and where the build
 deliberately differs.
-**Raised by:** bitsov-app F4 broker staleness (app PR #36). App side:
+**Raised by:** bitsov-app broker staleness (app PR #36). App side:
 `src-tauri/src/jarvis/broker/freshness.rs`, `docs/ASSISTANT_LOCAL_BROKER.md`
 § Freshness.
 **App pin at time of writing:** `v0.3.0-rc7` (`958e399`). No tag or pin bump
@@ -49,10 +49,10 @@ BitSov-Data-Stale: 1                      (optional; present only when the node 
 
 ### Deliberate deviation from the original proposal
 
-The first draft of this spec (written app-side during F4) proposed
+The first draft of this spec (written app-side) proposed
 `BitSov-Data-As-Of: <u64 ms since Unix epoch>`, ASCII digits only. The node
-**deliberately** sends RFC 3339 UTC whole seconds instead, as the genome
-ticket required: it is self-describing on the wire and in logs, unambiguous
+**deliberately** sends RFC 3339 UTC whole seconds instead: it is
+self-describing on the wire and in logs, unambiguous
 about the unit and zone, and sub-second precision carries no meaning for data
 whose freshness bounds are 60 s to 10 min. Consequence for the app: its parser
 must accept RFC 3339 (primary); accepting digit ms as well is harmless

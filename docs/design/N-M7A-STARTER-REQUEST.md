@@ -1,10 +1,10 @@
-# N-M7a — Newcomer starter-channel request + status API (Option A, signet)
+# N-M7a — Newcomer starter-channel request + status API (signet)
 
 Original design baseline. Source read at `origin/main` `e8ed587` (v0.3.0-rc19 prep). Paths are under `crates/` unless stated. The implementation amendments below supersede the original proposal where noted.
 
 **Goal (M7).** A brand-new user gets a hub-funded starter channel from inside the app, with no command line, so two users on their own nodes can message, call and pay each other from iPhone and Mac.
 
-**Scope.** One owner-requested starter channel per node, funded by the hub from its own wallet under Option A / T4a (`docs/DESIGN-REASONING.md` T4a). Signet only, invite-only. Implementable in two PRs (§11).
+**Scope.** One owner-requested starter channel per node, funded by the hub from its own wallet under T4a (`docs/DESIGN-REASONING.md` T4a). Signet only, invite-only. Implementable in two PRs (§11).
 
 **Decided (21 Oct):** invite-only admission for v1 (no open mode); `receive` scope + verified paired session, no Admin; signet caps 20 opens/day, 2,000,000 sats lifetime, 2,000-sat funding-fee cap; ship without idle reclaim on signet (reclaim is required before mainnet); the hub logs node id and amount only, and retains no IP address or LN alias.
 
@@ -28,7 +28,7 @@ Original design baseline. Source read at `origin/main` `e8ed587` (v0.3.0-rc19 pr
 | **Hub node** | The dedicated non-lockable MindLink signet hub (T4a) | Checks the invite and caps, opens a private 0-conf channel to the newcomer with a fixed push from its **own** wallet, reports status | Lends, records a balance owed, issues ecash, or opens without a persisted admitted request |
 | **App** | Paired Mac / iPhone app | Generates a UUIDv4 `request_id` once, POSTs, polls GET, shows 4 states | Holds Admin or Spend for this flow |
 
-Preconditions on the newcomer (written by the app's config template, Option A A1; checked at request time):
+Preconditions on the newcomer (written by the app's config template; checked at request time):
 an LDK backend; `[lightning.liquidity] enabled = true`, `selected_provider = <hub LN pubkey>` with `trust_no_reserve = true` (N1, #326); the hub in `[[peers]]` (so it is whitelisted and dialled); and `[starter] enabled = true, hub_node_id = <hub mesh id>`.
 
 Precondition on the hub: a pending, unexpired invite bound to the newcomer's node id, issued by the hub operator with the existing Admin `POST /api/v1/invites` (`invites.rs:279`). Issuing it whitelists the invitee atomically (`invites.rs:416-434`). This is an operator step on the hub, never in the app.
@@ -311,7 +311,7 @@ Verification runs before the owner can have spent anything from the channel, and
 | Layer | Rule |
 |---|---|
 | Startup, both roles | `[starter] enabled` or `[starter_hub] enabled` requires an LDK backend with `bitcoin_network()` ∈ {`signet`, `regtest`} (`konsensus-node/src/config.rs:820`). Anything else (mainnet, testnet, or a backend that states no network) is a startup config error, `starter_network_not_allowed` |
-| Mainnet flag | `allow_mainnet` exists in both sections and defaults to `false`. `true` is **rejected at startup** in this release with `starter_mainnet_not_approved`. Lifting it is a code change after the owner says GO, and it also requires idle reclaim (Option A H3) to exist |
+| Mainnet flag | `allow_mainnet` exists in both sections and defaults to `false`. `true` is **rejected at startup** in this release with `starter_mainnet_not_approved`. Lifting it is a code change after the owner says GO, and it also requires idle reclaim to exist |
 | Newcomer POST | Re-checks the network → `not_dispatched / network_not_allowed` |
 | Hub, per request | `request.network` must equal the hub's network; checked again immediately before `open_channel_with_funding` |
 | Regtest | Allowed only so the E2E fixtures can run; documented as test-only |
@@ -384,7 +384,7 @@ Metrics (hub, no peer-identifying labels): `konsensus_starter_requests_total{res
 
 **Order.** Merge PR-1 → enable on the signet hub only → issue invites to the two north-star nodes → merge PR-2 → enable `[starter]` on those nodes → the app ships the button against `starter_channel_request_v1`. Rollback is `enabled = false`; existing channels are unaffected.
 
-Out of scope: idle reclaim (Option A H3; not needed on signet, **required before mainnet**), the invite issuance service (H5), mainnet sizes, app UI, the ONB5 fix (#349).
+Out of scope: idle reclaim (not needed on signet, **required before mainnet**), the invite issuance service, mainnet sizes, app UI, the ONB5 fix (#349).
 
 ## 12. Decision log
 
@@ -395,15 +395,15 @@ Out of scope: idle reclaim (Option A H3; not needed on signet, **required before
 
 No open questions remain for signet. Mainnet stays behind (c) and (d), and the 20-per-day cap is re-checked at the mainnet GO.
 
-### PR-2 implementation follow-ups: C3 and F4
+### PR-2 implementation follow-ups: channel evidence and retries
 
-C3 replaces the §7 current-balance heuristic with durable negotiated
+Channel verification replaces the §7 current-balance heuristic with durable negotiated
 `initial_push_msat` in LDK channel persistence. The newcomer verifies that value
 and local channel readiness; ordinary spending cannot erase the proof. Old
 channel records with no evidence fail closed. This is an optional LDK TLV
 extension, not a SQL migration.
 
-F4 keeps timeout retransmissions on the same UUID. To bound delivery work, there
+The retry policy keeps timeout retransmissions on the same UUID. To bound delivery work, there
 are eight sends per mesh connection with §3's capped backoff; reconnect or an
 explicit POST replay rearms the same operation. Local reconciliation never stops
 on timeout. Retryable terminal hub refusals can create at most three successor
