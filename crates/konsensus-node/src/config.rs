@@ -223,6 +223,18 @@ pub struct PairingConfig {
     /// See `docs/operations/password-input.md`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub unattended_device_approvals: bool,
+    /// Standing allowances. The owner may attach an allowance to a pairing
+    /// ticket (`konsensus pair-ticket --allow`): a daily cap counted over any
+    /// rolling 24 hours, a per-call cap and an end date. Inside it, the node
+    /// opens the paired app's spend windows by itself; anything outside it
+    /// still needs the owner. Only owner channels write an allowance, never
+    /// the app. Off by default; only the value `true` turns it on, and any
+    /// other value leaves it off.
+    #[serde(
+        deserialize_with = "deserialize_off_unless_true",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub standing_allowance_v1: bool,
 }
 impl Default for PairingConfig {
     fn default() -> Self {
@@ -230,8 +242,27 @@ impl Default for PairingConfig {
             second_device_enrollment: false,
             second_device_claim_v1: true,
             unattended_device_approvals: false,
+            standing_allowance_v1: false,
         }
     }
+}
+
+/// A switch that fails closed: a literal `true` turns it on; `false` or any
+/// other value (a string, a number, a table) leaves it off.
+fn deserialize_off_unless_true<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Switch {
+        Set(bool),
+        Invalid(serde::de::IgnoredAny),
+    }
+    Ok(match Switch::deserialize(deserializer)? {
+        Switch::Set(on) => on,
+        Switch::Invalid(_) => {
+            tracing::warn!("pairing.standing_allowance_v1 is neither true nor false; it stays off");
+            false
+        }
+    })
 }
 
 /// Top-level node configuration, matching `konsensus.toml`.

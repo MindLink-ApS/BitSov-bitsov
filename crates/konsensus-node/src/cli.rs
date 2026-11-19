@@ -40,8 +40,22 @@ pub enum Command {
         #[arg(long)]
         qr: bool,
         /// Ticket lifetime: positive seconds, minutes, hours or days (s/m/h/d).
-        #[arg(long, default_value = "24h", default_value_if("second_device", "true", "10m"), value_parser = crate::ticket_cmd::parse_ttl)]
+        /// With --allow: 15m by default and at most 1h.
+        #[arg(long, default_value = "24h", default_value_if("second_device", "true", "10m"), default_value_if("allow", clap::builder::ArgPredicate::IsPresent, "15m"), value_parser = crate::ticket_cmd::parse_ttl)]
         ttl: std::time::Duration,
+        /// Attach a standing allowance to the pairing this ticket creates:
+        /// the most its app may spend in any 24 hours, in sats (2500 if no
+        /// value is given). Needs `[pairing] standing_allowance_v1 = true`
+        /// and a node started with its owner control socket.
+        #[arg(long, num_args = 0..=1, default_missing_value = "2500", conflicts_with_all = ["second_device", "legacy"], value_parser = clap::value_parser!(u64).range(1..))]
+        allow: Option<u64>,
+        /// With --allow: the most one call may reserve, in sats (700, or the
+        /// daily cap if lower, if not given).
+        #[arg(long = "per-call", requires = "allow", value_parser = clap::value_parser!(u64).range(1..))]
+        per_call: Option<u64>,
+        /// With --allow: how many days the allowance lasts (30 if not given).
+        #[arg(long, requires = "allow", value_parser = clap::value_parser!(u32).range(1..=365))]
+        days: Option<u32>,
     },
     /// Reject a v2 enrollment and remove its provisional pairing.
     PairCancel {
@@ -1050,7 +1064,34 @@ mod second_device_console_tests {
                 "{args:?}"
             );
         }
+        // A standing allowance on a ticket: defaults, and a short ticket.
+        let Command::PairTicket { ttl, allow, per_call, days, .. } =
+            Cli::try_parse_from(["konsensus", "pair-ticket", "--allow"]).unwrap().command
+        else {
+            panic!("ticket");
+        };
+        assert_eq!((ttl.as_secs(), allow, per_call, days), (900, Some(2500), None, None));
+        let Command::PairTicket { ttl, allow, per_call, days, .. } = Cli::try_parse_from([
+            "konsensus", "pair-ticket", "--allow", "1000", "--per-call", "300", "--days", "7", "--ttl", "1h",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("ticket");
+        };
+        assert_eq!((ttl.as_secs(), allow, per_call, days), (3600, Some(1000), Some(300), Some(7)));
+        let Command::PairTicket { allow, .. } = Cli::try_parse_from(["konsensus", "pair-ticket"]).unwrap().command else {
+            panic!("ticket");
+        };
+        assert_eq!(allow, None);
         for args in [
+            vec!["pair-ticket", "--per-call", "300"],
+            vec!["pair-ticket", "--days", "7"],
+            vec!["pair-ticket", "--allow", "0"],
+            vec!["pair-ticket", "--allow", "--days", "0"],
+            vec!["pair-ticket", "--allow", "--days", "366"],
+            vec!["pair-ticket", "--allow", "--second-device"],
+            vec!["pair-ticket", "--allow", "--legacy"],
             vec!["pair-ticket", "--second-device", "--legacy"],
             vec!["device", "revoke"],
             vec!["device", "revoke", "--key", "a", "--approved-by", "b"],

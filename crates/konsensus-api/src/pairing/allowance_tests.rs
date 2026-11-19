@@ -1,0 +1,635 @@
+//! Standing allowance cases. Every fixture runs with the switch off as well
+//! as on: off must be exactly today's behaviour.
+use super::allowance::*;
+use super::*;
+
+const DAILY: u64 = 2_500_000;
+const PER_CALL: u64 = 700_000;
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn terms() -> AllowanceTerms {
+    AllowanceTerms::owner_defaults(now())
+}
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    svc: PairingService,
+    client: String,
+}
+
+/// A node (owner-run or not, switch on or off) with one app paired through a
+/// ticket that carries `ticket_terms`.
+fn fixture(owner_control: bool, switch: bool, ticket_terms: Option<AllowanceTerms>) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = PairingService::open(dir.path(), "identity".into(), owner_control)
+        .unwrap()
+        .with_standing_allowance(switch);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+    let client = svc
+        .create_ticket_remote_pairing_with_allowance(
+            "app",
+            &hex::encode(key.verifying_key().to_bytes()),
+            &[22; 32],
+            "ticket-code",
+            ticket_terms.as_ref(),
+        )
+        .unwrap()
+        .client_id;
+    Fixture { _dir: dir, svc, client }
+}
+
+fn reopen(f: Fixture, owner_control: bool, switch: bool) -> Fixture {
+    let Fixture { _dir, svc, client } = f;
+    drop(svc);
+    let svc = PairingService::open(_dir.path(), "identity".into(), owner_control)
+        .unwrap()
+        .with_standing_allowance(switch);
+    Fixture { _dir, svc, client }
+}
+
+fn proposal(budget_msat: u64, per_call_msat: u64) -> GrantTerms {
+    GrantTerms::new(budget_msat).per_call(per_call_msat).for_secs(MAX_SPEND_GRANT_TTL_SECS)
+}
+
+/// What a request led to.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    /// The node opened a window from the allowance, and the app reads it as granted.
+    Window,
+    /// A pending request for the owner, as today.
+    Owner,
+}
+
+fn ask(f: &Fixture, terms: GrantTerms) -> Result<(String, Outcome), PairingError> {
+    let op = f
+        .svc
+        .create_budget_elevation_request(&f.client, vec![Scope::Spend], Some(terms))?;
+    let status = f.svc.elevation_status(&f.client, &op.op_id)?;
+    let window = allowance_grants(f).iter().any(|g| g.op_id == op.op_id);
+    let pending = f.svc.snapshot().pending_elevations.iter().any(|e| e.op_id == op.op_id);
+    let outcome = match (window, pending) {
+        (true, false) => {
+            assert_eq!(status, ElevationStatus::Granted, "an opened window reads as granted");
+            Outcome::Window
+        }
+        (false, true) => Outcome::Owner,
+        other => panic!("request {} ended as {other:?}", op.op_id),
+    };
+    Ok((op.op_id, outcome))
+}
+
+fn allowance_grants(f: &Fixture) -> Vec<SpendGrant> {
+    f.svc
+        .lock()
+        .file
+        .grants
+        .iter()
+        .filter(|g| g.granted_by == ALLOWANCE_GRANTED_BY && g.budget.is_some())
+        .cloned()
+        .collect()
+}
+
+fn spend_scope(f: &Fixture) -> bool {
+    let inner = f.svc.lock();
+    let record = inner.file.clients.iter().find(|c| c.client_id == f.client).unwrap().clone();
+    f.svc.effective_scopes(&inner, &record, now()).contains(&Scope::Spend)
+}
+
+/// Reserve a call hold of `minutes * 2,500 msat` under the live window.
+fn hold(f: &Fixture, call: &str, minutes: u16) -> u64 {
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, call, 2_000, 500, minutes).unwrap();
+    let reserved = terms.reserved_msat;
+    f.svc.reserve_call_spend(&f.client, 1, terms, u64::MAX / 4).unwrap();
+    reserved
+}
+
+fn ledger(f: &Fixture) -> StandingAllowance {
+    f.svc.lock().file.allowances.get(&f.client).cloned().unwrap()
+}
+
+// ── N2-T1 / P08: only an owner channel writes an allowance ───────────────
+
+#[test]
+fn ticket_terms_become_an_owner_allowance_with_provenance() {
+    let f = fixture(true, true, Some(terms()));
+    let view = f.svc.allowance_view(&f.client).expect("the ticket's terms are on the pairing");
+    assert_eq!((view.daily_msat, view.per_call_max_msat, view.set_by.as_str()), (DAILY, PER_CALL, SET_BY_CLI));
+    assert!(view.until > now() + 29 * 86_400 && view.until <= now() + 30 * 86_400);
+    let stored = ledger(&f);
+    let receipt = stored.receipt.expect("a ticket allowance keeps a receipt");
+    assert_eq!(receipt, format!("ticket:{}", ticket_hash("ticket-code")));
+    assert!(!serde_json::to_string(&f.svc.reload_from_disk().unwrap()).unwrap().contains("ticket-code"));
+}
+
+#[test]
+fn a_client_cannot_set_or_raise_an_allowance() {
+    // No ticket terms: the first paired app gets nothing for arriving first.
+    let f = fixture(true, true, None);
+    assert!(f.svc.allowance_view(&f.client).is_none());
+    let (op, outcome) = ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+    assert_eq!(outcome, Outcome::Owner);
+    assert_eq!(f.svc.elevation_status(&f.client, &op).unwrap(), ElevationStatus::Pending);
+    assert!(allowance_grants(&f).is_empty());
+
+    // The request body cannot carry allowance fields of any shape.
+    for extra in [
+        r#""allowance":{"daily_msat":1}"#,
+        r#""standing_allowance":true"#,
+        r#""set_by":"cli""#,
+        r#""daily_msat":99999999"#,
+        r#""until":9999999999"#,
+    ] {
+        let body = format!(r#"{{"scopes":["spend"],"budget":{{"budget_msat":1000}},{extra}}}"#);
+        assert!(serde_json::from_str::<crate::handlers::pairing_routes::ElevationRequestBody>(&body).is_err(), "{extra}");
+        let nested = format!(r#"{{"scopes":["spend"],"budget":{{"budget_msat":1000,{extra}}}}}"#);
+        assert!(serde_json::from_str::<crate::handlers::pairing_routes::ElevationRequestBody>(&nested).is_err(), "{extra}");
+    }
+
+    // With an allowance, no number of requests changes its terms.
+    let f = fixture(true, true, Some(terms()));
+    let before = f.svc.allowance_view(&f.client).unwrap();
+    for budget in [1, DAILY, DAILY + 1, u64::MAX / 2] {
+        let _ = ask(&f, proposal(budget, 1.max(budget.min(PER_CALL))));
+    }
+    let after = f.svc.allowance_view(&f.client).unwrap();
+    assert_eq!((after.daily_msat, after.per_call_max_msat, after.until), (before.daily_msat, before.per_call_max_msat, before.until));
+}
+
+// ── N2-T4 / P08: a ticket's terms are bound node-side, used once ────────
+
+#[test]
+fn replayed_expired_or_foreign_ticket_terms_give_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = terms();
+    write_ticket_allowance(dir.path(), "code-a", &t).unwrap();
+    assert_eq!(read_ticket_allowance(dir.path(), "code-a", now()), Some(t.clone()));
+    assert_eq!(read_ticket_allowance(dir.path(), "code-b", now()), None, "bound to one code");
+    assert_eq!(read_ticket_allowance(dir.path(), "code-a", t.until), None, "ended terms");
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("remote-access-allowance")).unwrap()).unwrap();
+    raw["terms"]["daily_msat"] = serde_json::json!(0);
+    std::fs::write(dir.path().join("remote-access-allowance"), raw.to_string()).unwrap();
+    assert_eq!(read_ticket_allowance(dir.path(), "code-a", now()), None, "invalid terms");
+    raw["terms"]["daily_msat"] = serde_json::json!(1_000);
+    raw["extra"] = serde_json::json!(true);
+    std::fs::write(dir.path().join("remote-access-allowance"), raw.to_string()).unwrap();
+    assert_eq!(read_ticket_allowance(dir.path(), "code-a", now()), None, "unknown fields");
+    remove_ticket_allowance(dir.path()).unwrap();
+    assert_eq!(read_ticket_allowance(dir.path(), "code-a", now()), None);
+
+    // Removing the ticket removes its terms.
+    let f = fixture(true, true, None);
+    write_ticket_allowance(f.svc.dir(), "code-a", &t).unwrap();
+    f.svc.remove_remote_access_link().unwrap();
+    assert_eq!(read_ticket_allowance(f.svc.dir(), "code-a", now()), None);
+
+    // A ticket reused for a pairing that already exists attaches nothing.
+    let f = fixture(true, true, None);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+    f.svc
+        .create_ticket_remote_pairing_with_allowance(
+            "app",
+            &hex::encode(key.verifying_key().to_bytes()),
+            &[22; 32],
+            "second-code",
+            Some(&t),
+        )
+        .unwrap();
+    assert!(f.svc.allowance_view(&f.client).is_none());
+
+    // Expired terms carried to consumption attach nothing either.
+    let mut ended = terms();
+    ended.until = now() - 1;
+    let f = fixture(true, true, Some(ended));
+    assert!(f.svc.allowance_view(&f.client).is_none());
+}
+
+// ── N2-T2 / P10: auto-grant only within the allowance ───────────────────
+
+#[test]
+fn a_request_within_the_allowance_opens_a_window_at_once() {
+    let f = fixture(true, true, Some(terms()));
+    let (op, outcome) = ask(&f, proposal(2_000_000, PER_CALL)).unwrap();
+    assert_eq!(outcome, Outcome::Window);
+    let grants = allowance_grants(&f);
+    assert_eq!(grants.len(), 1);
+    let grant = &grants[0];
+    assert_eq!(grant.op_id, op);
+    assert_eq!(grant.scopes, vec![Scope::Spend]);
+    let budget = grant.budget.as_ref().unwrap();
+    assert_eq!((budget.budget_msat, budget.per_call_max_msat, budget.used_msat), (2_000_000, PER_CALL, 0));
+    assert_eq!(budget.breakers, terms().breakers);
+    assert!(grant.expires_at - grant.granted_at <= MAX_SPEND_GRANT_TTL_SECS);
+    assert!(spend_scope(&f));
+    assert!(f.svc.snapshot().pending_elevations.is_empty(), "no owner request was raised");
+    // Exactly the daily cap and exactly the per-call cap also fit.
+    assert_eq!(ask(&f, proposal(DAILY, PER_CALL)).unwrap().1, Outcome::Window);
+}
+
+#[test]
+fn requests_outside_the_allowance_take_the_owner_path_unchanged() {
+    let cases: Vec<(&str, Option<GrantTerms>, Vec<Scope>)> = vec![
+        ("above the daily cap", Some(proposal(DAILY + 1, PER_CALL)), vec![Scope::Spend]),
+        ("above the per-call cap", Some(proposal(1_000_000, PER_CALL + 1)), vec![Scope::Spend]),
+        ("liquidity fees", Some(GrantTerms { allow_liquidity_fees: true, ..proposal(1_000, 1_000) }), vec![Scope::Spend]),
+        ("no budget", None, vec![Scope::Spend]),
+        ("scopes other than spend alone", Some(proposal(1_000, 1_000)), vec![Scope::Spend, Scope::Spend]),
+    ];
+    for owner_control in [true, false] {
+        for (name, proposed, scopes) in &cases {
+            let f = fixture(owner_control, true, Some(terms()));
+            let result = f.svc.create_budget_elevation_request(&f.client, scopes.clone(), proposed.clone());
+            match owner_control {
+                true => {
+                    let op = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+                    assert_eq!(f.svc.elevation_status(&f.client, &op.op_id).unwrap(), ElevationStatus::Pending, "{name}");
+                }
+                false => assert!(matches!(result, Err(PairingError::OwnerApprovalUnavailable)), "{name}"),
+            }
+            assert!(allowance_grants(&f).is_empty(), "{name}");
+            assert!(f.svc.lock().file.allowances.get(&f.client).is_none_or(|a| a.windows.is_empty()), "{name}");
+        }
+    }
+    // A window just above 24 h, a zero budget and an overflowing one are
+    // refused before anything else, as today.
+    let f = fixture(true, true, Some(terms()));
+    for bad in [proposal(1_000, 1_000).for_secs(MAX_SPEND_GRANT_TTL_SECS + 1), GrantTerms::new(0), proposal(u64::MAX, 1)] {
+        assert!(matches!(
+            f.svc.create_budget_elevation_request(&f.client, vec![Scope::Spend], Some(bad)),
+            Err(PairingError::Malformed(_))
+        ));
+    }
+    assert!(allowance_grants(&f).is_empty());
+}
+
+// ── Switch off = today's behaviour, same fixtures both ways ─────────────
+
+#[test]
+fn with_the_switch_off_nothing_changes() {
+    for owner_control in [true, false] {
+        let on = fixture(owner_control, true, Some(terms()));
+        let off = fixture(owner_control, false, Some(terms()));
+        assert!(on.svc.standing_allowance_enabled() && !off.svc.standing_allowance_enabled());
+        assert!(off.svc.allowance_view(&off.client).is_none(), "off writes no allowance");
+        let off_result = off.svc.create_budget_elevation_request(&off.client, vec![Scope::Spend], Some(proposal(1_000_000, PER_CALL)));
+        if owner_control {
+            assert_eq!(on.svc.allowance_view(&on.client).map(|v| v.set_by), Some(SET_BY_CLI.into()));
+            assert_eq!(ask(&on, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+            let op = off_result.unwrap();
+            assert_eq!(off.svc.elevation_status(&off.client, &op.op_id).unwrap(), ElevationStatus::Pending);
+        } else {
+            assert!(matches!(off_result, Err(PairingError::OwnerApprovalUnavailable)));
+        }
+        assert!(allowance_grants(&off).is_empty());
+        assert!(!spend_scope(&off));
+    }
+
+    // A window opened while on authorizes nothing once the node restarts off.
+    let f = fixture(true, true, Some(terms()));
+    let (op, _) = ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+    let f = reopen(f, true, false);
+    assert!(!spend_scope(&f));
+    assert!(f.svc.grant_view_for(&f.client).is_none());
+    assert_ne!(f.svc.elevation_status(&f.client, &op).unwrap(), ElevationStatus::Granted);
+    let peer = "aa".repeat(32);
+    let call = crate::spend_budget::CallSpendTerms::new(&peer, "c", 2_000, 500, 10).unwrap();
+    assert!(f.svc.reserve_call_spend(&f.client, 1, call, u64::MAX / 4).is_err());
+    // And a new request takes the owner path.
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Owner);
+}
+
+// ── N2-T5 / P09: no owner provenance, no window ─────────────────────────
+
+#[test]
+fn a_start_without_owner_control_does_not_honour_a_cli_allowance() {
+    let f = fixture(true, true, Some(terms()));
+    let (op, _) = ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+    assert!(spend_scope(&f));
+    let f = reopen(f, false, true);
+    assert!(!spend_scope(&f), "the open window stops authorizing");
+    assert_ne!(f.svc.elevation_status(&f.client, &op).unwrap(), ElevationStatus::Granted);
+    assert!(matches!(
+        f.svc.create_budget_elevation_request(&f.client, vec![Scope::Spend], Some(proposal(1_000_000, PER_CALL))),
+        Err(PairingError::OwnerApprovalUnavailable)
+    ));
+    // Nor does a ticket consumed on such a start attach its terms.
+    let f = fixture(false, true, Some(terms()));
+    assert!(f.svc.allowance_view(&f.client).is_none());
+}
+
+// ── N2-T3 / P11 / P12: the rolling cap ──────────────────────────────────
+
+#[test]
+fn renewal_counts_what_the_old_window_used() {
+    let f = fixture(true, true, Some(terms()));
+    assert_eq!(ask(&f, proposal(2_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+    let used = hold(&f, "call-1", 240);
+    assert_eq!(used, 600_000);
+    // The old window's hold stays counted: 2,500,000 - 600,000 is left.
+    assert_eq!(ask(&f, proposal(1_900_001, PER_CALL)).unwrap().1, Outcome::Owner);
+    assert_eq!(allowance_grants(&f).len(), 1, "a refused renewal leaves the old window alone");
+    assert_eq!(ask(&f, proposal(1_900_000, PER_CALL)).unwrap().1, Outcome::Window);
+    let book = ledger(&f);
+    assert_eq!(book.committed_msat(now()), DAILY);
+    assert_eq!(book.remaining_msat(now()), 0);
+    // Renewing an unused window gives its budget back, never more.
+    assert_eq!(ask(&f, proposal(1_900_000, PER_CALL)).unwrap().1, Outcome::Window);
+    assert_eq!(ask(&f, proposal(1_900_001, PER_CALL)).unwrap().1, Outcome::Owner);
+    let live: u64 = allowance_grants(&f).iter().map(|g| g.budget.as_ref().unwrap().budget_msat).sum();
+    let ended: u64 = ledger(&f).windows.iter().filter(|w| w.ended_at.is_some()).map(|w| w.committed_msat).sum();
+    assert!(live + ended <= DAILY, "{live} + {ended}");
+}
+
+#[test]
+fn concurrent_requests_share_one_balance() {
+    let f = fixture(true, true, Some(terms()));
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+    hold(&f, "call-1", 240);
+    let barrier = std::sync::Barrier::new(8);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| {
+                barrier.wait();
+                let _ = f.svc.create_budget_elevation_request(&f.client, vec![Scope::Spend], Some(proposal(1_900_000, PER_CALL)));
+                let peer = "aa".repeat(32);
+                let call = crate::spend_budget::CallSpendTerms::new(&peer, &format!("call-{}", rand::random::<u32>()), 2_000, 500, 240).unwrap();
+                let _ = f.svc.reserve_call_spend(&f.client, 1, call, u64::MAX / 4);
+            });
+        }
+    });
+    let book = ledger(&f);
+    let live: Vec<_> = allowance_grants(&f);
+    assert_eq!(live.len(), 1, "one window at a time");
+    let open = book.windows.iter().filter(|w| w.ended_at.is_none()).count();
+    assert_eq!(open, 1);
+    assert!(book.committed_msat(now()) <= DAILY);
+    // What every window could have spent, together, stays under the cap.
+    let ended: u64 = book.windows.iter().filter(|w| w.ended_at.is_some()).map(|w| w.committed_msat).sum();
+    assert!(ended + live[0].budget.as_ref().unwrap().budget_msat <= DAILY);
+}
+
+#[test]
+fn the_ledger_survives_restart_and_expiry() {
+    let f = fixture(true, true, Some(terms()));
+    assert_eq!(ask(&f, proposal(2_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+    hold(&f, "call-1", 240);
+    let f = reopen(f, true, true);
+    assert_eq!(ask(&f, proposal(1_900_001, PER_CALL)).unwrap().1, Outcome::Owner);
+    // The window expires (here: its clock runs out) while the node is down.
+    {
+        let mut inner = f.svc.lock();
+        let grant = inner.file.grants.iter_mut().find(|g| g.granted_by == ALLOWANCE_GRANTED_BY).unwrap();
+        grant.granted_at -= 2 * MAX_SPEND_GRANT_TTL_SECS;
+        grant.expires_at = now() - 1;
+        f.svc.persist(&mut inner.file).unwrap();
+    }
+    let f = reopen(f, true, true);
+    assert!(allowance_grants(&f).is_empty(), "the expired window is gone");
+    let book = ledger(&f);
+    assert_eq!(book.windows.len(), 1);
+    assert_eq!(book.windows[0].committed_msat, 600_000, "an ended window counts what it used");
+    assert!(book.windows[0].ended_at.is_some());
+    assert_eq!(ask(&f, proposal(1_900_001, PER_CALL)).unwrap().1, Outcome::Owner);
+    assert_eq!(ask(&f, proposal(1_900_000, PER_CALL)).unwrap().1, Outcome::Window);
+}
+
+/// Deterministic schedule of windows, renewals and spends over forty days,
+/// with windows opening right before and after midnight and right at the
+/// moment an old window stops counting. In no 24 hours does spending exceed
+/// the cap, whatever the schedule.
+#[test]
+fn no_schedule_of_renewals_exceeds_the_cap_in_any_24_hours() {
+    let start = 1_767_225_599; // 31 Dec 23:59:59 UTC
+    let cap_terms = AllowanceTerms {
+        daily_msat: DAILY,
+        per_call_max_msat: PER_CALL,
+        until: start + 60 * 86_400,
+        breakers: Default::default(),
+    };
+    let mut book = StandingAllowance::new(cap_terms, SET_BY_CLI, None, 1, "identity", start);
+    let mut spends: Vec<(i64, u64)> = Vec::new();
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |m: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % m
+    };
+    let mut t = start;
+    let mut open: Option<(String, i64, GrantBudget)> = None;
+    let mut granted = 0;
+    while t < start + 40 * 86_400 {
+        // Spend inside the open window (spending is only possible there).
+        if let Some((_, expires, budget)) = open.as_mut() {
+            if t < *expires {
+                let want = next(PER_CALL) + 1;
+                if budget.used_msat + want <= budget.budget_msat {
+                    budget.used_msat += want;
+                    spends.push((t, want));
+                }
+            }
+        }
+        // Renew at random, sometimes with the largest budget that could fit.
+        if next(3) == 0 {
+            let budget_msat = match next(3) {
+                0 => DAILY,
+                1 => book.remaining_msat(t).max(1),
+                _ => next(DAILY) + 1,
+            };
+            let ttl = [60, 3_600, MAX_SPEND_GRANT_TTL_SECS][next(3) as usize];
+            let proposal = GrantTerms::new(budget_msat).per_call(budget_msat.min(PER_CALL)).for_secs(ttl);
+            let replacing = open.as_ref().filter(|(_, e, _)| t < *e).map(|(op, _, b)| (op.as_str(), b.used_msat));
+            if let Ok(ttl) = book.admit(&proposal, replacing, t) {
+                if let Some((op, _, budget)) = open.take() {
+                    book.end_window(&op, t, Some(&budget));
+                }
+                let op = format!("w{granted}");
+                granted += 1;
+                book.open_window(&op, budget_msat, t);
+                open = Some((op, t + ttl, GrantBudget::from_terms(&proposal)));
+            }
+        }
+        // Expiry, as the store's sweep records it.
+        if let Some((op, expires, budget)) = open.as_ref() {
+            if t >= *expires {
+                book.end_window(op, *expires, Some(budget));
+                open = None;
+            }
+        }
+        book.forget_old_windows(t);
+        t += [1, 59, 600, 3_599, 86_399][next(5) as usize] as i64;
+    }
+    assert!(granted > 20, "the schedule must exercise renewals ({granted})");
+    for &(at, _) in &spends {
+        let in_day: u64 = spends.iter().filter(|(s, _)| *s > at - ROLLING_SECS && *s <= at).map(|(_, m)| m).sum();
+        assert!(in_day <= DAILY, "{in_day} msat in the 24 h ending at {at}");
+    }
+}
+
+#[test]
+fn an_ended_window_counts_until_a_day_after_its_last_possible_spend() {
+    let w = AllowanceWindow { op_id: "w".into(), opened_at: 100, committed_msat: 5, ended_at: Some(1_000) };
+    let edge = 1_000 + CALL_TAIL_SECS + ROLLING_SECS;
+    assert!(w.counts(edge - 1));
+    assert!(!w.counts(edge));
+    assert!(w.counts(50), "a clock before the window still counts it");
+    let live = AllowanceWindow { ended_at: None, ..w };
+    assert!(live.counts(i64::MAX));
+}
+
+// ── P13 / Q5(a): the clock cannot extend `until`; it ends new windows only
+
+#[test]
+fn until_ends_new_windows_and_a_clock_rollback_cannot_reopen_it() {
+    let t0 = 1_800_000_000;
+    let t = AllowanceTerms { until: t0 + 3_600, ..AllowanceTerms::owner_defaults(t0) };
+    let mut book = StandingAllowance::new(t, SET_BY_CLI, None, 1, "identity", t0);
+    // A window opened near the end lasts until the end, no longer.
+    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 1_800), Ok(1_800));
+    book.open_window("w", 1_000, t0 + 1_800);
+    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 3_570), Err(NoWindow::Ended), "under a minute left");
+    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 3_600), Err(NoWindow::Ended));
+    // The node saw t0 + 3,600 once; a clock set back an hour changes nothing.
+    book.open_window("x", 0, t0 + 3_600);
+    assert!(!book.is_live(t0));
+    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0), Err(NoWindow::Ended));
+}
+
+#[test]
+fn a_window_opened_by_a_live_allowance_never_outlives_it() {
+    let f = fixture(true, true, Some(AllowanceTerms { until: now() + 600, ..terms() }));
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+    let grant = &allowance_grants(&f)[0];
+    assert!(grant.expires_at <= now() + 600);
+}
+
+// ── P15: breakers carry over; renewal never resets them ─────────────────
+
+#[test]
+fn breakers_are_not_reset_by_renewal_or_expiry() {
+    let f = fixture(true, true, Some(terms()));
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+    hold(&f, "call-1", 10);
+    let first = allowance_grants(&f)[0].budget.clone().unwrap();
+    assert_eq!(first.breaker_status(now()).payments_last_hour, 1);
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+    let second = allowance_grants(&f)[0].budget.clone().unwrap();
+    assert_eq!(second.breaker_state, first.breaker_state, "renewal carries the breaker history");
+    assert_eq!(second.breaker_status(now()).payments_last_hour, 1);
+    // After expiry the history is kept with the allowance for the next one.
+    {
+        let mut inner = f.svc.lock();
+        let grant = inner.file.grants.iter_mut().find(|g| g.granted_by == ALLOWANCE_GRANTED_BY && g.budget.is_some()).unwrap();
+        grant.expires_at = now() - 1;
+        f.svc.persist(&mut inner.file).unwrap();
+    }
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+    let third = allowance_grants(&f)[0].budget.clone().unwrap();
+    assert_eq!(third.breaker_state, first.breaker_state);
+}
+
+// ── P16 / (c): lowering the cap; revoke dominates ───────────────────────
+
+#[test]
+fn a_lower_cap_applies_from_now_and_never_undoes_spending() {
+    let t0 = 1_800_000_000;
+    let mut book = StandingAllowance::new(AllowanceTerms::owner_defaults(t0), SET_BY_CLI, None, 1, "identity", t0);
+    book.open_window("w", 2_000_000, t0);
+    let mut used = GrantBudget::from_terms(&GrantTerms::new(2_000_000));
+    used.used_msat = 1_800_000;
+    book.end_window("w", t0 + 60, Some(&used));
+    let lower = StandingAllowance::new(
+        AllowanceTerms { daily_msat: 1_000_000, ..AllowanceTerms::owner_defaults(t0 + 60) },
+        SET_BY_CLI,
+        None,
+        1,
+        "identity",
+        t0 + 60,
+    );
+    book.replace_terms(lower);
+    assert_eq!(book.terms.daily_msat, 1_000_000);
+    assert_eq!(book.committed_msat(t0 + 120), 1_800_000, "spending already done stays counted");
+    assert_eq!(book.remaining_msat(t0 + 120), 0);
+    assert!(matches!(book.admit(&proposal(1, 1), None, t0 + 120), Err(NoWindow::OverDailyCap { remaining_msat: 0 })));
+    // Once it ages out, the lower cap is what is left.
+    let later = t0 + 60 + CALL_TAIL_SECS + ROLLING_SECS;
+    assert_eq!(book.remaining_msat(later), 1_000_000);
+}
+
+#[test]
+fn revocation_removes_the_allowance_and_its_window() {
+    type Revoke = fn(&Fixture);
+    let revocations: [(&str, Revoke); 3] = [
+        ("revoke grants", |f| {
+            f.svc.revoke_grants(Some(&f.client)).unwrap();
+        }),
+        ("epoch bump", |f| {
+            f.svc.bump_epoch(&f.client).unwrap();
+        }),
+        ("all grants", |f| {
+            f.svc.revoke_grants(None).unwrap();
+        }),
+    ];
+    for (name, revoke) in revocations {
+        let f = fixture(true, true, Some(terms()));
+        assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+        revoke(&f);
+        assert!(f.svc.allowance_view(&f.client).is_none(), "{name}");
+        assert!(f.svc.reload_from_disk().unwrap().allowances.is_empty(), "{name}");
+        assert!(allowance_grants(&f).is_empty(), "{name}");
+        assert!(!spend_scope(&f), "{name}");
+        assert_eq!(ask(&f, proposal(1_000, 1_000)).unwrap().1, Outcome::Owner, "{name}");
+    }
+    let f = fixture(true, true, Some(terms()));
+    f.svc.revoke(&f.client).unwrap();
+    assert!(f.svc.reload_from_disk().unwrap().allowances.is_empty(), "pair revoke");
+}
+
+// ── P21: the file stays readable both ways ──────────────────────────────
+
+#[test]
+fn a_pairing_file_with_allowance_fields_loads_in_code_without_them() {
+    let f = fixture(true, true, Some(terms()));
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+    let raw = std::fs::read(f.svc.dir().join("clients.json")).unwrap();
+    let mut json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(json["version"], serde_json::json!(PAIRING_FILE_VERSION), "no version bump: older nodes keep reading it");
+    assert!(json.get("allowances").is_some());
+    // Code without the field ignores it: every struct on the path tolerates
+    // unknown fields, which is how an older node reads this file.
+    json["allowances_from_a_later_version"] = json["allowances"].clone();
+    json["clients"][0]["allowance_from_a_later_version"] = serde_json::json!({"daily_msat": 1});
+    json["grants"][0]["field_from_a_later_version"] = serde_json::json!(1);
+    let parsed: PairingFile = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(parsed.clients.len(), 1);
+    // Without the field, nothing is opted in.
+    let mut base = json;
+    base.as_object_mut().unwrap().remove("allowances");
+    let parsed: PairingFile = serde_json::from_value(base.clone()).unwrap();
+    assert!(parsed.allowances.is_empty());
+    std::fs::write(f.svc.dir().join("clients.json"), serde_json::to_vec(&base).unwrap()).unwrap();
+    let f = reopen(f, true, true);
+    assert!(f.svc.allowance_view(&f.client).is_none());
+    assert!(allowance_grants(&f).is_empty(), "a window without its allowance is dropped");
+    assert!(!spend_scope(&f));
+    assert_eq!(ask(&f, proposal(1_000, 1_000)).unwrap().1, Outcome::Owner);
+    // A file with no allowance written by this code has no new key at all.
+    let plain = fixture(true, true, None);
+    assert!(!String::from_utf8(std::fs::read(plain.svc.dir().join("clients.json")).unwrap()).unwrap().contains("allowance"));
+}
+
+#[test]
+fn allowance_terms_refuse_what_cannot_be_enforced() {
+    let t0 = 1_800_000_000;
+    assert_eq!(AllowanceTerms::owner_defaults(t0).daily_msat, DAILY);
+    assert_eq!(AllowanceTerms::owner_defaults(t0).per_call_max_msat, PER_CALL);
+    assert_eq!(AllowanceTerms::owner_defaults(t0).until, t0 + 30 * 86_400);
+    for (daily, per_call, days) in [(0, 1, 1), (1, 0, 1), (1, 2, 1), (1, 1, 0), (1, 1, 366), (u64::MAX, 1, 1), (100_000_001, 1, 1)] {
+        assert!(AllowanceTerms::from_sats(daily, per_call, days, t0).is_err(), "{daily} {per_call} {days}");
+    }
+    assert!(AllowanceTerms::from_sats(1, 1, 365, t0).is_ok());
+}

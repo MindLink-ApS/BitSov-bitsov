@@ -278,11 +278,15 @@ async fn main() -> Result<()> {
             qr,
             ttl,
             legacy,
+            allow,
+            per_call,
+            days,
         } => {
             if second_device {
                 owner_cmd::check_second_device_ticket(&config).await?;
             }
-            ticket_cmd::cmd_pair_ticket(&config, qr, ttl, legacy, second_device)?;
+            let allowance = allow.map(|daily| ticket_cmd::AllowanceArgs { daily_sats: daily, per_call_sats: per_call, days });
+            ticket_cmd::cmd_pair_ticket_with_allowance(&config, qr, ttl, legacy, second_device, allowance)?;
         }
         Command::Peer { command } => match command {
             PeerCommand::Add {
@@ -1762,6 +1766,7 @@ async fn start_node_services<'a>(
         .with_hosted_by(config.node.hosted_by.clone())
         .with_second_device_enrollment(config.pairing.second_device_enrollment)
         .with_second_device_claim_v1(config.pairing.second_device_claim_v1)
+        .with_standing_allowance(config.pairing.standing_allowance_v1)
         .with_enrollment_audit(Arc::clone(&audit_log));
         let service = if local_owner_device {
             service.with_local_owner_device()

@@ -4,7 +4,7 @@ use std::{fs::File, path::Path, time::Duration};
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use konsensus_api::{
-    pairing::{fsync_dir_strict, load_box_transport_key, restrict_dir, write_protected},
+    pairing::{allowance, fsync_dir_strict, load_box_transport_key, restrict_dir, write_protected},
     remote_access::{PairLink, PAIR_LINK_VERSION},
 };
 use rand::Rng;
@@ -81,6 +81,31 @@ pub fn set_locked(dir: &Path, locked: bool) -> Result<()> {
     Ok(())
 }
 
+/// Owner terms for a standing allowance on the pairing a ticket creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowanceArgs {
+    pub daily_sats: u64,
+    pub per_call_sats: Option<u64>,
+    pub days: Option<u32>,
+}
+
+impl AllowanceArgs {
+    fn terms(&self, now: i64) -> Result<allowance::AllowanceTerms> {
+        let per_call = self
+            .per_call_sats
+            .unwrap_or_else(|| allowance::DEFAULT_PER_CALL_SATS.min(self.daily_sats));
+        allowance::AllowanceTerms::from_sats(
+            self.daily_sats,
+            per_call,
+            self.days.unwrap_or(allowance::DEFAULT_DAYS),
+            now,
+        )
+        .map_err(anyhow::Error::msg)
+    }
+}
+
+/// A ticket without an allowance (tests; the command passes its flags).
+#[cfg(test)]
 pub fn cmd_pair_ticket(
     config_path: &Path,
     qr: bool,
@@ -88,8 +113,37 @@ pub fn cmd_pair_ticket(
     legacy: bool,
     second_device: bool,
 ) -> Result<()> {
+    cmd_pair_ticket_with_allowance(config_path, qr, ttl, legacy, second_device, None)
+}
+
+pub fn cmd_pair_ticket_with_allowance(
+    config_path: &Path,
+    qr: bool,
+    ttl: Duration,
+    legacy: bool,
+    second_device: bool,
+    allowance_args: Option<AllowanceArgs>,
+) -> Result<()> {
     let config = NodeConfig::load_before_identity_validation(config_path)?;
     config.node.validate()?;
+    let allowance_terms = match allowance_args {
+        None => None,
+        Some(args) => {
+            anyhow::ensure!(
+                config.pairing.standing_allowance_v1,
+                "standing allowances are off; set [pairing] standing_allowance_v1 = true first"
+            );
+            anyhow::ensure!(
+                !second_device && !legacy,
+                "an allowance attaches only to a regular pairing ticket"
+            );
+            anyhow::ensure!(
+                ttl.as_secs() <= allowance::MAX_TICKET_TTL_SECS,
+                "a ticket carrying an allowance lasts at most 1h"
+            );
+            Some(args.terms(chrono::Utc::now().timestamp())?)
+        }
+    };
     if second_device {
         anyhow::ensure!(
             config.pairing.second_device_enrollment,
@@ -225,6 +279,13 @@ pub fn cmd_pair_ticket(
     };
     // Render before publication: oversized payloads must not replace a good ticket.
     let rendered = if qr { Some(render_qr(&uri)?) } else { None };
+    // The terms are bound to this ticket's code node-side, written before the
+    // ticket so the node never reads the ticket without them; a ticket
+    // without --allow clears any terms left from an earlier one.
+    match &allowance_terms {
+        Some(terms) => allowance::write_ticket_allowance(&dir, &link.code, terms)?,
+        None => allowance::remove_ticket_allowance(&dir)?,
+    }
     let temporary = dir.join(format!(".remote-access-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> Result<()> {
         write_protected(&temporary, uri.as_bytes())?;
@@ -233,11 +294,22 @@ pub fn cmd_pair_ticket(
         Ok(())
     })();
     let _ = std::fs::remove_file(temporary);
+    if result.is_err() && allowance_terms.is_some() {
+        let _ = allowance::remove_ticket_allowance(&dir);
+    }
     result?;
     // Only this explicit operator command prints the secret link.
     println!("{uri}");
     if let Some(rendered) = rendered {
         println!("{rendered}");
+    }
+    if let Some(terms) = &allowance_terms {
+        println!(
+            "Allowance on this pairing: up to {} sats in any 24 hours, {} sats per call, until {}. Revoke the pairing to end it.",
+            terms.daily_msat / 1000,
+            terms.per_call_max_msat / 1000,
+            chrono::DateTime::from_timestamp(terms.until, 0).map(|t| t.to_rfc3339()).unwrap_or_default()
+        );
     }
     if second_device {
         println!("Open Add a device on your other device now, so it can approve");

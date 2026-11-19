@@ -480,6 +480,9 @@ async fn status(
             {
                 capabilities.push(crate::pairing::second_device::CAPABILITY);
             }
+            if state.pairing.as_ref().is_some_and(|p| p.standing_allowance_enabled()) {
+                capabilities.push(crate::pairing::allowance::STANDING_ALLOWANCE_CAPABILITY);
+            }
             capabilities
         },
         status: "ok",

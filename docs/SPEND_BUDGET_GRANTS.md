@@ -475,3 +475,63 @@ Routing policy defaults to `min(max(5000, floor(P / 100)), 10000)` msat per
 payment, with caller tightening. A 1,000-msat principal therefore needs a
 6,000-msat all-in allowance by default. See [fee caps](v2/ALL-IN-FEE-CAPS.md)
 for backend support, single-use invoice hashes, and the app migration.
+
+## Standing allowance (optional, off by default)
+
+With `[pairing] standing_allowance_v1 = true` (only the value `true` turns it
+on), the owner can approve a series of budget windows for one app at once,
+when the app is paired:
+
+```
+konsensus pair-ticket --allow [<sats per day>] [--per-call <sats>] [--days <n>] --config <path>
+```
+
+Without values the terms are 2,500 sats in any 24 hours, 700 sats per call
+(or the daily cap, if lower) and 30 days. The ticket lasts 15 minutes by
+default and at most an hour. The terms are bound to that one ticket on the
+node, in an owner-only file next to it, and are never part of the link. They
+are copied onto the pairing the ticket creates, with who set them and the
+ticket's hash as a receipt. A ticket that has expired, was already used, or
+re-binds an existing pairing attaches nothing.
+
+Inside the allowance, `POST /api/v1/pair/elevation-request` opens the window
+at once: a spend window marked `granted_by: "allowance"`, which the app reads
+as `granted` with the same status call as before. A request opens a window
+only if:
+
+- it asks for `spend` alone, with a budget;
+- its budget fits what is left of the daily cap (see below), its per-call
+  maximum is within the allowance's, and it asks for no liquidity fees;
+- the allowance has not ended. A window never lasts past the end date, and one
+  with less than a minute left is not opened.
+
+Anything else takes the owner path, unchanged. A new window replaces the
+app's previous one, as every window does. Breakers are the allowance's and
+carry their history from one window to the next; a renewal never resets them.
+
+**The daily cap counts any 24 hours, not each window.** Every window is
+recorded with the most it could spend: its whole budget while it can spend,
+and what it used (settled, reserved or of unknown outcome) once it has ended.
+An ended window keeps counting until 24 hours after its end, plus the longest
+call. A window opens only if its budget fits under the cap together with what
+is still counted. This may hold back sats that were not spent; it never lets
+more than the cap be spent in any 24 hours. The record is stored with the
+pairing, so a restart does not reset it. A clock moving backward keeps windows
+counting longer and cannot reopen an allowance whose end date the node has
+already seen. New terms for a pairing keep the record, so a lower cap applies
+from then on and counts what was already spent.
+
+**Only an owner channel writes an allowance.** No request body can set or
+raise one, and the first app to pair gets nothing for arriving first. An
+allowance written with `pair-ticket` is honoured only on a node started with
+its owner control socket; elsewhere its windows authorize nothing and none
+open. Revoking the app's grants (`konsensus grant-revoke`), an epoch bump,
+rotating its key or removing the pairing removes the allowance with them.
+With the switch off nothing is written, nothing opens, and a window opened
+earlier authorizes nothing. `GET /api/v1/status` lists
+`standing_allowance_v1` only while the switch is on.
+
+The new fields are optional in `pairing/clients.json`, and the file version
+does not change: an older node ignores the allowance (and drops it on its
+next write); a window it finds is treated like a console window, so it is
+honoured on an owner-run node until it expires, never longer than 24 hours.
