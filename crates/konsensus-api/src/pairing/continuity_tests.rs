@@ -459,3 +459,160 @@ fn renewal_after_expiry_takes_over_the_open_hold_once() {
     // Only the renewed grant's own budget is new authority.
     assert!(new_payment(&fx).is_ok());
 }
+
+fn grant_with_terms(fx: &Fx, terms: GrantTerms) -> SpendGrant {
+    let op = fx.service.create_elevation_request(&fx.client, vec![Scope::Spend]).unwrap();
+    let phrase = fx.console.confirmation(&grant_confirmation_phrase(&op));
+    fx.service.grant_elevation(&op.op_id, &phrase, terms).unwrap()
+}
+
+/// Pay whatever blocks the call can still draw and dispatch.
+fn pay_what_draws(fx: &Fx) {
+    for seq in 1..u32::from(MINUTES) {
+        let Ok(block) = draw(fx, "call", seq) else { break };
+        if fx.service.with_call_spend_authority(&block, Some((&peer(), "call")), || ()).is_err() {
+            fx.service.try_resolve_spend(&block, &peer(), 0).unwrap();
+            break;
+        }
+        fx.service.try_resolve_spend(&block, &peer(), PRICE).unwrap();
+    }
+}
+
+#[test]
+fn renewal_must_honor_the_successor_total() {
+    let fx = fixture(true);
+    grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    // The renewed grant allows 1 minute; the hold still has 4.
+    let next = grant_with_terms(&fx, GrantTerms::new(PRICE));
+    pay_what_draws(&fx);
+    let budget = disk_budget(&fx, &next.op_id).unwrap();
+    assert!(budget.used_msat <= budget.budget_msat,
+        "successor authorized {} but migration charged {}", budget.budget_msat, budget.used_msat);
+    assert_eq!(budget.used_msat, 0, "a hold that does not fit is not carried");
+    assert!(budget.call_reservations.is_empty());
+    assert!(!fx.service.call_hold_live(&fx.binding, &peer(), "call"));
+}
+
+#[test]
+fn renewal_must_honor_the_successor_payee_set_recipient_cap_and_per_payment_limit() {
+    let mut payees = GrantTerms::new(50_000);
+    payees.payee_allowlist = Some(Default::default());
+    let recipient = GrantTerms::new(50_000).recipient(&peer(), PRICE);
+    let per_payment = GrantTerms::new(50_000).per_call(PRICE - 1);
+    for (name, terms) in [("payees", payees), ("recipient", recipient), ("per-payment", per_payment)] {
+        let fx = fixture(true);
+        grant(&fx, 100_000);
+        admit(&fx, "call");
+        pay(&fx, "call", 0);
+        let next = grant_with_terms(&fx, terms);
+        if let Ok(block) = draw(&fx, "call", 1) {
+            assert!(fx.service.with_call_spend_authority(&block, Some((&peer(), "call")), || ()).is_err(),
+                "{name}: dispatch authorized a payment the successor grant excludes");
+        }
+        let budget = disk_budget(&fx, &next.op_id).unwrap();
+        assert!(budget.call_reservations.is_empty(), "{name}: an excluded hold was carried");
+        assert_eq!(budget.used_msat, 0, "{name}");
+    }
+}
+
+#[test]
+fn an_unfit_renewal_closes_the_hold_and_settles_its_block_in_flight_on_the_old_grant() {
+    let fx = fixture(true);
+    let first = grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    let in_flight = draw(&fx, "call", 1).unwrap();
+    let next = grant_with_terms(&fx, GrantTerms::new(PRICE));
+    // Not carried: the successor is untouched and nothing more can be drawn.
+    let budget = disk_budget(&fx, &next.op_id).unwrap();
+    assert_eq!((budget.used_msat, budget.call_reservations.len()), (0, 0));
+    assert!(draw(&fx, "call", 2).is_err());
+    // The block in flight is no longer dispatched, and settles once on the
+    // grant that reserved it; the rest of the hold was released at once.
+    assert!(fx.service.with_call_spend_authority(&in_flight, Some((&peer(), "call")), || ()).is_err());
+    let old = disk_budget(&fx, &first.op_id).expect("the old grant stays only to settle its block");
+    let kept = fx.service.reload_from_disk().unwrap().grants.into_iter().find(|g| g.op_id == first.op_id).unwrap();
+    assert!(!kept.is_live(chrono::Utc::now().timestamp()) && kept.expires_at <= chrono::Utc::now().timestamp(),
+        "a settling grant reads as ended even to a node without the end reason");
+    assert_eq!(kept.ended, Some(GrantEnd::Replaced));
+    assert_eq!(old.used_msat, 2 * PRICE, "one paid minute plus the one in flight");
+    fx.service.try_resolve_spend(&in_flight, &peer(), 0).unwrap();
+    fx.service.try_resolve_spend(&in_flight, &peer(), 0).unwrap();
+    assert!(disk_budget(&fx, &first.op_id).is_none(), "settled, the old grant goes");
+    assert_eq!(disk_budget(&fx, &next.op_id).unwrap().used_msat, 0);
+    let status = fx.service.call_spend_status(&peer(), "call");
+    assert!(status.is_none_or(|s| s.closed));
+}
+
+fn relation_fixture() -> (Fx, String, ring::signature::EcdsaKeyPair, ring::rand::SystemRandom) {
+    use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+    let mut fx = fixture(true);
+    let owner = konsensus_core::OwnerApprovalKey::from_seed(&[31; 64], &[32; 32]).unwrap();
+    fx.service = fx.service.with_owner_approval_key(owner.verifying_key());
+    let rng = ring::rand::SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+    let signer = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+    let public = hex::encode(signer.public_key().as_ref());
+    let key_id = device::key_id_for(signer.public_key().as_ref());
+    let client_pubkey = hex::encode(ed25519_dalek::SigningKey::from_bytes(&[12; 32]).verifying_key().to_bytes());
+    {
+        let mut inner = fx.service.lock();
+        inner.file.device_keys.push(device::DeviceKey {
+            key_id: key_id.clone(), client_id: fx.client.clone(), public_key: public.clone(),
+            name: "device".into(), registered_at: 0, epoch: fx.binding.epoch,
+            client_pubkey: client_pubkey.clone(), enrolled_by: "console".into(),
+            owner_approval: hex::encode(owner.sign(device::owner_approval_message(
+                "identity", &client_pubkey, fx.binding.epoch, &public).as_bytes()).to_bytes()),
+        });
+    }
+    (fx, key_id, signer, rng)
+}
+
+fn relation_intent(fx: &Fx, key_id: &str, signer: &ring::signature::EcdsaKeyPair, rng: &ring::rand::SystemRandom)
+    -> Result<device::RelationIntentOutcome, PairingError> {
+    let intent = device::RelationIntent {
+        device_key_id: key_id.into(), peer: peer(), level: device::LEVEL_CONTACT,
+        budget_msat: 50_000, per_act_max_msat: 10_000, window_secs: 3600,
+        issued_at: chrono::Utc::now().timestamp(), nonce: "12".repeat(16),
+    };
+    let message = device::intent_message("identity", &fx.client, fx.binding.epoch, &intent);
+    let signature = hex::encode(signer.sign(rng, message.as_bytes()).unwrap().as_ref());
+    fx.service.apply_relation_intent(&fx.client, fx.binding.epoch, &intent, &signature)
+}
+
+#[test]
+fn failed_relation_renewal_must_restore_call_funding() {
+    let (fx, key_id, signer, rng) = relation_fixture();
+    let original = grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    expire(&fx);
+    let before = fx.service.lock().file.clone();
+    let blocked = fx.service.file_path.with_extension("json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    let result = relation_intent(&fx, &key_id, &signer, &rng);
+    std::fs::remove_dir(&blocked).unwrap();
+    assert!(result.is_err(), "expected a storage failure");
+    let inner = fx.service.lock_without_cleanup();
+    assert!(inner.file.grants.iter().any(|g| g.op_id == original.op_id && g.budget.is_some()));
+    assert_eq!(inner.file.call_spend_grants, before.call_spend_grants, "failed renewal changed call funding provenance");
+    assert_eq!(inner.file.grants, before.grants, "failed renewal changed the grants");
+}
+
+#[test]
+fn a_relation_renewal_for_the_called_peer_carries_the_hold() {
+    let (fx, key_id, signer, rng) = relation_fixture();
+    grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    expire(&fx);
+    let outcome = relation_intent(&fx, &key_id, &signer, &rng).unwrap();
+    let file = fx.service.reload_from_disk().unwrap();
+    let relation = file.grants.iter().find(|g| g.budget.as_ref().is_some_and(|b| b.recipients_only)).unwrap();
+    assert_eq!(relation.budget.as_ref().unwrap().used_msat, HELD - PRICE);
+    assert_eq!(file.call_spend_grants.get(&format!("{}:call", peer())), Some(&relation.op_id));
+    assert_eq!(outcome.grant.op_id, relation.op_id);
+    pay(&fx, "call", 1);
+}
