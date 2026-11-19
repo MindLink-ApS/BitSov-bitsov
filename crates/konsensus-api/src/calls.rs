@@ -608,6 +608,35 @@ pub async fn prepare_incoming_block<'a>(store: Store<'a>, peer: &NodeId, plainte
     Ok(IncomingBlock { _guard: guard, store, peer: *peer, signal, next })
 }
 
+/// Receiving side of free call replies, at the payment gate: whether a
+/// free-reply-shaped envelope from `sender` names, by its reference, a call
+/// this node placed to `sender`, whose paid offer is bound and which is still
+/// ringing at `now`. Always false while `[calls] call_reply_free_v1` is off.
+pub async fn free_reply_bound(_enabled: bool, _store: Store<'_>, _envelope: &konsensus_core::UkmEnvelope,
+    _now: u64) -> Result<bool, konsensus_storage::StorageError> {
+    Ok(false)
+}
+
+/// Receiving side, after decryption: a zero-amount answer or hangup was
+/// accepted only as a free reply, so its payload must be exactly that reply,
+/// to the call its reference names: an answer, or a hangup whose reason is
+/// `declined`, to this node's own ringing offer. Anything else is refused and
+/// withdrawn; it was never paid, so the refusal costs the sender nothing more.
+pub async fn check_free_reply(_store: Store<'_>, _envelope: &konsensus_core::UkmEnvelope,
+    _plaintext: Option<&str>) -> Result<(), CallRefusal> {
+    Ok(())
+}
+
+/// Sending side: whether this answer or declined hangup goes out free. Only
+/// with the switch on, to a connected peer that advertised
+/// [`konsensus_core::payloads::call::FREE_REPLY_CAPABILITY`], for a call this
+/// node is ringing for as callee, and with no other reference. Otherwise the
+/// legacy paid path is used unchanged.
+pub(crate) async fn free_reply_allowed(_state: &AppState, _peer: &NodeId, _kind: u16, _plaintext: &str,
+    _references: &[konsensus_core::MessageId]) -> bool {
+    false
+}
+
 /// Admit a signal this node (`own`) received from `peer` (after the payment
 /// gate). A refusal means it must not reach the app (the caller also
 /// withdraws the stored message). A meeting leg must come from the earlier

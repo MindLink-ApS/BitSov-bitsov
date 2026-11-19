@@ -1962,6 +1962,7 @@ async fn start_node_services<'a>(
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
         max_call_minutes: config.calls.max_call_minutes,
+        call_reply_free: config.calls.call_reply_free_v1,
         stun_port: stun_socket
             .as_ref()
             .and_then(|s| s.local_addr().ok())

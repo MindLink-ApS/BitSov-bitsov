@@ -409,6 +409,7 @@ async fn start_node(identity: Arc<NodeIdentity>, peer: NodeId, ledger: &Path, na
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,

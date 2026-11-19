@@ -246,6 +246,16 @@ pub trait NonceStore: Send + Sync {
         Ok(())
     }
 
+    /// Whether this free-reply-shaped envelope answers or declines a ringing
+    /// call offer THIS node paid for, to this sender, under the reference it
+    /// carries. Default: never (the reply then meets the price floor).
+    async fn is_free_call_reply(
+        &self,
+        _envelope: &UkmEnvelope,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
+    }
+
     /// Atomically take the outstanding web request for this payment hash, if any.
     ///
     /// Default returns `None` (no binding). Production stores must override.
@@ -1016,6 +1026,8 @@ mod tests {
         seen_payment_hashes: Mutex<HashSet<[u8; 32]>>,
         outstanding_web:
             Mutex<std::collections::HashMap<[u8; 32], crate::web_reply::OutstandingWebRequest>>,
+        /// The (callee, reference) of a ringing offer this node made.
+        ringing_offer: Mutex<Option<(NodeId, crate::MessageId)>>,
     }
 
     impl MockNonceStore {
@@ -1025,6 +1037,7 @@ mod tests {
                 seen: Mutex::new(HashSet::new()),
                 seen_payment_hashes: Mutex::new(HashSet::new()),
                 outstanding_web: Mutex::new(std::collections::HashMap::new()),
+                ringing_offer: Mutex::new(None),
             }
         }
     }
@@ -1101,6 +1114,19 @@ mod tests {
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(self.outstanding_web.lock().unwrap().remove(payment_hash))
+        }
+
+        async fn is_free_call_reply(
+            &self,
+            envelope: &UkmEnvelope,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self
+                .ringing_offer
+                .lock()
+                .unwrap()
+                .is_some_and(|(callee, reference)| {
+                    envelope.sender == callee && envelope.references == [reference]
+                }))
         }
     }
 
@@ -3638,5 +3664,73 @@ mod tests {
         assert_eq!(call_minute_price_msat(23_000, 30_000), 30_000);
         assert_eq!(call_minute_price_msat(500, 0), 1_000);
         assert_eq!(call_minute_price_msat(u64::MAX, 30_000), u64::MAX);
+    }
+
+    fn call_reply(identity: &NodeIdentity, kind: u16, amount_msat: u64, references: Vec<crate::MessageId>) -> UkmEnvelope {
+        let mut envelope = UkmEnvelopeBuilder::new(
+            kind,
+            *identity.node_id(),
+            Recipient::Node(NodeId::from_bytes([2u8; 32])),
+            b"sealed reply".to_vec(),
+            make_proof(amount_msat),
+        )
+        .references(references)
+        .timestamp(now_ms())
+        .build();
+        envelope.signature = crate::types::Signature::from_ed25519(&identity.sign(&envelope.signable_bytes()));
+        envelope
+    }
+
+    #[tokio::test]
+    async fn free_call_reply_bound_to_our_ringing_offer_needs_no_payment_and_is_single_use() {
+        use crate::kind::{KIND_CALL_ANSWER, KIND_CALL_HANGUP};
+        let callee = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let reference = crate::payloads::call::free_reply_reference("0123456789abcdef0123456789abcdef");
+        for kind in [KIND_CALL_ANSWER, KIND_CALL_HANGUP] {
+            let store = MockNonceStore::new();
+            *store.ringing_offer.lock().unwrap() = Some((*callee.node_id(), reference));
+            let reply = call_reply(&callee, kind, 0, vec![reference]);
+            let gate = PaymentGate::new();
+            let pricing = MockPricing { price_msat: 5_000 };
+            gate.verify(&reply, &store, &pricing, None, None, 0.0, None)
+                .await
+                .unwrap_or_else(|e| panic!("kind {kind}: a bound free reply was refused: {e:?}"));
+            // Its replay keys are consumed: the same reply cannot come twice.
+            assert!(matches!(
+                gate.verify(&reply, &store, &pricing, None, None, 0.0, None).await,
+                Err(GateRejection::ReplayDetected)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unbound_zero_amount_call_reply_still_meets_the_price_floor() {
+        use crate::kind::{KIND_CALL_ANSWER, KIND_CALL_HANGUP, KIND_ICE_CANDIDATE};
+        let callee = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let other = NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "").unwrap();
+        let reference = crate::payloads::call::free_reply_reference("0123456789abcdef0123456789abcdef");
+        let elsewhere = crate::payloads::call::free_reply_reference("fedcba9876543210fedcba9876543210");
+        let gate = PaymentGate::new();
+        let pricing = MockPricing { price_msat: 5_000 };
+        let cases = [
+            (&callee, KIND_CALL_ANSWER, vec![reference], None),
+            (&other, KIND_CALL_ANSWER, vec![reference], Some(reference)),
+            (&callee, KIND_CALL_ANSWER, vec![elsewhere], Some(reference)),
+            (&callee, KIND_CALL_ANSWER, vec![reference, reference], Some(reference)),
+            (&callee, KIND_CALL_ANSWER, vec![], Some(reference)),
+            (&callee, KIND_ICE_CANDIDATE, vec![reference], Some(reference)),
+            (&callee, KIND_CHAT, vec![reference], Some(reference)),
+            (&callee, KIND_CALL_HANGUP, vec![reference], None),
+        ];
+        for (sender, kind, references, ringing) in cases {
+            let store = MockNonceStore::new();
+            *store.ringing_offer.lock().unwrap() = ringing.map(|r| (*callee.node_id(), r));
+            let reply = call_reply(sender, kind, 0, references.clone());
+            let result = gate.verify(&reply, &store, &pricing, None, None, 0.0, None).await;
+            assert!(
+                matches!(result, Err(GateRejection::InsufficientPayment { paid_msat: 0, .. })),
+                "kind {kind} refs {references:?}: {result:?}"
+            );
+        }
     }
 }

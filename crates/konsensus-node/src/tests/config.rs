@@ -4176,3 +4176,30 @@ fn calls_duration_setting_defaults_and_rejects_out_of_bounds() {
         assert!(toml::from_str::<crate::config::CallsConfig>(&format!("max_call_minutes = {minutes}")).is_err());
     }
 }
+
+#[test]
+fn call_reply_free_is_off_unless_set_to_true() {
+    let base = r#"
+[identity]
+mnemonic_file = "/tmp/m.txt"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+"#;
+    let unset: NodeConfig = toml::from_str(base).unwrap();
+    assert!(!unset.calls.call_reply_free_v1);
+    assert!(!crate::config::CallsConfig::default().call_reply_free_v1);
+    let on: NodeConfig = toml::from_str(&format!("{base}\n[calls]\ncall_reply_free_v1 = true\n")).unwrap();
+    assert!(on.calls.call_reply_free_v1);
+    for value in ["false", "\"true\"", "\"yes\"", "1", "0", "1.0", "[true]", "{ on = true }"] {
+        let parsed: NodeConfig = toml::from_str(&format!("{base}\n[calls]\ncall_reply_free_v1 = {value}\n"))
+            .unwrap_or_else(|e| panic!("{value}: {e}"));
+        assert!(!parsed.calls.call_reply_free_v1, "{value} must leave free replies off");
+    }
+    assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\ncall_reply_free = true\n")).is_err());
+    assert!(!toml::to_string(&unset.calls).unwrap().contains("call_reply_free_v1"));
+}

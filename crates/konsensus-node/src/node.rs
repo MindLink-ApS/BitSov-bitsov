@@ -583,7 +583,8 @@ impl KonsensusNode {
         let transport_config = TransportConfig {
             listen_addr: config.network.listen_addr,
             tier: config.network.tier,
-            capabilities: advertised_capabilities(config.relay.enabled, config.starter_hub.enabled),
+            capabilities: advertised_capabilities(config.relay.enabled, config.starter_hub.enabled,
+                config.calls.call_reply_free_v1),
             whitelist: peer_registry.whitelist(),
             version: 2,
             admission_mode: config.admission_mode,
@@ -900,7 +901,7 @@ pub(crate) fn merge_persisted_peers(
 /// explicitly enables `[relay] enabled = true`. Default nodes stay non-relay;
 /// enabling the flag is still a negotiation signal only and does not mount a
 /// relay engine or change custody/decryption boundaries.
-fn advertised_capabilities(relay_enabled: bool, starter_enabled: bool) -> Vec<Capability> {
+fn advertised_capabilities(relay_enabled: bool, starter_enabled: bool, _call_reply_free: bool) -> Vec<Capability> {
     let mut caps = default_advertised_capabilities(relay_enabled);
     if starter_enabled {
         caps.push(Capability::Custom("starter_hub_v1".into()));
@@ -911,8 +912,16 @@ fn advertised_capabilities(relay_enabled: bool, starter_enabled: bool) -> Vec<Ca
 #[test]
 fn starter_capability_is_only_advertised_when_enabled() {
     let capability = Capability::Custom("starter_hub_v1".into());
-    assert!(!advertised_capabilities(false, false).contains(&capability));
-    assert!(advertised_capabilities(false, true).contains(&capability));
+    assert!(!advertised_capabilities(false, false, false).contains(&capability));
+    assert!(advertised_capabilities(false, true, false).contains(&capability));
+}
+
+#[test]
+fn free_call_replies_are_only_advertised_when_enabled() {
+    let capability = Capability::Custom(konsensus_core::payloads::call::FREE_REPLY_CAPABILITY.into());
+    assert!(!advertised_capabilities(false, false, false).contains(&capability));
+    assert!(!default_advertised_capabilities(false).contains(&capability));
+    assert!(advertised_capabilities(false, false, true).contains(&capability));
 }
 
 pub(crate) fn default_advertised_capabilities(relay_enabled: bool) -> Vec<Capability> {
