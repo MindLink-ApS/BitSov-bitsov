@@ -632,7 +632,7 @@ impl PairingService {
             ApprovalRequest::SpendGrant { .. } => {
                 let terms = op.request.spend_terms()?;
                 let budget = GrantBudget::from_terms(&terms);
-                let grant = SpendGrant {
+                let mut grant = SpendGrant {
                     op_id: op.op_id.clone(),
                     client_id: op.client_id.clone(),
                     scopes: vec![Scope::Spend],
@@ -650,11 +650,7 @@ impl PairingService {
                     ended: None,
                 };
                 let before = inner.file.clone();
-                for old in &mut inner.file.grants {
-                    if old.client_id == op.client_id {
-                        old.budget = None;
-                    }
-                }
+                inner.file.replace_grants(&mut grant, self.call_continuity);
                 inner.file.grants.push(grant);
                 if let Err(e) = self.persist(&mut inner.file) {
                     inner.file = before;

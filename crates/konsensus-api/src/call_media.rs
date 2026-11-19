@@ -11,7 +11,10 @@
 //!
 //! The socket needs this node's `spend` authority. Paired tokens are bound to
 //! the client that placed or answered the call, re-checked while it is open.
-//! The node owner's own authority can also attach. It opens only
+//! With `[calls] call_continuity_v1` on, a paired token without `spend` may
+//! also keep or reattach the media of a call it owns while that call's pinned
+//! hold is funded by a grant that expired or was replaced; never after a
+//! revocation. The node owner's own authority can also attach. It opens only
 //! while the router admits media for `(peer, call_id)`; the router closes it
 //! once the call is no longer admitted.
 //!
@@ -441,9 +444,15 @@ async fn media_handler(
     };
     let client = match auth::check_pairing_binding(&state, &claims) {
         Ok(client) => client,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        Err(_) => match continuity_binding(&state, &claims) {
+            Some(client) => Some(client),
+            None => return (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
+        },
     };
-    if !claims.scp.contains(&auth::Scope::Spend) {
+    // Without `spend`, only a call this pairing owns under continuity; the
+    // stream check below decides which.
+    let continuity = client.is_some() && state.pairing.as_ref().is_some_and(|p| p.call_continuity_enabled());
+    if !claims.scp.contains(&auth::Scope::Spend) && !continuity {
         warn!(node_id = %claims.sub, "call media socket refused: token lacks the spend scope");
         return (StatusCode::FORBIDDEN, "token lacks required scope: spend").into_response();
     }
@@ -668,6 +677,10 @@ async fn media_io(socket: &mut WebSocket, from_node: &MediaQueue, to_node: &Medi
 }
 
 fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims, peer: &NodeId, call_id: &str) -> bool {
+    spend_authorized(state, claims, peer, call_id) || continuity_authorized(state, claims, peer, call_id)
+}
+
+fn spend_authorized(state: &Arc<AppState>, claims: &auth::Claims, peer: &NodeId, call_id: &str) -> bool {
     if claims.exp <= chrono::Utc::now().timestamp()
         || !claims.scp.contains(&auth::Scope::Spend)
         || claims.sub != state.identity.node_id().to_hex()
@@ -680,6 +693,35 @@ fn stream_authorized(state: &Arc<AppState>, claims: &auth::Claims, peer: &NodeId
             .is_some_and(|service| service.owns_call_media(&binding, &peer.to_hex(), call_id)),
         Err(_) => false,
     }
+}
+
+/// With continuity on: the paired binding of `claims`, verified as on every
+/// request except for `spend`, which an ended grant no longer gives. Owner
+/// and bootstrap tokens never qualify.
+fn continuity_binding(state: &Arc<AppState>, claims: &auth::Claims) -> Option<auth::PairingBinding> {
+    let service = state.pairing.as_ref().filter(|service| service.call_continuity_enabled())?;
+    if claims.bst == Some(true) {
+        return None;
+    }
+    let binding = auth::PairingBinding::from_claims(claims).ok()??;
+    let scopes: Vec<auth::Scope> = claims.scp.iter().copied().filter(|s| *s != auth::Scope::Spend).collect();
+    service.verify_token_binding(&binding.client_id, binding.epoch, &binding.fingerprint, &scopes).ok()?;
+    Some(binding)
+}
+
+/// A paired token's media for a call it owns, while that call's hold is
+/// still funded (see `PairingService::call_hold_live`). Rechecked every
+/// second like `spend`: a revocation, epoch bump, pairing removal or identity
+/// change ends it within the same bound.
+fn continuity_authorized(state: &Arc<AppState>, claims: &auth::Claims, peer: &NodeId, call_id: &str) -> bool {
+    if claims.exp <= chrono::Utc::now().timestamp() || claims.sub != state.identity.node_id().to_hex() {
+        return false;
+    }
+    let Some(binding) = continuity_binding(state, claims) else { return false };
+    let peer = peer.to_hex();
+    state.pairing.as_ref().is_some_and(|service| {
+        service.call_hold_live(&binding, &peer, call_id) && service.owns_call_media(&binding, &peer, call_id)
+    })
 }
 
 /// Registers the owner media socket.

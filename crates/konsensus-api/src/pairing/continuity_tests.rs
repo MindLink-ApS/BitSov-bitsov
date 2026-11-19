@@ -438,3 +438,24 @@ fn normalize(value: &mut serde_json::Value) {
         _ => {}
     }
 }
+
+#[test]
+fn renewal_after_expiry_takes_over_the_open_hold_once() {
+    let fx = fixture(true);
+    let first = grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    expire(&fx);
+    pay(&fx, "call", 1);
+    assert_eq!(disk_budget(&fx, &first.op_id).unwrap().used_msat, HELD);
+    let renewed = grant(&fx, 30_000);
+    let budget = disk_budget(&fx, &renewed.op_id).unwrap();
+    assert_eq!(budget.call_reservations.len(), 1);
+    assert_eq!(budget.used_msat, HELD - 2 * PRICE);
+    assert_eq!(fx.service.reload_from_disk().unwrap().grants.len(), 1);
+    assert!(fx.service.verify_token_binding(&fx.client, 1, "identity", &[Scope::Spend]).is_ok());
+    pay(&fx, "call", 2);
+    assert_eq!(status(&fx, "call"), Some((HELD, 3 * PRICE, 0, HELD - 3 * PRICE)));
+    // Only the renewed grant's own budget is new authority.
+    assert!(new_payment(&fx).is_ok());
+}

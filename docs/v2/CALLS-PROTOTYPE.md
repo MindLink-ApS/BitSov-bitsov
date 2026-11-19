@@ -166,6 +166,39 @@ node at the default rates sends no such header and answers as it always did.
 Nothing here changes a price or admission: a call is admitted and paid the same
 whatever it carries and whatever these limits are.
 
+## Live-call continuity
+
+`[calls] call_continuity_v1` is off by default. Only the value `true` turns it
+on; any other value leaves it off. While it is on, `GET /api/v1/status` lists
+`call_continuity_v1` in `api_capabilities`.
+
+With it on, a call admitted while the paired app held a live spend grant
+survives that grant ending by expiry or by the owner writing a newer grant:
+
+- The app keeps the call's media socket, and may reattach to that same call
+  with a fresh token that no longer carries `spend`, while the call's hold is
+  open and the app's pairing owns the call.
+- Minute blocks keep drawing on the hold reserved at admission, within its
+  pinned price, routing ceiling, minute limit and amount. Nothing new is
+  reserved: no second call, offer or other payment can use the ended grant.
+- A newer grant takes over the call's open hold once, charged only what the
+  hold still has; minutes already paid are not charged again, and the hold's
+  release returns its unspent part once. The newer grant's own limits apply
+  from then on, so a lower per-payment value closes the hold.
+- The grant record stays on file, marked `ended: expired`, until its calls
+  close, and at most the longest call (240 minutes) plus a minute after its
+  window. A restart drops it, as it drops call media ownership.
+
+A revocation, an epoch bump, a removed pairing or an identity change ends the
+grant as revoked: draws are refused and the media socket closes at its next
+one-second recheck, with the switch on or off. With the switch off, expiry and
+replacement end a call's grant authority exactly as before.
+
+Minute payments still arrive through the app's `spend`-scoped request path.
+After an expiry with no renewal the app's fresh token has no `spend`, so this
+switch keeps the media and the hold, but the app cannot yet submit further
+minute payments; a renewal restores them on the same hold.
+
 ## Persistence, recovery and bounds
 
 `call_state` stores side, phase, effective deadline, replay deadline,

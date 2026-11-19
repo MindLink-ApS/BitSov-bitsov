@@ -123,6 +123,33 @@ impl PairingService {
             .ok_or(BudgetRefusal::NoGrant)
     }
 
+    /// With continuity on, the grant of this pairing that holds call
+    /// `(peer, call_id)`: live, or ended by expiry or replacement (see
+    /// [`SpendGrant::continues_call`]). Draws on it stay inside the hold
+    /// pinned at admission; nothing new is reserved through it.
+    fn call_hold_grant_index(&self, inner: &Inner, client: &str, epoch: u64, peer: &str, call_id: &str) -> Option<usize> {
+        if !self.call_continuity {
+            return None;
+        }
+        let now = chrono::Utc::now().timestamp();
+        if !inner.file.clients.iter().any(|c| {
+            c.client_id == client && c.epoch == epoch && c.identity_fingerprint == inner.identity_fingerprint
+        }) {
+            return None;
+        }
+        inner.file.grants.iter().position(|g| {
+            g.client_id == client
+                && g.epoch == epoch
+                && g.identity_fingerprint == inner.identity_fingerprint
+                && (g.is_live(now) || g.continues_call(now))
+                && g.scopes.contains(&Scope::Spend)
+                && self.permits_spend_grant(g)
+                && g.budget.as_ref().is_some_and(|b| {
+                    b.call_reservations.values().any(|c| c.terms.peer == peer && c.terms.call_id == call_id)
+                })
+        })
+    }
+
     /// The capacity is an observed outbound channel bound. Subtract all holds
     /// under the same lock as the grant debit so concurrent calls cannot both
     /// promise the same funds. This is deliberately conservative across routes.
@@ -342,7 +369,10 @@ impl PairingService {
     fn draw_call_spend_for_grant(&self, client: &str, epoch: u64, peer: &str, call_id: &str,
         seq: u32, price: u64, fee: u64, link: OperationReservationLink, closing_grant: Option<&str>) -> Result<Reservation, BudgetRefusal> {
         let mut inner = self.lock();
-        let idx = self.call_grant_index(&inner, client, epoch)?;
+        let idx = match self.call_hold_grant_index(&inner, client, epoch, peer, call_id) {
+            Some(idx) => idx,
+            None => self.call_grant_index(&inner, client, epoch)?,
+        };
         if closing_grant.is_some_and(|id| inner.file.grants[idx].op_id != id) { return Err(BudgetRefusal::NoGrant); }
         let before = inner.file.clone();
         let grant = &mut inner.file.grants[idx];
@@ -588,8 +618,18 @@ impl PairingService {
     /// call is funded by a grant of this exact pairing that is live or ended
     /// by expiry or replacement. Never after a revocation, an epoch bump, a
     /// pairing removal or an identity change.
-    pub fn call_hold_live(&self, _binding: &auth::PairingBinding, _peer: &str, _call_id: &str) -> bool {
-        false
+    pub fn call_hold_live(&self, binding: &auth::PairingBinding, peer: &str, call_id: &str) -> bool {
+        if !self.call_continuity {
+            return false;
+        }
+        let inner = self.lock();
+        if inner.identity_fingerprint != binding.fingerprint {
+            return false;
+        }
+        self.call_hold_grant_index(&inner, &binding.client_id, binding.epoch, peer, call_id)
+            .and_then(|idx| inner.file.grants[idx].budget.as_ref())
+            .is_some_and(|b| b.call_reservations.values()
+                .any(|c| c.terms.peer == peer && c.terms.call_id == call_id && !c.closed))
     }
 }
 

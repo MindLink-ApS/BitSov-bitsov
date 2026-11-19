@@ -5,6 +5,16 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Add `[calls] call_continuity_v1` (off by default; anything but `true`
+  leaves it off). With it on, a call admitted under a live spend grant keeps
+  its media socket and its pinned hold when that grant expires or is
+  replaced: blocks draw only on that hold, within its price, minute limit and
+  amount, a renewal takes the hold over once without charging paid minutes
+  again, and nothing new is admitted on the ended grant. Spend grants record
+  how they ended (`expired`, `replaced` or `revoked`, an optional field older
+  nodes ignore); a revocation, epoch bump, pairing removal or identity change
+  still closes the media within a second. `GET /api/v1/status` lists
+  `call_continuity_v1` only while it is on.
 - Pay a contact by keysend only at a Lightning key their identity signed. A
   `LightningInfo` announcement now carries an Ed25519 signature by the node's
   identity key over a domain-separated binding of its Lightning pubkey; the

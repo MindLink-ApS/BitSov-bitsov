@@ -313,6 +313,55 @@ impl GrantBudget {
         true
     }
 
+    /// Whether any call this grant funds is still open or still paying.
+    pub(crate) fn has_open_call(&self) -> bool {
+        self.call_reservations.values().any(|call| !call.closed || !call.draws.is_empty())
+    }
+
+    /// Whether reservation `id` is a block drawn from one of this grant's calls.
+    pub(crate) fn holds_draw(&self, id: &str) -> bool {
+        self.call_reservations.values().any(|call| call.draws.contains_key(id))
+    }
+
+    /// Move every call still open or still paying to `successor`, once, with
+    /// what its hold has left and its blocks in flight. The successor is
+    /// charged exactly that remainder, which the call's own settlement and
+    /// release then resolve; minutes already paid stay with this grant, and
+    /// no breaker count is made again. Returns each moved call's
+    /// `peer:call_id`.
+    pub(crate) fn move_open_calls_to(&mut self, successor: &mut GrantBudget) -> Vec<String> {
+        let ids: Vec<String> = self
+            .call_reservations
+            .iter()
+            .filter(|(id, call)| (!call.closed || !call.draws.is_empty()) && !successor.call_reservations.contains_key(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut moved = Vec::with_capacity(ids.len());
+        for id in ids {
+            let call = self.call_reservations.remove(&id).expect("listed call");
+            let peer = call.terms.peer.clone();
+            let mut outstanding: u64 = 0;
+            for key in std::iter::once(id.clone()).chain(call.draws.keys().cloned()) {
+                if let Some(recipients) = self.pending.remove(&key) {
+                    outstanding = recipients.values().fold(outstanding, |sum, amount| sum.saturating_add(*amount));
+                    successor.pending.insert(key.clone(), recipients);
+                }
+                if let Some(link) = self.operation_links.remove(&key) {
+                    successor.operation_links.insert(key, link);
+                }
+            }
+            successor.used_msat = successor.used_msat.saturating_add(outstanding);
+            if outstanding > 0 {
+                let used = successor.used_by_recipient.entry(peer.clone()).or_insert(0);
+                *used = used.saturating_add(outstanding);
+            }
+            self.resolve(&peer, outstanding, 0);
+            moved.push(format!("{peer}:{}", call.terms.call_id));
+            successor.call_reservations.insert(id, call);
+        }
+        moved
+    }
+
     pub(crate) fn close_call(&mut self, id: &str) {
         let Some(call) = self.call_reservations.get_mut(id) else {
             return;

@@ -441,8 +441,27 @@ impl SpendGrant {
     /// an extension).
     pub fn is_live(&self, now: i64) -> bool {
         self.budget.is_some()
+            && self.ended.is_none()
             && self.expires_at > now
             && self.expires_at - self.granted_at <= MAX_SPEND_GRANT_TTL_SECS
+    }
+
+    /// Whether this expired grant still funds a call admitted while it was
+    /// live: not revoked or replaced, past its window by less than the
+    /// longest call, and holding a call that is open or still paying. Such a
+    /// grant only pays draws from that call's pinned hold; it never
+    /// reserves, admits or grants a scope. Used only with continuity on.
+    pub(crate) fn continues_call(&self, now: i64) -> bool {
+        matches!(self.ended, None | Some(GrantEnd::Expired))
+            && self.expires_at <= now
+            && now < self.expires_at.saturating_add(CALL_CONTINUITY_MAX_SECS)
+            && self.expires_at - self.granted_at <= MAX_SPEND_GRANT_TTL_SECS
+            && self.budget.as_ref().is_some_and(GrantBudget::has_open_call)
+    }
+
+    /// Live, or (with continuity on) still funding an admitted call.
+    fn is_kept(&self, now: i64, continuity: bool) -> bool {
+        self.is_live(now) || (continuity && self.continues_call(now))
     }
 }
 
@@ -580,6 +599,7 @@ impl PairingFile {
         for grant in &mut self.grants {
             if client_id.is_none_or(|id| grant.client_id == id) {
                 grant.budget = None;
+                grant.ended = Some(GrantEnd::Revoked);
                 revoked += 1;
             }
         }
@@ -593,14 +613,48 @@ impl PairingFile {
     }
 
     /// Any grant, of either kind, that can no longer authorise anything.
-    fn has_dead_grant(&self, now: i64) -> bool {
-        self.grants.iter().any(|g| !g.is_live(now))
+    /// With `continuity`, an expired grant still funding an admitted call is
+    /// not dead yet.
+    fn has_dead_grant(&self, now: i64, continuity: bool) -> bool {
+        self.grants.iter().any(|g| !g.is_kept(now, continuity))
             || self.front_door_grants.iter().any(|g| !g.is_live(now))
     }
 
-    fn retain_live_grants(&mut self, now: i64) {
-        self.grants.retain(|g| g.is_live(now));
+    fn retain_live_grants(&mut self, now: i64, continuity: bool) {
+        self.grants.retain(|g| g.is_kept(now, continuity));
+        for grant in self.grants.iter_mut().filter(|g| !g.is_live(now)) {
+            grant.ended.get_or_insert(GrantEnd::Expired);
+        }
         self.front_door_grants.retain(|g| g.is_live(now));
+    }
+
+    /// End every earlier grant of `successor`'s pairing as replaced, as a new
+    /// budget window does. With `carry_calls`, the open calls of a grant of
+    /// the same pairing epoch and identity move to `successor` first, once,
+    /// with their funding provenance; a revoked grant has no budget and
+    /// carries nothing.
+    fn replace_grants(&mut self, successor: &mut SpendGrant, carry_calls: bool) {
+        let mut moved = Vec::new();
+        for old in &mut self.grants {
+            if old.client_id != successor.client_id {
+                continue;
+            }
+            let same_pairing = old.epoch == successor.epoch
+                && old.identity_fingerprint == successor.identity_fingerprint
+                && old.ended != Some(GrantEnd::Revoked);
+            if let (true, Some(budget), Some(next)) =
+                (carry_calls && same_pairing, old.budget.as_mut(), successor.budget.as_mut())
+            {
+                moved.extend(budget.move_open_calls_to(next));
+            }
+            old.budget = None;
+            if old.ended != Some(GrantEnd::Revoked) {
+                old.ended = Some(GrantEnd::Replaced);
+            }
+        }
+        for key in moved {
+            self.call_spend_grants.insert(key, successor.op_id.clone());
+        }
     }
 }
 
@@ -1474,7 +1528,7 @@ impl PairingService {
         let inner = self.lock();
         let mut snapshot = inner.file.clone();
         // Cleanup failures stay retryable internally, never visible as grants.
-        snapshot.retain_live_grants(chrono::Utc::now().timestamp());
+        snapshot.retain_live_grants(chrono::Utc::now().timestamp(), self.call_continuity);
         snapshot
     }
 
@@ -2900,7 +2954,7 @@ impl PairingService {
             .find(|c| c.client_id == op.client_id)
             .cloned()
             .ok_or(PairingError::UnknownClient)?;
-        let grant = SpendGrant {
+        let mut grant = SpendGrant {
             op_id: op.op_id.clone(),
             client_id: op.client_id.clone(),
             scopes: op.scopes.clone(),
@@ -2916,11 +2970,7 @@ impl PairingService {
         inner.file.pending_elevations.retain(|e| e.op_id != op_id);
         // A new budget window replaces the client's old one. A live front-door
         // grant is a different authority and stays.
-        for old in &mut inner.file.grants {
-            if old.client_id == grant.client_id {
-                old.budget = None;
-            }
-        }
+        inner.file.replace_grants(&mut grant, self.call_continuity);
         inner.file.grants.push(grant.clone());
         self.persist(&mut inner.file)?;
         inner.owner_confirmations.remove(op_id);
@@ -4115,9 +4165,15 @@ impl PairingService {
         let purpose = purpose.or(call.map(|_| crate::spend_budget::CallPayment::Media));
         let inner = self.lock();
         let now = clock();
+        // With continuity, a block of an admitted call is paid by the grant
+        // that now holds the call: the one it was drawn from, its successor
+        // after a replacement, or that grant after expiry.
+        let continuity = self.call_continuity && call.is_some();
+        let funds = |g: &SpendGrant| g.op_id == reservation.op_id
+            || (continuity && g.budget.as_ref().is_some_and(|b| b.holds_draw(&reservation.id)));
         let valid = inner.file.grants.iter().any(|g| {
             self.permits_spend_grant(g)
-                && g.op_id == reservation.op_id
+                && funds(g)
                 && g.budget.as_ref().is_some_and(|b| {
                     // A relation grant lives until its latest envelope, so
                     // each recipient's own deadline is rechecked here, at
@@ -4137,7 +4193,7 @@ impl PairingService {
                 && g.client_id == reservation.client_id
                 && g.identity_fingerprint == inner.identity_fingerprint
                 && g.scopes.contains(&Scope::Spend)
-                && g.is_live(now)
+                && (g.is_live(now) || (continuity && g.continues_call(now)))
                 && inner.file.clients.iter().any(|c| {
                     c.client_id == g.client_id
                         && c.epoch == g.epoch
@@ -4148,7 +4204,7 @@ impl PairingService {
             return Err(BudgetRefusal::NoGrant);
         }
         if inner.file.grants.iter().any(|g| {
-            g.op_id == reservation.op_id
+            funds(g)
                 && g.client_id == reservation.client_id
                 && g.budget.as_ref().is_some_and(|b| b.is_paused())
         }) {
@@ -4203,14 +4259,34 @@ impl PairingService {
         payment_failed: bool,
     ) -> Result<(), PairingError> {
         let mut inner = self.lock();
-        let Some(grant) = inner
+        let mut found = inner
             .file
             .grants
-            .iter_mut()
-            .find(|g| g.op_id == reservation.op_id && g.client_id == reservation.client_id)
-        else {
+            .iter()
+            .position(|g| g.op_id == reservation.op_id && g.client_id == reservation.client_id);
+        // With continuity, a block drawn before a replacement settles on the
+        // grant its call moved to, exactly once.
+        if self.call_continuity
+            && found.is_none_or(|i| {
+                inner.file.grants[i].budget.as_ref().is_none_or(|b| !b.pending.contains_key(&reservation.id))
+            })
+        {
+            found = inner
+                .file
+                .grants
+                .iter()
+                .position(|g| {
+                    g.client_id == reservation.client_id
+                        && g.budget.as_ref().is_some_and(|b| {
+                            b.pending.contains_key(&reservation.id) && b.holds_draw(&reservation.id)
+                        })
+                })
+                .or(found);
+        }
+        let Some(index) = found else {
             return Ok(());
         };
+        let grant = &mut inner.file.grants[index];
         let Some(budget) = grant.budget.as_mut() else {
             return Ok(());
         };
@@ -4233,14 +4309,9 @@ impl PairingService {
             budget.record_outcome(reserved, actual_msat, chrono::Utc::now().timestamp());
         }
         if let Err(e) = self.persist(&mut inner.file) {
-            if let Some(grant) = inner
-                .file
-                .grants
-                .iter_mut()
-                .find(|g| g.op_id == reservation.op_id)
-            {
-                grant.budget = Some(before);
-            }
+            // A failed write leaves the in-memory file as it was, so the
+            // grant is still at `index`.
+            inner.file.grants[index].budget = Some(before);
             return Err(e);
         }
         tracing::info!(client_id = %reservation.client_id, grant_op_id = %reservation.op_id,
@@ -4311,7 +4382,7 @@ impl PairingService {
     fn prune_expired_locked(&self, file: &mut PairingFile) -> Result<usize, PairingError> {
         let now = chrono::Utc::now().timestamp();
         let before = file.grants.len() + file.front_door_grants.len();
-        if file.has_dead_grant(now) {
+        if file.has_dead_grant(now, self.call_continuity) {
             self.persist(file)?;
         }
         Ok(before - file.grants.len() - file.front_door_grants.len())
@@ -4322,11 +4393,12 @@ impl PairingService {
     pub(crate) fn grant_cleanup_delay(&self) -> Duration {
         let inner = self.lock_without_cleanup();
         let now = chrono::Utc::now().timestamp_millis();
+        let continuing = |g: &SpendGrant| self.call_continuity && g.continues_call(now / 1000);
         let millis = inner
             .file
             .grants
             .iter()
-            .map(|g| g.expires_at)
+            .map(|g| if continuing(g) { g.expires_at.saturating_add(CALL_CONTINUITY_MAX_SECS) } else { g.expires_at })
             .chain(inner.file.front_door_grants.iter().map(|g| g.expires_at))
             .map(|at| at.saturating_mul(1000).saturating_sub(now).max(0) as u64)
             .min()
@@ -4416,7 +4488,7 @@ impl PairingService {
         let tmp = self.file_path.with_extension("json.tmp");
         loop {
             let now = clock();
-            candidate.retain_live_grants(now);
+            candidate.retain_live_grants(now, self.call_continuity);
             let bytes = serde_json::to_vec_pretty(&candidate)
                 .map_err(|e| PairingError::Io(format!("serializing pairing store: {e}")))?;
             if let Err(e) = write_protected(&tmp, &bytes) {
@@ -4426,7 +4498,7 @@ impl PairingService {
                 return Err(e.into());
             }
             let now = clock();
-            if candidate.has_dead_grant(now) {
+            if candidate.has_dead_grant(now, self.call_continuity) {
                 continue;
             }
             if let Err(e) = std::fs::rename(&tmp, &self.file_path) {
@@ -4435,7 +4507,7 @@ impl PairingService {
             }
             fsync_dir(&self.dir)?;
             let now = clock();
-            if candidate.has_dead_grant(now) {
+            if candidate.has_dead_grant(now, self.call_continuity) {
                 continue;
             }
             *file = candidate;

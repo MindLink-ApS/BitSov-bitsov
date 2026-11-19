@@ -19,7 +19,7 @@ use rand::{Rng, TryRng};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use super::{Inner, PairingError, PairingRefusal, PairingService, SpendGrant, ELEVATION_TTL_SECS};
+use super::{GrantEnd, Inner, PairingError, PairingRefusal, PairingService, SpendGrant, ELEVATION_TTL_SECS};
 use crate::auth::Scope;
 use crate::spend_budget::{GrantBudget, GrantView, MAX_SPEND_GRANT_TTL_SECS};
 
@@ -1228,6 +1228,7 @@ impl PairingService {
                 && grant.budget.as_ref().is_some_and(|b| b.recipients_only)
             {
                 grant.budget = None;
+                grant.ended = Some(GrantEnd::Revoked);
             }
         }
     }
@@ -1431,14 +1432,9 @@ impl PairingService {
             None => {
                 // Retire expired grants before opening a new relation window.
                 // A live console budget was refused above.
-                for old in &mut inner.file.grants {
-                    if old.client_id == client_id {
-                        old.budget = None;
-                    }
-                }
                 let mut op = [0u8; 12];
                 rand::rng().fill_bytes(&mut op);
-                inner.file.grants.push(SpendGrant {
+                let mut grant = SpendGrant {
                     owner_approval: None,
                     op_id: format!("rel-{}", hex::encode(op)),
                     client_id: client_id.to_string(),
@@ -1450,7 +1446,9 @@ impl PairingService {
                     granted_by: format!("device:{}", key.key_id),
                     budget: Some(GrantBudget::relations()),
                     ended: None,
-                });
+                };
+                inner.file.replace_grants(&mut grant, self.call_continuity);
+                inner.file.grants.push(grant);
                 inner.file.grants.len() - 1
             }
         };
