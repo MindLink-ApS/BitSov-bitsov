@@ -369,9 +369,11 @@ impl PairingService {
     fn draw_call_spend_for_grant(&self, client: &str, epoch: u64, peer: &str, call_id: &str,
         seq: u32, price: u64, fee: u64, link: OperationReservationLink, closing_grant: Option<&str>) -> Result<Reservation, BudgetRefusal> {
         let mut inner = self.lock();
-        let idx = match self.call_hold_grant_index(&inner, client, epoch, peer, call_id) {
-            Some(idx) => idx,
-            None => self.call_grant_index(&inner, client, epoch)?,
+        // With continuity, a draw on an admitted call's existing hold is
+        // bounded by that hold, not by the window it was admitted in.
+        let (idx, existing_hold) = match self.call_hold_grant_index(&inner, client, epoch, peer, call_id) {
+            Some(idx) => (idx, true),
+            None => (self.call_grant_index(&inner, client, epoch)?, false),
         };
         if closing_grant.is_some_and(|id| inner.file.grants[idx].op_id != id) { return Err(BudgetRefusal::NoGrant); }
         let before = inner.file.clone();
@@ -387,7 +389,10 @@ impl PairingService {
             }
             return Err(refusal);
         }
-        if !budget.envelopes_live(
+        // A relation envelope's deadline ends new spending for its peer. An
+        // admitted call's own hold keeps paying past it, up to its pinned
+        // amount and minute limit (checked below), unless revoked.
+        if !existing_hold && !budget.envelopes_live(
             std::iter::once(&peer.to_owned()),
             chrono::Utc::now().timestamp(),
         ) {

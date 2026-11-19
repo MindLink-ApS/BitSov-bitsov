@@ -9,7 +9,7 @@ also live on the corresponding GitHub pre-release pages.
   leaves it off). With it on, a call admitted under a live spend grant keeps
   its media socket and its pinned hold when that grant expires or is
   replaced: blocks draw only on that hold, within its price, minute limit and
-  amount, a renewal takes the hold over once without charging paid minutes
+  amount (also past a device relation envelope's deadline), a renewal takes the hold over once without charging paid minutes
   again, and only when the hold fits every limit of the renewed grant (it is
   closed otherwise), and nothing new is admitted on the ended grant. Spend grants record
   how they ended (`expired`, `replaced` or `revoked`, an optional field older

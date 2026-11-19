@@ -193,6 +193,9 @@ survives that grant ending by expiry or by the owner writing a newer grant:
   own limits apply from then on, so a lower per-payment value closes the hold.
   A renewal whose write fails leaves the hold and its funding exactly as
   they were.
+- On a device relation grant the same holds for the peer's envelope: its
+  deadline ends new spending for that peer, but an admitted call's own hold
+  keeps paying past it within the same bounds, unless revoked.
 - The grant record stays on file, marked `ended: expired`, until its calls
   close, and at most the longest call (240 minutes) plus a minute after its
   window. A restart drops it, as it drops call media ownership.

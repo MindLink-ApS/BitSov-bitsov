@@ -4202,7 +4202,12 @@ impl PairingService {
                     // dispatch: an expired peer never pays on a live one's time.
                     b.pending
                         .get(&reservation.id)
-                        .is_some_and(|recipients| b.envelopes_live(recipients.keys(), now))
+                        .is_some_and(|recipients| b.envelopes_live(recipients.keys(), now)
+                            // A block of an admitted call's own hold is not
+                            // stopped by the relation window, only by its hold.
+                            || (continuity && call.is_some_and(|(peer, id)| b.call_reservations.values().any(|hold|
+                                hold.terms.peer == peer && hold.terms.call_id == id
+                                    && hold.draws.contains_key(&reservation.id)))))
                         && call.is_none_or(|(peer, id)| b.call_reservations.values().any(|hold|
                             hold.terms.peer == peer && hold.terms.call_id == id && !hold.closed
                                 // Recovery re-dispatches under the grant as it is now.
