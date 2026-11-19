@@ -640,7 +640,7 @@ restart the box to reopen it. Tickets cannot outlive that window. In LOCKED or
 UNLOCKED, the page contains only label, state, fingerprint and “Use the BitSov
 app”; no QR, approval controls or secrets. Adding later devices still requires
 an existing owner device or the trusted console flow, with SAS on claimed boxes.
-Client app support is delivered separately (A1); old clients cannot downgrade a
+Client app support is delivered separately; old clients cannot downgrade a
 box that has a claim code.
 
 **Ticket authority (design open item 9):** in home SETUP, the daemon's single
@@ -911,7 +911,7 @@ Only one ceremony can be pending. Setup closes after 15 minutes, or after three
 mismatches/cancels; restart to reopen it. Reconnecting requires cancelling the
 pending SAS ceremony and starting again.
 
-The node box page is available; app integration follows in A1. On boxes with
+The node box page is available; app integration follows separately. On boxes with
 a claim code, enrollment without `sas_version` is refused, including legacy
 console/delegation pending operations. Already initialized legacy boxes without
 a claim code retain their existing path; this does not migrate a funded box. See [the SAS wire contract](../security/pairing.md#sas-v1-and-the-box-claim-code-n3)
