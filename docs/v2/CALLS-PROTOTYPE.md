@@ -166,6 +166,40 @@ node at the default rates sends no such header and answers as it always did.
 Nothing here changes a price or admission: a call is admitted and paid the same
 whatever it carries and whatever these limits are.
 
+## Free call replies
+
+`[calls] call_reply_free_v1` is off by default. Only the value `true` turns it
+on; any other value leaves it off. While it is on, the node lists
+`call_reply_free_v1` in `GET /api/v1/status` `api_capabilities` and advertises
+it to peers in its handshake (`Custom("call_reply_free_v1")`).
+
+With it on, two replies to a ringing call cost nothing:
+
+- **Sending (callee).** An answer, or a hangup whose reason is `declined`, for
+  a call this node is ringing for goes out with no quote, no invoice, no grant
+  debit, no reservation and no payment, but only to a connected caller whose
+  node advertised the capability and only with no other reference. The
+  envelope carries amount 0, a fresh preimage that only keeps its replay keys
+  unique, and one reference derived from the call id. It is journaled and
+  resent like any other signal, so a double tap or a lost receipt still
+  sends one reply; it is never retried as a paid one. To any other caller,
+  and for every other signal, the paid path is unchanged.
+- **Receiving (caller).** The payment gate accepts such a reply without
+  payment only when its sender is the callee of a call this node placed,
+  whose paid offer is bound and which is still ringing, and its reference
+  names that call. After decryption the payload must be that exact answer or
+  decline; anything else is withdrawn. A late reply, a second reply, a reply
+  for another call or peer, or an unsolicited one meets the price floor and
+  is refused as before. The reply's nonce and preimage are burned like any
+  accepted envelope's, so the same reply is never admitted twice.
+
+A free reply is not a free message channel: it is bound to an offer the
+caller already paid for, at most one per call, inside the ring window.
+
+The callee's app still needs a token with `spend` to submit the answer, and
+its media socket still needs `spend` for an answered call: this switch makes
+the reply free, not grant-free.
+
 ## Persistence, recovery and bounds
 
 `call_state` stores side, phase, effective deadline, replay deadline,

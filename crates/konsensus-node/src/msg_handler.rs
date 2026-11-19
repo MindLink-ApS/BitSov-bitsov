@@ -49,6 +49,9 @@ pub(crate) struct MsgHandlerDeps {
     pub plaintext_cipher: Arc<PlaintextCacheCipher>,
     pub ws_tx: broadcast::Sender<Arc<WsMessage>>,
     pub call_devices: Arc<konsensus_api::calls::devices::Devices>,
+    /// `[calls] call_reply_free_v1`: accept, at no charge, the answer or the
+    /// declined hangup that replies to this node's own ringing offer.
+    pub call_reply_free: bool,
     pub audit_log: Arc<AuditLog>,
     /// Operator-selectable admission mode. In `Whitelist` (default) the receive-path
     /// gate still passes `Some(&whitelist)` (Step-2 membership enforced); in
@@ -293,6 +296,53 @@ impl konsensus_core::gate::NonceStore for InviteReceipts<'_> {
     }
 }
 
+/// Receipts for a free-reply-shaped answer or hangup: the ordinary replay
+/// store, plus the binding that lets the gate accept it without payment when
+/// it replies to this node's own ringing offer (and the switch is on).
+struct FreeCallReplies<'a> {
+    inner: &'a dyn konsensus_core::gate::NonceStore,
+    storage: &'a dyn konsensus_storage::Storage,
+    enabled: bool,
+}
+
+#[async_trait::async_trait]
+impl konsensus_core::gate::NonceStore for FreeCallReplies<'_> {
+    async fn delivery_price_floor(&self, envelope: &konsensus_core::UkmEnvelope, paid_at: u64, now: u64) -> Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.delivery_price_floor(envelope, paid_at, now).await
+    }
+
+    async fn is_paid_envelope_accepted(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.is_paid_envelope_accepted(envelope).await
+    }
+
+    async fn check_and_store_paid(&self, nonce: &konsensus_core::Nonce, payment_hash: &[u8; 32], sender: &konsensus_core::NodeId,
+        message_id: &konsensus_core::MessageId) -> Result<konsensus_core::gate::PaidReplay, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.check_and_store_paid(nonce, payment_hash, sender, message_id).await
+    }
+
+    async fn check_and_store(&self, nonce: &konsensus_core::Nonce, sender: &konsensus_core::NodeId) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.check_and_store(nonce, sender).await
+    }
+
+    async fn check_and_store_payment_hash(&self, payment_hash: &[u8; 32], sender: &konsensus_core::NodeId,
+        message_id: &konsensus_core::MessageId) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.check_and_store_payment_hash(payment_hash, sender, message_id).await
+    }
+
+    async fn record_outgoing_web_request(&self, payment_hash: &[u8; 32], request: konsensus_core::web_reply::OutstandingWebRequest)
+        -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.record_outgoing_web_request(payment_hash, request).await
+    }
+
+    async fn take_outstanding_web_request(&self, hash: &[u8; 32]) -> Result<Option<konsensus_core::web_reply::OutstandingWebRequest>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner.take_outstanding_web_request(hash).await
+    }
+
+    async fn is_free_call_reply(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(konsensus_api::calls::free_reply_bound(self.enabled, self.storage, envelope, konsensus_api::calls::now_ms()).await?)
+    }
+}
+
 /// Both duplicate paths use the original durable device outcome, even after
 /// withdrawal, content retention, call expiry, or a process restart.
 async fn duplicate_reply(
@@ -351,6 +401,7 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
         plaintext_cipher,
         ws_tx: ws_tx_for_recv,
         call_devices,
+        call_reply_free,
         audit_log: audit_for_recv,
         admission_mode: admission_mode_for_recv,
         relay_engine: relay_engine_for_recv,
@@ -425,7 +476,12 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             && konsensus_core::kind::KindCategory::from_kind(envelope.kind)
                                 == konsensus_core::kind::KindCategory::Storage;
                         let invite_receipts = InviteReceipts(storage_for_recv.as_ref());
-                        let receipts: &dyn konsensus_core::gate::NonceStore = if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE { &invite_receipts } else { nonce_adapter.as_ref() };
+                        let free_replies = FreeCallReplies { inner: nonce_adapter.as_ref(), storage: storage_for_recv.as_ref(), enabled: call_reply_free };
+                        let receipts: &dyn konsensus_core::gate::NonceStore = if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {
+                            &invite_receipts
+                        } else if call_reply_free && konsensus_core::payloads::call::is_free_reply_shape(&envelope) {
+                            &free_replies
+                        } else { nonce_adapter.as_ref() };
                         let mut gate_result = whitelist_then_verify(
                             &envelope,
                             audit_for_recv.membrane(),
@@ -954,6 +1010,8 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                             admission_mode_for_recv,
                             konsensus_message::ReachabilityMode::PriceOpen
                         ) && !konsensus_core::is_web_service_reply(&envelope)
+                            // Nor does a free call reply: the callee paid nothing.
+                            && !konsensus_core::payloads::call::is_free_reply_shape(&envelope)
                         {
                             if let Some(promoted) = transport_for_recv.promote_to_privileged_at(&sender).await {
                                 offer_prekey_after_promotion(
@@ -1128,7 +1186,12 @@ pub(crate) async fn run(deps: MsgHandlerDeps) {
                                 // the call lock, so expiry cannot be undone by a late release.
                                 // If that write fails the signal is refused: fail closed, the
                                 // peer gets a reject, not an ACK.
-                                None => call_devices.admit(storage_for_recv.as_ref(), identity_for_recv.node_id(), &envelope, plaintext.as_deref(), arrived_ms, konsensus_api::calls::now_ms).await,
+                                // A free reply's payload must be exactly the answer or
+                                // decline its reference bound at the gate.
+                                None => match konsensus_api::calls::check_free_reply(storage_for_recv.as_ref(), &envelope, plaintext.as_deref()).await {
+                                    Ok(()) => call_devices.admit(storage_for_recv.as_ref(), identity_for_recv.node_id(), &envelope, plaintext.as_deref(), arrived_ms, konsensus_api::calls::now_ms).await,
+                                    Err(refusal) => Err(refusal),
+                                },
                             };
                             if let Err(refusal) = admitted {
                                 warn!(sender = %sender, kind = envelope.kind, reason = %refusal, "call signal refused; not forwarded");

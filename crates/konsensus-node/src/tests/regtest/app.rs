@@ -470,6 +470,7 @@ impl App {
                     identity.aes_key(),
                 )),
                 call_devices: state.call_devices.clone(),
+                call_reply_free: false,
                 ws_tx: state.ws_broadcast.clone(),
                 audit_log: state.audit_log.clone(),
                 admission_mode: ReachabilityMode::PriceOpen,

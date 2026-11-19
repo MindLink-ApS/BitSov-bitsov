@@ -437,6 +437,7 @@ async fn start_node(identity: Arc<NodeIdentity>, peer: NodeId, ledger: &Path, na
             identity: Arc::clone(&identity),
             plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::new(identity.aes_key())),
             call_devices: state.call_devices.clone(),
+            call_reply_free: false,
             ws_tx: ws_broadcast.clone(),
             audit_log: Arc::clone(&audit),
             admission_mode: ReachabilityMode::PriceOpen,

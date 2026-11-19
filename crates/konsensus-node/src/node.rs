@@ -901,10 +901,15 @@ pub(crate) fn merge_persisted_peers(
 /// explicitly enables `[relay] enabled = true`. Default nodes stay non-relay;
 /// enabling the flag is still a negotiation signal only and does not mount a
 /// relay engine or change custody/decryption boundaries.
-fn advertised_capabilities(relay_enabled: bool, starter_enabled: bool, _call_reply_free: bool) -> Vec<Capability> {
+fn advertised_capabilities(relay_enabled: bool, starter_enabled: bool, call_reply_free: bool) -> Vec<Capability> {
     let mut caps = default_advertised_capabilities(relay_enabled);
     if starter_enabled {
         caps.push(Capability::Custom("starter_hub_v1".into()));
+    }
+    // Peers answer or decline this node's ringing offers for free only when
+    // it says so; older nodes and nodes with the switch off keep the paid reply.
+    if call_reply_free {
+        caps.push(Capability::Custom(konsensus_core::payloads::call::FREE_REPLY_CAPABILITY.into()));
     }
     caps
 }

@@ -596,6 +596,26 @@ impl PaymentGate {
             debug!("web service reply: no outstanding request — applying price floor");
         }
 
+        // ── Step 4.6: Free call replies ─────────────────────────────────
+        // An answer or a declined hangup to a ringing offer THIS node paid
+        // for, from the callee it rang: amount 0 and one reference naming
+        // the call. Only the store can bind it (and only when the operator
+        // turned free replies on); otherwise it meets the price floor below,
+        // so an unbound zero-amount reply stays rejected. The decrypted
+        // payload is checked against the same call before it is admitted.
+        if crate::payloads::call::is_free_reply_shape(envelope) {
+            if let Some(store) = receipts {
+                if store
+                    .is_free_call_reply(envelope)
+                    .await
+                    .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?
+                {
+                    debug!("free call reply: bound to our ringing offer, skipping price/settlement");
+                    return Ok(false);
+                }
+            }
+        }
+
         // ── Step 5: Price verification ─────────────────────────────────
         // Determine the required price for this message kind and verify
         // the payment amount meets or exceeds it. Plasticity pricing

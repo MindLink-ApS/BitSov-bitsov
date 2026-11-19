@@ -676,6 +676,7 @@ async fn start_node(spec: NodeSpec<'_>) -> Node {
             identity.aes_key(),
         )),
         call_devices: state.call_devices.clone(),
+        call_reply_free: false,
         ws_tx: ws_broadcast.clone(),
         audit_log: Arc::clone(&audit),
         admission_mode: ReachabilityMode::PriceOpen,

@@ -388,6 +388,7 @@ async fn start_node(spec: Spec<'_>) -> SimNode {
     tokio::spawn(tracing::Instrument::instrument(run_msg_handler(MsgHandlerDeps {
         transport: Arc::clone(&transport),
         call_devices: state.call_devices.clone(),
+        call_reply_free: false,
         transport_ack: Arc::clone(&transport),
         storage: Arc::clone(&storage),
         gate,

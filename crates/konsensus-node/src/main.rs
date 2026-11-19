@@ -2173,6 +2173,7 @@ async fn start_node_services<'a>(
             node.record_policy(),
         )),
         call_devices: api_state.call_devices.clone(),
+        call_reply_free: config.calls.call_reply_free_v1,
         ws_tx,
         audit_log: Arc::clone(&audit_log),
         // M1a: wire the configured admission mode into the receive-path gate carrier.

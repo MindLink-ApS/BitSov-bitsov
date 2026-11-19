@@ -5,6 +5,15 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Add `[calls] call_reply_free_v1` (off by default; anything but `true` leaves
+  it off). With it on, the answer or the declined hangup a callee sends to its
+  own ringing incoming call costs nothing (no quote, invoice, grant debit,
+  reservation or payment) when the caller's node advertises
+  `call_reply_free_v1`, and the caller's node accepts such a reply without
+  payment only when it names its own ringing, paid offer from that peer. Every
+  other signal, and every reply to a node without the switch, is paid as
+  before. `GET /api/v1/status` and the peer handshake list
+  `call_reply_free_v1` only while it is on.
 - Pay a contact by keysend only at a Lightning key their identity signed. A
   `LightningInfo` announcement now carries an Ed25519 signature by the node's
   identity key over a domain-separated binding of its Lightning pubkey; the

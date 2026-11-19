@@ -72,6 +72,11 @@ async fn offer_bound_answer_and_decline_cost_zero_without_grant() {
         let entry = fx.state.storage.call_get(&fx.peer, call_id).await.unwrap().unwrap();
         assert_eq!(entry.phase, if kind == 401 { Phase::Live } else { Phase::Ended }, "{kind}");
 
+        // Reconciling the journal later never turns the free reply into a
+        // payment or undoes it.
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+        assert_eq!(ledger(&fx, &transport), before, "{kind}: reconciliation charged a free reply");
+        assert_eq!(fx.state.storage.call_get(&fx.peer, call_id).await.unwrap().unwrap().phase, entry.phase);
         // A double tap is the same operation: still one reply, still free.
         let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, call_id, &operation)).await;
         assert!(status == StatusCode::OK || status.is_client_error(), "{kind}: {status} {body}");
