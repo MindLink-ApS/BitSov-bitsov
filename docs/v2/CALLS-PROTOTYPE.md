@@ -183,8 +183,16 @@ survives that grant ending by expiry or by the owner writing a newer grant:
   reserved: no second call, offer or other payment can use the ended grant.
 - A newer grant takes over the call's open hold once, charged only what the
   hold still has; minutes already paid are not charged again, and the hold's
-  release returns its unspent part once. The newer grant's own limits apply
-  from then on, so a lower per-payment value closes the hold.
+  release returns its unspent part once. It takes the hold over only if it
+  could fund it as a new reservation: not paused, the peer allowed by its
+  payee list, the per-block and closing amounts within its per-payment limits
+  (and a live envelope for the peer on a device relation grant), and room in
+  its recipient budget and total. Otherwise the call's hold is closed: its
+  unpaid part is released at once, and a block already in flight settles on
+  the earlier grant, which is kept inert only until then. The newer grant's
+  own limits apply from then on, so a lower per-payment value closes the hold.
+  A renewal whose write fails leaves the hold and its funding exactly as
+  they were.
 - The grant record stays on file, marked `ended: expired`, until its calls
   close, and at most the longest call (240 minutes) plus a minute after its
   window. A restart drops it, as it drops call media ownership.
@@ -194,10 +202,15 @@ grant as revoked: draws are refused and the media socket closes at its next
 one-second recheck, with the switch on or off. With the switch off, expiry and
 replacement end a call's grant authority exactly as before.
 
-Minute payments still arrive through the app's `spend`-scoped request path.
-After an expiry with no renewal the app's fresh token has no `spend`, so this
-switch keeps the media and the hold, but the app cannot yet submit further
-minute payments; a renewal restores them on the same hold.
+After an expiry with no renewal the app's fresh token has no `spend`. On
+`POST /api/v1/messages/compose`, and only there, such a paired token may still
+send a minute block (kind 404) of a call its pairing owns, while that call's
+hold is funded as above. The block is drawn on that hold alone, at its pinned
+price, routing ceiling, minute limit and amount. Any other request without
+`spend` on that route (another call, a new call, an offer, a hangup, a chat
+message) and every other paid route refuse it exactly as before. With the
+switch off the route refuses it too. A renewal gives the token `spend` again,
+on the same hold.
 
 ## Persistence, recovery and bounds
 

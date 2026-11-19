@@ -459,9 +459,20 @@ impl SpendGrant {
             && self.budget.as_ref().is_some_and(GrantBudget::has_open_call)
     }
 
-    /// Live, or (with continuity on) still funding an admitted call.
+    /// A grant replaced while one of its calls had a block in flight, and
+    /// whose hold did not fit the successor: kept, inert, only until that
+    /// block settles, so its outcome resolves once on the grant that
+    /// reserved it. It authorizes nothing. Used only with continuity on.
+    pub(crate) fn settles_replaced_call(&self, now: i64) -> bool {
+        self.ended == Some(GrantEnd::Replaced)
+            && now < self.expires_at.saturating_add(CALL_CONTINUITY_MAX_SECS)
+            && self.budget.as_ref().is_some_and(GrantBudget::has_unsettled_draw)
+    }
+
+    /// Live, or (with continuity on) still funding an admitted call or
+    /// settling a replaced one.
     fn is_kept(&self, now: i64, continuity: bool) -> bool {
-        self.is_live(now) || (continuity && self.continues_call(now))
+        self.is_live(now) || (continuity && (self.continues_call(now) || self.settles_replaced_call(now)))
     }
 }
 
@@ -634,6 +645,7 @@ impl PairingFile {
     /// with their funding provenance; a revoked grant has no budget and
     /// carries nothing.
     fn replace_grants(&mut self, successor: &mut SpendGrant, carry_calls: bool) {
+        let now = chrono::Utc::now().timestamp();
         let mut moved = Vec::new();
         for old in &mut self.grants {
             if old.client_id != successor.client_id {
@@ -645,9 +657,19 @@ impl PairingFile {
             if let (true, Some(budget), Some(next)) =
                 (carry_calls && same_pairing, old.budget.as_mut(), successor.budget.as_mut())
             {
-                moved.extend(budget.move_open_calls_to(next));
+                moved.extend(budget.move_open_calls_to(next, now));
             }
-            old.budget = None;
+            // A call that did not fit was closed on this grant; one with a
+            // block still in flight keeps the grant until that settles.
+            let settling = carry_calls && same_pairing
+                && old.budget.as_ref().is_some_and(GrantBudget::has_unsettled_draw);
+            if settling {
+                // Closed to everything but settlement, also for a node that
+                // does not know the end reason: its window ends now.
+                old.expires_at = old.expires_at.min(now);
+            } else {
+                old.budget = None;
+            }
             if old.ended != Some(GrantEnd::Revoked) {
                 old.ended = Some(GrantEnd::Replaced);
             }
@@ -4393,7 +4415,8 @@ impl PairingService {
     pub(crate) fn grant_cleanup_delay(&self) -> Duration {
         let inner = self.lock_without_cleanup();
         let now = chrono::Utc::now().timestamp_millis();
-        let continuing = |g: &SpendGrant| self.call_continuity && g.continues_call(now / 1000);
+        let continuing = |g: &SpendGrant| self.call_continuity
+            && (g.continues_call(now / 1000) || g.settles_replaced_call(now / 1000));
         let millis = inner
             .file
             .grants

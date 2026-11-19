@@ -10,10 +10,14 @@ also live on the corresponding GitHub pre-release pages.
   its media socket and its pinned hold when that grant expires or is
   replaced: blocks draw only on that hold, within its price, minute limit and
   amount, a renewal takes the hold over once without charging paid minutes
-  again, and nothing new is admitted on the ended grant. Spend grants record
+  again, and only when the hold fits every limit of the renewed grant (it is
+  closed otherwise), and nothing new is admitted on the ended grant. Spend grants record
   how they ended (`expired`, `replaced` or `revoked`, an optional field older
   nodes ignore); a revocation, epoch bump, pairing removal or identity change
-  still closes the media within a second. `GET /api/v1/status` lists
+  still closes the media within a second. After an expiry the app's token
+  without `spend` may still pay that call's minute blocks on
+  `POST /api/v1/messages/compose`, from the call's pinned hold only; nothing
+  else moves without `spend`. `GET /api/v1/status` lists
   `call_continuity_v1` only while it is on.
 - Pay a contact by keysend only at a Lightning key their identity signed. A
   `LightningInfo` announcement now carries an Ed25519 signature by the node's

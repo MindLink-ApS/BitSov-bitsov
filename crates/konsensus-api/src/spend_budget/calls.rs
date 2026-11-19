@@ -323,13 +323,40 @@ impl GrantBudget {
         self.call_reservations.values().any(|call| call.draws.contains_key(id))
     }
 
+    /// Whether any call this grant funds still has a block whose outcome is
+    /// not settled.
+    pub(crate) fn has_unsettled_draw(&self) -> bool {
+        self.call_reservations.values().any(|call| !call.draws.is_empty())
+    }
+
+    /// Whether `successor` could fund what a carried hold still has
+    /// (`outstanding`) under every restriction a new reservation meets: not
+    /// paused, payee allowed, the hold's per-block ceiling and closing signal
+    /// within its per-payment limits (and a live envelope on a relation
+    /// grant), and room in its recipient budget and its total.
+    fn fits_carried_hold(&self, terms: &CallSpendTerms, outstanding: u64, now: i64) -> bool {
+        let peer = &terms.peer;
+        let recipient_room = self.per_recipient_msat.get(peer).is_none_or(|cap| {
+            cap.saturating_sub(self.used_by_recipient.get(peer).copied().unwrap_or(0)) >= outstanding
+        });
+        !self.is_paused()
+            && self.payee_allowlist.as_ref().is_none_or(|payees| payees.contains(peer))
+            && self.check_call_hold(terms).is_ok()
+            && self.check_call_closing(terms).is_ok()
+            && self.envelopes_live(std::iter::once(peer), now)
+            && recipient_room
+            && self.remaining_msat() >= outstanding
+    }
+
     /// Move every call still open or still paying to `successor`, once, with
-    /// what its hold has left and its blocks in flight. The successor is
-    /// charged exactly that remainder, which the call's own settlement and
-    /// release then resolve; minutes already paid stay with this grant, and
-    /// no breaker count is made again. Returns each moved call's
-    /// `peer:call_id`.
-    pub(crate) fn move_open_calls_to(&mut self, successor: &mut GrantBudget) -> Vec<String> {
+    /// what its hold has left and its blocks in flight, when the successor
+    /// can fund it ([`Self::fits_carried_hold`]). The successor is charged
+    /// exactly that remainder, which the call's own settlement and release
+    /// then resolve; minutes already paid stay with this grant, and no
+    /// breaker count is made again. A call that does not fit is closed here
+    /// instead: its unpaid remainder is released at once and any block in
+    /// flight settles on this grant. Returns each moved call's `peer:call_id`.
+    pub(crate) fn move_open_calls_to(&mut self, successor: &mut GrantBudget, now: i64) -> Vec<String> {
         let ids: Vec<String> = self
             .call_reservations
             .iter()
@@ -338,12 +365,19 @@ impl GrantBudget {
             .collect();
         let mut moved = Vec::with_capacity(ids.len());
         for id in ids {
+            let call = &self.call_reservations[&id];
+            let keys: Vec<String> = std::iter::once(id.clone()).chain(call.draws.keys().cloned()).collect();
+            let outstanding = keys.iter().filter_map(|key| self.pending.get(key))
+                .flat_map(|recipients| recipients.values())
+                .fold(0u64, |sum, amount| sum.saturating_add(*amount));
+            if call.closed || !successor.fits_carried_hold(&call.terms, outstanding, now) {
+                self.close_call(&id);
+                continue;
+            }
             let call = self.call_reservations.remove(&id).expect("listed call");
             let peer = call.terms.peer.clone();
-            let mut outstanding: u64 = 0;
-            for key in std::iter::once(id.clone()).chain(call.draws.keys().cloned()) {
+            for key in keys {
                 if let Some(recipients) = self.pending.remove(&key) {
-                    outstanding = recipients.values().fold(outstanding, |sum, amount| sum.saturating_add(*amount));
                     successor.pending.insert(key.clone(), recipients);
                 }
                 if let Some(link) = self.operation_links.remove(&key) {
