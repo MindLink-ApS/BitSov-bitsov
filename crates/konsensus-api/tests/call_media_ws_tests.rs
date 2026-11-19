@@ -51,6 +51,10 @@ struct Fixture {
 }
 
 async fn fixture(dir: &std::path::Path, port: Option<Arc<dyn CallMediaPort>>) -> Fixture {
+    fixture_with(dir, port, false).await
+}
+
+async fn fixture_with(dir: &std::path::Path, port: Option<Arc<dyn CallMediaPort>>, continuity: bool) -> Fixture {
     let console = OwnerConsole::default();
     let base = test_state_with_data_dir(dir.to_path_buf());
     let fingerprint = pairing::identity_fingerprint(&base.identity.node_id().to_hex());
@@ -58,7 +62,8 @@ async fn fixture(dir: &std::path::Path, port: Option<Arc<dyn CallMediaPort>>) ->
         PairingService::open(dir, fingerprint, true)
             .unwrap()
             .with_owner_console(Box::new(console.clone()))
-            .without_stdout_code(),
+            .without_stdout_code()
+            .with_call_continuity(continuity),
     );
     let state = Arc::new(AppState { pairing: Some(Arc::clone(&service)), call_media: port, ..(*base).clone() });
     let addr = serve(state.clone()).await;
@@ -527,4 +532,107 @@ async fn stream_rechecks_call_ownership_without_waiting_for_media() {
     tokio::time::timeout(std::time::Duration::from_millis(1300), port.released.notified()).await
         .expect("the open stream did not recheck its ownership binding");
     assert_eq!(f.upgrade(&media_path(&peer), Some(&token)).await, StatusCode::FORBIDDEN);
+}
+
+/// The paired app's binding and a fresh token for it carrying `scopes`, as
+/// the app gets after `POST /pair/token`.
+fn fresh_token(f: &Fixture, token: &str, scopes: Vec<Scope>) -> String {
+    let claims = konsensus_api::auth::validate_token(token, &f.state.jwt_secret).unwrap();
+    let binding = konsensus_api::auth::PairingBinding::from_claims(&claims).unwrap().unwrap();
+    konsensus_api::auth::create_paired_token(&claims.sub, &f.state.jwt_secret, scopes, &binding.client_id,
+        binding.epoch, &binding.fingerprint).unwrap()
+}
+
+fn client_of(f: &Fixture, token: &str) -> konsensus_api::auth::PairingBinding {
+    let claims = konsensus_api::auth::validate_token(token, &f.state.jwt_secret).unwrap();
+    konsensus_api::auth::PairingBinding::from_claims(&claims).unwrap().unwrap()
+}
+
+/// A call the app placed under its live grant: a pinned hold of 5 minutes at
+/// 1 sat each, and the invite that makes the app the call's media owner.
+async fn held_call(f: &Fixture, token: &str, peer: &NodeId) {
+    let binding = client_of(f, token);
+    let terms = konsensus_api::spend_budget::CallSpendTerms::new(&peer.to_hex(), CALL, 1_000, 0, 5).unwrap();
+    f.service.reserve_call_hold_for_test(&binding.client_id, binding.epoch, terms, 1_000_000).unwrap();
+    f.own_call(token, peer, false).await;
+}
+
+#[tokio::test]
+async fn expired_grant_keeps_the_owned_call_media_and_a_refreshed_token_reattaches() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = ObservedPort::new();
+    let f = fixture_with(dir.path(), Some(port.clone()), true).await;
+    let peer = NodeId::from_bytes([8; 32]);
+    let token = f.paired_token(47, vec![Scope::Read, Scope::Receive, Scope::Spend]);
+    held_call(&f, &token, &peer).await;
+    let (status, socket) = f.open(&media_path(&peer), Some(&token)).await;
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+
+    // The grant expires mid-call. Over several 1 s rechecks the socket stays.
+    f.service.end_spend_windows_for_test(&client_of(&f, &token).client_id);
+    let kept = tokio::time::timeout(std::time::Duration::from_millis(2_500), port.released.notified()).await;
+    assert!(kept.is_err(), "the admitted call's media was closed when its grant expired");
+    drop(socket);
+    tokio::time::timeout(std::time::Duration::from_secs(2), port.released.notified()).await.unwrap();
+
+    // The token runs out; the app fetches a fresh one, which has no `spend`
+    // now, and reattaches to the same call.
+    let fresh = fresh_token(&f, &token, vec![Scope::Read, Scope::Receive]);
+    assert_eq!(f.upgrade(&media_path(&peer), Some(&fresh)).await, StatusCode::SWITCHING_PROTOCOLS);
+    // Not another peer, not another call, not another pairing.
+    assert_eq!(f.upgrade(&media_path(&NodeId::from_bytes([9; 32])), Some(&fresh)).await, StatusCode::FORBIDDEN);
+    assert_eq!(f.upgrade(&format!("/api/v1/calls/{}/media?peer={}", "ff".repeat(16), peer.to_hex()), Some(&fresh)).await,
+        StatusCode::FORBIDDEN);
+    let stranger = f.paired_token(48, vec![Scope::Read, Scope::Receive]);
+    assert_eq!(f.upgrade(&media_path(&peer), Some(&stranger)).await, StatusCode::FORBIDDEN);
+    let binding = client_of(&f, &token);
+    // Revocation still closes the reattached socket within the recheck, and
+    // the same token cannot come back.
+    let (status, socket) = f.open(&media_path(&peer), Some(&fresh)).await;
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+    f.service.revoke_grants(Some(&binding.client_id)).unwrap();
+    tokio::time::timeout(std::time::Duration::from_millis(1_350), port.released.notified()).await
+        .expect("revocation did not close the media within the recheck");
+    drop(socket);
+    assert_eq!(f.upgrade(&media_path(&peer), Some(&fresh)).await, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn expired_grant_with_continuity_off_closes_the_call_media_as_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = ObservedPort::new();
+    let f = fixture_with(dir.path(), Some(port.clone()), false).await;
+    let peer = NodeId::from_bytes([8; 32]);
+    let token = f.paired_token(49, vec![Scope::Read, Scope::Receive, Scope::Spend]);
+    held_call(&f, &token, &peer).await;
+    let (status, _socket) = f.open(&media_path(&peer), Some(&token)).await;
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+    f.service.end_spend_windows_for_test(&client_of(&f, &token).client_id);
+    tokio::time::timeout(std::time::Duration::from_millis(1_350), port.released.notified()).await
+        .expect("an expired grant closes the media within the recheck");
+    assert_eq!(f.upgrade(&media_path(&peer), Some(&token)).await, StatusCode::UNAUTHORIZED);
+    let fresh = fresh_token(&f, &token, vec![Scope::Read, Scope::Receive]);
+    assert_eq!(f.upgrade(&media_path(&peer), Some(&fresh)).await, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn status_advertises_call_continuity_only_when_it_is_on() {
+    for continuity in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fixture_with(dir.path(), None, continuity).await;
+        let app = konsensus_api::build_router_for_addr(Arc::clone(&f.state), f.addr)
+            .layer(axum::extract::connect_info::MockConnectInfo(f.addr));
+        let request = Request::builder()
+            .uri("/api/v1/status")
+            .header("host", f.addr.to_string())
+            .header("authorization", auth_header(&f.state))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let advertised = body["api_capabilities"].as_array().unwrap().contains(&serde_json::json!("call_continuity_v1"));
+        assert_eq!(advertised, continuity);
+    }
 }

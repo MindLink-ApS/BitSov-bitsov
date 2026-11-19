@@ -582,6 +582,38 @@ impl PairingService {
     }
 }
 
+impl PairingService {
+    /// Whether `binding` may keep the media of call `(peer, call_id)` without
+    /// holding `spend`: live-call continuity is on, and an open hold for that
+    /// call is funded by a grant of this exact pairing that is live or ended
+    /// by expiry or replacement. Never after a revocation, an epoch bump, a
+    /// pairing removal or an identity change.
+    pub fn call_hold_live(&self, _binding: &auth::PairingBinding, _peer: &str, _call_id: &str) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl PairingService {
+    /// Test hook: reserve a call's hold as an admitted paid invite does.
+    pub fn reserve_call_hold_for_test(&self, client: &str, epoch: u64, terms: CallSpendTerms,
+        capacity_msat: u64) -> Result<Reservation, BudgetRefusal> {
+        self.reserve_call_spend(client, epoch, terms, capacity_msat)
+    }
+
+    /// Test hook: end every spend window of `client_id` one second ago,
+    /// keeping its length, as if the clock had run past it.
+    pub fn end_spend_windows_for_test(&self, client_id: &str) {
+        let mut inner = self.lock_without_cleanup();
+        let now = chrono::Utc::now().timestamp();
+        for grant in inner.file.grants.iter_mut().filter(|g| g.client_id == client_id) {
+            let length = grant.expires_at - grant.granted_at;
+            grant.expires_at = now - 1;
+            grant.granted_at = grant.expires_at - length;
+        }
+    }
+}
+
 fn call_reference(grant: &SpendGrant, id: &str, terms: &CallSpendTerms) -> Reservation {
     Reservation {
         id: id.into(),

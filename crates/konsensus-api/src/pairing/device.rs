@@ -1449,6 +1449,7 @@ impl PairingService {
                     epoch,
                     granted_by: format!("device:{}", key.key_id),
                     budget: Some(GrantBudget::relations()),
+                    ended: None,
                 });
                 inner.file.grants.len() - 1
             }

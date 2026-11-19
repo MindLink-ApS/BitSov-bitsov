@@ -118,6 +118,7 @@ async fn timed_out_drain_still_prunes_expired_grants() {
             epoch: 1,
             granted_by: "cli".into(),
             budget: Some(GrantBudget::from_terms(&GrantTerms::new(1_000))),
+            ended: None,
         }],
         ..Default::default()
     };

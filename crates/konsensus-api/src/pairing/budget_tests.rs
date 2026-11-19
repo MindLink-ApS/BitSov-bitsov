@@ -135,6 +135,7 @@ fn first_contact_service(dir: &Path) -> PairingService {
         epoch: client.epoch,
         granted_by: "cli".into(),
         budget: Some(GrantBudget::from_terms(&GrantTerms::new(10_000))),
+        ended: None,
     });
     service.persist(&mut inner.file).unwrap();
     drop(inner);
@@ -246,6 +247,7 @@ fn expiry_during_reservation_persistence(live_reads: usize) {
             epoch: 1,
             granted_by: "cli".into(),
             budget: Some(GrantBudget::from_terms(&GrantTerms::new(1000))),
+            ended: None,
         });
         service.persist(&mut inner.file).unwrap();
     }

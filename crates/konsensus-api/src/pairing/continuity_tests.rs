@@ -1,0 +1,440 @@
+//! Live-call continuity (`[calls] call_continuity_v1`): a call admitted under
+//! a live grant keeps its pinned hold when that grant expires or is replaced,
+//! and never after a revocation. Every case also runs with the switch off and
+//! must then behave exactly as before. Amounts are integer msat; grant windows
+//! are moved explicitly instead of waiting on the clock.
+use super::*;
+use crate::spend_budget::{CallSpendTerms, OperationReservationLink};
+
+/// The owner terminal, captured.
+#[derive(Clone, Default)]
+struct Console(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl io::Write for Console {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Console {
+    fn confirmation(&self, label: &str) -> String {
+        let text = String::from_utf8(self.0.lock().unwrap().clone()).unwrap();
+        text.lines()
+            .rfind(|line| line.starts_with(&format!("{label} CODE ")))
+            .expect("owner confirmation")
+            .to_owned()
+    }
+}
+
+const PRICE: u64 = 1_000;
+const MINUTES: u16 = 5;
+/// `PRICE` per minute for `MINUTES`, no routing fee.
+const HELD: u64 = 5_000;
+
+struct Fx {
+    _dir: tempfile::TempDir,
+    service: PairingService,
+    console: Console,
+    client: String,
+    binding: auth::PairingBinding,
+}
+
+fn peer() -> String {
+    "aa".repeat(32)
+}
+
+fn fixture(continuity: bool) -> Fx {
+    let dir = tempfile::tempdir().unwrap();
+    let console = Console::default();
+    let service = PairingService::open(dir.path(), "identity".into(), true)
+        .unwrap()
+        .with_owner_console(Box::new(console.clone()))
+        .without_stdout_code()
+        .with_call_continuity(continuity);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[12; 32]);
+    let client = service
+        .create_verified_remote_pairing("app", &hex::encode(key.verifying_key().to_bytes()), &[13; 32])
+        .unwrap();
+    let binding = auth::PairingBinding {
+        client_id: client.client_id.clone(),
+        epoch: client.epoch,
+        fingerprint: "identity".into(),
+    };
+    Fx { _dir: dir, service, console, client: client.client_id, binding }
+}
+
+/// The owner writes a spend grant for the app, replacing any earlier one.
+fn grant(fx: &Fx, budget_msat: u64) -> SpendGrant {
+    let op = fx.service.create_elevation_request(&fx.client, vec![Scope::Spend]).unwrap();
+    let phrase = fx.console.confirmation(&grant_confirmation_phrase(&op));
+    fx.service.grant_elevation(&op.op_id, &phrase, GrantTerms::new(budget_msat)).unwrap()
+}
+
+/// Close every spend window of the app one second ago, keeping its length:
+/// the clock ran past the grant.
+fn expire(fx: &Fx) {
+    let mut inner = fx.service.lock_without_cleanup();
+    let now = chrono::Utc::now().timestamp();
+    for grant in inner.file.grants.iter_mut() {
+        let length = grant.expires_at - grant.granted_at;
+        grant.expires_at = now - 1;
+        grant.granted_at = grant.expires_at - length;
+    }
+}
+
+/// A paid invite admitted the call under the live grant: its hold is
+/// reserved and the app's binding owns the call's media.
+fn admit(fx: &Fx, call: &str) -> Reservation {
+    let terms = CallSpendTerms::new(&peer(), call, PRICE, 0, MINUTES).unwrap();
+    let hold = fx.service.reserve_call_spend(&fx.client, fx.binding.epoch, terms, 1_000_000).unwrap();
+    fx.service.remember_call_client(Some(&fx.binding), &peer(), call, "invite", "request").unwrap();
+    fx.service.commit_call_client(None, &peer(), call, "invite", "request").unwrap();
+    fx.service.finish_call_client(&peer(), call, "invite", "request");
+    hold
+}
+
+fn link(id: &str) -> OperationReservationLink {
+    OperationReservationLink { operation_id: id.into(), execution_id: "attempt".into(), readmission: false }
+}
+
+/// One minute block drawn from the call's hold.
+fn draw(fx: &Fx, call: &str, seq: u32) -> Result<Reservation, BudgetRefusal> {
+    fx.service.draw_call_spend(&fx.client, fx.binding.epoch, &peer(), call, seq, PRICE, 0, link(&format!("{call}-{seq}")))
+}
+
+/// A draw that was dispatched and settled at its full price.
+fn pay(fx: &Fx, call: &str, seq: u32) {
+    let debit = draw(fx, call, seq).unwrap_or_else(|refusal| panic!("block {seq}: {refusal:?}"));
+    fx.service
+        .with_call_spend_authority(&debit, Some((&peer(), call)), || ())
+        .unwrap_or_else(|refusal| panic!("block {seq} dispatch: {refusal:?}"));
+    fx.service.try_resolve_spend(&debit, &peer(), PRICE).unwrap();
+}
+
+fn disk_budget(fx: &Fx, op_id: &str) -> Option<GrantBudget> {
+    fx.service.reload_from_disk().unwrap().grants.into_iter().find(|g| g.op_id == op_id).and_then(|g| g.budget)
+}
+
+fn status(fx: &Fx, call: &str) -> Option<(u64, u64, u64, u64)> {
+    fx.service.call_spend_status(&peer(), call)
+        .map(|s| (s.reserved_msat, s.spent_msat, s.released_msat, s.remaining_msat))
+}
+
+fn new_payment(fx: &Fx) -> Result<Reservation, BudgetRefusal> {
+    fx.service.reserve_operation_spend(&fx.client, fx.binding.epoch,
+        vec![Charge { recipient: peer(), amount_msat: 10 }], link("message"))
+}
+
+#[test]
+fn expired_hold_keeps_same_call_media_and_draws_but_not_new_admission() {
+    let fx = fixture(true);
+    let g = grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    expire(&fx);
+
+    // The admitted call draws on its existing hold, inside the pinned limit.
+    let block = draw(&fx, "call", 1);
+    assert!(block.is_ok(), "a call admitted before expiry lost its hold: {block:?}");
+    let block = block.unwrap();
+    fx.service.with_call_spend_authority(&block, Some((&peer(), "call")), || ())
+        .expect("the existing hold's block may be dispatched after expiry");
+    fx.service.try_resolve_spend(&block, &peer(), PRICE).unwrap();
+    assert!(fx.service.call_hold_live(&fx.binding, &peer(), "call"));
+    assert!(fx.service.owns_call_media(&fx.binding, &peer(), "call"));
+    for seq in 2..u32::from(MINUTES) {
+        pay(&fx, "call", seq);
+    }
+    // The minute limit and the hold stay where admission pinned them.
+    assert!(matches!(draw(&fx, "call", u32::from(MINUTES)), Err(BudgetRefusal::Unpriced(_))));
+    assert_eq!(status(&fx, "call"), Some((HELD, HELD, 0, 0)));
+    let budget = disk_budget(&fx, &g.op_id).expect("the funding grant stays on disk while its call is open");
+    assert_eq!(budget.used_msat, HELD, "post-expiry spending stays inside the hold reserved before it");
+    assert_eq!(budget.pending.values().flat_map(|r| r.values()).sum::<u64>(), 0);
+
+    // Nothing new: no second call, no ordinary payment, no `spend` scope.
+    let second = CallSpendTerms::new(&peer(), "second", PRICE, 0, MINUTES).unwrap();
+    assert_eq!(fx.service.reserve_call_spend(&fx.client, 1, second, 1_000_000), Err(BudgetRefusal::NoGrant));
+    assert_eq!(new_payment(&fx), Err(BudgetRefusal::NoGrant));
+    assert!(fx.service.verify_token_binding(&fx.client, 1, "identity", &[Scope::Spend]).is_err());
+    assert!(fx.service.grant_view_for(&fx.client).is_none());
+    // Only this pairing, this call.
+    assert!(!fx.service.call_hold_live(&fx.binding, &peer(), "second"));
+    assert!(!fx.service.call_hold_live(&fx.binding, "bb", "call"));
+    assert!(!fx.service.call_hold_live(&auth::PairingBinding { epoch: 2, ..fx.binding.clone() }, &peer(), "call"));
+    assert!(!fx.service.call_hold_live(&auth::PairingBinding { client_id: "other".into(), ..fx.binding.clone() },
+        &peer(), "call"));
+
+    // The call ends: nothing was left to release, and the grant goes.
+    let hold = fx.service.call_spend_holds().into_iter().map(|(r, _)| r).next().unwrap();
+    fx.service.close_call_spend(&hold).unwrap();
+    assert!(!fx.service.call_hold_live(&fx.binding, &peer(), "call"));
+    assert!(fx.service.reload_from_disk().unwrap().grants.is_empty());
+}
+
+#[test]
+fn expired_hold_with_continuity_off_ends_as_before() {
+    let fx = fixture(false);
+    let g = grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    expire(&fx);
+    assert_eq!(draw(&fx, "call", 1), Err(BudgetRefusal::NoGrant));
+    assert!(!fx.service.call_hold_live(&fx.binding, &peer(), "call"));
+    assert!(disk_budget(&fx, &g.op_id).is_none());
+    assert!(fx.service.reload_from_disk().unwrap().grants.is_empty());
+    assert_eq!(status(&fx, "call"), None);
+    let second = CallSpendTerms::new(&peer(), "second", PRICE, 0, MINUTES).unwrap();
+    assert_eq!(fx.service.reserve_call_spend(&fx.client, 1, second, 1_000_000), Err(BudgetRefusal::NoGrant));
+}
+
+#[test]
+fn replacement_migrates_hold_once_without_budget_credit() {
+    let fx = fixture(true);
+    let first = grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    // Block 1 is in flight when the owner renews.
+    let in_flight = draw(&fx, "call", 1).unwrap();
+    assert_eq!(disk_budget(&fx, &first.op_id).unwrap().used_msat, HELD);
+
+    let second = grant(&fx, 50_000);
+    let budget = disk_budget(&fx, &second.op_id).expect("renewed grant");
+    assert_eq!(budget.call_reservations.len(), 1, "replacement lost the live call's hold");
+    // Only what the hold still had moved: 3 unpaid minutes and the one in
+    // flight. The minute paid under the first grant is not charged again.
+    assert_eq!(budget.used_msat, HELD - PRICE);
+    assert_eq!(budget.remaining_msat(), 50_000 - (HELD - PRICE));
+    assert!(disk_budget(&fx, &first.op_id).is_none(), "the replaced grant funds nothing");
+    assert_eq!(
+        fx.service.reload_from_disk().unwrap().call_spend_grants.get(&format!("{}:call", peer())),
+        Some(&second.op_id)
+    );
+    assert_eq!(status(&fx, "call"), Some((HELD, PRICE, 0, HELD - PRICE)));
+    assert!(fx.service.call_hold_live(&fx.binding, &peer(), "call"));
+    assert!(fx.service.owns_call_media(&fx.binding, &peer(), "call"));
+
+    // The block in flight settles once, on the hold where it now lives.
+    fx.service.with_call_spend_authority(&in_flight, Some((&peer(), "call")), || ())
+        .expect("a block in flight at renewal may still be dispatched");
+    fx.service.try_resolve_spend(&in_flight, &peer(), PRICE).unwrap();
+    fx.service.try_resolve_spend(&in_flight, &peer(), PRICE).unwrap();
+    assert_eq!(status(&fx, "call"), Some((HELD, 2 * PRICE, 0, HELD - 2 * PRICE)));
+
+    // Renew again mid-call: still one hold, moved once more.
+    pay(&fx, "call", 2);
+    let third = grant(&fx, 40_000);
+    let budget = disk_budget(&fx, &third.op_id).unwrap();
+    assert_eq!(budget.call_reservations.len(), 1);
+    assert_eq!(budget.used_msat, HELD - 3 * PRICE);
+    assert_eq!(fx.service.reload_from_disk().unwrap().grants.len(), 1);
+
+    pay(&fx, "call", 3);
+    // A cheaper minute leaves change that goes back to the hold, not the grant.
+    let last = draw(&fx, "call", 4).unwrap();
+    fx.service.try_resolve_spend(&last, &peer(), PRICE / 2).unwrap();
+    assert!(matches!(draw(&fx, "call", 5), Err(BudgetRefusal::Unpriced(_))));
+    let hold = fx.service.call_spend_holds().into_iter().map(|(r, _)| r).next().unwrap();
+    assert_eq!(hold.op_id, third.op_id);
+    fx.service.close_call_spend(&hold).unwrap();
+    fx.service.close_call_spend(&hold).unwrap();
+    let spent = HELD - PRICE / 2;
+    assert_eq!(status(&fx, "call"), Some((HELD, spent, PRICE / 2, 0)));
+    let budget = disk_budget(&fx, &third.op_id).unwrap();
+    // The third grant carries exactly what was paid under it; the release
+    // returned the unspent half minute once and created nothing.
+    assert_eq!(budget.used_msat, 2 * PRICE - PRICE / 2);
+    assert_eq!(budget.remaining_msat(), 40_000 - (2 * PRICE - PRICE / 2));
+    assert!(budget.pending.is_empty());
+}
+
+#[test]
+fn replacement_with_continuity_off_drops_the_hold_as_before() {
+    let fx = fixture(false);
+    grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    let second = grant(&fx, 50_000);
+    let budget = disk_budget(&fx, &second.op_id).unwrap();
+    assert!(budget.call_reservations.is_empty());
+    assert_eq!(budget.used_msat, 0);
+    assert_eq!(status(&fx, "call"), None);
+    assert!(matches!(draw(&fx, "call", 1), Err(BudgetRefusal::Unpriced(_))));
+    assert!(!fx.service.call_hold_live(&fx.binding, &peer(), "call"));
+}
+
+#[derive(Debug, Clone, Copy)]
+enum End {
+    RevokeGrants,
+    RemovePairing,
+    BumpEpoch,
+    NewIdentity,
+}
+
+fn end(fx: &Fx, how: End) {
+    match how {
+        End::RevokeGrants => { fx.service.revoke_grants(Some(&fx.client)).unwrap(); }
+        End::RemovePairing => fx.service.revoke(&fx.client).unwrap(),
+        End::BumpEpoch => { fx.service.bump_epoch(&fx.client).unwrap(); }
+        End::NewIdentity => fx.service.rebind_to_identity("another-identity").unwrap(),
+    }
+}
+
+#[test]
+fn revocation_beats_continuity_and_renewal() {
+    for continuity in [true, false] {
+        for expired_first in [false, true] {
+            for how in [End::RevokeGrants, End::RemovePairing, End::BumpEpoch, End::NewIdentity] {
+                let case = format!("continuity={continuity} expired_first={expired_first} {how:?}");
+                let fx = fixture(continuity);
+                grant(&fx, 100_000);
+                admit(&fx, "call");
+                pay(&fx, "call", 0);
+                let in_flight = draw(&fx, "call", 1).unwrap();
+                if expired_first {
+                    expire(&fx);
+                }
+                end(&fx, how);
+                assert!(draw(&fx, "call", 2).is_err(), "{case}: drew after revocation");
+                assert!(fx.service.with_call_spend_authority(&in_flight, Some((&peer(), "call")), || ()).is_err(),
+                    "{case}: dispatched after revocation");
+                assert!(!fx.service.call_hold_live(&fx.binding, &peer(), "call"), "{case}");
+                assert!(fx.service.verify_token_binding(&fx.client, fx.binding.epoch, "identity", &[]).is_err()
+                    || matches!(how, End::RevokeGrants), "{case}");
+                assert!(fx.service.verify_token_binding(&fx.client, fx.binding.epoch, "identity", &[Scope::Spend]).is_err(),
+                    "{case}");
+                assert!(fx.service.reload_from_disk().unwrap().grants.is_empty(), "{case}");
+                // A renewal after the revocation never revives the old hold.
+                if matches!(how, End::RevokeGrants | End::BumpEpoch) {
+                    let renewed = grant(&fx, 50_000);
+                    let budget = disk_budget(&fx, &renewed.op_id).unwrap();
+                    assert!(budget.call_reservations.is_empty(), "{case}: revived a revoked hold");
+                    assert_eq!(budget.used_msat, 0, "{case}");
+                    assert_eq!(status(&fx, "call"), None, "{case}");
+                    assert!(draw(&fx, "call", 2).is_err(), "{case}");
+                    assert!(!fx.service.call_hold_live(&fx.binding, &peer(), "call"), "{case}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn continuity_does_not_outlive_the_longest_call() {
+    let fx = fixture(true);
+    grant(&fx, 100_000);
+    admit(&fx, "call");
+    {
+        let mut inner = fx.service.lock_without_cleanup();
+        let now = chrono::Utc::now().timestamp();
+        let grant = &mut inner.file.grants[0];
+        let length = grant.expires_at - grant.granted_at;
+        // Expired longer ago than any call admitted before it can last.
+        grant.expires_at = now - CALL_CONTINUITY_MAX_SECS - 1;
+        grant.granted_at = grant.expires_at - length;
+    }
+    assert_eq!(draw(&fx, "call", 0), Err(BudgetRefusal::NoGrant));
+    assert!(!fx.service.call_hold_live(&fx.binding, &peer(), "call"));
+    assert!(fx.service.reload_from_disk().unwrap().grants.is_empty());
+}
+
+/// The fields of a spend grant as nodes without continuity read it. Serde
+/// ignores fields a struct does not name unless it opts out, and none of the
+/// durable pairing structs touched here do; this proves it for the new ones.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct EarlierSpendGrant {
+    op_id: String,
+    client_id: String,
+    scopes: Vec<Scope>,
+    granted_at: i64,
+    expires_at: i64,
+    identity_fingerprint: String,
+    epoch: u64,
+    granted_by: String,
+    #[serde(default)]
+    budget: Option<GrantBudget>,
+    #[serde(default)]
+    owner_approval: Option<approval::ApprovalReceipt>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct EarlierPairingFile {
+    version: u32,
+    clients: Vec<PairedClient>,
+    grants: Vec<EarlierSpendGrant>,
+    #[serde(default)]
+    call_spend_grants: BTreeMap<String, String>,
+}
+
+#[test]
+fn pairing_file_with_an_ended_grant_loads_without_the_new_field() {
+    let fx = fixture(true);
+    grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    expire(&fx);
+    pay(&fx, "call", 1);
+    let bytes = std::fs::read(fx.service.dir().join("clients.json")).unwrap();
+    let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(written["grants"][0]["ended"], "expired", "the retained grant records how it ended");
+    assert_eq!(written["version"], PAIRING_FILE_VERSION, "no schema version bump: older nodes still read it");
+    let earlier: EarlierPairingFile = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(earlier.grants.len(), 1);
+    let budget = earlier.grants[0].budget.as_ref().unwrap();
+    assert_eq!(budget.call_reservations.len(), 1);
+    // Read the way a node without continuity reads it, the expired grant is
+    // simply not live: it is pruned and funds nothing.
+    let current: PairingFile = serde_json::from_slice(&bytes).unwrap();
+    assert!(!current.grants[0].is_live(chrono::Utc::now().timestamp()));
+    assert_eq!(current.grants[0].ended, Some(GrantEnd::Expired));
+
+    // And a file written before the field existed reads as "not ended".
+    let mut older = written.clone();
+    older["grants"][0].as_object_mut().unwrap().remove("ended");
+    let current: PairingFile = serde_json::from_value(older).unwrap();
+    assert_eq!(current.grants[0].ended, None);
+    for (end, text) in [(GrantEnd::Expired, "expired"), (GrantEnd::Replaced, "replaced"), (GrantEnd::Revoked, "revoked")] {
+        assert_eq!(serde_json::to_value(end).unwrap(), text);
+    }
+}
+
+#[test]
+fn a_live_grant_writes_the_same_file_with_continuity_on_or_off() {
+    let files = [true, false].map(|continuity| {
+        let fx = fixture(continuity);
+        grant(&fx, 100_000);
+        admit(&fx, "call");
+        pay(&fx, "call", 0);
+        let mut file = serde_json::to_value(fx.service.reload_from_disk().unwrap()).unwrap();
+        // Identifiers and timestamps differ per run; the shape must not.
+        normalize(&mut file);
+        file
+    });
+    assert_eq!(files[0], files[1]);
+    assert!(files[0]["grants"][0].get("ended").is_none());
+}
+
+fn normalize(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                let mut inner = map.remove(&key).unwrap();
+                normalize(&mut inner);
+                let generated = uuid::Uuid::parse_str(&key).is_ok() || key.len() == 32 || key.parse::<i64>().is_ok();
+                let key = if generated { "<id>".to_owned() } else { key };
+                map.insert(key, inner);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(normalize),
+        serde_json::Value::Number(_) => *value = serde_json::Value::Null,
+        serde_json::Value::String(text) => *value = serde_json::Value::String(text.len().to_string()),
+        _ => {}
+    }
+}

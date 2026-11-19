@@ -647,6 +647,7 @@ impl PairingService {
                         approver,
                         signature: signature.into(),
                     }),
+                    ended: None,
                 };
                 let before = inner.file.clone();
                 for old in &mut inner.file.grants {

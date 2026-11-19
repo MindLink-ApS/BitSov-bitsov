@@ -399,7 +399,35 @@ pub struct SpendGrant {
     /// Exact signed evidence for owner-approval-v1 spend windows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_approval: Option<approval::ApprovalReceipt>,
+    /// Why the grant stopped authorizing new spending, once it has. Absent
+    /// while live and in files written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<GrantEnd>,
 }
+
+/// How a spend grant ended. Only an expired or replaced grant can keep
+/// funding a call admitted while it was live (see [`CALL_CONTINUITY_CAPABILITY`]);
+/// a revoked one never funds anything again.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GrantEnd {
+    /// Its window closed.
+    Expired,
+    /// The owner wrote a newer grant for the same pairing.
+    Replaced,
+    /// The owner revoked it, the pairing epoch moved, the pairing was
+    /// removed or the node identity changed.
+    Revoked,
+}
+
+/// Advertised while `[calls] call_continuity_v1` is on: a call admitted under
+/// a live grant keeps its media and its pinned hold when that grant expires or
+/// is replaced, never after a revocation.
+pub const CALL_CONTINUITY_CAPABILITY: &str = "call_continuity_v1";
+
+/// The longest an expired grant keeps funding calls admitted before its
+/// window closed: the longest call, plus a minute of grace.
+pub(crate) const CALL_CONTINUITY_MAX_SECS: i64 = 240 * 60 + 60;
 
 impl SpendGrant {
     /// Existing signed provenance distinguishes messaging authority from
@@ -723,6 +751,8 @@ pub struct PairingService {
     local_owner_device: bool,
     second_device_enrollment: bool,
     second_device_claim_v1: bool,
+    /// `[calls] call_continuity_v1`, off by default.
+    call_continuity: bool,
     enrollment_audit: Option<std::sync::Arc<crate::audit::AuditLog>>,
     /// Whether a safe protected-file instruction is written to stdout. The
     /// code/challenge itself is never printed.
@@ -1040,6 +1070,7 @@ impl PairingService {
             local_owner_device: false,
             second_device_enrollment: false,
             second_device_claim_v1: true,
+            call_continuity: false,
             enrollment_audit: None,
             print_pairing_instruction: true,
             owner_console: Mutex::new(Box::new(OwnerTerminal)),
@@ -1095,6 +1126,19 @@ impl PairingService {
                     .budget
                     .as_ref()
                     .is_some_and(|budget| budget.recipients_only))
+    }
+
+    /// Startup-only switch for live-call continuity (`[calls]
+    /// call_continuity_v1`). Off by default; off keeps every grant check as
+    /// it was.
+    pub fn with_call_continuity(mut self, enabled: bool) -> Self {
+        self.call_continuity = enabled;
+        self
+    }
+
+    /// Whether live-call continuity is on for this node run.
+    pub fn call_continuity_enabled(&self) -> bool {
+        self.call_continuity
     }
 
     /// Supply a trusted owner-console transport (also used by disposable test
@@ -2867,6 +2911,7 @@ impl PairingService {
             granted_by: "cli".to_string(),
             budget: Some(GrantBudget::from_terms(&terms)),
             owner_approval: None,
+            ended: None,
         };
         inner.file.pending_elevations.retain(|e| e.op_id != op_id);
         // A new budget window replaces the client's old one. A live front-door
@@ -4732,6 +4777,10 @@ pub fn fsync_dir(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 #[path = "pairing/budget_tests.rs"]
 mod budget_transaction_tests;
+
+#[cfg(test)]
+#[path = "pairing/continuity_tests.rs"]
+mod continuity_tests;
 
 #[cfg(all(test, unix))]
 #[path = "pairing/headless_tests.rs"]
