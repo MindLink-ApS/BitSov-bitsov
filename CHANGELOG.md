@@ -7,7 +7,9 @@ also live on the corresponding GitHub pre-release pages.
 
 - Add `[calls] call_reply_free_v1` (off by default; anything but `true` leaves
   it off). With it on, the answer or the declined hangup a callee sends to its
-  own ringing incoming call costs nothing (no quote, invoice, grant debit,
+  own ringing incoming call (a decline also while the call waits for a
+  device; a reply is refused unsent, never paid, if the call cannot be read)
+  costs nothing (no quote, invoice, grant debit,
   reservation or payment) when the caller's node advertises
   `call_reply_free_v1`, and the caller's node accepts such a reply without
   payment only when it names its own ringing, paid offer from that peer. Every

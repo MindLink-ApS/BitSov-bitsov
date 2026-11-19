@@ -176,14 +176,16 @@ it to peers in its handshake (`Custom("call_reply_free_v1")`).
 With it on, two replies to a ringing call cost nothing:
 
 - **Sending (callee).** An answer, or a hangup whose reason is `declined`, for
-  a call this node is ringing for goes out with no quote, no invoice, no grant
+  a call this node is ringing for (a decline also while the call still waits
+  for a device to fetch it) goes out with no quote, no invoice, no grant
   debit, no reservation and no payment, but only to a connected caller whose
   node advertised the capability and only with no other reference. The
   envelope carries amount 0, a fresh preimage that only keeps its replay keys
   unique, and one reference derived from the call id. It is journaled and
   resent like any other signal, so a double tap or a lost receipt still
-  sends one reply; it is never retried as a paid one. To any other caller,
-  and for every other signal, the paid path is unchanged.
+  sends one reply; it is never retried as a paid one. If the call cannot be
+  read when deciding, the reply is refused unsent, never paid instead. To any
+  other caller, and for every other signal, the paid path is unchanged.
 - **Receiving (caller).** The payment gate accepts such a reply without
   payment only when its sender is the callee of a call this node placed,
   whose paid offer is bound and which is still ringing, and its reference

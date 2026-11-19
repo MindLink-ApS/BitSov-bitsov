@@ -3905,7 +3905,7 @@ pub(super) async fn compose_peer(
         // nodes): no quote, no invoice, no grant debit, no reservation and no
         // payment. It is bound to that call and to the open session below.
         let free_reply = state.session_manager.has_session(&peer_id).await
-            && crate::calls::free_reply_allowed(&state, &peer_id, req.kind, &req.plaintext, &references).await;
+            && crate::calls::free_reply_allowed(&state, &peer_id, req.kind, &req.plaintext, &references).await?;
         let references = if free_reply {
             let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?;
