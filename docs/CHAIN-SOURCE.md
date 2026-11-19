@@ -111,12 +111,15 @@ transport is HTTP. Do not expose it to the Internet. No `txindex` is required.
 
 Replace the node's `[chain]` stanza (absolute paths recommended):
 
+In the examples below, replace `<home>` with the absolute home directory of the
+account running BitSov.
+
 ```toml
 [chain]
 backend = "bitcoind"
 rpc_host = "127.0.0.1"
 rpc_port = 8332
-cookie_file = "/home/bitsov/.bitcoin/.cookie"
+cookie_file = "<home>/.bitcoin/.cookie"
 ```
 
 This also selects Core for `[lightning] backend = "ldk"`; its Esplora URLs and
@@ -131,7 +134,7 @@ Core's cookie without making it world-readable. Alternatively, omit
 
 ```toml
 rpc_user = "bitsov"
-rpc_password_file = "/home/bitsov/secrets/bitcoin-rpc-password"
+rpc_password_file = "<home>/secrets/bitcoin-rpc-password"
 ```
 
 The password file contains only the password, optionally followed by a newline.
@@ -267,14 +270,14 @@ Stop the node and edit the config by hand. Keep a copy of the old file first.
    backend = "bitcoind"
    rpc_host = "127.0.0.1"
    rpc_port = 38332
-   cookie_file = "/home/bitsov/.bitcoin/signet/.cookie"
+   cookie_file = "<home>/.bitcoin/signet/.cookie"
    ```
 
    Or with a user and a password file instead of `cookie_file`:
 
    ```toml
    rpc_user = "bitsov"
-   rpc_password_file = "/home/bitsov/secrets/bitcoin-rpc-password"
+   rpc_password_file = "<home>/secrets/bitcoin-rpc-password"
    ```
 
    Use Core's RPC port and data subdirectory for your `[lightning] network`
@@ -446,7 +449,7 @@ Example for Blockstream Explorer API:
 [chain]
 backend = "esplora"
 api_url = "https://enterprise.blockstream.info/api"
-credentials_file = "/home/bitsov/secrets/chain-api.toml"
+credentials_file = "<home>/secrets/chain-api.toml"
 # Optional: use an Esplora endpoint you have chosen as the fallback.
 api_url_fallback = "https://your-fallback.example/api"
 
@@ -454,7 +457,7 @@ api_url_fallback = "https://your-fallback.example/api"
 backend = "ldk"
 network = "bitcoin"
 esplora_url = "https://enterprise.blockstream.info/api"
-credentials_file = "/home/bitsov/secrets/chain-api.toml"
+credentials_file = "<home>/secrets/chain-api.toml"
 esplora_url_fallback = "https://your-fallback.example/api"
 ```
 
@@ -467,7 +470,7 @@ client_secret = "YOUR_CLIENT_SECRET"
 ```
 
 Create it privately, owned by the account running BitSov, with **exactly mode
-0600** (`chmod 600 /home/bitsov/secrets/chain-api.toml`). Startup refuses insecure
+0600** (`chmod 600 "<home>/secrets/chain-api.toml"`). Startup refuses insecure
 permissions, another owner's file, symlinks, directories, or malformed contents.
 Use HTTPS URLs without userinfo, query parameters or fragments. Redirects are
 not followed. Keep secrets out of the node config, URLs and command arguments.
