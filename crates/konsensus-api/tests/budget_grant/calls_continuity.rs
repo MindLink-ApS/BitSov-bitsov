@@ -170,3 +170,71 @@ async fn a_renewal_mid_call_moves_the_hold_once_and_blocks_keep_one_ledger() {
     // Paid under the renewed grant: one block; the closing reserve came back.
     assert_eq!(fx.used(), BLOCK);
 }
+
+/// A paired app under a device relation grant for the contact on a node with
+/// continuity on, in a live call (3 pinned minutes) with block 0 paid.
+async fn relation_call() -> (Fx, String) {
+    let fx = call_ready(fixture().await).await;
+    let (mut fx, _, _) = super::super::messaging_cap::approved_grant(fx, true, 200_000, Some(20_000)).await;
+    let fingerprint = fx.service.bound_fingerprint();
+    fx.service = Arc::new(
+        PairingService::open(fx.tmp.path(), fingerprint, true).unwrap()
+            .with_owner_console(Box::new(fx.console.clone()))
+            .without_stdout_code()
+            .with_call_continuity(true),
+    );
+    fx.state = Arc::new(AppState {
+        pairing: Some(Arc::clone(&fx.service)), max_call_minutes: MINUTES,
+        ..(*fx.state).clone()
+    });
+    let token = fx.token().await;
+    let (status, body) = send(&fx, &token, 400, BLOCK, 0).await;
+    assert_eq!(status, StatusCode::OK, "live relation invite: {body}");
+    answer(&fx).await;
+    due(&fx).await;
+    let (status, body) = send(&fx, &token, 404, BLOCK, 0).await;
+    assert_eq!(status, StatusCode::OK, "live relation minute: {body}");
+    (fx, token)
+}
+
+#[tokio::test]
+async fn after_its_relation_window_an_admitted_call_pays_its_next_minutes_over_http() {
+    let (fx, _) = relation_call().await;
+    fx.service.end_recipient_windows_for_test(&fx.client_id);
+    let token = expire(&fx).await;
+    let binding = konsensus_api::auth::PairingBinding {
+        client_id: fx.client_id.clone(), epoch: 1, fingerprint: fx.service.bound_fingerprint(),
+    };
+    assert!(fx.service.call_hold_live(&binding, &fx.peer.to_hex(), CALL));
+    assert!(fx.service.owns_call_media(&binding, &fx.peer.to_hex(), CALL));
+    for seq in 1..u32::from(MINUTES) {
+        due(&fx).await;
+        let money = fx.wallet.money();
+        let (status, body) = send(&fx, &token, 404, BLOCK, seq).await;
+        assert_eq!(status, StatusCode::OK, "funded relation minute {seq} after the window: {body}");
+        assert_eq!(fx.wallet.money(), money + 1);
+    }
+    due(&fx).await;
+    let money = fx.wallet.money();
+    assert_ne!(send(&fx, &token, 404, BLOCK, u32::from(MINUTES)).await.0, StatusCode::OK);
+    // Nothing new: another call is refused, and nothing was paid for it.
+    let (status, _) = send_id(&fx, &token, 400, BLOCK, 0, "99999999888877776666555544443333").await;
+    assert_ne!(status, StatusCode::OK);
+    assert_eq!(fx.wallet.money(), money);
+    let view = hold(&fx);
+    assert_eq!(view.spent_msat, BLOCK * u64::from(MINUTES));
+    assert!(view.spent_msat <= view.reserved_msat);
+}
+
+#[tokio::test]
+async fn after_its_relation_window_a_revoked_call_pays_nothing_more() {
+    let (fx, _) = relation_call().await;
+    fx.service.end_recipient_windows_for_test(&fx.client_id);
+    let token = expire(&fx).await;
+    fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
+    due(&fx).await;
+    let money = fx.wallet.money();
+    let (status, body) = send(&fx, &token, 404, BLOCK, 1).await;
+    assert!(status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED, "{status} {body}");
+    assert_eq!(fx.wallet.money(), money);
+}

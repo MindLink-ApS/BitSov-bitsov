@@ -641,6 +641,20 @@ impl PairingService {
         self.reserve_call_spend(client, epoch, terms, capacity_msat)
     }
 
+    /// Test hook: end every recipient envelope of `client_id`'s relation
+    /// grants one second ago, as if the clock had run past them.
+    pub fn end_recipient_windows_for_test(&self, client_id: &str) {
+        let mut inner = self.lock_without_cleanup();
+        let now = chrono::Utc::now().timestamp();
+        for grant in inner.file.grants.iter_mut().filter(|g| g.client_id == client_id) {
+            if let Some(budget) = grant.budget.as_mut() {
+                for deadline in budget.recipient_expires_at.values_mut() {
+                    *deadline = now - 1;
+                }
+            }
+        }
+    }
+
     /// Test hook: end every spend window of `client_id` one second ago,
     /// keeping its length, as if the clock had run past it.
     pub fn end_spend_windows_for_test(&self, client_id: &str) {

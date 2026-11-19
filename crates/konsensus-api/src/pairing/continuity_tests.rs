@@ -616,3 +616,94 @@ fn a_relation_renewal_for_the_called_peer_carries_the_hold() {
     assert_eq!(outcome.grant.op_id, relation.op_id);
     pay(&fx, "call", 1);
 }
+
+/// The relation window closes: the grant and every recipient envelope end
+/// one second ago, as the clock would close them.
+fn expire_relation_window(fx: &Fx) {
+    let now = chrono::Utc::now().timestamp();
+    let mut inner = fx.service.lock_without_cleanup();
+    for grant in &mut inner.file.grants {
+        let length = grant.expires_at - grant.granted_at;
+        grant.expires_at = now - 1;
+        grant.granted_at = grant.expires_at - length;
+        if let Some(budget) = grant.budget.as_mut() {
+            for at in budget.recipient_expires_at.values_mut() {
+                *at = now - 1;
+            }
+        }
+    }
+}
+
+#[test]
+fn relation_window_expiry_keeps_the_next_minute_of_an_admitted_call() {
+    let (fx, key_id, signer, rng) = relation_fixture();
+    relation_intent(&fx, &key_id, &signer, &rng).unwrap();
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    expire_relation_window(&fx);
+    assert!(fx.service.call_hold_live(&fx.binding, &peer(), "call"));
+    assert!(fx.service.owns_call_media(&fx.binding, &peer(), "call"));
+    // Nothing new on the ended window: no payment, no second call.
+    assert!(new_payment(&fx).is_err());
+    let second = CallSpendTerms::new(&peer(), "second", PRICE, 0, MINUTES).unwrap();
+    assert!(fx.service.reserve_call_spend(&fx.client, 1, second, 1_000_000).is_err());
+    // The admitted call keeps drawing on its hold, to its pinned limit.
+    let block = draw(&fx, "call", 1);
+    assert!(block.is_ok(), "funded admitted relation call cannot draw its next minute after its window: {block:?}");
+    let block = block.unwrap();
+    fx.service.with_call_spend_authority(&block, Some((&peer(), "call")), || ()).unwrap();
+    fx.service.try_resolve_spend(&block, &peer(), PRICE).unwrap();
+    for seq in 2..u32::from(MINUTES) {
+        pay(&fx, "call", seq);
+    }
+    assert!(matches!(draw(&fx, "call", u32::from(MINUTES)), Err(BudgetRefusal::Unpriced(_))));
+    assert_eq!(status(&fx, "call"), Some((HELD, HELD, 0, 0)));
+}
+
+#[test]
+fn relation_window_expiry_keeps_a_drawn_minute_dispatchable() {
+    let (fx, key_id, signer, rng) = relation_fixture();
+    relation_intent(&fx, &key_id, &signer, &rng).unwrap();
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    let block = draw(&fx, "call", 1).unwrap();
+    fx.service.with_call_spend_authority(&block, Some((&peer(), "call")), || ()).unwrap();
+    expire_relation_window(&fx);
+    assert!(fx.service.call_hold_live(&fx.binding, &peer(), "call"));
+    let dispatch = fx.service.with_call_spend_authority(&block, Some((&peer(), "call")), || ());
+    assert!(dispatch.is_ok(), "an existing held relation minute cannot dispatch after its window: {dispatch:?}");
+}
+
+#[test]
+fn after_a_relation_window_revocation_still_stops_the_call_and_the_switch_off_keeps_the_window() {
+    // Revoked after the window closed: no draw, no dispatch, no media.
+    let (fx, key_id, signer, rng) = relation_fixture();
+    relation_intent(&fx, &key_id, &signer, &rng).unwrap();
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    let block = draw(&fx, "call", 1).unwrap();
+    expire_relation_window(&fx);
+    fx.service.revoke_grants(Some(&fx.client)).unwrap();
+    assert!(draw(&fx, "call", 2).is_err());
+    assert!(fx.service.with_call_spend_authority(&block, Some((&peer(), "call")), || ()).is_err());
+    assert!(!fx.service.call_hold_live(&fx.binding, &peer(), "call"));
+
+    // Switch off: the envelope deadline stops the call as before.
+    let (mut fx, key_id, signer, rng) = relation_fixture();
+    fx.service = fx.service.with_call_continuity(false);
+    relation_intent(&fx, &key_id, &signer, &rng).unwrap();
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    let block = draw(&fx, "call", 1).unwrap();
+    {
+        // Only the peer's envelope ends; the grant stays live on paper.
+        let now = chrono::Utc::now().timestamp();
+        let mut inner = fx.service.lock_without_cleanup();
+        for at in inner.file.grants.iter_mut().filter_map(|g| g.budget.as_mut())
+            .flat_map(|b| b.recipient_expires_at.values_mut()) {
+            *at = now - 1;
+        }
+    }
+    assert_eq!(draw(&fx, "call", 2), Err(BudgetRefusal::NoGrant));
+    assert!(fx.service.with_call_spend_authority(&block, Some((&peer(), "call")), || ()).is_err());
+}
