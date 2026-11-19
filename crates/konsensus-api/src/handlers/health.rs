@@ -10,10 +10,10 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::scoped::{Read, ScopedAuth};
 use crate::freshness::DataFreshness;
@@ -25,6 +25,9 @@ pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
+    /// Opt-in, read-only discovery. This view never grants authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compound_readiness: Option<crate::compound_readiness::Discovery>,
     /// Configured Bitcoin network; null when the backend configuration has none.
     pub network: Option<String>,
     /// Sanitized restore journal diagnostics, owner-only and read-only.
@@ -302,17 +305,49 @@ pub(crate) async fn health(
     )
 }
 
+#[derive(Default, Deserialize)]
+struct StatusQuery {
+    #[serde(default)]
+    compound_readiness: bool,
+    generation: Option<String>,
+    request_id: Option<String>,
+}
+
 /// `GET /api/v1/status` — owner-only full node status (behind [`ScopedAuth<Read>`]).
 ///
 /// Includes identity, connected peer IDs, wallet balance, and LN pubkey — the
 /// fields redacted from the public `/health` endpoint.
 async fn status(
     auth: ScopedAuth<Read>,
+    Query(query): Query<StatusQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<HealthResponse>, axum::http::StatusCode> {
     if auth.node_id != state.identity.node_id().to_hex() {
         return Err(axum::http::StatusCode::FORBIDDEN);
     }
+    let correlation = if query.compound_readiness {
+        match (
+            query.generation.and_then(|value| value.parse::<u64>().ok()),
+            query.request_id,
+        ) {
+            (Some(generation), Some(request_id))
+                if crate::compound_readiness::valid_request_id(&request_id) =>
+            {
+                Some(crate::compound_readiness::ConnectionBinding {
+                    generation,
+                    request_id,
+                    client_context: auth
+                        .pairing
+                        .as_ref()
+                        .map(|p| p.client_id.clone())
+                        .unwrap_or_else(|| "local-owner".into()),
+                })
+            }
+            _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+        }
+    } else {
+        None
+    };
     let recovery = if let Some(dir) = state.recovery_dir.clone() {
         Some(
             tokio::task::spawn_blocking(move || konsensus_lightning::recover::status(&dir))
@@ -370,7 +405,27 @@ async fn status(
         state.stun_port,
         state.configured_stun_server.as_deref(),
     );
+    let compound_readiness = correlation.map(|connection| {
+        crate::compound_readiness::runtime_discovery(crate::compound_readiness::RuntimeInputs {
+            node_id: state.identity.node_id().to_hex(),
+            network: state.introduction.network.clone(),
+            connection,
+            role: if auth.pairing.is_some() {
+                crate::compound_readiness::Role::Reader
+            } else {
+                crate::compound_readiness::Role::Owner
+            },
+            enrollment_epoch: auth.pairing.as_ref().map_or(0, |p| p.epoch),
+            device_approvals: state
+                .pairing
+                .as_ref()
+                .map(|p| p.device_authority_off().is_none()),
+            chain_ready: block_height.is_some(),
+            payment_ready: readiness.money_ready && ln_payment_capable,
+        })
+    });
     Ok(Json(HealthResponse {
+        compound_readiness,
         network: state.introduction.network.clone(),
         recovery,
         channel_safety: state.lightning.channel_safety(),
