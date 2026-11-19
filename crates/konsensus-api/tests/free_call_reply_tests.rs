@@ -150,3 +150,17 @@ async fn a_free_reply_payload_must_be_exactly_the_bound_answer_or_decline() {
     assert_eq!(calls::check_free_reply(&fx.store, &paid,
         Some(&text(json!({"v": 1, "call_id": CALL, "reason": "hangup"})))).await, Ok(()));
 }
+
+#[tokio::test]
+async fn a_free_answer_that_raced_the_ring_window_is_withdrawn_after_decryption() {
+    // Bound at the gate while ringing; the window closes before admission.
+    let fx = ringing().await;
+    let answer = reply(&fx.callee, &fx.own, KIND_CALL_ANSWER, 0, vec![free_reply_reference(CALL)]);
+    assert!(bound(&fx, true, &answer, now()).await);
+    let mut entry = fx.store.call_get(fx.callee.node_id(), CALL).await.unwrap().unwrap();
+    entry.deadline_ms = now().saturating_sub(1);
+    fx.store.call_put(fx.callee.node_id(), CALL, &entry).await.unwrap();
+    assert!(calls::check_free_reply(&fx.store, &answer,
+        Some(&json!({"v": 1, "call_id": CALL, "sdp": "answer"}).to_string())).await.is_err());
+    assert!(!bound(&fx, true, &answer, now()).await);
+}

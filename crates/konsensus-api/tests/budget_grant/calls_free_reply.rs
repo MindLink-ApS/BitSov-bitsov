@@ -10,6 +10,15 @@ const FREE: &str = "Custom(\"call_reply_free_v1\")";
 /// A paired app on a node with free replies `on`, ringing for an incoming
 /// call `call_id` from the contact, which advertises `peer_caps`.
 async fn ringing(on: bool, peer_caps: &[&str], call_id: &str) -> (Fx, String, Arc<ConnectedStubTransport>) {
+    let (fx, token, transport) = awaiting_device(on, peer_caps, call_id).await;
+    let fetched = fx.state.storage.call_get(&fx.peer, call_id).await.unwrap().unwrap()
+        .device_fetched(konsensus_api::calls::now_ms()).unwrap();
+    fx.state.storage.call_put(&fx.peer, call_id, &fetched).await.unwrap();
+    (fx, token, transport)
+}
+
+/// As [`ringing`], before any device fetched the offer: the call waits for one.
+async fn awaiting_device(on: bool, peer_caps: &[&str], call_id: &str) -> (Fx, String, Arc<ConnectedStubTransport>) {
     let (mut fx, token) = prepared().await;
     let peer = fx.peer;
     let transport = Arc::new(ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
@@ -24,9 +33,7 @@ async fn ringing(on: bool, peer_caps: &[&str], call_id: &str) -> (Fx, String, Ar
     fx.state = Arc::new(AppState { transport: transport.clone(), call_reply_free: on, ..(*fx.state).clone() });
     konsensus_api::calls::admit_incoming(fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, 400,
         Some(&json!({"v": 1, "call_id": call_id, "sdp": "offer", "media": "audio"}).to_string())).await.unwrap();
-    let fetched = fx.state.storage.call_get(&fx.peer, call_id).await.unwrap().unwrap()
-        .device_fetched(konsensus_api::calls::now_ms()).unwrap();
-    fx.state.storage.call_put(&fx.peer, call_id, &fetched).await.unwrap();
+    assert_eq!(fx.state.storage.call_get(&fx.peer, call_id).await.unwrap().unwrap().phase, Phase::AwaitingDevice);
     (fx, token, transport)
 }
 
@@ -144,4 +151,63 @@ async fn status_advertises_free_call_replies_only_when_on() {
         let listed = body["api_capabilities"].as_array().unwrap().contains(&json!("call_reply_free_v1"));
         assert_eq!(listed, on);
     }
+}
+
+#[tokio::test]
+async fn a_decline_while_the_call_waits_for_a_device_is_free_too() {
+    let (fx, token, transport) = awaiting_device(true, &[FREE], CALL).await;
+    let before = ledger(&fx, &transport);
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 403, CALL, &uuid::Uuid::new_v4().to_string())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["amount_msat"], 0, "{body}");
+    assert_eq!(ledger(&fx, &transport), before, "a decline before any device fetched the call charged");
+    let out = sent(&transport, 403);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].payment_proof.amount_msat, 0);
+    assert_eq!(out[0].references, vec![konsensus_core::payloads::call::free_reply_reference(CALL)]);
+    assert_eq!(fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase, Phase::Ended);
+    // With the switch off the same decline is paid, as before.
+    let (fx, token, transport) = awaiting_device(false, &[FREE], CALL).await;
+    let money = fx.wallet.money();
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 403, CALL, &uuid::Uuid::new_v4().to_string())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.money(), money + 1);
+    assert!(sent(&transport, 403)[0].payment_proof.amount_msat > 0);
+}
+
+#[tokio::test]
+async fn an_answer_after_the_ring_window_is_refused_not_paid() {
+    let (fx, token, transport) = ringing(true, &[FREE], CALL).await;
+    let mut entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    entry.deadline_ms = konsensus_api::calls::now_ms().saturating_sub(1);
+    fx.state.storage.call_put(&fx.peer, CALL, &entry).await.unwrap();
+    let before = ledger(&fx, &transport);
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &uuid::Uuid::new_v4().to_string())).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(ledger(&fx, &transport), before, "a late answer was paid: {body}");
+    assert!(sent(&transport, 401).is_empty());
+}
+
+#[tokio::test]
+async fn an_unreadable_call_state_refuses_the_reply_instead_of_paying_it() {
+    let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+    // Move the ringing call into storage whose second read of it fails: the
+    // first read reserves the reply, the second decides whether it is free.
+    let store = Arc::new(common::MemStorage::new());
+    let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    konsensus_storage::Storage::call_put(store.as_ref(), &fx.peer, CALL, &entry).await.unwrap();
+    let failing = Arc::clone(&store);
+    *store.call_get_hook.lock().unwrap() = Some(Box::new(move || {
+        let failing2 = Arc::clone(&failing);
+        *failing.call_get_hook.lock().unwrap() = Some(Box::new(move || {
+            *failing2.fail_call_get_for.lock().unwrap() = Some(CALL.into());
+        }));
+    }));
+    fx.state = Arc::new(AppState { storage: store.clone(), ..(*fx.state).clone() });
+    let before = ledger(&fx, &transport);
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &uuid::Uuid::new_v4().to_string())).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["reason"], "call_reply_unavailable", "{body}");
+    assert_eq!(ledger(&fx, &transport), before, "an unreadable call state paid the reply: {body}");
+    assert!(sent(&transport, 401).is_empty());
 }
