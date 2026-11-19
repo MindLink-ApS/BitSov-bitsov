@@ -1847,7 +1847,7 @@ async fn invoice_persistence_failure_refuses_and_removes_unpublished_invoice() {
 
 #[tokio::test]
 async fn invoice_restart_preserves_an_invoice_whose_expiry_is_unknown() {
-    // Codex P1 on #403: a two-hour owner invoice with no sidecar row must not
+    // A two-hour owner invoice with no sidecar row must not
     // be given a guessed one-hour lifetime and deleted.
     let dir = tempfile::tempdir().unwrap();
     let mut builder = ldk_node::Builder::new();

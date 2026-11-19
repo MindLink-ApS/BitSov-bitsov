@@ -5447,7 +5447,7 @@ async fn unknown_deadline_wallet_invoices_neither_hold_the_cap_nor_are_deleted()
         &peer,
     )
     .await;
-    // Codex P1 on #403: invoices with an unknown deadline may be owner
+    // Invoices with an unknown deadline may be owner
     // invoices. They neither hold the service cap nor get deleted.
     assert_eq!(
         lightning.list_payments(10).await.unwrap().len(),
