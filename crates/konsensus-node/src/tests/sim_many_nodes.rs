@@ -745,13 +745,23 @@ fn money_violations(sent: &[Sent], payments: &[Payment]) -> (Vec<String>, u64, u
             if reported > MAX_TOTAL_MSAT {
                 v.push(format!("I4 cap: step {} n{p}->n{r} reported {reported} msat over its max_total_msat {MAX_TOTAL_MSAT}", s.step));
             }
-            let message = s.body["payment_hash"]
-                .as_str()
-                .and_then(|h| left.iter().position(|x| x.hash == h))
-                .map_or(0, |i| {
+            // A reported message payment must have settled: its money is never
+            // reclassified as admission, so unrelated payments cannot stand in.
+            let hash = s.body["payment_hash"].as_str().filter(|h| !h.is_empty());
+            let message = match hash.map(|h| (h, left.iter().position(|x| x.hash == h))) {
+                Some((_, Some(i))) => {
                     by_hash += 1;
                     left.swap_remove(i).amount
-                });
+                }
+                Some((h, None)) => {
+                    v.push(format!(
+                        "I4 message unsettled: step {} n{p}->n{r} op {} reported message payment {h}, which never settled",
+                        s.step, s.operation_id
+                    ));
+                    continue;
+                }
+                None => 0,
+            };
             match reported.checked_sub(message) {
                 Some(0) => {}
                 Some(admission) => admissions.push((s, admission)),
@@ -1996,6 +2006,11 @@ fn sim_money_oracle_accounts_for_every_admission_payment() {
         ("message paid twice", sent.clone(), [good.clone(), vec![pay(0, 1, CHAT_MSAT, "m2-again")]].concat()),
         ("reported admission never settled", sent.clone(), good.iter().filter(|p| p.hash != "adm1").cloned().collect()),
         ("payment with no send", sent.clone(), [good.clone(), vec![pay(1, 0, CHAT_MSAT, "back")]].concat()),
+        (
+            "a reported message hash that never settled, offset by unrelated payments",
+            vec![send(0, 1, 2 * CHAT_MSAT, None, "ghost")],
+            vec![pay(0, 1, CHAT_MSAT, "u1"), pay(0, 1, CHAT_MSAT, "u2")],
+        ),
         (
             "a failed compose that paid but reported nothing",
             [sent.clone(), vec![Sent { status: Some(502), body: serde_json::json!({"accepted": false, "code": 502}), ..send(0, 1, 0, None, "m4") }]].concat(),

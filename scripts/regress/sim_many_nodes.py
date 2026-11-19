@@ -344,6 +344,11 @@ def money_violations(sent, payments):
             hit = next((k for k, row in enumerate(left) if h and row[3] == h), None)
             if hit is not None:
                 message = left.pop(hit)[2]
+            elif h:
+                # A reported message payment must have settled; its money is never
+                # reclassified as admission, so unrelated payments cannot stand in.
+                v.append(f"I4 message unsettled n{p}->n{q}: reported message payment {h}, which never settled")
+                continue
             if reported < message:
                 v.append(f"I4 under-reported n{p}->n{q}: reported {reported} msat, its message payment {h} settled {message}")
             elif reported > message:
