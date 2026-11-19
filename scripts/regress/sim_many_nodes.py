@@ -30,9 +30,14 @@ Invariants checked after the traffic settles:
      delivered at most once, and never at another node;
   I2 no sim plaintext appears that was not sent;
   I4 the ledger conserves money; no compose reports more than its cap; per
-     (payer, payee), settled msat <= what the compose responses reported + one
-     admission per connection epoch, and never more than the sum of those
-     composes' all-in caps (admission is inside the cap);
+     (payer, payee), every settled payment is explained exactly: a message
+     payment by the payment_hash its compose reported, and every other
+     payment by an admission or re-admission a compose reported (its amount
+     minus its message payment, plus readmission_msat). Reported money that
+     never settled, and any payment left over, are violations. Only a compose
+     cut by its own node's restart (outcome unknown) explains leftover
+     payments, up to its all-in cap. The pair never settles more than the sum
+     of its composes' caps;
   I5 no compose hangs past the deadline or loses its connection, unless its
      own node was restarted under it: the connection was lost (not timed out)
      and the request was in flight while the restart ran; no node process
@@ -58,6 +63,10 @@ ROUTING_FEE_MSAT = 1_000
 MAX_TOTAL_MSAT = 3 * (CHAT_MSAT + ROUTING_FEE_MSAT)
 START_MSAT = 50_000_000
 COMPOSE_TIMEOUT_S = 75
+# Messages per listing page (the API's maximum), and how many pages one
+# inbox read may take before it is refused as runaway paging.
+PAGE_LIMIT = 1000
+MAX_PAGES = 200
 SANDBOX = ('(version 1)\n(allow default)\n(deny network*)\n'
            '(allow network-inbound (local ip "localhost:*"))\n'
            '(allow network-outbound (remote ip "localhost:*"))\n'
@@ -73,6 +82,10 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # Never an inherited HTTP proxy, never a redirect: the controller only talks
 # to the loopback nodes it started.
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+class ListingIncomplete(Exception):
+    """An inbox could not be read to its end: a page failed or paging ran away."""
 
 
 def log(*a):
@@ -165,7 +178,8 @@ content_dir = "{root}/pages"
         sig = base64.urlsafe_b64encode(hmac.new(self.secrets[i].encode(), unsigned, hashlib.sha256).digest()).rstrip(b"=")
         return (unsigned + b"." + sig).decode()
 
-    def api(self, i, method, path, body=None, timeout=30):
+    def api(self, i, method, path, body=None, timeout=30, headers_out=None):
+        """(status, json body); `headers_out`, if given, receives the response headers."""
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.ports[i]['api']}/api/v1{path}", method=method,
             data=json.dumps(body).encode() if body is not None else None,
@@ -176,6 +190,8 @@ content_dir = "{root}/pages"
             try:
                 with OPENER.open(req, timeout=timeout) as r:
                     text = r.read().decode()
+                    if headers_out is not None:
+                        headers_out.update({k.lower(): v for k, v in r.headers.items()})
                     return r.status, (json.loads(text) if text else None)
             except urllib.error.HTTPError as e:
                 with e:
@@ -232,8 +248,37 @@ content_dir = "{root}/pages"
         return st == 200 and wait(lambda: self.connected(a, b) and self.connected(b, a), 10)
 
     def messages(self, i):
-        st, v = self.api(i, "GET", "/messages?limit=1000")
-        return v if st == 200 and isinstance(v, list) else []
+        """Every message at node i, newest first, across all pages.
+
+        The list is keyset-paged on (timestamp, id) descending. A page names
+        its continuation in X-BitSov-Next-Before(-Id) when the scan stopped
+        early (unreadable rows, scan budget); otherwise a full page continues
+        from its last message. A page shorter than the limit with no
+        continuation header ends the listing. A failed page, a cursor that
+        does not move, or more than MAX_PAGES pages raise ListingIncomplete:
+        a truncated inbox must never pass for a complete one.
+        """
+        out, cursor, seen = [], None, set()
+        for page in range(1, MAX_PAGES + 1):
+            path = f"/messages?limit={PAGE_LIMIT}"
+            if cursor is not None:
+                path += f"&before={cursor[0]}&before_id={cursor[1]}"
+            headers = {}
+            st, v = self.api(i, "GET", path, headers_out=headers)
+            if st != 200 or not isinstance(v, list):
+                raise ListingIncomplete(f"n{i} page {page}: {st} {str(v)[:120]}")
+            out += v
+            if "x-bitsov-next-before" in headers and "x-bitsov-next-before-id" in headers:
+                nxt = (headers["x-bitsov-next-before"], headers["x-bitsov-next-before-id"])
+            elif len(v) >= PAGE_LIMIT:
+                nxt = (str(v[-1].get("timestamp")), str(v[-1].get("id")))
+            else:
+                return out
+            if nxt == cursor or nxt in seen:
+                raise ListingIncomplete(f"n{i}: paging cursor {nxt} did not advance")
+            seen.add(nxt)
+            cursor = nxt
+        raise ListingIncomplete(f"n{i}: more than {MAX_PAGES} pages of {PAGE_LIMIT}")
 
     def log_text(self, i):
         with open(f"{self.run}/node-{i}.log", errors="replace") as f:
@@ -258,12 +303,80 @@ def claims_delivery(r):
     return acked(r) or (r["status"] == 200 and r["body"].get("delivered") is True and r["body"].get("state") == "sent")
 
 
+def money_violations(sent, payments):
+    """I4 per (payer, payee) over the settled ledger payments (payer, payee, msat, hash).
+
+    A compose's reported money is its message payment (found by the
+    payment_hash it reported) plus the admission or re-admission it reported:
+    amount_msat (message + any first-contact admission) - the message
+    payment + readmission_msat. Each reported admission consumes settled
+    payments of exactly its amount; reported money that did not settle is a
+    violation. Whatever is left is explained only by composes cut by their
+    own node's restart (`interrupted`: outcome unknown), each up to its
+    all-in cap; with none, any leftover payment is a violation.
+    """
+    v = []
+    pairs = {}
+    for r in sent:
+        pairs.setdefault((r["from"], r["to"]), ([], []))[0].append(r)
+    for row in payments:
+        pairs.setdefault((row[0], row[1]), ([], []))[1].append(row)
+    for (p, q), (sends, rows) in sorted(pairs.items()):
+        total = sum(row[2] for row in rows)
+        if not sends:
+            v.append(f"I4 n{p} paid n{q} {len(rows)}x/{total} msat but never sent to it")
+            continue
+        cap = len(sends) * MAX_TOTAL_MSAT
+        if total > cap:
+            v.append(f"I4 over cap n{p}->n{q}: ledger {len(rows)}/{total} msat > {len(sends)} compose(s) x max_total_msat = {cap}")
+        left = list(rows)
+        admissions, interrupted = [], 0
+        for r in sends:
+            if r["interrupted"]:
+                interrupted += 1
+                continue
+            body = r["body"]
+            reported = (body.get("amount_msat") or 0) + (body.get("readmission_msat") or 0)
+            if reported > MAX_TOTAL_MSAT:
+                v.append(f"I4 cap: n{p}->n{q} reported {reported} msat over its max_total_msat {MAX_TOTAL_MSAT}")
+            message = 0
+            h = body.get("payment_hash")
+            hit = next((k for k, row in enumerate(left) if h and row[3] == h), None)
+            if hit is not None:
+                message = left.pop(hit)[2]
+            elif h:
+                # A reported message payment must have settled; its money is never
+                # reclassified as admission, so unrelated payments cannot stand in.
+                v.append(f"I4 message unsettled n{p}->n{q}: reported message payment {h}, which never settled")
+                continue
+            if reported < message:
+                v.append(f"I4 under-reported n{p}->n{q}: reported {reported} msat, its message payment {h} settled {message}")
+            elif reported > message:
+                admissions.append((r, reported - message))
+        left.sort(key=lambda row: -row[2])
+        for r, want in admissions:
+            need, k = want, 0
+            while need and k < len(left):
+                if left[k][2] <= need:
+                    need -= left.pop(k)[2]
+                else:
+                    k += 1
+            if need:
+                v.append(f"I4 unsettled n{p}->n{q} {r['text']!r}: reported {want} msat of admission/re-admission, "
+                         f"{need} msat of it has no settled payment")
+        extra = sum(row[2] for row in left)
+        if extra and extra > interrupted * MAX_TOTAL_MSAT:
+            v.append(f"I4 unexplained n{p}->n{q}: {len(left)} payment(s)/{extra} msat match no reported message, "
+                     f"admission or re-admission ({interrupted} interrupted compose(s) explain at most "
+                     f"{interrupted * MAX_TOTAL_MSAT}; hashes {[row[3][:16] for row in left]})")
+    return v
+
+
 def simulate(args, workdir, sandbox):
     rng = random.Random(args.seed)
     net = Net(args.bin, os.path.join(workdir, f"seed-{args.seed}"), args.nodes, sandbox)
     started = time.time()
     violations, notes, sent = [], [], []
-    epochs = {}
     try:
         # One at a time: nodes funding the shared mock ledger at once can
         # fail to start with "database is locked".
@@ -277,7 +390,6 @@ def simulate(args, workdir, sandbox):
                 if a != b and (min(a, b), max(a, b)) not in edges:
                     if net.dial(a, b):
                         edges.add((min(a, b), max(a, b)))
-                        epochs[(min(a, b), max(a, b))] = epochs.get((min(a, b), max(a, b)), 0) + 1
                     else:
                         notes.append(f"dial n{a}->n{b} failed")
         log(f"mesh: {len(edges)} edges, {time.time() - started:.1f}s")
@@ -307,7 +419,6 @@ def simulate(args, workdir, sandbox):
                 if e not in edges:
                     if net.dial(a, b):
                         edges.add(e)
-                        epochs[e] = epochs.get(e, 0) + 1
                 jobs.append((step, a, b, f"sim:{args.seed}:{step}:n{a}>n{b}:{len(sent) + len(jobs)}"))
             # Chaos: restart one node mid-step.
             victim = rng.randrange(args.nodes) if rng.random() < args.restart else None
@@ -341,24 +452,32 @@ def simulate(args, workdir, sandbox):
                 for e in list(edges):
                     if victim in e:
                         other = e[0] if e[1] == victim else e[1]
-                        if net.dial(victim, other):
-                            epochs[e] = epochs.get(e, 0) + 1
+                        net.dial(victim, other)
             ok = sum(1 for r in results if acked(r))
             log(f"step {step}: {len(results)} sends, {ok} ok, t={time.time() - started:.1f}s")
 
         # Settle, then check.
         want = {(r["to"], r["text"]) for r in sent if claims_delivery(r)}
-        inbox = {}
+        inbox, unread = {}, {}
 
         def refresh():
             for i in range(args.nodes):
-                inbox[i] = net.messages(i)
+                try:
+                    inbox[i] = net.messages(i)
+                    unread.pop(i, None)
+                except ListingIncomplete as e:
+                    inbox.setdefault(i, [])
+                    unread[i] = str(e)
+            if unread:
+                return False
             got = {(i, m.get("plaintext")) for i, ms in inbox.items() for m in ms}
             return want <= got
         wait(refresh, 30)
         time.sleep(5)
         refresh()
 
+        for i, why in sorted(unread.items()):
+            violations.append(f"I1 inbox of n{i} not read to its end: {why}")
         texts = {r["text"]: r for r in sent}
         seen = {}
         for i, ms in inbox.items():
@@ -398,35 +517,13 @@ def simulate(args, workdir, sandbox):
         if total != args.nodes * START_MSAT:
             violations.append(f"I4 ledger holds {total}, expected {args.nodes * START_MSAT}")
         idx = {h: i for i, h in enumerate(net.ids)}
+        payments = [(idx[payer], idx[recipient], amount, h) for payer, recipient, amount, h in db.execute(
+            "SELECT payer, recipient, amount, hash FROM invoices WHERE payer IS NOT NULL")
+            if payer in idx and recipient in idx]
         paid = {}
-        for payer, recipient, amount in db.execute("SELECT payer, recipient, amount FROM invoices WHERE payer IS NOT NULL"):
-            if payer in idx and recipient in idx:
-                k = (idx[payer], idx[recipient])
-                paid[k] = (paid.get(k, (0, 0))[0] + 1, paid.get(k, (0, 0))[1] + amount)
-        reported, caps = {}, {}
-        for r in sent:
-            k = (r["from"], r["to"])
-            caps[k] = caps.get(k, 0) + MAX_TOTAL_MSAT
-            if r["interrupted"]:
-                amt = MAX_TOTAL_MSAT  # unknown outcome: at most its cap
-            else:
-                amt = (r["body"].get("amount_msat") or 0) + (r["body"].get("readmission_msat") or 0)
-                if amt > MAX_TOTAL_MSAT:
-                    violations.append(f"I4 cap: n{r['from']}->n{r['to']} reported {amt} msat over its max_total_msat {MAX_TOTAL_MSAT}")
-            reported[k] = (reported.get(k, (0, 0))[0] + 1, reported.get(k, (0, 0))[1] + amt)
-        for (p, q), (count, msat) in sorted(paid.items()):
-            sends = reported.get((p, q), (0, 0))
-            ep = max(1, epochs.get((min(p, q), max(p, q)), 0))
-            # Each compose's cap is all-in (admission included): the pair can
-            # never settle more than the sum of its caps, however its
-            # composes ended.
-            cap = caps.get((p, q), 0)
-            if sends[0] == 0:
-                violations.append(f"I4 n{p} paid n{q} {count}x/{msat} msat but never sent to it")
-            elif msat > cap:
-                violations.append(f"I4 over cap n{p}->n{q}: ledger {count}/{msat} msat > {sends[0]} compose(s) x max_total_msat = {cap}")
-            elif msat > sends[1] + ep * CHAT_MSAT:
-                violations.append(f"I4 overcharge n{p}->n{q}: ledger {count}/{msat} msat > reported {sends[1]} + {ep} admission(s)")
+        for p, q, amount, _ in payments:
+            paid[(p, q)] = (paid.get((p, q), (0, 0))[0] + 1, paid.get((p, q), (0, 0))[1] + amount)
+        violations += money_violations(sent, payments)
 
         acked_pairs = {(r["from"], r["to"]) for r in sent if acked(r)}
         if not acked_pairs:
