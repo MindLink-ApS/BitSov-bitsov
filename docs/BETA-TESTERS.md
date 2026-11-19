@@ -181,7 +181,7 @@ proof without publishing private data" afterwards.
 
 ## 6. Report
 
-Send your report **privately to Rasmus**, through the channel you were invited
+Send your report **privately to the maintainer**, through the channel you were invited
 through. Report anything security-related through [SECURITY.md](../SECURITY.md),
 never in a public issue.
 

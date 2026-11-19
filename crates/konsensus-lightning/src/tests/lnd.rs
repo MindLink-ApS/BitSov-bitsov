@@ -1560,7 +1560,7 @@ async fn lnd_peer_invoice_hooks_cancel_and_inventory() {
     handle.abort();
 }
 
-/// Codex P2 on #403: LND cancels expired invoices by itself; cleanup must still
+/// LND cancels expired invoices by itself; cleanup must still
 /// delete them, and a failed DELETE is an error (tracking kept for a retry),
 /// not a silent success.
 #[tokio::test]
