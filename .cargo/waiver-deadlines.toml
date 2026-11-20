@@ -76,3 +76,12 @@ deadline = 2026-12-09
 [[waiver]]
 ids = ["RUSTSEC-2026-0441"]
 deadline = 2027-02-09
+
+# OSV-only maintenance notices for chrono and chrono-tz; same date as their ignoreUntil.
+[[waiver]]
+ids = ["RUSTSEC-2026-0543"]
+deadline = 2026-12-20
+
+[[waiver]]
+ids = ["RUSTSEC-2026-0555"]
+deadline = 2026-12-20

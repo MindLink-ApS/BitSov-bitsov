@@ -116,3 +116,17 @@ reason = "False positive. The advisory covers block-buffer >= 0.11.0, < 0.12.1 (
 id = "GHSA-h2v8-394m-p7vv"
 ignoreUntil = 2027-02-03
 reason = "rustls Brotli certificate decompression; alias RUSTSEC-2026-0348. Only 0.21.12 matches, via pinned sqlx-core 0.8.0. That version has no certificate compression code and no brotli feature, and Cargo.lock has no brotli crate. rustls 0.21 has no fixed release: the fix is 0.23.46, which sqlx 0.8.0 cannot use, and newer sqlx is blocked by the sqlite conflict (#59). The rustls 0.23 copy is already 0.23.46. Remove on the sqlx/ldk-node upgrade (#59). Recheck if a new rustls 0.21 consumer or a brotli crate appears."
+
+# Maintenance-only notices for the chrono date/time stack (triage 2026-11-20).
+# No patched release exists; every version is listed. chrono-tz is already on
+# 0.10.4, whose optional build helper (chrono-tz-build) is no longer compiled.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+ignoreUntil = 2026-12-20
+reason = "Maintenance-only notice for chrono 0.4.45; no vulnerability or patched release is identified and every version is listed. chrono is the runtime date/time type across the workspace (API timestamps and auth expiry, storage rows, calendar recurrence) and is also pulled in by sqlx 0.8.0 and ldk-node 0.7, so removing it is a dependency migration, not a lockfile bump. Recheck on any new chrono advisory, a maintained successor release, or a migration of the workspace date/time types. Expires 2026-12-20."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0555"
+ignoreUntil = 2026-12-20
+reason = "Maintenance-only notice for chrono-tz 0.10.4; no vulnerability or patched release is identified and every version is listed. Its only consumer is konsensus-core calendar recurrence, which parses an IANA zone name (falling back to UTC) to keep local wall-clock times across DST. The 0.10 line bundles its zone data, so the unmaintained chrono-tz-build helper is no longer compiled. Recheck on any new chrono-tz advisory, a new consumer, or a stale IANA zone release; remove with the calendar's move off chrono-tz. Expires 2026-12-20."

@@ -113,7 +113,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = { version = "0.9", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
 
 # Testing
 mockall = "0.15"
