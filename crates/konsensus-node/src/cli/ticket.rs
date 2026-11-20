@@ -318,6 +318,10 @@ pub fn cmd_pair_ticket_with_allowance(
                 anyhow::bail!("ticket replace failed (test)");
             }
             std::fs::rename(&temporary, &link_path)?;
+            #[cfg(test)]
+            if FAIL_AFTER_LINK_RENAME.with(|fail| fail.replace(false)) {
+                anyhow::bail!("ticket sync failed (test)");
+            }
             fsync_dir_strict(&dir)?;
             Ok(())
         })();
@@ -332,7 +336,26 @@ pub fn cmd_pair_ticket_with_allowance(
         if let Some(staged) = &staged {
             let _ = std::fs::remove_file(staged);
         }
-        return Err(error);
+        // A failure after the rename (syncing the directory) leaves the new
+        // ticket published next to the previous terms: put the previous
+        // ticket back. The terms were not touched yet.
+        let renamed = std::fs::read(&link_path).is_ok_and(|bytes| bytes == uri.as_bytes());
+        if !renamed {
+            return Err(error);
+        }
+        let restored = match &previous_link {
+            Some(bytes) => replace_link(bytes, false),
+            None => std::fs::remove_file(&link_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| fsync_dir_strict(&dir).map_err(anyhow::Error::from)),
+        };
+        return Err(error.context(match restored {
+            Ok(()) => "could not publish the ticket; the previous ticket is back in place".to_string(),
+            Err(e) => format!(
+                "could not publish the ticket, nor put the previous one back ({e}); \
+                 the new ticket may be published without its terms: run pair-ticket again"
+            ),
+        }));
     }
     match &staged {
         Some(staged) => {
@@ -407,6 +430,8 @@ thread_local! {
     static FAIL_LINK_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test-only: make publishing the staged terms fail.
     static FAIL_TERMS_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: fail once, right after a ticket was renamed into place.
+    static FAIL_AFTER_LINK_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test-only: fail after the staged terms were renamed into place.
     static FAIL_AFTER_TERMS_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -554,6 +579,28 @@ mod allowance_publish_tests {
             FAIL_AFTER_TERMS_RENAME.with(|fail| fail.set(false));
             assert!(result.is_err());
             assert_eq!(published(dir.path()), before, "previous {previous:?}");
+        }
+    }
+
+    /// A failure right after the new ticket was renamed into place (for
+    /// example syncing the directory) puts the previous ticket back, so the
+    /// published ticket and its terms still belong together.
+    #[test]
+    fn a_failure_after_the_ticket_rename_restores_the_previous_pair() {
+        for previous in [None, Some(false), Some(true)] {
+            for next_allow in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = node(dir.path());
+                if let Some(allow) = previous {
+                    ticket(&path, allow).unwrap();
+                }
+                let before = published(dir.path());
+                FAIL_AFTER_LINK_RENAME.with(|fail| fail.set(true));
+                let result = ticket(&path, next_allow);
+                FAIL_AFTER_LINK_RENAME.with(|fail| fail.set(false));
+                assert!(result.is_err(), "previous {previous:?}, next {next_allow}");
+                assert_eq!(published(dir.path()), before, "previous {previous:?}, next {next_allow}");
+            }
         }
     }
 }
