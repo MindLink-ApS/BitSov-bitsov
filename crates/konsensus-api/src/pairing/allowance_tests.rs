@@ -1812,17 +1812,18 @@ fn renewal_write_failure_restores_advanced_clock_and_liabilities() {
 /// write fails, nothing changes at all.
 #[test]
 fn refused_renewal_clock_write_failure_preserves_all_accounting() {
-    let f = day_fixture(true, DAY);
-    ask(&f, proposal(400_000, 300_000)).unwrap();
-    let paid = ln_payment(&f, "paid", 100_000).unwrap();
-    f.svc.try_resolve_spend(&paid, &"bb".repeat(33), 100_000).unwrap();
-    let later = now() + 3_600;
-    let before = snapshot(&f);
     let outside = GrantTerms { allow_liquidity_fees: true, ..proposal(1_000, 1_000) };
     for (terms, refusal) in [
         (outside, NoWindow::OutsideTerms("liquidity fees need the owner")),
         (proposal(900_001, 300_000), NoWindow::OverDailyCap { remaining_msat: 900_000 }),
     ] {
+        // A fresh fixture per case: nothing carries over from the last one.
+        let f = day_fixture(true, DAY);
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        let paid = ln_payment(&f, "paid", 100_000).unwrap();
+        f.svc.try_resolve_spend(&paid, &"bb".repeat(33), 100_000).unwrap();
+        let later = now() + 3_600;
+        let before = snapshot(&f);
         fail_next_write(PersistFault::BeforeWrite);
         assert!(open_at(&f, terms.clone(), later).is_err());
         assert_eq!(snapshot(&f), before, "a failed clock write changes nothing");
@@ -1830,13 +1831,75 @@ fn refused_renewal_clock_write_failure_preserves_all_accounting() {
         let (grants, allowances) = snapshot(&f);
         assert_eq!(grants, before.0, "a refusal moves nothing");
         assert_eq!(allowances[&f.client].windows, before.1[&f.client].windows);
+        assert_eq!(allowances[&f.client].consumed_payment_ids, before.1[&f.client].consumed_payment_ids);
         assert_eq!(allowances[&f.client].observed_at, later, "only the time it saw is recorded");
-        let f2 = PairingService::open(f._dir.path(), "identity".into(), true).unwrap();
-        assert_eq!(f2.lock().file.allowances[&f.client].observed_at, later, "and it is on disk");
-        drop(f2);
-        // Reset the clock for the next case, as it was.
-        let mut inner = f.svc.lock();
-        inner.file.allowances.get_mut(&f.client).unwrap().observed_at = before.1[&f.client].observed_at;
-        f.svc.persist(&mut inner.file).unwrap();
+        let reopened = PairingService::open(f._dir.path(), "identity".into(), true).unwrap();
+        assert_eq!(reopened.lock().file.allowances[&f.client].observed_at, later, "and it is on disk");
+    }
+}
+
+// ── Paid identities stay protected ──────────────────────────────────────
+
+/// Age every ended window of the allowance past the time it counts.
+fn age_ended_windows(f: &Fixture) {
+    let mut inner = f.svc.lock_without_cleanup();
+    let past = now() - ROLLING_SECS - CALL_TAIL_SECS - 10;
+    for window in inner.file.allowances.get_mut(&f.client).unwrap().windows.iter_mut() {
+        if window.ended_at.is_some() {
+            window.ended_at = Some(past);
+            window.opened_at = window.opened_at.min(past);
+        }
+    }
+    f.svc.persist(&mut inner.file).unwrap();
+}
+
+/// A payment carried through renewals keeps its identity protected after the
+/// window that first paid it is merged into older history.
+#[test]
+fn a_carried_payment_stays_protected_after_its_first_window_compacts() {
+    for (continuity, restart) in [(false, false), (true, false), (false, true), (true, true)] {
+        let f = day_fixture(continuity, DAY);
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        let payment = ln_payment(&f, "x", 100_000).unwrap();
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        age_ended_windows(&f);
+        let f = if restart { reopen_with(f, continuity) } else { f };
+        assert_eq!(ln_payment(&f, "x", 100_000), Err(BudgetRefusal::DuplicatePayment), "in flight ({continuity} {restart})");
+        f.svc.try_resolve_spend(&payment, &"bb".repeat(33), 100_000).unwrap();
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        assert_eq!(day_total(&f), 500_000);
+        let used = live_window(&f).budget.unwrap().used_msat;
+        assert_eq!(ln_payment(&f, "x", 100_000), Err(BudgetRefusal::DuplicatePayment), "{continuity} {restart}");
+        assert_eq!(live_window(&f).budget.unwrap().used_msat, used, "no second debit");
+    }
+}
+
+/// A store written before paid identities were recorded (the field absent)
+/// still refuses paying a settled or an in-flight payment again.
+#[test]
+fn a_store_from_before_the_paid_identity_record_still_refuses_replays() {
+    for continuity in [false, true] {
+        let f = day_fixture(continuity, DAY);
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        let settled = ln_payment(&f, "settled", 100_000).unwrap();
+        f.svc.try_resolve_spend(&settled, &"bb".repeat(33), 100_000).unwrap();
+        let pending = ln_payment(&f, "pending", 50_000).unwrap();
+        {
+            let mut inner = f.svc.lock();
+            inner.file.allowances.get_mut(&f.client).unwrap().consumed_payment_ids.clear();
+            f.svc.persist(&mut inner.file).unwrap();
+        }
+        let raw = std::fs::read_to_string(f.svc.dir().join("clients.json")).unwrap();
+        assert!(!raw.contains("consumed_payment_ids"), "the store is in the earlier format");
+        let f = reopen_with(f, continuity);
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        let f = reopen_with(f, continuity);
+        f.svc.try_resolve_spend(&pending, &"bb".repeat(33), 50_000).unwrap();
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        let used = live_window(&f).budget.unwrap().used_msat;
+        assert_eq!(ln_payment(&f, "settled", 100_000), Err(BudgetRefusal::DuplicatePayment), "{continuity}");
+        assert_eq!(ln_payment(&f, "pending", 50_000), Err(BudgetRefusal::DuplicatePayment), "{continuity}");
+        assert_eq!(live_window(&f).budget.unwrap().used_msat, used, "no second debit");
     }
 }

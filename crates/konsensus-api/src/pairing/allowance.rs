@@ -609,6 +609,44 @@ pub fn read_ticket_allowance(pairing_dir: &Path, code: &str, now: i64) -> Option
 }
 
 impl super::PairingFile {
+    /// Record, for every allowance window still holding a budget, the
+    /// payment identities it has paid that the allowance does not yet
+    /// remember: a store written before that record existed keeps them only
+    /// on its grants, which a renewal replaces. Only grants the allowance
+    /// opened, for its own epoch and identity; existing entries are kept.
+    /// Returns whether anything was added.
+    pub(super) fn backfill_consumed_payment_ids(&mut self) -> bool {
+        let mut found: Vec<(String, String, String)> = Vec::new();
+        for grant in self.grants.iter().filter(|g| g.granted_by == ALLOWANCE_GRANTED_BY) {
+            let (Some(budget), Some(allowance)) = (grant.budget.as_ref(), self.allowances.get(&grant.client_id)) else {
+                continue;
+            };
+            if allowance.epoch != grant.epoch || allowance.identity_fingerprint != grant.identity_fingerprint {
+                continue;
+            }
+            for id in &budget.payment_ids {
+                found.push((grant.client_id.clone(), id.clone(), grant.op_id.clone()));
+            }
+            for (reservation, ids) in &allowance.payment_ids_in_flight {
+                if budget.pending.contains_key(reservation) {
+                    for id in ids {
+                        found.push((grant.client_id.clone(), id.clone(), grant.op_id.clone()));
+                    }
+                }
+            }
+        }
+        let mut added = false;
+        for (client_id, id, op_id) in found {
+            if let Some(allowance) = self.allowances.get_mut(&client_id) {
+                if let std::collections::btree_map::Entry::Vacant(entry) = allowance.consumed_payment_ids.entry(id) {
+                    entry.insert(op_id);
+                    added = true;
+                }
+            }
+        }
+        added
+    }
+
     /// Whether the allowance behind `grant` still records its window, open
     /// or ended. An ended window's grant may still be kept to finish an
     /// admitted call or settle a payment in flight.
@@ -671,14 +709,19 @@ impl super::PairingFile {
                     window.committed_msat = window.committed_msat.max(budget.used_msat);
                 }
             }
-            // A paid identity is remembered while its window is recorded.
-            let recorded: std::collections::BTreeSet<&str> =
-                allowance.windows.iter().map(|w| w.op_id.as_str()).collect();
-            allowance.consumed_payment_ids.retain(|_, op| recorded.contains(op.as_str()));
             // Identities of payments that settled are no longer carried.
             allowance.payment_ids_in_flight.retain(|id, _| {
                 grants.iter().filter_map(|g| g.budget.as_ref()).any(|b| b.pending.contains_key(id))
             });
+            // A paid identity is remembered while the window it now belongs
+            // to is recorded, and always while its payment is in flight.
+            let recorded: std::collections::BTreeSet<&str> =
+                allowance.windows.iter().map(|w| w.op_id.as_str()).collect();
+            let in_flight: std::collections::BTreeSet<&str> =
+                allowance.payment_ids_in_flight.values().flatten().map(String::as_str).collect();
+            allowance
+                .consumed_payment_ids
+                .retain(|id, op| recorded.contains(op.as_str()) || in_flight.contains(id.as_str()));
             // Offer counts only matter while a window still holds the call.
             allowance.call_offers_msat.retain(|key, _| {
                 grants.iter().filter_map(|g| g.budget.as_ref()).any(|b| {
@@ -811,6 +854,7 @@ impl super::PairingService {
         // both whether the window fits under the daily cap and what the
         // ledger records, so admission and publication use one result.
         let mut prepared = inner.file.clone();
+        prepared.backfill_consumed_payment_ids();
         let renewal = Self::prepare_renewal(&mut prepared, grant, self.call_continuity_enabled(), now);
         let allowance = prepared
             .allowances
@@ -925,6 +969,13 @@ impl super::PairingService {
                     .collect()
             })
             .unwrap_or_default();
+        // A carried payment's identity now belongs to the new window: it
+        // stays paid for as long as that window is recorded.
+        if let Some(allowance) = file.allowances.get_mut(&grant.client_id) {
+            for id in &carried_ids {
+                allowance.consumed_payment_ids.insert(id.clone(), grant.op_id.clone());
+            }
+        }
         file.replace_grants_where(&mut grant, continuity, |old| old.granted_by == ALLOWANCE_GRANTED_BY);
         if let Some(next) = grant.budget.as_mut() {
             next.accept_open_payments(payments);

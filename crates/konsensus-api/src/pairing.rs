@@ -1190,7 +1190,10 @@ impl PairingService {
         };
         // A grant that expired while the node was down, or an unmetered
         // pre-G1 grant, must not survive the restart on disk either.
-        if funding_upgraded {
+        // Paid identities of an earlier store are recorded with the
+        // allowance before any renewal can replace the grants holding them.
+        let consumed_upgraded = service.lock_without_cleanup().file.backfill_consumed_payment_ids();
+        if funding_upgraded || consumed_upgraded {
             service.persist(&mut service.lock_without_cleanup().file)?;
         }
         service.prune_expired_grants()?;
