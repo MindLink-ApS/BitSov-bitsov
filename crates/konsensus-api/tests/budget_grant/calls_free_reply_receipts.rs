@@ -697,6 +697,7 @@ async fn f12_queue_visibility_follows_the_transition_and_history_is_not_rewritte
         assert!(polls.0.lock().unwrap().iter().all(|p| *p == Some(to)), "{kind}: a reader saw the reply before its call moved");
         assert!(queued(&db).await.iter().all(|(_, phase, _)| phase.as_deref() == Some(to.as_str())), "{kind}");
         assert!(flusher.seen().await.len() <= 1, "{kind}");
+        assert_eq!(sent(&transport, kind).len(), 1, "{kind}");
     }
     // A reply queued for a call that had ended without it, as an older node
     // could leave it: still delivered. Auditing such rows is separate work.
