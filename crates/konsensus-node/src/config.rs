@@ -1395,6 +1395,15 @@ pub struct CallsConfig {
     /// on, and any other value leaves it off.
     #[serde(default, deserialize_with = "deserialize_fail_closed_switch", skip_serializing_if = "std::ops::Not::not")]
     pub call_continuity_v1: bool,
+    /// Free call replies. This node answers a call, or declines it, at no
+    /// charge when the caller's node advertises the same switch, and accepts
+    /// such an answer or decline at no charge when it replies to this node's
+    /// own ringing offer. Nothing else becomes free; every other signal, and
+    /// every reply to a node without the switch, is paid as before. Off by
+    /// default; only the value `true` turns it on, and any other value leaves
+    /// it off.
+    #[serde(default, deserialize_with = "deserialize_fail_closed_switch", skip_serializing_if = "std::ops::Not::not")]
+    pub call_reply_free_v1: bool,
 }
 
 /// A switch that fails closed: a literal `true` turns it on; `false` or any
@@ -1409,7 +1418,7 @@ fn deserialize_fail_closed_switch<'de, D: serde::Deserializer<'de>>(deserializer
     Ok(match Switch::deserialize(deserializer)? {
         Switch::Set(on) => on,
         Switch::Invalid(_) => {
-            tracing::warn!("calls.call_continuity_v1 is neither true nor false; it stays off");
+            tracing::warn!("a [calls] switch is neither true nor false; it stays off");
             false
         }
     })
@@ -1465,6 +1474,7 @@ impl Default for CallsConfig {
             media_max_bytes_per_second: default_media_max_bytes_per_second(),
             media_drop_bulk_over_share: false,
             call_continuity_v1: false,
+            call_reply_free_v1: false,
         }
     }
 }

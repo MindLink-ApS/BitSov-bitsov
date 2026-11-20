@@ -100,6 +100,29 @@ pub const MAX_MEETING_PARTICIPANTS: usize = 4;
 /// meeting offer after it was paid, so apps must not send it one.
 pub const MEETING_CAPABILITY: &str = "call_meeting_v1";
 
+/// A node advertising this accepts, at no charge, the answer and the declined
+/// hangup that reply to its own ringing offer (see [`is_free_reply_shape`]).
+pub const FREE_REPLY_CAPABILITY: &str = "call_reply_free_v1";
+
+/// The single reference a free reply carries: it names the call it answers
+/// without revealing the call id outside the encrypted payload.
+pub fn free_reply_reference(call_id: &str) -> crate::types::MessageId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bitsov call free reply v1\0");
+    hasher.update(call_id.as_bytes());
+    crate::types::MessageId::from_bytes(*hasher.finalize().as_bytes())
+}
+
+/// Whether `envelope` is shaped as a free call reply: an answer or a hangup,
+/// carrying no payment (amount zero) and exactly one reference. The shape
+/// alone grants nothing: the receiving node accepts it only against its own
+/// ringing offer to that sender, and checks the payload after decryption.
+pub fn is_free_reply_shape(envelope: &crate::envelope::UkmEnvelope) -> bool {
+    matches!(envelope.kind, KIND_CALL_ANSWER | KIND_CALL_HANGUP)
+        && envelope.payment_proof.amount_msat == 0
+        && envelope.references.len() == 1
+}
+
 /// What media an offer asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -284,6 +284,11 @@ pub struct AppState {
     /// Owner-configured cap for outgoing calls (1..=240, default 60).
     pub max_call_minutes: u16,
 
+    /// `[calls] call_reply_free_v1`, off by default. When on, this node sends
+    /// an answer or a declined hangup at no charge to a peer that advertises
+    /// it, and accepts those replies at no charge to its own ringing offers.
+    pub call_reply_free: bool,
+
     /// Validated `[network] stun_server` as `host:port` (no `stun:` prefix),
     /// used for `/status` `stun_url` when the node's own responder has no
     /// dialable public host. `None` when unset or invalid at config load.

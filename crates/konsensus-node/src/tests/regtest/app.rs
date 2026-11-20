@@ -389,6 +389,7 @@ impl App {
             sponsor: Default::default(),
             stun_port: None,
             max_call_minutes: calls.map_or(60, |c| c.max_minutes),
+            call_reply_free: false,
             configured_stun_server: None,
             custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
             call_media: media
@@ -469,6 +470,7 @@ impl App {
                     identity.aes_key(),
                 )),
                 call_devices: state.call_devices.clone(),
+                call_reply_free: false,
                 ws_tx: state.ws_broadcast.clone(),
                 audit_log: state.audit_log.clone(),
                 admission_mode: ReachabilityMode::PriceOpen,
