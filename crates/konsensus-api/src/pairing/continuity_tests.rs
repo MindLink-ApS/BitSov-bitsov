@@ -707,3 +707,43 @@ fn after_a_relation_window_revocation_still_stops_the_call_and_the_switch_off_ke
     assert_eq!(draw(&fx, "call", 2), Err(BudgetRefusal::NoGrant));
     assert!(fx.service.with_call_spend_authority(&block, Some((&peer(), "call")), || ()).is_err());
 }
+
+/// A console renewal whose write fails leaves the pairing exactly as it was,
+/// in memory as on disk: the earlier grant, its call's hold where it was,
+/// no successor. Later draws behave as before the attempt.
+fn failed_console_renewal_restores_the_file(continuity: bool) {
+    let fx = fixture(continuity);
+    let first = grant(&fx, 100_000);
+    admit(&fx, "call");
+    pay(&fx, "call", 0);
+    let op = fx.service.create_elevation_request(&fx.client, vec![Scope::Spend]).unwrap();
+    let phrase = fx.console.confirmation(&grant_confirmation_phrase(&op));
+    let before = fx.service.lock().file.clone();
+    let blocked = fx.service.file_path.with_extension("json.tmp");
+    std::fs::create_dir(&blocked).unwrap();
+    let result = fx.service.grant_elevation(&op.op_id, &phrase, GrantTerms::new(50_000));
+    std::fs::remove_dir(&blocked).unwrap();
+    assert!(matches!(result, Err(PairingError::Io(_))), "continuity={continuity}: expected a storage failure: {result:?}");
+    {
+        let inner = fx.service.lock_without_cleanup();
+        assert_eq!(inner.file.grants, before.grants, "continuity={continuity}: a failed renewal changed the grants in memory");
+        assert_eq!(inner.file.call_spend_grants, before.call_spend_grants, "continuity={continuity}");
+        assert_eq!(inner.file, before, "continuity={continuity}: a failed renewal changed the pairing file in memory");
+    }
+    assert_eq!(fx.service.reload_from_disk().unwrap().grants, before.grants, "continuity={continuity}");
+    // The call keeps drawing on its hold under the earlier grant.
+    assert_eq!(status(&fx, "call"), Some((HELD, PRICE, 0, HELD - PRICE)));
+    pay(&fx, "call", 1);
+    assert_eq!(disk_budget(&fx, &first.op_id).unwrap().used_msat, HELD);
+    assert_eq!(fx.service.grant_view_for(&fx.client).unwrap().op_id, first.op_id);
+}
+
+#[test]
+fn a_failed_renewal_write_restores_the_pairing_file_with_continuity_on() {
+    failed_console_renewal_restores_the_file(true);
+}
+
+#[test]
+fn a_failed_renewal_write_restores_the_pairing_file_with_continuity_off() {
+    failed_console_renewal_restores_the_file(false);
+}
