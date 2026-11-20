@@ -141,3 +141,106 @@ async fn with_the_switch_off_the_same_request_waits_for_the_owner() {
     assert!(!fx.keysend(&token, OTHER_LN, 1_000).await.0.is_success());
     assert_eq!(used(&fx, &client), 0);
 }
+
+// ── A live owner window and a new request: the status says what is in force ──
+
+/// The app asks for `budget`; returns the request and its status reply.
+async fn ask_with(fx: &Fx, read: &str, budget: Value) -> (Value, Value) {
+    let (status, op) = fx
+        .call("POST", "/api/v1/pair/elevation-request", Some(json!({"scopes": ["spend"], "budget": budget})), Some(read))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{op}");
+    let (status, body) = fx
+        .call("GET", &format!("/api/v1/pair/elevation/{}", op["op_id"].as_str().unwrap()), None, Some(read))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    (op, body)
+}
+
+fn owner_window(fx: &Fx, client: &str) -> pairing::SpendGrant {
+    let grants: Vec<_> = fx
+        .service
+        .snapshot()
+        .grants
+        .into_iter()
+        .filter(|g| g.client_id == client && g.is_live(chrono::Utc::now().timestamp()))
+        .collect();
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(grants[0].granted_by, "cli");
+    grants.into_iter().next().unwrap()
+}
+
+#[tokio::test]
+async fn a_live_owner_window_that_covers_the_request_reads_granted() {
+    for switch in [true, false] {
+        let (fx, client, key) = with_allowance(switch).await;
+        fx.grant_as(&client, &key, None, GrantTerms::new(2_000_000).per_call(700_000)).await;
+        let before = owner_window(&fx, &client);
+        let read = fx.token_as(&client, &key).await;
+        let (op, body) =
+            ask_with(&fx, &read, json!({"budget_msat": 1_000_000, "per_call_max_msat": 500_000, "ttl_secs": 3_600})).await;
+        assert_eq!(body["status"], "granted", "switch {switch}: {body}");
+        assert_eq!(body["owner_confirmation_required"], false, "switch {switch}");
+        // Nothing was opened or replaced: the owner's window is what is in force.
+        assert_eq!(owner_window(&fx, &client), before, "switch {switch}");
+        assert!(op["owner_action"].as_str().unwrap().contains("konsensus grant"), "switch {switch}: {op}");
+    }
+}
+
+#[tokio::test]
+async fn a_live_owner_window_smaller_than_the_request_does_not_read_granted() {
+    for switch in [true, false] {
+        let (fx, client, key) = with_allowance(switch).await;
+        fx.grant_as(&client, &key, None, GrantTerms::new(300_000).per_call(200_000).for_secs(1_800)).await;
+        let before = owner_window(&fx, &client);
+        let read = fx.token_as(&client, &key).await;
+        // Inside the allowance, but more than the owner's window allows.
+        let (op, body) =
+            ask_with(&fx, &read, json!({"budget_msat": 1_000_000, "per_call_max_msat": 700_000, "ttl_secs": 3_600})).await;
+        assert_eq!(body["status"], "pending", "switch {switch}: {body}");
+        assert_eq!(body["owner_confirmation_required"], true, "switch {switch}");
+        assert!(op["owner_action"].as_str().unwrap().contains("konsensus grant"), "switch {switch}: {op}");
+        assert!(!op["owner_action"].as_str().unwrap().starts_with("none"), "switch {switch}: {op}");
+        assert_eq!(owner_window(&fx, &client), before, "switch {switch}");
+        let pending = fx.service.snapshot().pending_elevations;
+        assert!(pending.iter().any(|e| Some(e.op_id.as_str()) == op["op_id"].as_str()), "switch {switch}");
+
+        // Each term counts on its own: a larger per-call limit, or a longer
+        // window, is not in force either.
+        for budget in [
+            json!({"budget_msat": 250_000, "per_call_max_msat": 250_000, "ttl_secs": 3_600}),
+            json!({"budget_msat": 100_000, "per_call_max_msat": 100_000, "ttl_secs": 86_400}),
+        ] {
+            let (_, body) = ask_with(&fx, &read, budget.clone()).await;
+            assert_eq!(body["status"], "pending", "switch {switch}: {budget} -> {body}");
+            assert_eq!(body["owner_confirmation_required"], true, "switch {switch}: {budget}");
+        }
+        assert_eq!(owner_window(&fx, &client), before, "switch {switch}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_the_owner_window_did_not_cover_reads_granted_once_the_owner_approves_it() {
+    let (fx, client, key) = with_allowance(true).await;
+    fx.grant_as(&client, &key, None, GrantTerms::new(300_000).per_call(200_000).for_secs(1_800)).await;
+    let read = fx.token_as(&client, &key).await;
+    let (op, body) =
+        ask_with(&fx, &read, json!({"budget_msat": 1_000_000, "per_call_max_msat": 700_000, "ttl_secs": 3_600})).await;
+    assert_eq!(body["status"], "pending", "{body}");
+    let op_id = op["op_id"].as_str().unwrap().to_string();
+    let pending = fx.service.snapshot().pending_elevations.into_iter().find(|e| e.op_id == op_id).unwrap();
+    let phrase = fx.console.confirmation(&pairing::grant_confirmation_phrase(&pending));
+    let resp = control::handle(
+        &fx.control(),
+        ControlRequest::Grant {
+            op_id: op_id.clone(),
+            confirmation: phrase,
+            terms: GrantTerms::new(1_000_000).per_call(700_000).for_secs(3_600),
+        },
+    );
+    assert!(matches!(resp, ControlResponse::Ok { .. }), "{resp:?}");
+    let (_, body) = fx.call("GET", &format!("/api/v1/pair/elevation/{op_id}"), None, Some(&read)).await;
+    assert_eq!(body["status"], "granted", "{body}");
+    assert_eq!(body["owner_confirmation_required"], false);
+    assert_eq!(owner_window(&fx, &client).op_id, op_id);
+}
