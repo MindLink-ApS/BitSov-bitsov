@@ -1767,6 +1767,7 @@ async fn start_node_services<'a>(
         .with_second_device_enrollment(config.pairing.second_device_enrollment)
         .with_second_device_claim_v1(config.pairing.second_device_claim_v1)
         .with_standing_allowance(config.pairing.standing_allowance_v1)
+        .with_call_continuity(config.calls.call_continuity_v1)
         .with_enrollment_audit(Arc::clone(&audit_log));
         let service = if local_owner_device {
             service.with_local_owner_device()

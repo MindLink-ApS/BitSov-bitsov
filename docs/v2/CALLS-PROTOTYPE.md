@@ -166,6 +166,57 @@ node at the default rates sends no such header and answers as it always did.
 Nothing here changes a price or admission: a call is admitted and paid the same
 whatever it carries and whatever these limits are.
 
+## Live-call continuity
+
+`[calls] call_continuity_v1` is off by default. Only the value `true` turns it
+on; any other value leaves it off. While it is on, `GET /api/v1/status` lists
+`call_continuity_v1` in `api_capabilities`.
+
+With it on, a call admitted while the paired app held a live spend grant
+survives that grant ending by expiry or by the owner writing a newer grant:
+
+- The app keeps the call's media socket, and may reattach to that same call
+  with a fresh token that no longer carries `spend`, while the call's hold is
+  open and the app's pairing owns the call.
+- Minute blocks keep drawing on the hold reserved at admission, within its
+  pinned price, routing ceiling, minute limit and amount. Nothing new is
+  reserved: no second call, offer or other payment can use the ended grant.
+- A newer grant takes over the call's open hold once, charged only what the
+  hold still has; minutes already paid are not charged again, and the hold's
+  release returns its unspent part once. It takes the hold over only if it
+  could fund it as a new reservation: not paused, the peer allowed by its
+  payee list, the per-block and closing amounts within its per-payment limits
+  (and a live envelope for the peer on a device relation grant), and room in
+  its recipient budget and total. Otherwise the call's hold is closed: its
+  unpaid part is released at once, and a block already in flight settles on
+  the earlier grant, which is kept inert only until then. The newer grant's
+  own limits apply from then on, so a lower per-payment value closes the hold.
+  A renewal whose write fails leaves the hold and its funding exactly as
+  they were. This holds for console renewals too, with the switch on or
+  off: a failed write restores the whole pairing state in memory, so it
+  never differs from what is on disk.
+- On a device relation grant the same holds for the peer's envelope: its
+  deadline ends new spending for that peer, but an admitted call's own hold
+  keeps paying past it within the same bounds, unless revoked.
+- The grant record stays on file, marked `ended: expired`, until its calls
+  close, and at most the longest call (240 minutes) plus a minute after its
+  window. A restart drops it, as it drops call media ownership.
+
+A revocation, an epoch bump, a removed pairing or an identity change ends the
+grant as revoked: draws are refused and the media socket closes at its next
+one-second recheck, with the switch on or off. With the switch off, expiry and
+replacement end a call's grant authority exactly as before.
+
+After an expiry with no renewal the app's fresh token has no `spend`. On
+`POST /api/v1/messages/compose`, and only there, such a paired token may still
+send a minute block (kind 404) of a call its pairing owns, while that call's
+hold is funded as above. The block is drawn on that hold alone, at its pinned
+price, routing ceiling, minute limit and amount. Any other request without
+`spend` on that route (another call, a new call, an offer, a hangup, a chat
+message) and every other paid route refuse it exactly as before. With the
+switch off the route refuses it too. A renewal gives the token `spend` again,
+on the same hold.
+
 ## Persistence, recovery and bounds
 
 `call_state` stores side, phase, effective deadline, replay deadline,

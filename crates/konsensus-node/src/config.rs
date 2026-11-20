@@ -1416,6 +1416,34 @@ pub struct CallsConfig {
     /// against one budget and the socket closes past it, as it always has.
     #[serde(default)]
     pub media_drop_bulk_over_share: bool,
+    /// Live-call continuity. When a paired app's spend grant expires or the
+    /// owner replaces it during a call, the call admitted under it keeps its
+    /// media socket and keeps paying its minutes from the hold reserved at
+    /// admission, up to that hold and its minute limit. Nothing new is
+    /// reserved and no new call is admitted on the ended grant. A revocation,
+    /// epoch bump, removed pairing or identity change still ends the call's
+    /// media within a second. Off by default; only the value `true` turns it
+    /// on, and any other value leaves it off.
+    #[serde(default, deserialize_with = "deserialize_fail_closed_switch", skip_serializing_if = "std::ops::Not::not")]
+    pub call_continuity_v1: bool,
+}
+
+/// A switch that fails closed: a literal `true` turns it on; `false` or any
+/// other value (a string, a number, a table) leaves it off.
+fn deserialize_fail_closed_switch<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Switch {
+        Set(bool),
+        Invalid(serde::de::IgnoredAny),
+    }
+    Ok(match Switch::deserialize(deserializer)? {
+        Switch::Set(on) => on,
+        Switch::Invalid(_) => {
+            tracing::warn!("calls.call_continuity_v1 is neither true nor false; it stays off");
+            false
+        }
+    })
 }
 
 fn default_media_max_frames_per_second() -> u32 { konsensus_api::call_media::DEFAULT_MAX_FRAMES_PER_SECOND }
@@ -1467,6 +1495,7 @@ impl Default for CallsConfig {
             media_max_frames_per_second: default_media_max_frames_per_second(),
             media_max_bytes_per_second: default_media_max_bytes_per_second(),
             media_drop_bulk_over_share: false,
+            call_continuity_v1: false,
         }
     }
 }

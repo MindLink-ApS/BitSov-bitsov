@@ -839,8 +839,213 @@ fn an_owner_window_keeps_its_per_payment_meaning() {
             epoch,
             granted_by: "cli".into(),
             budget: Some(GrantBudget::from_terms(&proposal(1_000_000, PER_CALL))),
+            ended: None,
         });
         f.svc.persist(&mut inner.file).unwrap();
     }
     f.svc.reserve_call_spend(&f.client, 1, call("owner-call", 3_500, 200), u64::MAX / 4).unwrap();
+}
+
+// ── With live-call continuity ([calls] call_continuity_v1) ──────────────
+// A call admitted inside an allowance window keeps its hold when that window
+// expires or the allowance opens the next one; the allowance still counts
+// everything the call can pay. Every case also runs with continuity off.
+
+const MINUTE: u64 = 1_000;
+const MINUTES: u16 = 5;
+
+fn continuity_fixture(continuity: bool) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = PairingService::open(dir.path(), "identity".into(), true)
+        .unwrap()
+        .with_standing_allowance(true)
+        .with_call_continuity(continuity);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+    let client = svc
+        .create_ticket_remote_pairing_with_allowance(
+            "app",
+            &hex::encode(key.verifying_key().to_bytes()),
+            &[22; 32],
+            "ticket-code",
+            Some(&terms()),
+        )
+        .unwrap()
+        .client_id;
+    Fixture { _dir: dir, svc, client }
+}
+
+fn binding(f: &Fixture) -> auth::PairingBinding {
+    auth::PairingBinding { client_id: f.client.clone(), epoch: 1, fingerprint: "identity".into() }
+}
+
+fn admit_call(f: &Fixture, id: &str) {
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, id, MINUTE, 0, MINUTES).unwrap();
+    f.svc.reserve_call_spend(&f.client, 1, terms, 1_000_000).unwrap();
+    let b = binding(f);
+    f.svc.remember_call_client(Some(&b), &peer, id, "invite", "request").unwrap();
+    f.svc.commit_call_client(None, &peer, id, "invite", "request").unwrap();
+    f.svc.finish_call_client(&peer, id, "invite", "request");
+}
+
+fn draw_block(f: &Fixture, id: &str, seq: u32) -> Result<Reservation, BudgetRefusal> {
+    f.svc.draw_call_spend(&f.client, 1, &"aa".repeat(32), id, seq, MINUTE, 0, offer_link(&format!("{id}-{seq}")))
+}
+
+fn pay_block(f: &Fixture, id: &str, seq: u32) {
+    let debit = draw_block(f, id, seq).unwrap_or_else(|e| panic!("block {seq}: {e:?}"));
+    f.svc.try_resolve_spend(&debit, &"aa".repeat(32), MINUTE).unwrap();
+}
+
+fn window_committed(f: &Fixture, op: &str) -> Option<(u64, bool)> {
+    ledger(f).windows.iter().find(|w| w.op_id == op).map(|w| (w.committed_msat, w.ended_at.is_some()))
+}
+
+#[test]
+fn the_next_allowance_window_carries_an_admitted_call_once() {
+    for continuity in [true, false] {
+        let f = continuity_fixture(continuity);
+        let (first, _) = ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+        admit_call(&f, "call");
+        pay_block(&f, "call", 0);
+        let in_flight = draw_block(&f, "call", 1).unwrap();
+        let (second, outcome) = ask(&f, proposal(900_000, PER_CALL)).unwrap();
+        assert_eq!(outcome, Outcome::Window);
+        // The old window counts what it used, the whole hold included,
+        // before any of it moved.
+        assert_eq!(window_committed(&f, &first), Some((u64::from(MINUTES) * MINUTE, true)), "{continuity}");
+        let next = allowance_grants(&f).into_iter().find(|g| g.op_id == second).unwrap();
+        let budget = next.budget.unwrap();
+        if continuity {
+            assert_eq!(budget.call_reservations.len(), 1, "the call moved to the new window");
+            assert_eq!(budget.used_msat, u64::from(MINUTES - 1) * MINUTE, "only what the hold still had moved");
+            // The block in flight settles once, where the call now lives.
+            f.svc.try_resolve_spend(&in_flight, &"aa".repeat(32), MINUTE).unwrap();
+            f.svc.try_resolve_spend(&in_flight, &"aa".repeat(32), MINUTE).unwrap();
+            let status = f.svc.call_spend_status(&"aa".repeat(32), "call").unwrap();
+            assert_eq!(status.spent_msat, 2 * MINUTE);
+            pay_block(&f, "call", 2);
+            assert!(f.svc.call_hold_live(&binding(&f), &"aa".repeat(32), "call"));
+        } else {
+            assert!(budget.call_reservations.is_empty(), "as before: a renewal ends the call's hold");
+            assert!(draw_block(&f, "call", 2).is_err());
+        }
+        // Nothing the call can pay is missing from the day's count.
+        let book = ledger(&f);
+        assert!(book.committed_msat(now()) >= u64::from(MINUTES) * MINUTE + 900_000);
+        assert!(book.committed_msat(now()) <= DAILY);
+    }
+}
+
+#[test]
+fn an_expired_allowance_window_keeps_its_admitted_call_and_counts_it() {
+    for continuity in [true, false] {
+        let f = continuity_fixture(continuity);
+        let (op, _) = ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+        admit_call(&f, "call");
+        pay_block(&f, "call", 0);
+        {
+            let mut inner = f.svc.lock_without_cleanup();
+            let grant = inner.file.grants.iter_mut().find(|g| g.op_id == op).unwrap();
+            let length = grant.expires_at - grant.granted_at;
+            grant.expires_at = now() - 1;
+            grant.granted_at = grant.expires_at - length;
+        }
+        let file = f.svc.reload_from_disk().unwrap();
+        let kept = file.grants.iter().find(|g| g.op_id == op);
+        if continuity {
+            // Kept, with its budget, to finish the call: not an orphan. Its
+            // window counts at least the whole hold.
+            assert!(kept.is_some_and(|g| g.budget.is_some()), "the call's grant was dropped");
+            let (counted, _) = window_committed(&f, &op).unwrap();
+            assert!((u64::from(MINUTES) * MINUTE..=1_000_000).contains(&counted), "{counted}");
+            pay_block(&f, "call", 1);
+            assert!(f.svc.call_hold_live(&binding(&f), &"aa".repeat(32), "call"));
+            // No new spending on the ended window.
+            let second = crate::spend_budget::CallSpendTerms::new(&"aa".repeat(32), "second", MINUTE, 0, MINUTES).unwrap();
+            assert_eq!(f.svc.reserve_call_spend(&f.client, 1, second, 1_000_000), Err(BudgetRefusal::NoGrant));
+            // The call ends: the grant goes. Its window ended at the grant's
+            // expiry with the whole hold counted; the release afterwards
+            // never lowers that, so the day's count stays an upper bound.
+            let hold = f.svc.call_spend_holds().into_iter().map(|(r, _)| r).next().unwrap();
+            f.svc.close_call_spend(&hold).unwrap();
+            let _ = f.svc.reload_from_disk().unwrap();
+            assert!(allowance_grants(&f).is_empty());
+            assert_eq!(window_committed(&f, &op), Some((u64::from(MINUTES) * MINUTE, true)));
+        } else {
+            assert!(kept.is_none());
+            assert_eq!(window_committed(&f, &op), Some((u64::from(MINUTES) * MINUTE, true)));
+            assert!(draw_block(&f, "call", 1).is_err());
+            // The next window has room for everything but what was used.
+            assert_eq!(ask(&f, proposal(DAILY - u64::from(MINUTES) * MINUTE + 1, PER_CALL)).unwrap().1, Outcome::Owner);
+            assert_eq!(ask(&f, proposal(DAILY - u64::from(MINUTES) * MINUTE, PER_CALL)).unwrap().1, Outcome::Window);
+        }
+    }
+}
+
+#[test]
+fn a_revocation_ends_a_call_kept_past_its_allowance_window() {
+    let f = continuity_fixture(true);
+    let (op, _) = ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+    admit_call(&f, "call");
+    pay_block(&f, "call", 0);
+    {
+        let mut inner = f.svc.lock_without_cleanup();
+        let grant = inner.file.grants.iter_mut().find(|g| g.op_id == op).unwrap();
+        let length = grant.expires_at - grant.granted_at;
+        grant.expires_at = now() - 1;
+        grant.granted_at = grant.expires_at - length;
+    }
+    let _ = f.svc.reload_from_disk().unwrap();
+    pay_block(&f, "call", 1);
+    f.svc.revoke_grants(Some(&f.client)).unwrap();
+    assert!(draw_block(&f, "call", 2).is_err());
+    assert!(!f.svc.call_hold_live(&binding(&f), &"aa".repeat(32), "call"));
+    assert!(f.svc.reload_from_disk().unwrap().allowances.is_empty());
+    assert!(allowance_grants(&f).is_empty());
+}
+
+#[test]
+fn an_epoch_bump_ends_a_carried_call_and_the_allowance() {
+    let f = continuity_fixture(true);
+    ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+    admit_call(&f, "call");
+    pay_block(&f, "call", 0);
+    ask(&f, proposal(900_000, PER_CALL)).unwrap();
+    f.svc.bump_epoch(&f.client).unwrap();
+    assert!(draw_block(&f, "call", 1).is_err());
+    assert!(f.svc.reload_from_disk().unwrap().allowances.is_empty());
+    assert!(allowance_grants(&f).is_empty());
+}
+
+/// A write that fails leaves the window, the call, its offers and the day's
+/// count exactly as they were.
+#[cfg(unix)]
+#[test]
+fn a_failed_write_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = continuity_fixture(true);
+    let (first, _) = ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+    let peer = "aa".repeat(32);
+    f.svc
+        .reserve_call_with_offer(&f.client, 1, call("call", 3_000, 10), u64::MAX / 4,
+            vec![Charge { recipient: peer.clone(), amount_msat: 3_500 }], None, offer_link("offer-1"))
+        .unwrap();
+    let before = f.svc.lock().file.clone();
+    let dir = f.svc.dir().to_path_buf();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let probe = std::fs::write(dir.join("probe"), b"x").is_ok();
+    let renew = f.svc.create_budget_elevation_request(&f.client, vec![Scope::Spend], Some(proposal(900_000, PER_CALL)));
+    let offer = f.svc.reserve_call_offer_spend(&f.client, 1,
+        vec![Charge { recipient: peer.clone(), amount_msat: 1 }], "call", None, offer_link("offer-2"));
+    let after = f.svc.lock().file.clone();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if probe {
+        return; // The directory stayed writable (a privileged run); nothing to test.
+    }
+    assert!(renew.is_err() && offer.is_err(), "{renew:?} {offer:?}");
+    assert_eq!(after.allowances, before.allowances, "ledger and offer count unchanged");
+    assert_eq!(after.grants, before.grants, "windows and holds unchanged");
+    assert_eq!(after.call_spend_grants, before.call_spend_grants);
+    assert!(allowance_grants(&f).iter().any(|g| g.op_id == first));
 }

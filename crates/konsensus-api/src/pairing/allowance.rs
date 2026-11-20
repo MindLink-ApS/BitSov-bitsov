@@ -542,13 +542,15 @@ pub fn read_ticket_allowance(pairing_dir: &Path, code: &str, now: i64) -> Option
 }
 
 impl super::PairingFile {
+    /// Whether the allowance behind `grant` still records its window, open
+    /// or ended. An ended window's grant may still be kept to finish an
+    /// admitted call or settle a payment in flight.
     fn has_open_window(
         allowances: &std::collections::BTreeMap<String, StandingAllowance>,
         grant: &super::SpendGrant,
     ) -> bool {
         allowances.get(&grant.client_id).is_some_and(|a| {
-            a.epoch == grant.epoch
-                && a.windows.iter().any(|w| w.op_id == grant.op_id && w.ended_at.is_none())
+            a.epoch == grant.epoch && a.windows.iter().any(|w| w.op_id == grant.op_id)
         })
     }
 
@@ -591,6 +593,15 @@ impl super::PairingFile {
                         allowance.end_window(&op_id, grant.expires_at.min(now), grant.budget.as_ref())
                     }
                     _ => allowance.end_window(&op_id, now, None),
+                }
+            }
+            // An ended window whose grant is still kept, to finish an admitted
+            // call or settle a payment in flight, can still record what that
+            // call pays. What it used is counted at its highest: a settlement
+            // above the reservation raises it, a release never lowers it.
+            for window in allowance.windows.iter_mut().filter(|w| w.ended_at.is_some()) {
+                if let Some(budget) = grants.iter().find(|g| g.op_id == window.op_id).and_then(|g| g.budget.as_ref()) {
+                    window.committed_msat = window.committed_msat.max(budget.used_msat);
                 }
             }
             // Offer counts only matter while a window still holds the call.
@@ -720,24 +731,29 @@ impl super::PairingService {
             granted_by: ALLOWANCE_GRANTED_BY.to_string(),
             budget: Some(budget),
             owner_approval: None,
+            ended: None,
         };
+        let mut grant = grant;
         let before = inner.file.clone();
         let file = &mut inner.file;
         let allowance = file
             .allowances
             .get_mut(&client.client_id)
             .expect("checked above under the same lock");
-        // A new window replaces the client's old one, as every budget window
-        // does. The allowance's own window ends now with what it used.
-        for old in &mut file.grants {
-            if old.client_id == client.client_id {
-                if old.granted_by == ALLOWANCE_GRANTED_BY && old.budget.is_some() {
-                    allowance.end_window(&old.op_id, old.expires_at.min(now), old.budget.as_ref());
-                }
-                old.budget = None;
+        // The allowance's own earlier window ends now with what it used,
+        // counted before any open call moves out of it.
+        for old in &file.grants {
+            if old.client_id == client.client_id
+                && old.granted_by == ALLOWANCE_GRANTED_BY
+                && old.budget.is_some()
+            {
+                allowance.end_window(&old.op_id, old.expires_at.min(now), old.budget.as_ref());
             }
         }
         allowance.open_window(&op_id, terms.budget_msat, now);
+        // A new window replaces the client's old one, as every budget window
+        // does, carrying admitted calls over when continuity is on.
+        file.replace_grants(&mut grant, self.call_continuity_enabled());
         file.grants.push(grant);
         if let Err(error) = self.persist(&mut inner.file) {
             inner.file = before;
