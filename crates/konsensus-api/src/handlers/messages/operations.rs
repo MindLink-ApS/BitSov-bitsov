@@ -46,6 +46,10 @@ struct Recovery {
     draft: Option<UkmEnvelope>,
     #[serde(default)]
     envelope_ready: bool,
+    /// The sealed envelope is a free call reply, saved before its call
+    /// transition: recovery sends it, a failure never resets it to unsent.
+    #[serde(default)]
+    free_reply: bool,
     dispatched: bool,
     expected_msat: u64,
     settlement: Option<PaymentDetails>,
@@ -452,8 +456,45 @@ impl Operation {
         proof: PaymentProof,
         fee_ceiling_msat: u64,
     ) -> Result<UkmEnvelope, ApiError> {
+        let (mut op, env) = self.seal(proof, fee_ceiling_msat, false).await?;
+        materialize(&self.state, &mut op, &env).await?;
+        Ok(env)
+    }
+    /// A free call reply's evidence: its signed envelope is saved before the
+    /// call transition, but not yet queued, so a stop or a failed write at
+    /// any point leaves either an unsent reply on a still-ringing call, or a
+    /// recorded one that recovery queues ([`reconcile`]) after the transition.
+    pub(crate) async fn sealed_envelope(&self, proof: PaymentProof, fee_ceiling_msat: u64) -> Result<UkmEnvelope, ApiError> {
+        self.seal(proof, fee_ceiling_msat, true).await.map(|(_, env)| env)
+    }
+    /// Queue a sealed envelope, once its call transition is published.
+    pub(crate) async fn publish_sealed(&self, env: &UkmEnvelope) -> Result<(), ApiError> {
+        let mut op = self.load().await?;
+        materialize(&self.state, &mut op, env).await
+    }
+    /// The call transition of a sealed free reply did not happen: take its
+    /// evidence back, so the operation is plainly unsent and can be retried.
+    /// If this write fails too, the reply stays sealed and recovery sends it.
+    pub(crate) async fn unseal(&self) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
+        if !data.free_reply || data.dispatched || data.expected_msat > 0 {
+            return Err(storage("only a sealed free reply can be unsealed"));
+        }
+        data.envelope_ready = false;
+        data.free_reply = false;
+        op.payment_hash = None;
+        op.settled_msat = 0;
+        encode(&mut op, &data)?;
+        save(&self.state, &mut op).await
+    }
+    async fn seal(&self, proof: PaymentProof, fee_ceiling_msat: u64, free_reply: bool) -> Result<(OutboxOperation, UkmEnvelope), ApiError> {
+        let mut op = self.load().await?;
+        let mut data = recovery(&op)?;
+        if free_reply && (data.dispatched || data.expected_msat > 0 || proof.amount_msat > 0) {
+            return Err(storage("a free reply carries no payment"));
+        }
+        data.free_reply = free_reply;
         data.fee_ceiling_msat = fee_ceiling_msat;
         let mut env = data
             .draft
@@ -481,8 +522,7 @@ impl Operation {
         op.settled_msat = i64::try_from(env.payment_proof.amount_msat).map_err(storage)?;
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await?;
-        materialize(&self.state, &mut op, &env).await?;
-        Ok(env)
+        Ok((op, env))
     }
 }
 
@@ -633,8 +673,13 @@ pub(super) async fn compose_call(
         }
         return Err(contextual(ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::CallPriceChanged), op));
     }
+    // A sealed free reply still in `paying` (stopped after its evidence was
+    // saved) is completed by the reconcile below, not reserved again: its
+    // call may already have moved on.
     let paid = journal.as_ref().is_some_and(|op| {
         konsensus_core::payloads::call::settlement(Some(&op.state)) == konsensus_core::payloads::call::Settlement::Paid
+            || (matches!(op.state.as_str(), "paying" | "payment_unknown")
+                && recovery(op).is_ok_and(|data| data.free_reply && data.envelope_ready))
     });
     let plaintext = req.plaintext.clone();
     let spend_client = auth.user.pairing.clone();
@@ -835,6 +880,7 @@ async fn compose_locked(
     data.budget_admission_msat = 0;
     data.admission_fee_msat = Some(0);
     data.envelope_ready = false;
+    data.free_reply = false;
     data.draft = None;
     op.payment_hash = None;
     encode(&mut op, &data)?;
@@ -856,7 +902,9 @@ async fn compose_locked(
                 if op.state == "paying" {
                     op.state = if proven_unpaid(&state, &op, &data).await {
                         "released"
-                    } else if !data.dispatched && !data.admission_pending {
+                    } else if !data.dispatched && !data.admission_pending && !(data.free_reply && data.envelope_ready) {
+                        // A sealed free call reply is recorded evidence:
+                        // recovery sends it, never a reset to unsent.
                         "prepared"
                     } else {
                         "payment_unknown"

@@ -263,3 +263,153 @@ async fn a_ring_window_closing_after_the_reply_was_judged_free_still_sends_nothi
     assert_eq!(ledger(&fx, &transport), before, "{body}");
     assert!(sent(&transport, 401).is_empty());
 }
+
+/// Where a free reply is interrupted: the write that records its signed
+/// envelope, or the write that queues it for delivery.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Step { Record, Queue }
+
+/// Move the ringing call into storage where the first outbox write at `step`
+/// fails (`stop`: the node stops there instead, with no error handling).
+async fn interrupt(fx: &mut Fx, step: Step, stop: bool) -> Arc<common::MemStorage> {
+    let store = Arc::new(common::MemStorage::new());
+    let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    konsensus_storage::Storage::call_put(store.as_ref(), &fx.peer, CALL, &entry).await.unwrap();
+    let mut armed = true;
+    *store.outbox_write_hook.lock().unwrap() = Some(Box::new(move |op| {
+        let data: Value = serde_json::from_slice(&op.recovery).unwrap_or_default();
+        let hit = match step {
+            Step::Record => op.state == "paying" && data["envelope_ready"] == true,
+            Step::Queue => op.state == "paid",
+        };
+        if !(armed && hit) {
+            return Ok(());
+        }
+        armed = false;
+        assert!(!stop, "node stopped at {step:?}");
+        Err(konsensus_storage::StorageError::Serialization("injected journal failure".into()))
+    }));
+    fx.state = Arc::new(AppState { storage: store.clone(), ..(*fx.state).clone() });
+    store
+}
+
+async fn phase(fx: &Fx) -> Phase {
+    fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase
+}
+
+/// The node stops in the middle of `request`; then it restarts its recovery.
+async fn stop_and_restart(fx: &Fx, token: &str, request: Value) {
+    let (state, token) = (fx.state.clone(), token.to_string());
+    let stopped = tokio::spawn(async move {
+        call(&state, "POST", "/api/v1/messages/compose", Some(request), Some(&token)).await
+    }).await;
+    assert!(stopped.is_err_and(|e| e.is_panic()), "the request was meant to stop mid-way");
+    konsensus_api::calls::recover(fx.state.storage.as_ref()).await.unwrap();
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_journal_failure_before_the_transition_keeps_the_call_ringing_and_the_reply_retryable() {
+    for (kind, after) in [(401u16, Phase::Live), (403, Phase::Ended)] {
+        let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+        interrupt(&mut fx, Step::Record, false).await;
+        let before = ledger(&fx, &transport);
+        let operation = uuid::Uuid::new_v4().to_string();
+        let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &operation)).await;
+        assert_ne!(status, StatusCode::OK, "{kind}: {body}");
+        assert_eq!(phase(&fx).await, Phase::Ringing, "{kind}: the call moved on with no recorded reply: {body}");
+        assert!(sent(&transport, kind).is_empty(), "{kind}");
+        // The same tap again: sent once, free, and the call moves on.
+        let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &operation)).await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+        assert_eq!(body["amount_msat"], 0, "{kind}: {body}");
+        assert_eq!(sent(&transport, kind).len(), 1, "{kind}");
+        assert_eq!(phase(&fx).await, after, "{kind}");
+        assert_eq!(ledger(&fx, &transport), before, "{kind}: a retried free reply charged");
+    }
+}
+
+#[tokio::test]
+async fn a_stop_mid_reply_is_recovered_never_lost() {
+    for (kind, after) in [(401u16, Phase::Live), (403, Phase::Ended)] {
+        // Before the transition: the call is still ringing and the same tap
+        // goes out. After it: recovery queues and sends the recorded reply.
+        for step in [Step::Record, Step::Queue] {
+            let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+            interrupt(&mut fx, step, true).await;
+            let before = ledger(&fx, &transport);
+            let operation = uuid::Uuid::new_v4().to_string();
+            stop_and_restart(&fx, &token, reply(&fx, kind, CALL, &operation)).await;
+            if step == Step::Record {
+                assert_eq!(phase(&fx).await, Phase::Ringing, "{kind} {step:?}: the call moved on with no recorded reply");
+                assert!(sent(&transport, kind).is_empty(), "{kind} {step:?}");
+                let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &operation)).await;
+                assert_eq!(status, StatusCode::OK, "{kind} {step:?}: {body}");
+            }
+            let out = sent(&transport, kind);
+            assert_eq!(out.len(), 1, "{kind} {step:?}: the reply was lost or doubled");
+            assert_eq!(out[0].payment_proof.amount_msat, 0);
+            assert_eq!(phase(&fx).await, after, "{kind} {step:?}");
+            assert_eq!(ledger(&fx, &transport), before, "{kind} {step:?}: recovery charged a free reply");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_retry_after_a_stop_past_the_transition_sends_the_recorded_reply() {
+    for (kind, after) in [(401u16, Phase::Live), (403, Phase::Ended)] {
+        let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+        interrupt(&mut fx, Step::Queue, true).await;
+        let before = ledger(&fx, &transport);
+        let operation = uuid::Uuid::new_v4().to_string();
+        let (state, owned) = (fx.state.clone(), token.clone());
+        let request = reply(&fx, kind, CALL, &operation);
+        let stopped = tokio::spawn(async move {
+            call(&state, "POST", "/api/v1/messages/compose", Some(request), Some(&owned)).await
+        }).await;
+        assert!(stopped.is_err_and(|e| e.is_panic()));
+        assert_eq!(phase(&fx).await, after, "{kind}");
+        // No sweep ran: the app's retry of the same tap completes it.
+        let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &operation)).await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+        assert_eq!(body["amount_msat"], 0, "{kind}: {body}");
+        let out = sent(&transport, kind);
+        assert_eq!(out.len(), 1, "{kind}");
+        assert_eq!(out[0].references, vec![konsensus_core::payloads::call::free_reply_reference(CALL)]);
+        assert_eq!(ledger(&fx, &transport), before, "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn a_failed_call_transition_takes_the_recorded_reply_back() {
+    for (kind, after) in [(401u16, Phase::Live), (403, Phase::Ended)] {
+        let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+        let store = interrupt(&mut fx, Step::Queue, false).await;
+        // The reply is recorded, then the call write that would move it on fails.
+        let failing = Arc::clone(&store);
+        let mut armed = true;
+        *store.outbox_write_hook.lock().unwrap() = Some(Box::new(move |op| {
+            let data: Value = serde_json::from_slice(&op.recovery).unwrap_or_default();
+            if armed && op.state == "paying" && data["envelope_ready"] == true {
+                armed = false;
+                *failing.fail_call_put_for.lock().unwrap() = Some(CALL.into());
+            }
+            Ok(())
+        }));
+        let before = ledger(&fx, &transport);
+        let operation = uuid::Uuid::new_v4().to_string();
+        let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &operation)).await;
+        assert_ne!(status, StatusCode::OK, "{kind}: {body}");
+        assert_eq!(body["reason"], "call_reply_unavailable", "{kind}: {body}");
+        *store.fail_call_put_for.lock().unwrap() = None;
+        // Nothing went out, and a sweep does not send it behind the app's back.
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+        assert!(sent(&transport, kind).is_empty(), "{kind}");
+        assert_eq!(phase(&fx).await, Phase::Ringing, "{kind}");
+        let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &operation)).await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+        assert_eq!(sent(&transport, kind).len(), 1, "{kind}");
+        assert_eq!(phase(&fx).await, after, "{kind}");
+        assert_eq!(ledger(&fx, &transport), before, "{kind}");
+    }
+}

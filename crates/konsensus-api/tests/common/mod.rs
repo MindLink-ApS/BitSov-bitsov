@@ -67,6 +67,9 @@ pub struct MemStorage {
     pub fail_call_get_for: Mutex<Option<String>>,
     pub fail_call_put_for: Mutex<Option<String>>,
     pub call_get_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs before every outbox operation write; an error fails that write.
+    #[allow(clippy::type_complexity)]
+    pub outbox_write_hook: Mutex<Option<Box<dyn FnMut(&konsensus_storage::OutboxOperation) -> Result<(), StorageError> + Send>>>,
     calls: Mutex<HashMap<(NodeId, String), konsensus_core::payloads::call::CallEntry>>,
     call_offers: Mutex<HashMap<(NodeId, String), MessageId>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
@@ -107,6 +110,7 @@ impl MemStorage {
             fail_call_get_for: Mutex::new(None),
             fail_call_put_for: Mutex::new(None),
             call_get_hook: Mutex::new(None),
+            outbox_write_hook: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
             call_offers: Mutex::new(HashMap::new()),
             outbox: Mutex::new(HashMap::new()),
@@ -352,6 +356,14 @@ impl Storage for MemStorage {
         &self,
         op: &konsensus_storage::OutboxOperation,
     ) -> Result<bool, StorageError> {
+        // Taken out while it runs: a hook that panics (a node stopping) leaves
+        // no poisoned lock behind.
+        let hook = self.outbox_write_hook.lock().unwrap().take();
+        if let Some(mut hook) = hook {
+            let result = hook(op);
+            *self.outbox_write_hook.lock().unwrap() = Some(hook);
+            result?;
+        }
         let dispatching = op.state == "paying" && serde_json::from_slice::<serde_json::Value>(&op.recovery)
             .is_ok_and(|data| data["dispatched"] == true);
         let gate = if dispatching { self.outbox_dispatch_gate.lock().unwrap().take() } else { None };

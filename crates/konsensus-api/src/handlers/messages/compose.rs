@@ -4334,13 +4334,32 @@ pub(super) async fn compose_peer(
         let proof =
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
 
-        if crate::calls::is_call_kind(req.kind) {
-            // Paid: publish the call transition before the envelope goes out.
+        let envelope = if free_reply {
+            // Free: save the signed reply first, then publish the call
+            // transition, then queue the reply. A stop or failed write before
+            // the transition leaves the call ringing and the reply unsent;
+            // after it, recovery queues the saved reply.
+            let envelope = operation.sealed_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
             let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
-            crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await
-                .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
-        }
-        let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
+            if let Err(e) = crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await {
+                if let Err(error) = operation.unseal().await {
+                    tracing::warn!(%error, "free call reply kept sealed; recovery sends it");
+                }
+                return Err(ApiError::NotDispatched(format!(
+                    "the call could not be updated ({e}); the reply was not sent and nothing was paid"
+                )).with_reason("call_reply_unavailable"));
+            }
+            operation.publish_sealed(&envelope).await?;
+            envelope
+        } else {
+            if crate::calls::is_call_kind(req.kind) {
+                // Paid: publish the call transition before the envelope goes out.
+                let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
+                crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await
+                    .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
+            }
+            operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?
+        };
 
         // A paid web request's outstanding-reply row was committed by
         // `settled_envelope` in the same transaction as the envelope, and every
