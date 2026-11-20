@@ -362,6 +362,19 @@ impl GrantBudget {
         }
     }
 
+    /// What call `id` still holds here, msat: its unpaid remainder and its
+    /// blocks in flight, which is what a carry to the next window moves.
+    pub(crate) fn call_outstanding(&self, id: &str) -> u64 {
+        let Some(call) = self.call_reservations.get(id) else {
+            return 0;
+        };
+        std::iter::once(id.to_string())
+            .chain(call.draws.keys().cloned())
+            .filter_map(|key| self.pending.get(&key))
+            .flat_map(|recipients| recipients.values())
+            .fold(0u64, |sum, amount| sum.saturating_add(*amount))
+    }
+
     /// Whether reservation `id` is a block drawn from one of this grant's calls.
     pub(crate) fn holds_draw(&self, id: &str) -> bool {
         self.call_reservations.values().any(|call| call.draws.contains_key(id))
@@ -486,5 +499,10 @@ impl OpenPayment {
     /// Its reservation id.
     pub(crate) fn id(&self) -> &str {
         &self.id
+    }
+
+    /// What it reserved, msat.
+    pub(crate) fn amount_msat(&self) -> u64 {
+        self.recipients.values().fold(0u64, |sum, amount| sum.saturating_add(*amount))
     }
 }

@@ -528,10 +528,14 @@ renewal cannot free slots the breaker is holding.
 
 **The daily cap counts any 24 hours, not each window.** Every window is
 recorded with the most it could spend: its whole budget while it can spend,
-and what it used (settled, reserved or of unknown outcome) once it has ended.
-An ended window keeps counting until 24 hours after its end, plus the longest
-call. A window opens only if its budget fits under the cap together with what
-is still counted. This may hold back sats that were not spent; it never lets
+or more if it carries more, and what it used (settled, reserved or of unknown
+outcome) once it has ended. What a renewal moves to the next window (payments
+in flight, and with continuity the calls the next window now holds) counts on
+the next window only; what was paid, or did not move, stays counted where it
+was. An ended window keeps counting until 24 hours after its end, plus the
+longest call. A window opens only if what it will count fits under the cap
+together with what is still counted, worked out from the move it would
+make. This may hold back sats that were not spent; it never lets
 more than the cap be spent in any 24 hours. The record is stored with the
 pairing, so a restart does not reset it. Old entries are merged, never
 dropped, so a clock that jumps forward and comes back still finds them. Every

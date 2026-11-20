@@ -377,6 +377,22 @@ impl StandingAllowance {
         replacing: Option<(&str, u64)>,
         now: i64,
     ) -> Result<i64, NoWindow> {
+        let ttl = self.admit_terms(terms, now)?;
+        let overrides: std::collections::BTreeMap<String, u64> = replacing
+            .into_iter()
+            .filter(|(op, _)| self.windows.iter().any(|w| w.op_id == *op && w.ended_at.is_none()))
+            .map(|(op, used)| (op.to_string(), used))
+            .collect();
+        let remaining = self.room(&overrides, now);
+        if terms.budget_msat > remaining {
+            return Err(NoWindow::OverDailyCap { remaining_msat: remaining });
+        }
+        Ok(ttl)
+    }
+
+    /// Every check of a proposal except room under the daily cap, at `now`
+    /// (recorded as seen). Returns the window length to grant.
+    pub fn admit_terms(&mut self, terms: &GrantTerms, now: i64) -> Result<i64, NoWindow> {
         self.observe(now);
         let effective = self.effective_now(now);
         if effective >= self.terms.until {
@@ -399,18 +415,32 @@ impl StandingAllowance {
         if live_windows >= MAX_LEDGER_WINDOWS {
             return Err(NoWindow::OutsideTerms("too many windows in the last day"));
         }
-        let committed = self.windows.iter().filter(|w| w.counts(now)).fold(0u64, |sum, w| {
-            let counted = match replacing {
-                Some((op, used)) if w.op_id == op && w.ended_at.is_none() => used,
-                _ => w.committed_msat,
-            };
-            sum.saturating_add(counted)
-        });
-        let remaining = self.terms.daily_msat.saturating_sub(committed);
-        if terms.budget_msat > remaining {
-            return Err(NoWindow::OverDailyCap { remaining_msat: remaining });
-        }
         Ok(ttl)
+    }
+
+    /// Room left under the daily cap at `now` if the windows named in
+    /// `counted` counted those amounts instead of what they record.
+    pub fn room(&self, counted: &std::collections::BTreeMap<String, u64>, now: i64) -> u64 {
+        let committed = self.windows.iter().filter(|w| w.counts(now)).fold(0u64, |sum, w| {
+            sum.saturating_add(counted.get(&w.op_id).copied().unwrap_or(w.committed_msat))
+        });
+        self.terms.daily_msat.saturating_sub(committed)
+    }
+
+    /// Record a donor of a published renewal: its window ends (if still
+    /// open) and counts `counted`, what stayed with it.
+    fn settle_donor(&mut self, donor: &Donor, counted: Option<u64>) {
+        let Some(counted) = counted else {
+            return;
+        };
+        let Some(window) = self.windows.iter_mut().find(|w| w.op_id == donor.op_id) else {
+            return;
+        };
+        if window.ended_at.is_none() {
+            window.ended_at = Some(donor.ended_at);
+            self.carried_breakers = Some(CarriedBreakers::from_budget(&donor.budget));
+        }
+        window.committed_msat = counted;
     }
 
     /// Record that the open window `op_id` has ended at `ended_at` having
@@ -755,7 +785,6 @@ impl super::PairingService {
             })
             .max_by_key(|g| g.granted_at)
             .and_then(|g| Some((g.op_id.clone(), g.budget.clone()?)));
-        let replacing = previous.as_ref().map(|(op, budget)| (op.as_str(), budget.used_msat));
         // What a failed write restores: everything as it was before this
         // request, the allowance's clock included.
         let before = inner.file.clone();
@@ -764,23 +793,9 @@ impl super::PairingService {
             .allowances
             .get_mut(&client.client_id)
             .expect("checked above under the same lock");
-        let admitted = allowance.admit(terms, replacing, now);
-        let ttl = match admitted {
+        let ttl = match allowance.admit_terms(terms, now) {
             Ok(ttl) => ttl,
-            Err(why) => {
-                // A refusal still records the time it saw.
-                if allowance.observed_at != observed_before {
-                    let observed = allowance.observed_at;
-                    if let Err(error) = self.persist(&mut inner.file) {
-                        if let Some(a) = inner.file.allowances.get_mut(&client.client_id) {
-                            a.observed_at = observed_before;
-                        }
-                        return Err(error);
-                    }
-                    debug_assert!(inner.file.allowances.get(&client.client_id).is_none_or(|a| a.observed_at >= observed));
-                }
-                return Ok(Err(why));
-            }
+            Err(why) => return self.refuse_window(inner, &client.client_id, observed_before, why),
         };
         let allowance = &inner.file.allowances[&client.client_id];
         let budget = allowance.window_budget(terms, previous.as_ref().map(|(_, budget)| budget));
@@ -800,67 +815,27 @@ impl super::PairingService {
             owner_approval: None,
             ended: None,
         };
-        let mut grant = grant;
-        let continuity = self.call_continuity_enabled();
-        let file = &mut inner.file;
-        let allowance = file
+        // Prepare the whole renewal on a copy: what actually moves decides
+        // both whether the window fits under the daily cap and what the
+        // ledger records, so admission and publication use one result.
+        let mut prepared = inner.file.clone();
+        let renewal = Self::prepare_renewal(&mut prepared, grant, self.call_continuity_enabled(), now);
+        let allowance = prepared
             .allowances
             .get_mut(&client.client_id)
             .expect("checked above under the same lock");
-        // The allowance's own earlier window ends now with what it used,
-        // counted before anything moves out of it.
-        for old in &file.grants {
-            if old.client_id == client.client_id
-                && old.granted_by == ALLOWANCE_GRANTED_BY
-                && old.budget.is_some()
-            {
-                allowance.end_window(&old.op_id, old.expires_at.min(now), old.budget.as_ref());
-            }
+        if renewal.counted > allowance.room(&renewal.donors_counted, now) {
+            let remaining = allowance.room(&renewal.donors_counted, now);
+            return self.refuse_window(inner, &client.client_id, observed_before, NoWindow::OverDailyCap { remaining_msat: remaining });
         }
-        allowance.open_window(&op_id, terms.budget_msat, now);
-        // Payments of the replaced windows whose outcome is still unknown
-        // are taken out first, so that admitted calls are judged against the
-        // new window alone. Only within the same pairing epoch and identity,
-        // never from a revoked grant.
-        // Only windows the allowance itself opened are ended or replaced;
-        // an owner-written grant kept to finish a call stays as it is.
-        let mut payments = Vec::new();
-        for old in file.grants.iter_mut().filter(|old| {
-            old.client_id == grant.client_id
-                && old.granted_by == ALLOWANCE_GRANTED_BY
-                && old.epoch == grant.epoch
-                && old.identity_fingerprint == grant.identity_fingerprint
-                && old.ended != Some(super::GrantEnd::Revoked)
-        }) {
-            if let Some(budget) = old.budget.as_mut() {
-                payments.extend(budget.take_open_payments());
-            }
+        // Publish: each donor window counts what stayed with it, the new
+        // window its budget or what it carries if that is more.
+        for donor in &renewal.donors {
+            allowance.settle_donor(donor, renewal.donors_counted.get(&donor.op_id).copied());
         }
-        // Their payment identities go with them, so none is paid twice.
-        let carried_ids: Vec<String> = file
-            .allowances
-            .get(&client.client_id)
-            .map(|a| {
-                payments
-                    .iter()
-                    .filter_map(|p| a.payment_ids_in_flight.get(p.id()))
-                    .flatten()
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        // 1. Admitted calls move first, when the new window can fund them
-        //    (continuity on); the new window replaces the allowance's
-        //    earlier ones.
-        file.replace_grants_where(&mut grant, continuity, |old| old.granted_by == ALLOWANCE_GRANTED_BY);
-        // 2. Then the payments: already sent, they move whatever is left,
-        //    keep their failure slots and identities, and settle in the new
-        //    window once.
-        if let Some(next) = grant.budget.as_mut() {
-            next.accept_open_payments(payments);
-            next.payment_ids.extend(carried_ids);
-        }
-        file.grants.push(grant);
+        allowance.open_window(&op_id, renewal.counted, now);
+        prepared.grants.push(renewal.grant);
+        inner.file = prepared;
         if let Err(error) = self.persist(&mut inner.file) {
             inner.file = before;
             return Err(error);
@@ -874,6 +849,121 @@ impl super::PairingService {
             expires_at: now + super::ELEVATION_TTL_SECS,
             proposed_terms: Some(terms.clone()),
         }))
+    }
+
+    /// A request the allowance does not open a window for. It still records
+    /// the time it saw; nothing else changes.
+    fn refuse_window(
+        &self,
+        inner: &mut super::Inner,
+        client_id: &str,
+        observed_before: i64,
+        why: NoWindow,
+    ) -> Result<Result<super::PendingElevation, NoWindow>, super::PairingError> {
+        let Some(allowance) = inner.file.allowances.get(client_id) else {
+            return Ok(Err(why));
+        };
+        if allowance.observed_at != observed_before {
+            if let Err(error) = self.persist(&mut inner.file) {
+                if let Some(a) = inner.file.allowances.get_mut(client_id) {
+                    a.observed_at = observed_before;
+                }
+                return Err(error);
+            }
+        }
+        Ok(Err(why))
+    }
+
+    /// Move what the allowance's earlier windows still owe into `grant`, in
+    /// `file`: payments in flight are taken out first, admitted calls then
+    /// move if `grant` can fund them on its own (continuity on), and the
+    /// payments move in after them, past its budget if need be, with their
+    /// payment identities. Only windows the allowance opened, of the same
+    /// pairing epoch and identity and never revoked, give anything.
+    /// Returns what each donor window keeps and what the new one carries.
+    fn prepare_renewal(
+        file: &mut super::PairingFile,
+        mut grant: super::SpendGrant,
+        continuity: bool,
+        now: i64,
+    ) -> Renewal {
+        let donor_of = |old: &super::SpendGrant| {
+            old.client_id == grant.client_id
+                && old.granted_by == ALLOWANCE_GRANTED_BY
+                && old.epoch == grant.epoch
+                && old.identity_fingerprint == grant.identity_fingerprint
+                && old.ended != Some(super::GrantEnd::Revoked)
+                && old.budget.is_some()
+        };
+        let mut donors: Vec<Donor> = file
+            .grants
+            .iter()
+            .filter(|old| donor_of(old))
+            .map(|old| {
+                let budget = old.budget.clone().expect("filtered");
+                let calls = budget.call_reservations.keys().map(|id| (id.clone(), budget.call_outstanding(id))).collect();
+                Donor {
+                    op_id: old.op_id.clone(),
+                    ended_at: old.expires_at.min(now),
+                    used_msat: budget.used_msat,
+                    moved_msat: 0,
+                    calls,
+                    budget,
+                }
+            })
+            .collect();
+        let mut payments = Vec::new();
+        for old in file.grants.iter_mut().filter(|old| donor_of(old)) {
+            let taken = old.budget.as_mut().expect("filtered").take_open_payments();
+            let moved = taken.iter().fold(0u64, |sum, p| sum.saturating_add(p.amount_msat()));
+            if let Some(donor) = donors.iter_mut().find(|d| d.op_id == old.op_id) {
+                donor.moved_msat = donor.moved_msat.saturating_add(moved);
+            }
+            payments.extend(taken);
+        }
+        let carried_ids: Vec<String> = file
+            .allowances
+            .get(&grant.client_id)
+            .map(|a| {
+                payments
+                    .iter()
+                    .filter_map(|p| a.payment_ids_in_flight.get(p.id()))
+                    .flatten()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        file.replace_grants_where(&mut grant, continuity, |old| old.granted_by == ALLOWANCE_GRANTED_BY);
+        if let Some(next) = grant.budget.as_mut() {
+            next.accept_open_payments(payments);
+            next.payment_ids.extend(carried_ids);
+        }
+        // A call counts as moved only if the new window now holds it; one
+        // released because it did not fit stays on its donor.
+        let carried: std::collections::BTreeSet<String> =
+            grant.budget.iter().flat_map(|b| b.call_reservations.keys().cloned()).collect();
+        for donor in &mut donors {
+            let calls = donor
+                .calls
+                .iter()
+                .filter(|(id, _)| carried.contains(id))
+                .fold(0u64, |sum, (_, amount)| sum.saturating_add(*amount));
+            donor.moved_msat = donor.moved_msat.saturating_add(calls);
+        }
+        let allowance = file.allowances.get(&grant.client_id);
+        let donors_counted = donors
+            .iter()
+            .filter_map(|donor| {
+                let window = allowance?.windows.iter().find(|w| w.op_id == donor.op_id)?;
+                let kept = match window.ended_at {
+                    None => window.committed_msat.min(donor.used_msat.saturating_sub(donor.moved_msat)),
+                    Some(_) => window.committed_msat.saturating_sub(donor.moved_msat),
+                };
+                Some((donor.op_id.clone(), kept))
+            })
+            .collect();
+        let counted = grant.budget.as_ref().map_or(0, |b| b.budget_msat.max(b.used_msat));
+        Renewal { grant, donors, donors_counted, counted }
     }
 
     /// Pair through a consumed pairing ticket, attaching the owner's terms
@@ -922,6 +1012,30 @@ impl super::PairingService {
         }
         Ok(record)
     }
+}
+
+/// A window of the allowance that gives what it still owes to the next one.
+struct Donor {
+    op_id: String,
+    ended_at: i64,
+    /// What it had used before anything moved.
+    used_msat: u64,
+    /// What moved out of it into the new window: payments in flight and
+    /// what the calls the new window now holds still had.
+    moved_msat: u64,
+    calls: Vec<(String, u64)>,
+    budget: GrantBudget,
+}
+
+/// A renewal prepared under the pairing lock.
+struct Renewal {
+    grant: super::SpendGrant,
+    donors: Vec<Donor>,
+    /// What each donor window counts once this renewal is published; a
+    /// donor without a recorded window gets nothing back.
+    donors_counted: std::collections::BTreeMap<String, u64>,
+    /// What the new window counts: its budget, or what it carries if more.
+    counted: u64,
 }
 
 /// An offer counted against an allowance's whole-call cap, recorded once its
