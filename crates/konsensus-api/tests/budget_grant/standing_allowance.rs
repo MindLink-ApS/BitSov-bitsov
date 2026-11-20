@@ -236,6 +236,113 @@ async fn a_live_owner_window_smaller_than_the_request_does_not_read_granted() {
     }
 }
 
+/// Every status in `cases` (request budget, expected status), each request
+/// withdrawn after it is read.
+async fn expect_statuses(fx: &Fx, read: &str, label: &str, cases: Vec<(Value, &str)>) {
+    for (budget, expected) in cases {
+        let body = status_of(fx, read, budget.clone()).await;
+        assert_eq!(body["status"], expected, "{label}: {budget} -> {body}");
+        assert_eq!(body["owner_confirmation_required"], expected == "pending", "{label}: {budget}");
+    }
+}
+
+#[tokio::test]
+async fn a_live_owner_window_with_narrower_terms_does_not_read_granted() {
+    for switch in [true, false] {
+        // Budget, per-call limit and duration all cover every request below;
+        // only the narrower term differs. The first case of each window is
+        // the control: the same request within that term reads granted.
+        let wide = json!({"budget_msat": 1_000_000, "per_call_max_msat": 500_000, "ttl_secs": 3_600});
+        let with = |extra: Value| {
+            let mut budget = wide.clone();
+            budget.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            budget
+        };
+
+        // Payee allowlist: a window held to one payee does not answer a
+        // request for any payee, or for a payee outside it.
+        let (fx, client, key) = with_allowance(switch).await;
+        let mut terms = GrantTerms::new(2_000_000).per_call(700_000);
+        terms.payee_allowlist = Some([OTHER_LN.to_string()].into());
+        fx.grant_as(&client, &key, None, terms).await;
+        let before = owner_window(&fx, &client);
+        let read = fx.token_as(&client, &key).await;
+        expect_statuses(&fx, &read, &format!("payees, switch {switch}"), vec![
+            (with(json!({"payee_allowlist": [OTHER_LN]})), "granted"),
+            (wide.clone(), "pending"),
+            (with(json!({"payee_allowlist": [PEER_LN]})), "pending"),
+            (with(json!({"payee_allowlist": [OTHER_LN, PEER_LN]})), "pending"),
+        ])
+        .await;
+        assert_eq!(owner_window(&fx, &client), before, "switch {switch}");
+
+        // Per-recipient budget: a window that holds one recipient to less
+        // than the request may pay it does not answer the request.
+        let (fx, client, key) = with_allowance(switch).await;
+        fx.grant_as(&client, &key, None, GrantTerms::new(2_000_000).per_call(700_000).recipient(OTHER_LN, 100_000)).await;
+        let before = owner_window(&fx, &client);
+        let read = fx.token_as(&client, &key).await;
+        expect_statuses(&fx, &read, &format!("per recipient, switch {switch}"), vec![
+            (with(json!({"per_recipient_msat": {OTHER_LN: 100_000}})), "granted"),
+            (wide.clone(), "pending"),
+            (with(json!({"per_recipient_msat": {OTHER_LN: 150_000}})), "pending"),
+        ])
+        .await;
+        assert_eq!(owner_window(&fx, &client), before, "switch {switch}");
+
+        // Liquidity fees: a window without them does not answer a request
+        // that asks for them.
+        let (fx, client, key) = with_allowance(switch).await;
+        fx.grant_as(&client, &key, None, GrantTerms::new(2_000_000).per_call(700_000)).await;
+        let before = owner_window(&fx, &client);
+        let read = fx.token_as(&client, &key).await;
+        expect_statuses(&fx, &read, &format!("liquidity fees, switch {switch}"), vec![
+            (wide.clone(), "granted"),
+            (with(json!({"allow_liquidity_fees": true})), "pending"),
+        ])
+        .await;
+        assert_eq!(owner_window(&fx, &client), before, "switch {switch}");
+    }
+}
+
+#[tokio::test]
+async fn a_relation_grant_does_not_read_as_granted_for_a_spend_request() {
+    // A relation grant pays only recipients with a live envelope. Its total,
+    // per-call limit, duration and the envelope's own budget all cover this
+    // request; it still does not answer it.
+    let (fx, _, _) = super::messaging_cap::approved_grant(fixture().await, true, 6_000, None).await;
+    let window = fx.service.snapshot().grants.into_iter().find(|g| g.client_id == fx.client_id).unwrap();
+    assert!(window.budget.as_ref().unwrap().recipients_only, "{window:?}");
+    let read = fx.token().await;
+    let (op, body) = ask_with(&fx, &read, json!({"budget_msat": 5_000, "per_call_max_msat": 5_000, "ttl_secs": 600})).await;
+    assert_eq!(body["status"], "pending", "{body}");
+    assert_eq!(body["owner_confirmation_required"], true);
+    assert!(op["owner_action"].as_str().unwrap().contains("konsensus grant"), "{op}");
+}
+
+#[tokio::test]
+async fn what_is_left_of_a_live_owner_window_bounds_what_reads_granted() {
+    for switch in [true, false] {
+        let (fx, client, key) = with_allowance(switch).await;
+        let token = fx.grant_as(&client, &key, None, GrantTerms::new(300_000)).await;
+        let read = fx.token_as(&client, &key).await;
+        let ask = |budget_msat: u64| json!({"budget_msat": budget_msat, "per_call_max_msat": 1_000, "ttl_secs": 3_600});
+        expect_statuses(&fx, &read, &format!("unspent, switch {switch}"), vec![(ask(250_000), "granted")]).await;
+
+        assert_eq!(fx.keysend(&token, OTHER_LN, 200_000).await.0, StatusCode::OK);
+        let spent = used(&fx, &client);
+        assert!(spent >= 200_000, "switch {switch}: {spent}");
+        let left = 300_000 - spent;
+        assert_eq!(owner_window(&fx, &client).budget.unwrap().remaining_msat(), left, "switch {switch}");
+        expect_statuses(&fx, &read, &format!("partly spent, switch {switch}"), vec![
+            (ask(left), "granted"),
+            (ask(left + 1), "pending"),
+            (ask(250_000), "pending"),
+        ])
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn a_request_the_owner_window_did_not_cover_reads_granted_once_the_owner_approves_it() {
     let (fx, client, key) = with_allowance(true).await;
