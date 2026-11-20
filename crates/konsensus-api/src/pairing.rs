@@ -3391,6 +3391,14 @@ impl PairingService {
                 "grant does not authorize liquidity fees".into(),
             ));
         }
+        // Inside a standing allowance, the per-call cap bounds the whole call.
+        let allowance_offer = Self::check_allowance_call(
+            &inner.file,
+            &inner.file.grants[idx],
+            authority.call.as_ref(),
+            authority.call_offer.filter(|_| authority.call.is_none()).map(|(call_id, _)| call_id),
+            &charges,
+        )?;
         let call_binding = authority.call.as_ref().map(|terms| format!("{}:{}", terms.peer, terms.call_id));
         let before = inner.file.grants[idx].budget.clone();
         let op_id = inner.file.grants[idx].op_id.clone();
@@ -3514,10 +3522,16 @@ impl PairingService {
         }
         let previous_binding = call_binding.as_ref().and_then(|key|
             inner.file.call_spend_grants.insert(key.clone(), op_id.clone()));
+        let previous_offers = allowance_offer
+            .as_ref()
+            .map(|offer| Self::record_allowance_offer(&mut inner.file, offer));
         if in_memory {
             return Ok(reservation);
         }
         if let Err(e) = self.persist_with_clock(&mut inner.file, &mut clock) {
+            if let (Some(offer), Some(previous)) = (&allowance_offer, previous_offers) {
+                Self::unrecord_allowance_offer(&mut inner.file, offer, previous);
+            }
             if let Some(key) = call_binding {
                 match previous_binding {
                     Some(previous) => { inner.file.call_spend_grants.insert(key, previous); },

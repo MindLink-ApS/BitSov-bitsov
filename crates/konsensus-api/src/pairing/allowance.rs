@@ -97,7 +97,8 @@ const TICKET_ALLOWANCE_FILE: &str = "remote-access-allowance";
 pub struct AllowanceTerms {
     /// Most all windows together may spend in any rolling 24 hours, msat.
     pub daily_msat: u64,
-    /// Most one call may reserve in a window the allowance opens, msat.
+    /// Most one call may reserve in all (hold, closing signal and offers) in
+    /// a window the allowance opens, msat.
     pub per_call_max_msat: u64,
     /// Unix seconds after which no new window opens.
     pub until: i64,
@@ -237,6 +238,11 @@ pub struct StandingAllowance {
     /// Breaker history of the last window that ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub carried_breakers: Option<CarriedBreakers>,
+    /// Offers reserved for each call (`peer:call_id`) in this allowance's
+    /// windows, msat, so the per-call cap bounds the whole call. Dropped
+    /// once no window holds that call any more.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub call_offers_msat: std::collections::BTreeMap<String, u64>,
 }
 
 /// Why an allowance did not open a window. The request then takes the usual
@@ -278,6 +284,7 @@ impl StandingAllowance {
             windows: Vec::new(),
             observed_at: now,
             carried_breakers: None,
+            call_offers_msat: Default::default(),
         }
     }
 
@@ -287,10 +294,12 @@ impl StandingAllowance {
     pub fn replace_terms(&mut self, next: StandingAllowance) {
         let windows = std::mem::take(&mut self.windows);
         let carried = self.carried_breakers.take();
+        let offers = std::mem::take(&mut self.call_offers_msat);
         let observed = self.observed_at;
         *self = next;
         self.windows = windows;
         self.carried_breakers = carried;
+        self.call_offers_msat = offers;
         self.observed_at = self.observed_at.max(observed);
     }
 
@@ -584,6 +593,12 @@ impl super::PairingFile {
                     _ => allowance.end_window(&op_id, now, None),
                 }
             }
+            // Offer counts only matter while a window still holds the call.
+            allowance.call_offers_msat.retain(|key, _| {
+                grants.iter().filter_map(|g| g.budget.as_ref()).any(|b| {
+                    b.call_reservations.values().any(|c| format!("{}:{}", c.terms.peer, c.terms.call_id) == *key)
+                })
+            });
             // Every write records the time it saw (see `observe`).
             allowance.observe(now);
             allowance.forget_old_windows(now);
@@ -784,5 +799,77 @@ impl super::PairingService {
             tracing::warn!(%error, "could not store the allowance from a pairing ticket; paired without it");
         }
         Ok(record)
+    }
+}
+
+/// An offer counted against an allowance's whole-call cap, recorded once its
+/// reservation is kept.
+pub(super) struct AllowanceOffer {
+    client_id: String,
+    key: String,
+    msat: u64,
+}
+
+impl super::PairingService {
+    /// A window opened from an allowance bounds each whole call by the
+    /// allowance's per-call cap: the hold (minutes and closing signal) plus
+    /// every offer for that call. An owner-written window keeps its
+    /// per-payment meaning; this check does not apply to it.
+    pub(super) fn check_allowance_call(
+        file: &super::PairingFile,
+        grant: &super::SpendGrant,
+        hold: Option<&crate::spend_budget::CallSpendTerms>,
+        offer: Option<&str>,
+        charges: &[crate::spend_budget::Charge],
+    ) -> Result<Option<AllowanceOffer>, crate::spend_budget::BudgetRefusal> {
+        use crate::spend_budget::BudgetRefusal;
+        if grant.granted_by != ALLOWANCE_GRANTED_BY || (hold.is_none() && offer.is_none()) {
+            return Ok(None);
+        }
+        let allowance = file.allowances.get(&grant.client_id).ok_or(BudgetRefusal::NoGrant)?;
+        let max_msat = allowance.terms.per_call_max_msat;
+        let offered = |key: &str| allowance.call_offers_msat.get(key).copied().unwrap_or(0);
+        if let Some(terms) = hold {
+            let key = format!("{}:{}", terms.peer, terms.call_id);
+            if terms.reserved_msat.saturating_add(offered(&key)) > max_msat {
+                return Err(BudgetRefusal::PerCall { max_msat });
+            }
+            return Ok(None);
+        }
+        let call_id = offer.expect("checked above");
+        let Some(held) = grant.budget.as_ref().and_then(|b| {
+            b.call_reservations.values().find(|c| {
+                !c.closed && c.terms.call_id == call_id && charges.iter().all(|charge| charge.recipient == c.terms.peer)
+            })
+        }) else {
+            // No hold in this window: the messaging cap bounds it, as before.
+            return Ok(None);
+        };
+        let key = format!("{}:{}", held.terms.peer, held.terms.call_id);
+        let msat = charges.iter().fold(0u64, |sum, c| sum.saturating_add(c.amount_msat));
+        if held.terms.reserved_msat.saturating_add(offered(&key)).saturating_add(msat) > max_msat {
+            return Err(BudgetRefusal::PerCall { max_msat });
+        }
+        Ok(Some(AllowanceOffer { client_id: grant.client_id.clone(), key, msat }))
+    }
+
+    /// Count a kept offer; returns what to restore if the write fails.
+    pub(super) fn record_allowance_offer(file: &mut super::PairingFile, offer: &AllowanceOffer) -> Option<u64> {
+        let allowance = file.allowances.get_mut(&offer.client_id)?;
+        let entry = allowance.call_offers_msat.entry(offer.key.clone()).or_insert(0);
+        let previous = *entry;
+        *entry = entry.saturating_add(offer.msat);
+        Some(previous)
+    }
+
+    /// Undo [`Self::record_allowance_offer`].
+    pub(super) fn unrecord_allowance_offer(file: &mut super::PairingFile, offer: &AllowanceOffer, previous: Option<u64>) {
+        if let (Some(allowance), Some(previous)) = (file.allowances.get_mut(&offer.client_id), previous) {
+            if previous == 0 {
+                allowance.call_offers_msat.remove(&offer.key);
+            } else {
+                allowance.call_offers_msat.insert(offer.key.clone(), previous);
+            }
+        }
     }
 }

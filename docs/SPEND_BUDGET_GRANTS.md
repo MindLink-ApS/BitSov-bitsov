@@ -506,8 +506,15 @@ only if:
   with less than a minute left is not opened.
 
 Anything else takes the owner path, unchanged, and its status stays `pending`
-until the owner acts, even while an earlier allowance window is live. A new window replaces the
-app's previous one, as every window does. Breakers are the allowance's and
+until the owner acts, even while an earlier allowance window is live. A new
+window replaces the app's previous one, as every window does.
+
+In a window the allowance opened, the per-call cap bounds **the whole call**:
+its hold (every minute and the closing signal) plus every offer sent for it,
+each offer counted once it is reserved, and not given back if it fails. A call
+or offer that would go past the cap is refused before anything is reserved.
+In a window the owner wrote, the per-call maximum keeps its meaning as the
+limit on each payment. Breakers are the allowance's and
 carry their history from one window to the next; a renewal never resets them.
 
 **The daily cap counts any 24 hours, not each window.** Every window is

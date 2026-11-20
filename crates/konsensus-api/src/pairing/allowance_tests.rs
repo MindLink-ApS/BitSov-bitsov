@@ -735,3 +735,112 @@ fn the_sweep_latches_the_end_date_without_a_request() {
         .map(|op| op.op_id);
     assert_eq!(opened, Err(NoWindow::Ended));
 }
+
+// ── The per-call cap bounds the whole call ──────────────────────────────
+// The allowance's per-call cap is what one call may reserve in all: its hold
+// (minutes and closing signal) and its offers. A window opened from it
+// carries the same number as an ordinary grant's per-payment limit, which
+// alone would bound only each block.
+
+fn call_window() -> Fixture {
+    let f = fixture(true, true, Some(terms()));
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+    f
+}
+
+fn call(id: &str, price: u64, minutes: u16) -> crate::spend_budget::CallSpendTerms {
+    crate::spend_budget::CallSpendTerms::new(&"aa".repeat(32), id, price, 500, minutes).unwrap()
+}
+
+fn window_used(f: &Fixture) -> u64 {
+    allowance_grants(f)[0].budget.as_ref().unwrap().used_msat
+}
+
+fn offer_link(id: &str) -> crate::spend_budget::OperationReservationLink {
+    crate::spend_budget::OperationReservationLink { operation_id: id.into(), execution_id: "attempt".into(), readmission: false }
+}
+
+#[test]
+fn a_standing_allowance_accepts_a_call_at_its_whole_call_cap() {
+    let f = call_window();
+    let at_cap = call("at-cap", 3_000, 200);
+    assert_eq!(at_cap.reserved_msat, PER_CALL);
+    f.svc.reserve_call_spend(&f.client, 1, at_cap, u64::MAX / 4).unwrap();
+    assert_eq!(window_used(&f), PER_CALL);
+}
+
+#[test]
+fn a_standing_allowance_refuses_a_call_above_its_whole_call_cap() {
+    let f = call_window();
+    let above = call("above-cap", 3_500, 200);
+    assert_eq!(above.reserved_msat, 800_000);
+    let result = f.svc.reserve_call_spend(&f.client, 1, above, u64::MAX / 4);
+    assert!(matches!(result, Err(BudgetRefusal::PerCall { max_msat: PER_CALL })), "{result:?}");
+    assert_eq!(window_used(&f), 0, "a refusal leaves the window untouched");
+    assert!(allowance_grants(&f)[0].budget.as_ref().unwrap().call_reservations.is_empty());
+}
+
+#[test]
+fn the_whole_call_cap_counts_the_closing_signal_and_every_offer() {
+    let peer = "aa".repeat(32);
+    let offer = |msat| vec![Charge { recipient: peer.clone(), amount_msat: msat }];
+    // Closing signal included: 199 minutes plus closing past the cap.
+    let f = call_window();
+    let closing = call("closing", 3_000, 200).with_closing_signal(1, 0).unwrap();
+    assert_eq!(closing.reserved_msat, PER_CALL + 1_000);
+    assert!(matches!(
+        f.svc.reserve_call_spend(&f.client, 1, closing, u64::MAX / 4),
+        Err(BudgetRefusal::PerCall { max_msat: PER_CALL })
+    ));
+    // Hold plus offer exactly at the cap is accepted ...
+    let hold = call("with-offer", 3_000, 199);
+    assert_eq!(hold.reserved_msat + 3_500, PER_CALL);
+    f.svc
+        .reserve_call_with_offer(&f.client, 1, hold, u64::MAX / 4, offer(3_500), None, offer_link("offer-1"))
+        .unwrap();
+    assert_eq!(window_used(&f), PER_CALL);
+    // ... and one more offer for the same call is not.
+    let again = f.svc.reserve_call_offer_spend(&f.client, 1, offer(1), "with-offer", None, offer_link("offer-2"));
+    assert!(matches!(again, Err(BudgetRefusal::PerCall { max_msat: PER_CALL })), "{again:?}");
+    assert_eq!(window_used(&f), PER_CALL, "the refused offer reserved nothing");
+    // A hold at the cap with any offer is refused as a whole: no hold kept.
+    let f = call_window();
+    let full = call("full", 3_000, 200);
+    let refused = f.svc.reserve_call_with_offer(&f.client, 1, full, u64::MAX / 4, offer(1), None, offer_link("offer-3"));
+    assert!(matches!(refused, Err(BudgetRefusal::PerCall { max_msat: PER_CALL })), "{refused:?}");
+    assert_eq!(window_used(&f), 0);
+    assert!(allowance_grants(&f)[0].budget.as_ref().unwrap().call_reservations.is_empty());
+    // The offer count survives a restart.
+    let f = call_window();
+    f.svc
+        .reserve_call_with_offer(&f.client, 1, call("kept", 3_000, 199), u64::MAX / 4, offer(3_500), None, offer_link("offer-4"))
+        .unwrap();
+    let f = reopen(f, true, true);
+    assert!(f.svc.reserve_call_offer_spend(&f.client, 1, offer(1), "kept", None, offer_link("offer-5")).is_err());
+}
+
+#[test]
+fn an_owner_window_keeps_its_per_payment_meaning() {
+    // The same numbers in an owner-written window: its per-call maximum
+    // bounds each payment, as before, so the 800,000-msat hold is accepted.
+    let f = fixture(true, true, None);
+    {
+        let mut inner = f.svc.lock();
+        let epoch = inner.file.clients[0].epoch;
+        let now = now();
+        inner.file.grants.push(SpendGrant {
+            owner_approval: None,
+            op_id: "owner".into(),
+            client_id: f.client.clone(),
+            scopes: vec![Scope::Spend],
+            granted_at: now,
+            expires_at: now + 600,
+            identity_fingerprint: "identity".into(),
+            epoch,
+            granted_by: "cli".into(),
+            budget: Some(GrantBudget::from_terms(&proposal(1_000_000, PER_CALL))),
+        });
+        f.svc.persist(&mut inner.file).unwrap();
+    }
+    f.svc.reserve_call_spend(&f.client, 1, call("owner-call", 3_500, 200), u64::MAX / 4).unwrap();
+}

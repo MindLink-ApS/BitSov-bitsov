@@ -49,8 +49,9 @@ pub enum Command {
         /// and a node started with its owner control socket.
         #[arg(long, num_args = 0..=1, default_missing_value = "2500", conflicts_with_all = ["second_device", "legacy"], value_parser = clap::value_parser!(u64).range(1..))]
         allow: Option<u64>,
-        /// With --allow: the most one call may reserve, in sats (700, or the
-        /// daily cap if lower, if not given).
+        /// With --allow: the most one call may reserve in all (its minutes,
+        /// closing signal and offers), in sats (700, or the daily cap if
+        /// lower, if not given).
         #[arg(long = "per-call", requires = "allow", value_parser = clap::value_parser!(u64).range(1..))]
         per_call: Option<u64>,
         /// With --allow: how many days the allowance lasts (30 if not given).
