@@ -100,6 +100,12 @@ impl MemStorage {
         }
     }
 
+    /// A stored call's phase, read without the async storage path (from a hook).
+    #[allow(dead_code)]
+    pub fn call_phase(&self, peer: &NodeId, call_id: &str) -> Option<konsensus_core::payloads::call::Phase> {
+        self.calls.lock().unwrap().get(&(*peer, call_id.to_string())).map(|e| e.phase)
+    }
+
     pub fn new() -> Self {
         Self {
             peer_upsert_gate: Mutex::new(None),

@@ -976,6 +976,24 @@ pub async fn settle_operation(state: &AppState, op: &konsensus_storage::OutboxOp
     }
 }
 
+/// A saved free call reply is about to be queued by recovery: publish its
+/// call transition first if it is still missing, so the reply is never
+/// delivered ahead of it. A failed write keeps the reply unqueued; the next
+/// sweep or a retry of the same operation tries again.
+pub(crate) async fn commit_saved_reply(state: &AppState, op: &konsensus_storage::OutboxOperation)
+    -> Result<(), konsensus_storage::StorageError> {
+    let store = state.storage.as_ref();
+    let peer = NodeId::from_hex(&op.recipient)
+        .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+    for (p, call_id, entry) in store.call_pending().await? {
+        if p == peer && entry.pending.is_some_and(|x| x.is(&op.operation_id, &op.request_hash) && i64::from(x.kind) == op.kind) {
+            settle(store, &peer, &call_id, &op.operation_id, &op.request_hash, Settlement::Paid,
+                state.pairing.as_deref().map(|service| (service, None))).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Release every reservation of a durably abandoned operation. The caller
 /// holds its operation lock and has already persisted the tombstone: a
 /// cancelled POST may have reserved a signal before inserting any operation

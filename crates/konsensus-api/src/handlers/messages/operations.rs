@@ -1330,6 +1330,11 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
             save(state, op).await?;
             return Ok(());
         };
+        if data.free_reply {
+            // A saved free reply: its call transition is published before
+            // the reply becomes visible to the outbox, as on the send path.
+            crate::calls::commit_saved_reply(state, op).await.map_err(storage)?;
+        }
         materialize(state, op, env).await?;
         recover_budget(state, op).await?;
         return Ok(());

@@ -413,3 +413,135 @@ async fn a_failed_call_transition_takes_the_recorded_reply_back() {
         assert_eq!(ledger(&fx, &transport), before, "{kind}");
     }
 }
+
+/// From now on, record the call's phase each time a reply is queued (the
+/// moment it becomes visible to the outbox flusher).
+fn watch_queueing(fx: &Fx, store: &Arc<common::MemStorage>) -> Arc<std::sync::Mutex<Vec<Option<Phase>>>> {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (log, calls, peer) = (Arc::clone(&seen), Arc::clone(store), fx.peer);
+    *store.outbox_write_hook.lock().unwrap() = Some(Box::new(move |op| {
+        if op.state == "paid" {
+            log.lock().unwrap().push(calls.call_phase(&peer, CALL));
+        }
+        Ok(())
+    }));
+    seen
+}
+
+#[tokio::test]
+async fn recovery_publishes_a_missing_transition_before_queueing_the_saved_reply() {
+    for (kind, after) in [(401u16, Phase::Live), (403, Phase::Ended)] {
+        let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+        let store = interrupt(&mut fx, Step::Queue, false).await;
+        // The node stops after the reply is saved, before the call moves on.
+        let (stopper, mut armed) = (Arc::clone(&store), true);
+        *store.outbox_write_hook.lock().unwrap() = Some(Box::new(move |op| {
+            let data: Value = serde_json::from_slice(&op.recovery).unwrap_or_default();
+            if armed && op.state == "paying" && data["envelope_ready"] == true {
+                armed = false;
+                *stopper.call_get_hook.lock().unwrap() = Some(Box::new(|| panic!("node stopped before the transition")));
+            }
+            Ok(())
+        }));
+        let before = ledger(&fx, &transport);
+        let operation = uuid::Uuid::new_v4().to_string();
+        let (state, owned) = (fx.state.clone(), token.clone());
+        let request = reply(&fx, kind, CALL, &operation);
+        let stopped = tokio::spawn(async move {
+            call(&state, "POST", "/api/v1/messages/compose", Some(request), Some(&owned)).await
+        }).await;
+        assert!(stopped.is_err_and(|e| e.is_panic()));
+        assert_eq!(phase(&fx).await, Phase::Ringing, "{kind}: the stop came before the transition");
+        assert!(sent(&transport, kind).is_empty(), "{kind}");
+        let queued = watch_queueing(&fx, &store);
+        konsensus_api::calls::recover(fx.state.storage.as_ref()).await.unwrap();
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+        assert_eq!(*queued.lock().unwrap(), vec![Some(after)], "{kind}: the reply was queued before its call moved on");
+        let out = sent(&transport, kind);
+        assert_eq!(out.len(), 1, "{kind}: the reply was lost or doubled");
+        assert_eq!(phase(&fx).await, after, "{kind}");
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+        // Unacknowledged, a later sweep may resend it: the same reply, never a second one.
+        let ids: std::collections::HashSet<_> = sent(&transport, kind).iter().map(|e| e.id).collect();
+        assert_eq!(ids, std::collections::HashSet::from([out[0].id]), "{kind}: a later sweep made a second reply");
+        assert_eq!(ledger(&fx, &transport), before, "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn a_reply_left_saved_by_a_failed_take_back_moves_the_call_before_it_is_sent() {
+    for (kind, after) in [(401u16, Phase::Live), (403, Phase::Ended)] {
+        let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+        let store = interrupt(&mut fx, Step::Queue, false).await;
+        // The call write fails, and so does the write that would take the
+        // saved reply back: the reply stays saved with the call still ringing.
+        let (failing, mut saved) = (Arc::clone(&store), false);
+        *store.outbox_write_hook.lock().unwrap() = Some(Box::new(move |op| {
+            let data: Value = serde_json::from_slice(&op.recovery).unwrap_or_default();
+            if !saved && op.state == "paying" && data["envelope_ready"] == true {
+                saved = true;
+                *failing.fail_call_put_for.lock().unwrap() = Some(CALL.into());
+            } else if saved && op.state == "paying" && data["envelope_ready"] == false {
+                return Err(konsensus_storage::StorageError::Serialization("injected journal failure".into()));
+            }
+            Ok(())
+        }));
+        let before = ledger(&fx, &transport);
+        let operation = uuid::Uuid::new_v4().to_string();
+        let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &operation)).await;
+        assert_ne!(status, StatusCode::OK, "{kind}: {body}");
+        *store.fail_call_put_for.lock().unwrap() = None;
+        assert_eq!(phase(&fx).await, Phase::Ringing, "{kind}");
+        assert!(sent(&transport, kind).is_empty(), "{kind}");
+        let queued = watch_queueing(&fx, &store);
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+        assert_eq!(*queued.lock().unwrap(), vec![Some(after)], "{kind}: the reply was queued before its call moved on");
+        assert_eq!(sent(&transport, kind).len(), 1, "{kind}");
+        assert_eq!(phase(&fx).await, after, "{kind}");
+        assert_eq!(ledger(&fx, &transport), before, "{kind}");
+    }
+}
+
+#[tokio::test]
+async fn a_reply_that_cannot_be_taken_back_is_reported_unresolved_not_unsent() {
+    for (kind, after) in [(401u16, Phase::Live), (403, Phase::Ended)] {
+        let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+        let store = interrupt(&mut fx, Step::Queue, false).await;
+        // The call write fails, then so does the write taking the saved reply back.
+        let (failing, mut saved) = (Arc::clone(&store), false);
+        *store.outbox_write_hook.lock().unwrap() = Some(Box::new(move |op| {
+            let data: Value = serde_json::from_slice(&op.recovery).unwrap_or_default();
+            if !saved && op.state == "paying" && data["free_reply"] == true && data["envelope_ready"] == true {
+                saved = true;
+                *failing.fail_call_put_for.lock().unwrap() = Some(CALL.into());
+            } else if saved && op.state == "paying" && data["envelope_ready"] == false {
+                return Err(konsensus_storage::StorageError::Serialization("injected journal failure".into()));
+            }
+            Ok(())
+        }));
+        let before = ledger(&fx, &transport);
+        let operation = uuid::Uuid::new_v4().to_string();
+        let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &operation)).await;
+        assert_ne!(status, StatusCode::OK, "{kind}: {body}");
+        // The reply is still saved and recovery will send it: not "unsent".
+        assert_ne!(body["code"], "not_dispatched", "{kind}: a reply that may still go out was reported unsent: {body}");
+        assert_eq!(body["state"], "payment_unknown", "{kind}: {body}");
+        assert_eq!(body["retry_allowed"], false, "{kind}: {body}");
+        assert_eq!(phase(&fx).await, Phase::Ringing, "{kind}");
+        assert!(sent(&transport, kind).is_empty(), "{kind}");
+        // Writes work again: the sweep moves the call, then sends the reply once.
+        *store.fail_call_put_for.lock().unwrap() = None;
+        *store.outbox_write_hook.lock().unwrap() = None;
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+        let ids: std::collections::HashSet<_> = sent(&transport, kind).iter().map(|e| e.id).collect();
+        assert_eq!(ids.len(), 1, "{kind}: the saved reply was lost or doubled");
+        assert_eq!(phase(&fx).await, after, "{kind}");
+        assert_eq!(ledger(&fx, &transport), before, "{kind}");
+        // The same tap now reads the sent reply back; it does not pay or send another.
+        let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &operation)).await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+        let ids: std::collections::HashSet<_> = sent(&transport, kind).iter().map(|e| e.id).collect();
+        assert_eq!(ids.len(), 1, "{kind}");
+        assert_eq!(ledger(&fx, &transport), before, "{kind}");
+    }
+}

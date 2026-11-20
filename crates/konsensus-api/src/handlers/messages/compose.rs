@@ -4342,8 +4342,15 @@ pub(super) async fn compose_peer(
             let envelope = operation.sealed_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
             let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
             if let Err(e) = crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await {
+                // Unsent only once the saved reply is taken back. Otherwise
+                // it is still saved and recovery sends it after moving the
+                // call, so the outcome is unresolved, as for a paid send.
                 if let Err(error) = operation.unseal().await {
-                    tracing::warn!(%error, "free call reply kept sealed; recovery sends it");
+                    tracing::warn!(%error, "free call reply kept saved; recovery sends it");
+                    return Err(ApiError::PaymentUnresolved(format!(
+                        "the call could not be updated ({e}) and the saved reply could not be withdrawn; \
+                         it may still be sent, nothing was paid — read the operation before acting again"
+                    )).with_reason("call_reply_unresolved"));
                 }
                 return Err(ApiError::NotDispatched(format!(
                     "the call could not be updated ({e}); the reply was not sent and nothing was paid"
