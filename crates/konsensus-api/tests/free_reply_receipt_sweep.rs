@@ -137,6 +137,12 @@ async fn undecodable_row_case(corruption: &str, column: &str, stored: &str) {
 
 /// A row for `peer` whose receipt must be kept: its saved reply can still be recovered.
 async fn held(store: &dyn konsensus_storage::Storage, peer: &NodeId, op_id: &str) {
+    recoverable(store, peer, op_id).await;
+    store.call_put(peer, CALL, &row(peer, op_id)).await.unwrap();
+}
+
+/// An operation whose saved reply can still be recovered.
+async fn recoverable(store: &dyn konsensus_storage::Storage, peer: &NodeId, op_id: &str) {
     let mut op = OutboxOperation::prepared(op_id.into(), peer.to_hex(), 401, "digest".into());
     op.state = "payment_unknown".into();
     op.recovery = serde_json::to_vec(&serde_json::json!({
@@ -144,7 +150,6 @@ async fn held(store: &dyn konsensus_storage::Storage, peer: &NodeId, op_id: &str
         "dispatched": false, "expected_msat": 0, "fee_ceiling_msat": 0, "admission_msat": 0,
     })).unwrap();
     assert!(store.insert_outbox_operation(&op).await.unwrap());
-    store.call_put(peer, CALL, &row(peer, op_id)).await.unwrap();
 }
 
 #[tokio::test]
@@ -199,4 +204,120 @@ async fn after_an_exactly_full_last_page_the_next_sweep_starts_over_at_once() {
     assert_eq!(store.call_get(&peer(0), CALL).await.unwrap().unwrap().free_reply_receipts, vec![],
         "a sweep after an exactly full last page visited nothing");
     assert_eq!(holding(&db).await.len(), 256);
+}
+
+/// A row for `peer` and `call_id` holding one receipt whose operation is gone.
+fn releasable(peer: &NodeId, call_id: &str, operation_id: &str) -> CallEntry {
+    let mut entry = row(peer, operation_id);
+    entry.free_reply_receipts[0].call_id = call_id.into();
+    entry
+}
+
+#[tokio::test]
+async fn decoded_receipt_fault_waits_for_wrap_without_loss() {
+    let mem = Arc::new(common::MemStorage::new());
+    let mut state = common::test_state();
+    Arc::get_mut(&mut state).unwrap().storage = mem.clone();
+    let store = state.storage.as_ref();
+    let p = peer(1);
+    let id = |n: u32| format!("c{n:03}");
+    // 300 decodable rows in key order. Every receipt can be released except
+    // one, whose saved reply can still be recovered.
+    let mut stored = Vec::new();
+    for n in 0..300u32 {
+        let entry = releasable(&p, &id(n), &format!("gone-{n}"));
+        store.call_put(&p, &id(n), &entry).await.unwrap();
+        stored.push(entry);
+    }
+    // Last in key order, so it shares the second (short) page.
+    let held_id = "z-held";
+    recoverable(store, &p, "held-z").await;
+    let kept = releasable(&p, held_id, "held-z");
+    store.call_put(&p, held_id, &kept).await.unwrap();
+    let held_now = || async {
+        let mut left = Vec::new();
+        for n in 0..300u32 {
+            if !store.call_get(&p, &id(n)).await.unwrap().unwrap().free_reply_receipts.is_empty() {
+                left.push(n);
+            }
+        }
+        left
+    };
+
+    // Inside the first page: reading one row fails, writing another fails.
+    *mem.fail_call_get_for.lock().unwrap() = Some(id(5));
+    *mem.fail_call_put_for.lock().unwrap() = Some(id(9));
+    konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    *mem.fail_call_get_for.lock().unwrap() = None;
+    *mem.fail_call_put_for.lock().unwrap() = None;
+    let expected: Vec<u32> = [5, 9].into_iter().chain(256..300).collect();
+    assert_eq!(held_now().await, expected, "the first sweep did not keep exactly the failed rows and the rows past its page");
+
+    // Faults gone: the next sweep resumes after the first page. The failed
+    // rows are behind the cursor and are not retried yet.
+    konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    assert_eq!(held_now().await, vec![5, 9], "a failed row was retried before the cursor wrapped, or a later row was not reached");
+
+    // Having reached the end, cleanup wraps and releases them.
+    konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    assert_eq!(held_now().await, Vec::<u32>::new(), "a failed row was not retried after the cursor wrapped");
+
+    // No row was lost and nothing but the receipts changed; the receipt whose
+    // saved reply can still be recovered is still held.
+    for n in 0..300u32 {
+        let mut want = stored[n as usize].clone();
+        want.free_reply_receipts.clear();
+        assert_eq!(store.call_get(&p, &id(n)).await.unwrap(), Some(want), "row {n}");
+    }
+    assert_eq!(store.call_get(&p, held_id).await.unwrap(), Some(kept), "a receipt that must be kept was released");
+}
+
+#[tokio::test]
+async fn a_page_listing_more_rows_than_it_covered_is_still_swept() {
+    let mem = Arc::new(common::MemStorage::new());
+    let mut state = common::test_state();
+    Arc::get_mut(&mut state).unwrap().storage = mem.clone();
+    let store = state.storage.as_ref();
+    for n in 0..3u32 {
+        store.call_put(&peer(n), CALL, &row(&peer(n), &format!("gone-{n}"))).await.unwrap();
+    }
+    // A store whose count of covered rows falls short of the rows it lists.
+    *mem.receipt_page_hook.lock().unwrap() = Some(Box::new(|page| page.scanned = 0));
+    konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    for n in 0..3u32 {
+        assert_eq!(store.call_get(&peer(n), CALL).await.unwrap().unwrap().free_reply_receipts, vec![], "row {n}");
+    }
+}
+
+#[tokio::test]
+async fn a_stored_empty_receipt_list_is_cleared_once_and_no_longer_listed() {
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let mut state = common::test_state();
+    Arc::get_mut(&mut state).unwrap().storage = db.clone();
+    let store = state.storage.as_ref();
+    // Writes store no receipts as NULL, never as an empty list.
+    let mut none = row(&peer(0), "unused");
+    none.free_reply_receipts.clear();
+    store.call_put(&peer(0), CALL, &none).await.unwrap();
+    assert_eq!(holding(&db).await, vec![]);
+    // Rows holding an empty list, as only a damaged or hand-edited database could.
+    for (n, stored) in [(1u32, "[]"), (2, " [ ] ")] {
+        store.call_put(&peer(n), CALL, &row(&peer(n), &format!("gone-{n}"))).await.unwrap();
+        sqlx::query("UPDATE call_state SET free_reply_receipts = ? WHERE peer = ?").bind(stored).bind(peer(n).to_hex())
+            .execute(db.pool()).await.unwrap();
+    }
+    let before: Vec<_> = [1u32, 2].iter().map(|n| peer(*n)).collect();
+    let mut entries = Vec::new();
+    for p in &before {
+        entries.push(store.call_get(p, CALL).await.unwrap().unwrap());
+    }
+    assert_eq!(holding(&db).await.len(), 2);
+
+    konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    assert_eq!(holding(&db).await, vec![], "a row holding an empty receipt list stays listed by every sweep");
+    assert_eq!(store.call_with_free_reply_receipts(None, 256).await.unwrap().scanned, 0);
+    // Nothing else about the rows changed.
+    for (p, entry) in before.iter().zip(entries) {
+        assert_eq!(store.call_get(p, CALL).await.unwrap(), Some(entry));
+    }
 }

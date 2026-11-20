@@ -73,6 +73,9 @@ pub struct MemStorage {
     pub call_get_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once, right after the next listing of pending call reservations.
     pub call_pending_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once, on the next page of rows holding free-reply receipts before it is returned.
+    #[allow(clippy::type_complexity)]
+    pub receipt_page_hook: Mutex<Option<Box<dyn FnOnce(&mut konsensus_storage::FreeReplyReceiptPage) + Send>>>,
     /// Runs before every outbox operation write; an error fails that write.
     #[allow(clippy::type_complexity)]
     pub outbox_write_hook: Mutex<Option<Box<dyn FnMut(&konsensus_storage::OutboxOperation) -> Result<(), StorageError> + Send>>>,
@@ -131,6 +134,7 @@ impl MemStorage {
             outbox_read_hook: Mutex::new(None),
             call_get_hook: Mutex::new(None),
             call_pending_hook: Mutex::new(None),
+            receipt_page_hook: Mutex::new(None),
             outbox_write_hook: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
             call_offers: Mutex::new(HashMap::new()),
@@ -312,6 +316,9 @@ impl Storage for MemStorage {
     ) -> Result<konsensus_storage::FreeReplyReceiptPage, StorageError>
     {
         // Rows are held decoded in memory, so every listed row has its entry.
+        // An empty receipt list here is the SQL backends' NULL column: their
+        // writes store no receipts as NULL, never as an empty list, so this
+        // filter and their `IS NOT NULL` list the same rows.
         let mut rows: Vec<konsensus_storage::FreeReplyReceiptRow> = self
             .calls
             .lock()
@@ -324,7 +331,12 @@ impl Storage for MemStorage {
         rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         rows.truncate(max as usize);
         let last_key = rows.last().map(|(p, c, _)| (p.clone().into_bytes(), c.clone().into_bytes()));
-        Ok(konsensus_storage::FreeReplyReceiptPage { scanned: rows.len(), last_key, rows })
+        let mut page = konsensus_storage::FreeReplyReceiptPage { scanned: rows.len(), last_key, rows };
+        let hook = self.receipt_page_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(&mut page);
+        }
+        Ok(page)
     }
 
     async fn insert_channel_open_operation(
