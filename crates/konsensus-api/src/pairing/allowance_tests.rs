@@ -6,6 +6,28 @@ use super::*;
 const DAILY: u64 = 2_500_000;
 const PER_CALL: u64 = 700_000;
 
+/// The pure ledger check: a proposal against the terms at `now`, with the
+/// window `replacing` counted at what it used. Renewals of a pairing go
+/// through the prepared transfer instead; this checks the ledger alone.
+fn admit(
+    book: &mut StandingAllowance,
+    terms: &GrantTerms,
+    replacing: Option<(&str, u64)>,
+    now: i64,
+) -> Result<i64, NoWindow> {
+    let ttl = book.admit_terms(terms, now)?;
+    let counted: BTreeMap<String, u64> = replacing
+        .filter(|(op, _)| book.windows.iter().any(|w| w.op_id == *op && w.ended_at.is_none()))
+        .map(|(op, used)| (op.to_string(), used))
+        .into_iter()
+        .collect();
+    let remaining = book.room(&counted, now);
+    if terms.budget_msat > remaining {
+        return Err(NoWindow::OverDailyCap { remaining_msat: remaining });
+    }
+    Ok(ttl)
+}
+
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -443,7 +465,7 @@ fn no_schedule_of_renewals_exceeds_the_cap_in_any_24_hours() {
             let ttl = [60, 3_600, MAX_SPEND_GRANT_TTL_SECS][next(3) as usize];
             let proposal = GrantTerms::new(budget_msat).per_call(budget_msat.min(PER_CALL)).for_secs(ttl);
             let replacing = open.as_ref().filter(|(_, e, _)| t < *e).map(|(op, _, b)| (op.as_str(), b.used_msat));
-            if let Ok(ttl) = book.admit(&proposal, replacing, t) {
+            if let Ok(ttl) = admit(&mut book, &proposal, replacing, t) {
                 if let Some((op, _, budget)) = open.take() {
                     book.end_window(&op, t, Some(&budget));
                 }
@@ -489,14 +511,14 @@ fn until_ends_new_windows_and_a_clock_rollback_cannot_reopen_it() {
     let t = AllowanceTerms { until: t0 + 3_600, ..AllowanceTerms::owner_defaults(t0) };
     let mut book = StandingAllowance::new(t, SET_BY_CLI, None, 1, "identity", t0);
     // A window opened near the end lasts until the end, no longer.
-    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 1_800), Ok(1_800));
+    assert_eq!(admit(&mut book, &proposal(1_000, 1_000), None, t0 + 1_800), Ok(1_800));
     book.open_window("w", 1_000, t0 + 1_800);
-    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 3_570), Err(NoWindow::Ended), "under a minute left");
-    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 3_600), Err(NoWindow::Ended));
+    assert_eq!(admit(&mut book, &proposal(1_000, 1_000), None, t0 + 3_570), Err(NoWindow::Ended), "under a minute left");
+    assert_eq!(admit(&mut book, &proposal(1_000, 1_000), None, t0 + 3_600), Err(NoWindow::Ended));
     // The node saw t0 + 3,600 once, through a refusal; a clock set back an
     // hour changes nothing.
     assert!(!book.is_live(t0));
-    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0), Err(NoWindow::Ended));
+    assert_eq!(admit(&mut book, &proposal(1_000, 1_000), None, t0), Err(NoWindow::Ended));
 }
 
 #[test]
@@ -554,7 +576,7 @@ fn a_lower_cap_applies_from_now_and_never_undoes_spending() {
     assert_eq!(book.terms.daily_msat, 1_000_000);
     assert_eq!(book.committed_msat(t0 + 120), 1_800_000, "spending already done stays counted");
     assert_eq!(book.remaining_msat(t0 + 120), 0);
-    assert!(matches!(book.admit(&proposal(1, 1), None, t0 + 120), Err(NoWindow::OverDailyCap { remaining_msat: 0 })));
+    assert!(matches!(admit(&mut book, &proposal(1, 1), None, t0 + 120), Err(NoWindow::OverDailyCap { remaining_msat: 0 })));
     // Once it ages out, the lower cap is what is left.
     let later = t0 + 60 + CALL_TAIL_SECS + ROLLING_SECS;
     assert_eq!(book.remaining_msat(later), 1_000_000);
@@ -643,8 +665,8 @@ fn a_refusal_at_the_end_date_survives_a_clock_set_back() {
     let t0 = 1_800_000_000;
     let terms = AllowanceTerms { until: t0 + 3_600, ..AllowanceTerms::owner_defaults(t0) };
     let mut book = StandingAllowance::new(terms, SET_BY_CLI, None, 1, "identity", t0);
-    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 3_600), Err(NoWindow::Ended));
-    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 60), Err(NoWindow::Ended), "clock set back");
+    assert_eq!(admit(&mut book, &proposal(1_000, 1_000), None, t0 + 3_600), Err(NoWindow::Ended));
+    assert_eq!(admit(&mut book, &proposal(1_000, 1_000), None, t0 + 60), Err(NoWindow::Ended), "clock set back");
     assert!(!book.is_live(t0));
 }
 
@@ -688,7 +710,7 @@ fn a_forward_clock_jump_does_not_forget_spending() {
     let back = t0 + 120;
     assert!(book.committed_msat(back) >= 2_400_000, "{}", book.committed_msat(back));
     assert!(book.remaining_msat(back) <= DAILY - 2_400_000);
-    assert!(matches!(book.admit(&proposal(200_000, 200_000), None, back), Err(NoWindow::OverDailyCap { .. })));
+    assert!(matches!(admit(&mut book, &proposal(200_000, 200_000), None, back), Err(NoWindow::OverDailyCap { .. })));
     // Tidying keeps the ledger small without losing anything that counts.
     for i in 0..100 {
         let op = format!("w{i}");
@@ -911,9 +933,11 @@ fn the_next_allowance_window_carries_an_admitted_call_once() {
         let in_flight = draw_block(&f, "call", 1).unwrap();
         let (second, outcome) = ask(&f, proposal(900_000, PER_CALL)).unwrap();
         assert_eq!(outcome, Outcome::Window);
-        // The old window counts what it used, the whole hold included,
-        // before any of it moved.
-        assert_eq!(window_committed(&f, &first), Some((u64::from(MINUTES) * MINUTE, true)), "{continuity}");
+        // The old window counts what stayed with it: with continuity the
+        // minute paid there (the rest of the hold moved on), without it the
+        // whole hold (nothing moved).
+        let kept = if continuity { MINUTE } else { u64::from(MINUTES) * MINUTE };
+        assert_eq!(window_committed(&f, &first), Some((kept, true)), "{continuity}");
         let next = allowance_grants(&f).into_iter().find(|g| g.op_id == second).unwrap();
         let budget = next.budget.unwrap();
         if continuity {
@@ -930,10 +954,9 @@ fn the_next_allowance_window_carries_an_admitted_call_once() {
             assert!(budget.call_reservations.is_empty(), "as before: a renewal ends the call's hold");
             assert!(draw_block(&f, "call", 2).is_err());
         }
-        // Nothing the call can pay is missing from the day's count.
+        // Everything the call can pay is in the day's count, once.
         let book = ledger(&f);
-        assert!(book.committed_msat(now()) >= u64::from(MINUTES) * MINUTE + 900_000);
-        assert!(book.committed_msat(now()) <= DAILY);
+        assert_eq!(book.committed_msat(now()), kept + 900_000, "{continuity}");
     }
 }
 
@@ -1020,10 +1043,8 @@ fn an_epoch_bump_ends_a_carried_call_and_the_allowance() {
 
 /// A write that fails leaves the window, the call, its offers and the day's
 /// count exactly as they were.
-#[cfg(unix)]
 #[test]
 fn a_failed_write_changes_nothing() {
-    use std::os::unix::fs::PermissionsExt;
     let f = continuity_fixture(true);
     let (first, _) = ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
     let peer = "aa".repeat(32);
@@ -1032,22 +1053,22 @@ fn a_failed_write_changes_nothing() {
             vec![Charge { recipient: peer.clone(), amount_msat: 3_500 }], None, offer_link("offer-1"))
         .unwrap();
     let before = f.svc.lock().file.clone();
-    let dir = f.svc.dir().to_path_buf();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let probe = std::fs::write(dir.join("probe"), b"x").is_ok();
+    fail_next_write(PersistFault::BeforeWrite);
     let renew = f.svc.create_budget_elevation_request(&f.client, vec![Scope::Spend], Some(proposal(900_000, PER_CALL)));
+    fail_next_write(PersistFault::BeforeWrite);
     let offer = f.svc.reserve_call_offer_spend(&f.client, 1,
         vec![Charge { recipient: peer.clone(), amount_msat: 1 }], "call", None, offer_link("offer-2"));
     let after = f.svc.lock().file.clone();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    if probe {
-        return; // The directory stayed writable (a privileged run); nothing to test.
-    }
     assert!(renew.is_err() && offer.is_err(), "{renew:?} {offer:?}");
     assert_eq!(after.allowances, before.allowances, "ledger and offer count unchanged");
     assert_eq!(after.grants, before.grants, "windows and holds unchanged");
     assert_eq!(after.call_spend_grants, before.call_spend_grants);
     assert!(allowance_grants(&f).iter().any(|g| g.op_id == first));
+}
+
+/// Make the next pairing-store write on this thread fail at `fault`.
+fn fail_next_write(fault: PersistFault) {
+    PERSIST_FAULT.with(|f| f.set(Some(fault)));
 }
 
 // ── Unresolved payments across automatic renewals ───────────────────────
@@ -1280,5 +1301,605 @@ fn a_payment_in_flight_cannot_be_paid_again_after_a_renewal() {
         assert_eq!(pay("payment-x"), Err(BudgetRefusal::DuplicatePayment), "{continuity}");
         // Another identity still pays.
         pay("payment-y").unwrap();
+    }
+}
+
+// ── Each transferred liability counts once in the day ───────────────────
+// A renewal moves payments in flight and (with continuity) admitted calls to
+// the new window. What moved counts on the new window only; what was paid,
+// or did not move, stays on the window it was spent in.
+
+const DAY: u64 = 1_000_000;
+
+fn day_terms(daily: u64) -> AllowanceTerms {
+    AllowanceTerms {
+        daily_msat: daily,
+        per_call_max_msat: 700_000,
+        breakers: crate::spend_budget::BreakerLimits { max_msat_per_10_minutes: 10_000_000, ..Default::default() },
+        ..AllowanceTerms::owner_defaults(now())
+    }
+}
+
+fn day_fixture(continuity: bool, daily: u64) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = PairingService::open(dir.path(), "identity".into(), true)
+        .unwrap()
+        .with_standing_allowance(true)
+        .with_call_continuity(continuity);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+    let client = svc
+        .create_ticket_remote_pairing_with_allowance(
+            "app", &hex::encode(key.verifying_key().to_bytes()), &[22; 32], "ticket-code", Some(&day_terms(daily)),
+        )
+        .unwrap()
+        .client_id;
+    Fixture { _dir: dir, svc, client }
+}
+
+fn ln_payment(f: &Fixture, id: &str, msat: u64) -> Result<Reservation, BudgetRefusal> {
+    f.svc.reserve_payment(&f.client, 1, vec![Charge { recipient: "bb".repeat(33), amount_msat: msat }], vec![id.into()])
+}
+
+fn day_total(f: &Fixture) -> u64 {
+    ledger(f).committed_msat(now())
+}
+
+fn snapshot(f: &Fixture) -> (Vec<SpendGrant>, BTreeMap<String, StandingAllowance>) {
+    let inner = f.svc.lock();
+    (inner.file.grants.clone(), inner.file.allowances.clone())
+}
+
+#[test]
+fn a_renewal_counts_moved_payments_once_and_admits_up_to_the_cap() {
+    for continuity in [false, true] {
+        let f = day_fixture(continuity, DAY);
+        let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+        let paid = ln_payment(&f, "paid", 100_000).unwrap();
+        f.svc.try_resolve_spend(&paid, &"bb".repeat(33), 100_000).unwrap();
+        ln_payment(&f, "pending", 200_000).unwrap();
+        // 100,000 paid stays on the first window; the 200,000 in flight moves.
+        let before = snapshot(&f);
+        assert_eq!(ask(&f, proposal(900_001, 300_000)).unwrap().1, Outcome::Owner, "{continuity}");
+        let after = snapshot(&f);
+        assert_eq!(after.0.iter().filter(|g| g.granted_by == ALLOWANCE_GRANTED_BY).cloned().collect::<Vec<_>>(),
+            before.0.iter().filter(|g| g.granted_by == ALLOWANCE_GRANTED_BY).cloned().collect::<Vec<_>>(),
+            "a refused renewal changes no window ({continuity})");
+        assert_eq!(after.1[&f.client].windows, before.1[&f.client].windows, "nor the day's count ({continuity})");
+        let (w2, outcome) = ask(&f, proposal(900_000, 300_000)).unwrap();
+        assert_eq!(outcome, Outcome::Window, "{continuity}");
+        assert_eq!(window_committed(&f, &w1), Some((100_000, true)), "{continuity}");
+        assert_eq!(window_committed(&f, &w2), Some((900_000, false)), "{continuity}");
+        assert_eq!(day_total(&f), DAY, "{continuity}");
+        assert_eq!(window_used(&f), 200_000);
+    }
+}
+
+/// A call (continuity on) and payments in flight carried through two
+/// renewals count once; a third renewal is admitted exactly up to the cap.
+#[test]
+fn repeated_renewals_count_a_carried_call_and_payments_once() {
+    let f = day_fixture(true, DAY);
+    let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 9_500, 500, 5).unwrap();
+    assert_eq!(terms.reserved_msat, 50_000);
+    f.svc.reserve_call_spend(&f.client, 1, terms, u64::MAX / 4).unwrap();
+    let block = f.svc.draw_call_spend(&f.client, 1, &peer, "call", 0, 9_500, 500, offer_link("block-0")).unwrap();
+    f.svc.try_resolve_spend(&block, &peer, 10_000).unwrap();
+    let paid = ln_payment(&f, "paid", 100_000).unwrap();
+    f.svc.try_resolve_spend(&paid, &"bb".repeat(33), 100_000).unwrap();
+    ln_payment(&f, "pending", 100_000).unwrap();
+    // First window: a 10,000 minute and the 100,000 payment were paid there.
+    let (w2, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    assert_eq!(window_committed(&f, &w1), Some((110_000, true)));
+    assert_eq!(window_committed(&f, &w2), Some((400_000, false)));
+    assert_eq!(day_total(&f), 510_000);
+    let (w3, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    assert_eq!(window_committed(&f, &w2), Some((0, true)), "nothing was spent in the second window");
+    assert_eq!(window_committed(&f, &w3), Some((400_000, false)));
+    assert_eq!(day_total(&f), 510_000);
+    let carried = allowance_grants(&f).into_iter().find(|g| g.op_id == w3).unwrap().budget.unwrap();
+    assert_eq!((carried.used_msat, carried.call_reservations.len()), (140_000, 1));
+    // Exactly up to the cap: 110,000 + 890,000.
+    assert_eq!(ask(&f, proposal(890_001, 300_000)).unwrap().1, Outcome::Owner);
+    let (w4, outcome) = ask(&f, proposal(890_000, 300_000)).unwrap();
+    assert_eq!(outcome, Outcome::Window);
+    assert_eq!(window_committed(&f, &w3), Some((0, true)));
+    assert_eq!(day_total(&f), DAY);
+    assert_eq!(window_committed(&f, &w4), Some((890_000, false)));
+}
+
+/// The donor's window had already ended (its grant kept to finish the call)
+/// when the call moved on: the moved part is taken off that window once.
+#[test]
+fn a_call_moved_from_an_ended_window_is_counted_once() {
+    let f = day_fixture(true, DAY);
+    let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 9_500, 500, 5).unwrap();
+    f.svc.reserve_call_spend(&f.client, 1, terms, u64::MAX / 4).unwrap();
+    let b = binding(&f);
+    f.svc.remember_call_client(Some(&b), &peer, "call", "invite", "request").unwrap();
+    f.svc.commit_call_client(None, &peer, "call", "invite", "request").unwrap();
+    f.svc.finish_call_client(&peer, "call", "invite", "request");
+    let block = f.svc.draw_call_spend(&f.client, 1, &peer, "call", 0, 9_500, 500, offer_link("block-0")).unwrap();
+    f.svc.try_resolve_spend(&block, &peer, 10_000).unwrap();
+    {
+        let mut inner = f.svc.lock_without_cleanup();
+        let grant = inner.file.grants.iter_mut().find(|g| g.op_id == w1).unwrap();
+        let length = grant.expires_at - grant.granted_at;
+        grant.expires_at = now() - 1;
+        grant.granted_at = grant.expires_at - length;
+        f.svc.persist(&mut inner.file).unwrap();
+    }
+    assert_eq!(window_committed(&f, &w1), Some((50_000, true)));
+    let (w2, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    assert_eq!(window_committed(&f, &w1), Some((10_000, true)));
+    assert_eq!(day_total(&f), 410_000);
+    let carried = allowance_grants(&f).into_iter().find(|g| g.op_id == w2).unwrap().budget.unwrap();
+    assert_eq!(carried.call_reservations.len(), 1);
+}
+
+/// What does not move stays counted where it was: a call the next window
+/// cannot fund is released, not credited, and with continuity off no call
+/// moves at all.
+#[test]
+fn an_unmoved_call_is_not_credited() {
+    for (continuity, next_budget) in [(false, 400_000), (true, 30_000)] {
+        let f = day_fixture(continuity, DAY);
+        let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+        let peer = "aa".repeat(32);
+        let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 9_500, 500, 5).unwrap();
+        f.svc.reserve_call_spend(&f.client, 1, terms, u64::MAX / 4).unwrap();
+        ln_payment(&f, "pending", 20_000).unwrap();
+        let (w2, _) = ask(&f, proposal(next_budget, next_budget)).unwrap();
+        let carried = allowance_grants(&f).into_iter().find(|g| g.op_id == w2).unwrap().budget.unwrap();
+        assert!(carried.call_reservations.is_empty(), "{continuity}");
+        // Only the payment moved: the whole hold stays on the first window.
+        assert_eq!(window_committed(&f, &w1), Some((50_000, true)), "{continuity}");
+        assert_eq!(day_total(&f), 50_000 + next_budget, "{continuity}");
+    }
+}
+
+/// A call and payments that together exceed the new budget: the call fits
+/// on its own and moves first, the payments move after it past the budget,
+/// and the new window counts what it carries.
+#[test]
+fn the_new_window_counts_what_it_carries_when_that_exceeds_its_budget() {
+    let f = day_fixture(true, 2_500_000);
+    let (w1, _) = ask(&f, proposal(1_200_000, 700_000)).unwrap();
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 2_000, 500, 240).unwrap();
+    assert_eq!(terms.reserved_msat, 600_000);
+    f.svc.reserve_call_spend(&f.client, 1, terms, u64::MAX / 4).unwrap();
+    ln_payment(&f, "pending", 500_000).unwrap();
+    let (w2, outcome) = ask(&f, proposal(1_000_000, 700_000)).unwrap();
+    assert_eq!(outcome, Outcome::Window);
+    let carried = allowance_grants(&f).into_iter().find(|g| g.op_id == w2).unwrap().budget.unwrap();
+    assert_eq!((carried.used_msat, carried.remaining_msat()), (1_100_000, 0));
+    assert_eq!(window_committed(&f, &w1), Some((0, true)));
+    assert_eq!(window_committed(&f, &w2), Some((1_100_000, false)));
+    assert_eq!(day_total(&f), 1_100_000);
+    assert_eq!(ln_payment(&f, "more", 1), Err(BudgetRefusal::Total { remaining_msat: 0 }));
+}
+
+/// A renewal whose write fails credits nothing and moves nothing; after a
+/// restart the same renewal credits once.
+#[test]
+fn a_failed_renewal_write_credits_nothing_and_a_retry_credits_once() {
+    let f = day_fixture(true, DAY);
+    let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    ln_payment(&f, "pending", 200_000).unwrap();
+    let before = snapshot(&f);
+    fail_next_write(PersistFault::BeforeWrite);
+    let renewed = f.svc.create_budget_elevation_request(&f.client, vec![Scope::Spend], Some(proposal(800_000, 300_000)));
+    let after = snapshot(&f);
+    assert!(renewed.is_err());
+    assert_eq!(after, before);
+    let f = reopen(f, true, true);
+    let f = Fixture { svc: f.svc.with_call_continuity(true), ..f };
+    let (w2, outcome) = ask(&f, proposal(800_000, 300_000)).unwrap();
+    assert_eq!(outcome, Outcome::Window);
+    assert_eq!(window_committed(&f, &w1), Some((0, true)));
+    assert_eq!(window_committed(&f, &w2), Some((800_000, false)));
+    assert_eq!(day_total(&f), 800_000);
+}
+
+// ── Liabilities across renewals: further sequences ──────────────────────
+
+fn reopen_with(f: Fixture, continuity: bool) -> Fixture {
+    let Fixture { _dir, svc, client } = f;
+    drop(svc);
+    let svc = PairingService::open(_dir.path(), "identity".into(), true)
+        .unwrap()
+        .with_standing_allowance(true)
+        .with_call_continuity(continuity);
+    Fixture { _dir, svc, client }
+}
+
+const A_KEY: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const B_KEY: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+fn live_window(f: &Fixture) -> SpendGrant {
+    allowance_grants(f).into_iter().find(|g| g.is_live(now())).unwrap()
+}
+
+/// One payment to two recipients: one part settles before the renewal, the
+/// other after it, twice; the payment's identity stays consumed throughout.
+#[test]
+fn partial_multi_recipient_payment_survives_renewals_and_replay_once() {
+    for (continuity, restart) in [(false, false), (true, false), (false, true), (true, true)] {
+        let f = day_fixture(continuity, DAY);
+        let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+        let payment = f.svc.reserve_payment(&f.client, 1,
+            vec![Charge { recipient: A_KEY.into(), amount_msat: 100_000 }, Charge { recipient: B_KEY.into(), amount_msat: 200_000 }],
+            vec!["multi".into()]).unwrap();
+        f.svc.try_resolve_spend(&payment, A_KEY, 100_000).unwrap();
+        let (w2, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+        assert_eq!(window_committed(&f, &w1), Some((100_000, true)), "{continuity} {restart}");
+        assert_eq!(live_window(&f).budget.unwrap().used_msat, 200_000);
+        assert_eq!(day_total(&f), 500_000);
+        let f = if restart { reopen_with(f, continuity) } else { f };
+        f.svc.try_resolve_spend(&payment, B_KEY, 200_000).unwrap();
+        f.svc.try_resolve_spend(&payment, B_KEY, 200_000).unwrap();
+        let w2_budget = live_window(&f).budget.unwrap();
+        assert_eq!((w2_budget.used_msat, w2_budget.pending.len()), (200_000, 0), "{continuity} {restart}");
+        assert_eq!(day_total(&f), 500_000);
+        let (w3, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+        assert_eq!(window_committed(&f, &w2), Some((200_000, true)));
+        assert_eq!(window_committed(&f, &w3), Some((400_000, false)));
+        assert_eq!(day_total(&f), 700_000, "{continuity} {restart}");
+        // The payment's identity is still consumed: it cannot be paid again.
+        let again = f.svc.reserve_payment(&f.client, 1, vec![Charge { recipient: A_KEY.into(), amount_msat: 1 }], vec!["multi".into()]);
+        assert_eq!(again, Err(BudgetRefusal::DuplicatePayment), "{continuity} {restart}");
+        assert_eq!(live_window(&f).budget.unwrap().used_msat, 0);
+    }
+}
+
+/// Two renewals released together end as one of the serial histories.
+#[test]
+fn concurrent_renewals_are_linearizable_at_the_day_cap() {
+    for continuity in [false, true] {
+        let f = day_fixture(continuity, DAY);
+        let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+        let paid = ln_payment(&f, "paid", 100_000).unwrap();
+        f.svc.try_resolve_spend(&paid, &"bb".repeat(33), 100_000).unwrap();
+        let pending = ln_payment(&f, "pending", 200_000).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let renew = || {
+                barrier.wait();
+                f.svc.create_budget_elevation_request(&f.client, vec![Scope::Spend], Some(proposal(900_000, 300_000)))
+            };
+            let a = scope.spawn(renew);
+            let b = scope.spawn(renew);
+            vec![a.join().unwrap().unwrap().op_id, b.join().unwrap().unwrap().op_id]
+        });
+        let windows: Vec<_> = results.iter().filter(|op| window_committed(&f, op).is_some()).collect();
+        assert_eq!(windows.len(), 2, "both serial orders admit both ({continuity})");
+        let f = reopen_with(f, continuity);
+        assert_eq!(window_committed(&f, &w1), Some((100_000, true)));
+        assert_eq!(day_total(&f), DAY, "{continuity}");
+        let open: Vec<_> = ledger(&f).windows.into_iter().filter(|w| w.ended_at.is_none()).collect();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].committed_msat, 900_000);
+        let owners = f.svc.lock().file.grants.iter()
+            .filter(|g| g.budget.as_ref().is_some_and(|b| b.pending.contains_key(&pending.id))).count();
+        assert_eq!(owners, 1, "one owner of the payment in flight ({continuity})");
+        assert_eq!(ln_payment(&f, "pending", 1), Err(BudgetRefusal::DuplicatePayment));
+    }
+}
+
+/// Settlement and renewal in either order; and racing, the result is one of
+/// those two histories.
+#[test]
+fn settlement_racing_renewal_matches_a_serial_history() {
+    let setup = |continuity| {
+        let f = day_fixture(continuity, DAY);
+        let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+        let paid = ln_payment(&f, "paid", 100_000).unwrap();
+        f.svc.try_resolve_spend(&paid, &"bb".repeat(33), 100_000).unwrap();
+        let pending = ln_payment(&f, "pending", 200_000).unwrap();
+        (f, w1, pending)
+    };
+    for continuity in [false, true] {
+        // Settlement first: 300,000 stays on the first window.
+        let (f, w1, pending) = setup(continuity);
+        f.svc.try_resolve_spend(&pending, &"bb".repeat(33), 200_000).unwrap();
+        assert_eq!(ask(&f, proposal(900_000, 300_000)).unwrap().1, Outcome::Owner, "{continuity}");
+        assert_eq!(ask(&f, proposal(700_000, 300_000)).unwrap().1, Outcome::Window);
+        assert_eq!(window_committed(&f, &w1), Some((300_000, true)));
+        assert_eq!(day_total(&f), DAY);
+        // Renewal first: the payment settles once, where it moved.
+        let (f, w1, pending) = setup(continuity);
+        let (w2, outcome) = ask(&f, proposal(900_000, 300_000)).unwrap();
+        assert_eq!(outcome, Outcome::Window, "{continuity}");
+        f.svc.try_resolve_spend(&pending, &"bb".repeat(33), 200_000).unwrap();
+        f.svc.try_resolve_spend(&pending, &"bb".repeat(33), 200_000).unwrap();
+        assert_eq!(live_window(&f).budget.unwrap().used_msat, 200_000);
+        assert_eq!(window_committed(&f, &w1), Some((100_000, true)));
+        // The next renewal counts the 200,000 now paid in the second window.
+        assert_eq!(ask(&f, proposal(700_001, 300_000)).unwrap().1, Outcome::Owner);
+        assert_eq!(ask(&f, proposal(700_000, 300_000)).unwrap().1, Outcome::Window);
+        assert_eq!(window_committed(&f, &w2), Some((200_000, true)));
+        assert_eq!(day_total(&f), DAY);
+        // Racing.
+        let (f, w1, pending) = setup(continuity);
+        let barrier = std::sync::Barrier::new(2);
+        let renewed = std::thread::scope(|scope| {
+            let settle = scope.spawn(|| {
+                barrier.wait();
+                f.svc.try_resolve_spend(&pending, &"bb".repeat(33), 200_000).unwrap();
+            });
+            let renew = scope.spawn(|| {
+                barrier.wait();
+                f.svc.create_budget_elevation_request(&f.client, vec![Scope::Spend], Some(proposal(900_000, 300_000))).unwrap()
+            });
+            settle.join().unwrap();
+            renew.join().unwrap()
+        });
+        let opened = window_committed(&f, &renewed.op_id).is_some();
+        if opened {
+            assert_eq!(window_committed(&f, &w1), Some((100_000, true)), "renewal first ({continuity})");
+            assert_eq!(live_window(&f).budget.unwrap().used_msat, 200_000);
+        } else {
+            assert_eq!(window_committed(&f, &w1), Some((400_000, false)), "settlement first ({continuity})");
+            assert_eq!(live_window(&f).budget.unwrap().used_msat, 300_000);
+        }
+        assert!(day_total(&f) <= DAY);
+    }
+}
+
+/// An ended window's call moves on twice, across a restart, and pays a
+/// minute on the way: the moved part is never credited back twice.
+#[test]
+fn expired_donor_chain_reopens_without_recrediting_the_hold() {
+    let f = day_fixture(true, DAY);
+    let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 9_500, 500, 5).unwrap();
+    f.svc.reserve_call_spend(&f.client, 1, terms, u64::MAX / 4).unwrap();
+    let pay = |f: &Fixture, seq: u32| {
+        let block = f.svc.draw_call_spend(&f.client, 1, &peer, "call", seq, 9_500, 500, offer_link(&format!("block-{seq}"))).unwrap();
+        f.svc.try_resolve_spend(&block, &peer, 10_000).unwrap();
+    };
+    pay(&f, 0);
+    {
+        let mut inner = f.svc.lock_without_cleanup();
+        let grant = inner.file.grants.iter_mut().find(|g| g.op_id == w1).unwrap();
+        let length = grant.expires_at - grant.granted_at;
+        grant.expires_at = now() - 1;
+        grant.granted_at = grant.expires_at - length;
+        f.svc.persist(&mut inner.file).unwrap();
+    }
+    let (w2, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    let f = reopen_with(f, true);
+    let (w3, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    assert_eq!(window_committed(&f, &w1), Some((10_000, true)));
+    assert_eq!(window_committed(&f, &w2), Some((0, true)));
+    assert_eq!(day_total(&f), 410_000);
+    pay(&f, 1);
+    let (w4, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    assert_eq!(window_committed(&f, &w3), Some((10_000, true)));
+    assert_eq!(live_window(&f).budget.unwrap().used_msat, 30_000, "only the call's remaining 30,000 moved");
+    assert_eq!(window_committed(&f, &w4), Some((400_000, false)));
+    assert_eq!(day_total(&f), 420_000);
+}
+
+/// An over-budget carry, repeated, then partly settled, counts once.
+#[test]
+fn over_budget_carry_repeated_then_partially_settled_counts_once() {
+    let f = day_fixture(true, 2_500_000);
+    ask(&f, proposal(1_200_000, 700_000)).unwrap();
+    let peer = "aa".repeat(32);
+    let terms = crate::spend_budget::CallSpendTerms::new(&peer, "call", 2_000, 500, 240).unwrap();
+    f.svc.reserve_call_spend(&f.client, 1, terms, u64::MAX / 4).unwrap();
+    let payment = ln_payment(&f, "pending", 500_000).unwrap();
+    let (w2, _) = ask(&f, proposal(1_000_000, 700_000)).unwrap();
+    assert_eq!(window_committed(&f, &w2), Some((1_100_000, false)));
+    let (w3, _) = ask(&f, proposal(1_000_000, 700_000)).unwrap();
+    assert_eq!(window_committed(&f, &w2), Some((0, true)));
+    assert_eq!(window_committed(&f, &w3), Some((1_100_000, false)));
+    assert_eq!(day_total(&f), 1_100_000);
+    assert_eq!(ln_payment(&f, "more", 1), Err(BudgetRefusal::Total { remaining_msat: 0 }));
+    f.svc.try_resolve_spend(&payment, &"bb".repeat(33), 500_000).unwrap();
+    let (w4, _) = ask(&f, proposal(1_000_000, 700_000)).unwrap();
+    assert_eq!(window_committed(&f, &w3), Some((500_000, true)));
+    assert_eq!(window_committed(&f, &w4), Some((1_000_000, false)));
+    assert_eq!(live_window(&f).budget.unwrap().used_msat, 600_000);
+    assert_eq!(day_total(&f), 1_500_000);
+}
+
+/// Room under the cap never wraps around, however large the numbers.
+#[test]
+fn saturated_commitments_never_admit_an_extra_msat() {
+    let t0 = 1_800_000_000;
+    let mut book = StandingAllowance::new(AllowanceTerms::owner_defaults(t0), SET_BY_CLI, None, 1, "identity", t0);
+    book.terms.daily_msat = u64::MAX;
+    book.windows.push(AllowanceWindow { op_id: "a".into(), opened_at: t0, committed_msat: u64::MAX - 10, ended_at: Some(t0) });
+    book.windows.push(AllowanceWindow { op_id: "b".into(), opened_at: t0, committed_msat: 20, ended_at: Some(t0) });
+    let none = BTreeMap::new();
+    assert_eq!(book.room(&none, t0 + 1), 0);
+    assert_eq!(book.remaining_msat(t0 + 1), 0);
+    // Overrides that are not credits (equal to what is recorded) change nothing.
+    let same: BTreeMap<String, u64> = [("a".to_string(), u64::MAX - 10), ("b".to_string(), 20)].into();
+    assert_eq!(book.room(&same, t0 + 1), 0);
+    // A one-msat window never fits.
+    let terms = proposal(1, 1);
+    assert!(book.admit_terms(&terms, t0 + 1).is_ok());
+    assert!(1 > book.room(&none, t0 + 1));
+}
+
+/// Ask for a window at a chosen time, through the same path as a request.
+fn open_at(f: &Fixture, terms: GrantTerms, at: i64) -> Result<Result<String, NoWindow>, PairingError> {
+    let mut inner = f.svc.lock();
+    let client = inner.file.clients.iter().find(|c| c.client_id == f.client).unwrap().clone();
+    f.svc
+        .open_allowance_window(&mut inner, &client, &[Scope::Spend], &terms, at)
+        .map(|r| r.map(|op| op.op_id))
+}
+
+fn pending_owners(f: &Fixture, reservation: &Reservation) -> Vec<String> {
+    f.svc.lock().file.grants.iter()
+        .filter(|g| g.budget.as_ref().is_some_and(|b| b.pending.contains_key(&reservation.id)))
+        .map(|g| g.op_id.clone())
+        .collect()
+}
+
+/// A renewal stopped at each point of its write: before it (disk keeps the
+/// old state) or right after it (disk has the new state, the caller saw an
+/// error). After a restart either state is whole, and a retry counts the
+/// payment in flight once.
+#[test]
+fn renewal_crash_boundaries_recover_one_liability_owner() {
+    for (fault, published) in [(PersistFault::BeforeWrite, false), (PersistFault::AfterRename, true)] {
+        let f = day_fixture(true, DAY);
+        let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+        let pending = ln_payment(&f, "pending", 200_000).unwrap();
+        fail_next_write(fault);
+        let attempt = f.svc.create_budget_elevation_request(&f.client, vec![Scope::Spend], Some(proposal(800_000, 300_000)));
+        assert!(attempt.is_err(), "{fault:?}");
+        let f = reopen_with(f, true);
+        let book = ledger(&f);
+        if published {
+            let w2 = book.windows.iter().find(|w| w.ended_at.is_none()).unwrap().op_id.clone();
+            assert_ne!(w2, w1);
+            assert_eq!(window_committed(&f, &w1), Some((0, true)));
+            assert_eq!(window_committed(&f, &w2), Some((800_000, false)));
+            assert_eq!(pending_owners(&f, &pending), vec![w2]);
+        } else {
+            assert_eq!(book.windows.len(), 1);
+            assert_eq!(window_committed(&f, &w1), Some((400_000, false)));
+            assert_eq!(pending_owners(&f, &pending), vec![w1.clone()]);
+        }
+        assert_eq!(day_total(&f), if published { 800_000 } else { 400_000 });
+        // A retry: one more window, the same total, one owner.
+        let (next, outcome) = ask(&f, proposal(800_000, 300_000)).unwrap();
+        assert_eq!(outcome, Outcome::Window, "{fault:?}");
+        assert_eq!(day_total(&f), 800_000, "{fault:?}");
+        assert_eq!(pending_owners(&f, &pending), vec![next.clone()]);
+        f.svc.try_resolve_spend(&pending, &"bb".repeat(33), 200_000).unwrap();
+        f.svc.try_resolve_spend(&pending, &"bb".repeat(33), 200_000).unwrap();
+        assert_eq!(live_window(&f).budget.unwrap().used_msat, 200_000);
+        assert_eq!(ln_payment(&f, "pending", 1), Err(BudgetRefusal::DuplicatePayment));
+    }
+}
+
+/// A renewal at a later time whose write fails restores everything, the
+/// allowance's clock included; the retry counts once.
+#[test]
+fn renewal_write_failure_restores_advanced_clock_and_liabilities() {
+    let f = day_fixture(true, DAY);
+    let (w1, _) = ask(&f, proposal(400_000, 300_000)).unwrap();
+    let pending = ln_payment(&f, "pending", 200_000).unwrap();
+    let later = now() + 3_600;
+    let before = snapshot(&f);
+    assert!(before.1[&f.client].observed_at < later);
+    fail_next_write(PersistFault::BeforeWrite);
+    assert!(open_at(&f, proposal(800_000, 300_000), later).is_err());
+    assert_eq!(snapshot(&f), before, "grants, ledger, payments and clock as before");
+    let f = reopen_with(f, true);
+    assert_eq!(snapshot(&f).1, before.1);
+    let w2 = open_at(&f, proposal(800_000, 300_000), later).unwrap().unwrap();
+    assert_eq!(window_committed(&f, &w1), Some((0, true)));
+    assert_eq!(window_committed(&f, &w2), Some((800_000, false)));
+    assert_eq!(day_total(&f), 800_000);
+    assert_eq!(ledger(&f).observed_at, later);
+    assert_eq!(pending_owners(&f, &pending), vec![w2]);
+}
+
+/// A refusal at a later time records only the time it saw; if even that
+/// write fails, nothing changes at all.
+#[test]
+fn refused_renewal_clock_write_failure_preserves_all_accounting() {
+    let outside = GrantTerms { allow_liquidity_fees: true, ..proposal(1_000, 1_000) };
+    for (terms, refusal) in [
+        (outside, NoWindow::OutsideTerms("liquidity fees need the owner")),
+        (proposal(900_001, 300_000), NoWindow::OverDailyCap { remaining_msat: 900_000 }),
+    ] {
+        // A fresh fixture per case: nothing carries over from the last one.
+        let f = day_fixture(true, DAY);
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        let paid = ln_payment(&f, "paid", 100_000).unwrap();
+        f.svc.try_resolve_spend(&paid, &"bb".repeat(33), 100_000).unwrap();
+        let later = now() + 3_600;
+        let before = snapshot(&f);
+        fail_next_write(PersistFault::BeforeWrite);
+        assert!(open_at(&f, terms.clone(), later).is_err());
+        assert_eq!(snapshot(&f), before, "a failed clock write changes nothing");
+        assert_eq!(open_at(&f, terms, later).unwrap(), Err(refusal));
+        let (grants, allowances) = snapshot(&f);
+        assert_eq!(grants, before.0, "a refusal moves nothing");
+        assert_eq!(allowances[&f.client].windows, before.1[&f.client].windows);
+        assert_eq!(allowances[&f.client].consumed_payment_ids, before.1[&f.client].consumed_payment_ids);
+        assert_eq!(allowances[&f.client].observed_at, later, "only the time it saw is recorded");
+        let reopened = PairingService::open(f._dir.path(), "identity".into(), true).unwrap();
+        assert_eq!(reopened.lock().file.allowances[&f.client].observed_at, later, "and it is on disk");
+    }
+}
+
+// ── Paid identities stay protected ──────────────────────────────────────
+
+/// Age every ended window of the allowance past the time it counts.
+fn age_ended_windows(f: &Fixture) {
+    let mut inner = f.svc.lock_without_cleanup();
+    let past = now() - ROLLING_SECS - CALL_TAIL_SECS - 10;
+    for window in inner.file.allowances.get_mut(&f.client).unwrap().windows.iter_mut() {
+        if window.ended_at.is_some() {
+            window.ended_at = Some(past);
+            window.opened_at = window.opened_at.min(past);
+        }
+    }
+    f.svc.persist(&mut inner.file).unwrap();
+}
+
+/// A payment carried through renewals keeps its identity protected after the
+/// window that first paid it is merged into older history.
+#[test]
+fn a_carried_payment_stays_protected_after_its_first_window_compacts() {
+    for (continuity, restart) in [(false, false), (true, false), (false, true), (true, true)] {
+        let f = day_fixture(continuity, DAY);
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        let payment = ln_payment(&f, "x", 100_000).unwrap();
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        age_ended_windows(&f);
+        let f = if restart { reopen_with(f, continuity) } else { f };
+        assert_eq!(ln_payment(&f, "x", 100_000), Err(BudgetRefusal::DuplicatePayment), "in flight ({continuity} {restart})");
+        f.svc.try_resolve_spend(&payment, &"bb".repeat(33), 100_000).unwrap();
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        assert_eq!(day_total(&f), 500_000);
+        let used = live_window(&f).budget.unwrap().used_msat;
+        assert_eq!(ln_payment(&f, "x", 100_000), Err(BudgetRefusal::DuplicatePayment), "{continuity} {restart}");
+        assert_eq!(live_window(&f).budget.unwrap().used_msat, used, "no second debit");
+    }
+}
+
+/// A store written before paid identities were recorded (the field absent)
+/// still refuses paying a settled or an in-flight payment again.
+#[test]
+fn a_store_from_before_the_paid_identity_record_still_refuses_replays() {
+    for continuity in [false, true] {
+        let f = day_fixture(continuity, DAY);
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        let settled = ln_payment(&f, "settled", 100_000).unwrap();
+        f.svc.try_resolve_spend(&settled, &"bb".repeat(33), 100_000).unwrap();
+        let pending = ln_payment(&f, "pending", 50_000).unwrap();
+        {
+            let mut inner = f.svc.lock();
+            inner.file.allowances.get_mut(&f.client).unwrap().consumed_payment_ids.clear();
+            f.svc.persist(&mut inner.file).unwrap();
+        }
+        let raw = std::fs::read_to_string(f.svc.dir().join("clients.json")).unwrap();
+        assert!(!raw.contains("consumed_payment_ids"), "the store is in the earlier format");
+        let f = reopen_with(f, continuity);
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        let f = reopen_with(f, continuity);
+        f.svc.try_resolve_spend(&pending, &"bb".repeat(33), 50_000).unwrap();
+        ask(&f, proposal(400_000, 300_000)).unwrap();
+        let used = live_window(&f).budget.unwrap().used_msat;
+        assert_eq!(ln_payment(&f, "settled", 100_000), Err(BudgetRefusal::DuplicatePayment), "{continuity}");
+        assert_eq!(ln_payment(&f, "pending", 50_000), Err(BudgetRefusal::DuplicatePayment), "{continuity}");
+        assert_eq!(live_window(&f).budget.unwrap().used_msat, used, "no second debit");
     }
 }

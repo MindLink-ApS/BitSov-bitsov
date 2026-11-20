@@ -1190,7 +1190,10 @@ impl PairingService {
         };
         // A grant that expired while the node was down, or an unmetered
         // pre-G1 grant, must not survive the restart on disk either.
-        if funding_upgraded {
+        // Paid identities of an earlier store are recorded with the
+        // allowance before any renewal can replace the grants holding them.
+        let consumed_upgraded = service.lock_without_cleanup().file.backfill_consumed_payment_ids();
+        if funding_upgraded || consumed_upgraded {
             service.persist(&mut service.lock_without_cleanup().file)?;
         }
         service.prune_expired_grants()?;
@@ -3539,6 +3542,12 @@ impl PairingService {
         let before = inner.file.grants[idx].budget.clone();
         let op_id = inner.file.grants[idx].op_id.clone();
         let id = uuid::Uuid::new_v4().to_string();
+        // Across an allowance's windows, a payment identity is paid once.
+        if inner.file.grants[idx].granted_by == allowance::ALLOWANCE_GRANTED_BY
+            && Self::allowance_payment_consumed(&inner.file, client_id, &authority.payment_ids)
+        {
+            return Err(BudgetRefusal::DuplicatePayment);
+        }
         let budget = inner.file.grants[idx]
             .budget
             .as_mut()
@@ -3669,7 +3678,7 @@ impl PairingService {
             .as_ref()
             .map(|offer| Self::record_allowance_offer(&mut inner.file, offer));
         let recorded_ids = allowance_payment_ids.is_some_and(|ids| {
-            Self::record_allowance_payment_ids(&mut inner.file, client_id, &reservation.id, ids)
+            Self::record_allowance_payment_ids(&mut inner.file, client_id, &op_id, &reservation.id, ids)
         });
         if in_memory {
             return Ok(reservation);
@@ -4622,6 +4631,12 @@ impl PairingService {
         let mut candidate = file.clone();
         candidate.version = PAIRING_FILE_VERSION;
         let tmp = self.file_path.with_extension("json.tmp");
+        #[cfg(test)]
+        let fault = PERSIST_FAULT.with(std::cell::Cell::take);
+        #[cfg(test)]
+        if fault == Some(PersistFault::BeforeWrite) {
+            return Err(PairingError::Io("injected write failure (test)".into()));
+        }
         loop {
             let now = clock();
             candidate.retain_live_grants(now, self.call_continuity);
@@ -4642,6 +4657,12 @@ impl PairingService {
                 return Err(e.into());
             }
             fsync_dir(&self.dir)?;
+            #[cfg(test)]
+            if fault == Some(PersistFault::AfterRename) {
+                // The new file is durable; the caller is told it failed, as
+                // when syncing the directory fails or the process stops here.
+                return Err(PairingError::Io("injected failure after the write (test)".into()));
+            }
             let now = clock();
             if candidate.has_dead_grant(now, self.call_continuity) {
                 continue;
@@ -4651,6 +4672,21 @@ impl PairingService {
             return Ok(());
         }
     }
+}
+
+/// Test-only: make the next pairing-store write on this thread fail.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistFault {
+    /// Before anything is written: the store on disk stays as it was.
+    BeforeWrite,
+    /// After the new store is in place: it is on disk, the caller sees an error.
+    AfterRename,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PERSIST_FAULT: std::cell::Cell<Option<PersistFault>> = const { std::cell::Cell::new(None) };
 }
 
 /// Status of a pending elevation, as reported to the requesting client.
