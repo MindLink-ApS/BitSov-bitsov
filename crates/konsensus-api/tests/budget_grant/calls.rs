@@ -731,6 +731,8 @@ async fn recovered_failure_cannot_repay_when_call_cleanup_write_fails() {
 mod consent;
 #[path = "calls_settlement.rs"]
 mod settlement;
+#[path = "calls_continuity.rs"]
+mod continuity;
 
 #[tokio::test]
 async fn an_answer_recovered_after_an_ambiguous_payment_keeps_its_media_client() {
