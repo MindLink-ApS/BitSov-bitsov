@@ -211,3 +211,29 @@ async fn an_unreadable_call_state_refuses_the_reply_instead_of_paying_it() {
     assert_eq!(ledger(&fx, &transport), before, "an unreadable call state paid the reply: {body}");
     assert!(sent(&transport, 401).is_empty());
 }
+
+#[tokio::test]
+async fn a_ring_window_closing_after_reservation_refuses_the_reply_unsent_not_paid() {
+    for kind in [401u16, 403] {
+        let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+        // Move the ringing call into storage where the ring window closes
+        // right after the reply is reserved, before it is judged free.
+        let store = Arc::new(common::MemStorage::new());
+        let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+        konsensus_storage::Storage::call_put(store.as_ref(), &fx.peer, CALL, &entry).await.unwrap();
+        let (outer, peer) = (Arc::clone(&store), fx.peer);
+        *store.call_get_hook.lock().unwrap() = Some(Box::new(move || {
+            let inner = Arc::clone(&outer);
+            *outer.call_get_hook.lock().unwrap() = Some(Box::new(move || {
+                inner.set_call_deadline(&peer, CALL, konsensus_api::calls::now_ms().saturating_sub(1));
+            }));
+        }));
+        fx.state = Arc::new(AppState { storage: store.clone(), ..(*fx.state).clone() });
+        let before = ledger(&fx, &transport);
+        let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &uuid::Uuid::new_v4().to_string())).await;
+        assert_ne!(status, StatusCode::OK, "{kind}: {body}");
+        assert_eq!(ledger(&fx, &transport), before, "{kind}: a reply whose ring window closed was paid: {body}");
+        assert_eq!(body["reason"], "call_reply_expired", "{kind}: {body}");
+        assert!(sent(&transport, kind).is_empty(), "{kind}");
+    }
+}

@@ -89,6 +89,14 @@ pub struct MemStorage {
 }
 
 impl MemStorage {
+    /// Move a stored call's deadline, as the clock passing it would.
+    #[allow(dead_code)]
+    pub fn set_call_deadline(&self, peer: &NodeId, call_id: &str, deadline_ms: u64) {
+        if let Some(entry) = self.calls.lock().unwrap().get_mut(&(*peer, call_id.to_string())) {
+            entry.deadline_ms = deadline_ms;
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             peer_upsert_gate: Mutex::new(None),
