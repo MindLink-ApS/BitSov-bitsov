@@ -58,6 +58,9 @@ async fn hangup_with(fx: &Fx, token: &str, call_id: &str, reason: Option<&str>) 
     if let Some(reason) = reason {
         plaintext["reason"] = json!(reason);
     }
+    // Quote the hangup before the request starts: the background quote loop
+    // only refreshes it, so the request never sees an older price.
+    fx.state.peer_prices.update_kind_price(fx.peer, 403, 1_000, 850_000).await;
     send_priced_with_closing(fx, token, 1_000, BLOCK, 1_000, json!({
         "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(), "kind": 403,
         "plaintext": plaintext.to_string(), "max_routing_fee_msat": 0, "wait_ack_ms": 0,
@@ -335,6 +338,10 @@ async fn after_expiry_a_hangup_priced_above_its_closing_reserve_is_refused_unpai
     let (fx, _) = live_call(true).await;
     let token = expire(&fx).await;
     let money = fx.wallet.money();
+    // The callee's hangup price is 2 sat before the request starts; the
+    // reserve pinned at admission holds 1 sat.
+    fx.state.peer_prices.update_kind_price(fx.peer, 403, 2_000, 850_000).await;
+    assert_eq!(hold(&fx).reserved_msat - u64::from(MINUTES) * BLOCK, 1_000, "a 1 sat closing reserve");
     let (status, body) = send_priced_with_closing(&fx, &token, 1_000, BLOCK, 2_000, json!({
         "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(), "kind": 403,
         "plaintext": json!({"v": 1, "call_id": CALL, "reason": "hangup"}).to_string(),
