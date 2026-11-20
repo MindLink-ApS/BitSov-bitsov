@@ -4413,6 +4413,78 @@ mod migration_recovery_tests {
         admin.close().await;
     }
 
+    /// Free-reply receipts on Postgres: a row written before migration 042
+    /// reads with none; receipts round-trip exactly, page by row key, keep
+    /// their row through sweep and eviction, and survive a reconnect.
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn call_free_reply_receipts_upgrade_round_trip_and_page() {
+        use konsensus_core::payloads::call::{CallEntry, FreeReplyReceipt, Phase, Side, TOMBSTONE_MS};
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+        let admin = PgPool::connect(&url).await.unwrap();
+        let name = format!("call_receipts_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+        let db_url = format!("{}/{name}", url.rsplit_once('/').unwrap().0);
+        let call_id = "0123456789abcdef0123456789abcdef";
+        let old_peer = NodeId::from_bytes([1; 32]);
+        // A row written by a node before migration 042.
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .execute(&pool).await.unwrap();
+        for (version, description, sql) in PostgresStorage::pg_migrations().into_iter().filter(|(v, _, _)| *v < 42) {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO _konsensus_migrations VALUES ($1, $2)")
+                .bind(version).bind(description).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash) VALUES ($1, $2, 'callee', 'ringing', 5000, 86405000, 'op', 401, 'digest')")
+            .bind(old_peer.to_hex()).bind(call_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        let db = PostgresStorage::connect(&db_url).await.unwrap();
+        let old = db.call_get(&old_peer, call_id).await.unwrap().unwrap();
+        assert!(old.free_reply_receipts.is_empty());
+        assert_eq!(old.pending.as_ref().map(|p| p.operation_id.as_str()), Some("op"));
+        assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().is_empty());
+
+        let receipt = |peer: &NodeId, op: &str| FreeReplyReceipt {
+            peer: peer.to_hex(), call_id: call_id.into(), kind: 401, operation_id: op.into(),
+            request_hash: "digest".into(), phase: "live".into(), applied_ms: 1_000,
+        };
+        let held = |peer: &NodeId, op: &str| CallEntry {
+            side: Side::Callee, phase: Phase::Ended, deadline_ms: TOMBSTONE_MS, pending: None,
+            paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false,
+            free_reply_receipts: vec![receipt(peer, op)],
+        };
+        let peers: Vec<NodeId> = (2..=4u8).map(|b| NodeId::from_bytes([b; 32])).collect();
+        for (n, peer) in peers.iter().enumerate() {
+            db.call_put(peer, call_id, &held(peer, &format!("op{n}"))).await.unwrap();
+        }
+        // Exact round trip, then key-ordered pages after a cursor.
+        assert_eq!(db.call_get(&peers[0], call_id).await.unwrap(), Some(held(&peers[0], "op0")));
+        let first = db.call_with_free_reply_receipts(None, 2).await.unwrap();
+        assert_eq!(first.iter().map(|(p, _, _)| *p).collect::<Vec<_>>(), peers[..2].to_vec());
+        let (last_peer, last_call, _) = first.last().unwrap();
+        let rest = db.call_with_free_reply_receipts(Some((last_peer, last_call)), 2).await.unwrap();
+        assert_eq!(rest, vec![(peers[2], call_id.to_owned(), held(&peers[2], "op2"))]);
+        // Held rows survive sweep and eviction long after their tombstone.
+        let far = 10 * TOMBSTONE_MS;
+        db.call_evict_burned(Some(&peers[0]), far, far, 10).await.unwrap();
+        db.call_sweep(far, 10).await.unwrap();
+        assert_eq!(db.call_get(&peers[0], call_id).await.unwrap(), Some(held(&peers[0], "op0")));
+        let counts = db.call_counts(&peers[0], far).await.unwrap();
+        assert_eq!((counts.open_peer, counts.burned_peer), (0, 1));
+        // Released: swept like any other row. The others survive a reconnect.
+        db.call_put(&peers[0], call_id, &CallEntry { free_reply_receipts: Vec::new(), ..held(&peers[0], "op0") }).await.unwrap();
+        db.call_sweep(far, 10).await.unwrap();
+        assert!(db.call_get(&peers[0], call_id).await.unwrap().is_none());
+        db.pool.close().await;
+        let db = PostgresStorage::connect(&db_url).await.unwrap();
+        assert_eq!(db.call_with_free_reply_receipts(None, 10).await.unwrap().len(), 2);
+        assert_eq!(db.call_get(&peers[1], call_id).await.unwrap(), Some(held(&peers[1], "op1")));
+        db.pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
+        admin.close().await;
+    }
+
 
     /// #129 R1/R2 on Postgres: the outstanding web request survives a reconnect,
     /// is taken once, and expired rows are swept with a bound.
