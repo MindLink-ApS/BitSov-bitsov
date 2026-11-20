@@ -1172,9 +1172,15 @@ fn a_live_call_is_carried_before_payments_take_the_next_window() {
     assert_eq!(budget.used_msat, 600_000 + 40);
     assert_eq!(budget.breaker_status(now()).unresolved_payments, 5);
     assert_eq!(payment(&f, 100), Err(BudgetRefusal::FailuresPending));
-    // Nothing new fits until something settles.
-    f.svc.try_resolve_spend(&first_payment(&f), &peer, 10).ok();
-    assert!(window_used(&f) >= 600_000);
+    // One payment settles at its amount: its slot frees, the money stays
+    // used, and with the window already past its budget a new payment is
+    // refused for money, not for slots.
+    f.svc.try_resolve_spend(&first_payment(&f), &peer, 10).unwrap();
+    let budget = allowance_grants(&f).into_iter().find(|g| g.op_id == next).unwrap().budget.unwrap();
+    assert_eq!((budget.used_msat, budget.remaining_msat()), (600_040, 0));
+    assert_eq!(budget.breaker_status(now()).unresolved_payments, 4);
+    assert_eq!(payment(&f, 101), Err(BudgetRefusal::Total { remaining_msat: 0 }));
+    assert_eq!(window_used(&f), 600_040);
 }
 
 fn first_payment(f: &Fixture) -> Reservation {
