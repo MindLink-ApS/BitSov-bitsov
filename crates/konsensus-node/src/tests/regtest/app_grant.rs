@@ -393,7 +393,7 @@ async fn paid_call_and_unused_hold_release() {
     let (status, body) = signal(&pair.caller, &bid, 400, offer()).await;
     assert_eq!(status, StatusCode::OK, "offer: {body}");
     receipt(&pair, &body, 10_000, true).await;
-    recv_kind(&mut pair.callee, &aid, 400).await;
+    device_rings(&mut pair.callee, &aid, CALL).await;
     let hold = pair
         .caller
         .service

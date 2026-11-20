@@ -382,7 +382,7 @@ async fn one_call(lane: Lane, max_minutes: u16, paid_blocks: u32, reason: Hangup
     let offer = json!({"v":1, "call_id":CALL, "media":"audio", "sdp":SDP});
     let (status, body) = compose(&caller, &bid, 400, offer, SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "offer: {body}");
-    recv_kind(&mut callee, &aid, 400).await;
+    device_rings(&mut callee, &aid, CALL).await;
     let held = caller
         .service
         .call_spend_status(&bid.to_hex(), CALL)
@@ -705,7 +705,7 @@ async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
     let offer = json!({"v":1, "call_id":LOST, "media":"audio", "sdp":SDP});
     let (status, body) = compose(caller, &bid, 400, offer, SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "offer: {body}");
-    recv_kind(callee, &aid, 400).await;
+    device_rings(callee, &aid, LOST).await;
     let answer = json!({"v":1, "call_id":LOST, "sdp":SDP});
     let (status, body) = compose(callee, &aid, 401, answer, SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "answer: {body}");
@@ -995,7 +995,7 @@ async fn paid_signals_count_briefly_while_callee_is_not_ready() {
     let (status, body) = compose(&caller, &bid, 400, offer, SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "offer: {body}");
     assert_eq!(body["delivered"], true, "offer: {body}");
-    recv_kind(&mut callee, &aid, 400).await;
+    device_rings(&mut callee, &aid, CALL).await;
     assert_eq!(entry(&callee, &aid).await.phase, Phase::Ringing);
     // The callee cannot pay for its answer yet. That refusal costs nothing and
     // leaves the call ringing.
@@ -1094,7 +1094,7 @@ async fn client_detach_stops_renewals_and_unanswered_calls_still_expire() {
         let (status, body) = compose(caller, &bid, 400,
             json!({"v":1, "call_id":call_id, "media":"audio", "sdp":SDP}), SIGNAL_PRICE).await;
         assert_eq!(status, StatusCode::OK, "offer: {body}");
-        recv_kind(callee, &aid, 400).await;
+        device_rings(callee, &aid, call_id).await;
         let (status, body) = compose(callee, &aid, 401,
             json!({"v":1, "call_id":call_id, "sdp":SDP}), SIGNAL_PRICE).await;
         assert_eq!(status, StatusCode::OK, "answer: {body}");
@@ -1168,7 +1168,7 @@ async fn client_detach_stops_renewals_and_unanswered_calls_still_expire() {
     let (status, body) = compose(&lane.caller, &bid, 400,
         json!({"v":1, "call_id":call_id, "media":"audio", "sdp":SDP}), SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "unanswered offer: {body}");
-    recv_kind(&mut lane.callee, &aid, 400).await;
+    device_rings(&mut lane.callee, &aid, call_id).await;
     tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             let mut open = false;
