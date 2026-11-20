@@ -63,10 +63,12 @@ async fn kept_receipts_never_starve_cleanup_of_a_later_row() {
     }
 }
 
-/// Rows still holding receipts, in key order (peer hex, call id).
+/// Rows still holding receipts, in key order (peer hex, call id); a key that
+/// is not valid text is shown lossily.
 async fn holding(db: &SqliteStorage) -> Vec<(String, String)> {
-    sqlx::query_as("SELECT peer, call_id FROM call_state WHERE free_reply_receipts IS NOT NULL ORDER BY peer, call_id")
-        .fetch_all(db.pool()).await.unwrap()
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = sqlx::query_as("SELECT CAST(peer AS BLOB), CAST(call_id AS BLOB) FROM call_state WHERE free_reply_receipts IS NOT NULL ORDER BY peer, call_id")
+        .fetch_all(db.pool()).await.unwrap();
+    rows.into_iter().map(|(p, c)| (String::from_utf8_lossy(&p).into_owned(), String::from_utf8_lossy(&c).into_owned())).collect()
 }
 
 #[tokio::test]
@@ -131,4 +133,70 @@ async fn undecodable_row_case(corruption: &str, column: &str, stored: &str) {
     store.call_sweep(far, 1_000).await.unwrap();
     store.call_evict_burned(Some(&peer(5)), far, far, 1_000).await.unwrap();
     assert_eq!(holding(&db).await, vec![(corrupt, CALL.to_string())], "the undecodable row was dropped");
+}
+
+/// A row for `peer` whose receipt must be kept: its saved reply can still be recovered.
+async fn held(store: &dyn konsensus_storage::Storage, peer: &NodeId, op_id: &str) {
+    let mut op = OutboxOperation::prepared(op_id.into(), peer.to_hex(), 401, "digest".into());
+    op.state = "payment_unknown".into();
+    op.recovery = serde_json::to_vec(&serde_json::json!({
+        "free_reply": true, "envelope_ready": true, "free_reply_unresolved": true,
+        "dispatched": false, "expected_msat": 0, "fee_ceiling_msat": 0, "admission_msat": 0,
+    })).unwrap();
+    assert!(store.insert_outbox_operation(&op).await.unwrap());
+    store.call_put(peer, CALL, &row(peer, op_id)).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_row_with_an_unreadable_key_never_cuts_a_page_short() {
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let mut state = common::test_state();
+    Arc::get_mut(&mut state).unwrap().storage = db.clone();
+    let store = state.storage.as_ref();
+    // 255 kept rows, then 44 releasable ones behind them.
+    for n in 0..255u32 {
+        held(store, &peer(n), &format!("held-{n}")).await;
+    }
+    for n in 256..300u32 {
+        store.call_put(&peer(n), CALL, &row(&peer(n), &format!("gone-{n}"))).await.unwrap();
+    }
+    // Inside the first page (between the 4th and 5th kept rows): a row whose
+    // peer is not valid UTF-8 text, as only a damaged database could hold it.
+    let receipts = serde_json::to_string(&row(&peer(3), "bad-key").free_reply_receipts).unwrap();
+    sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, next_block_seq, unpaid_notice_used, free_reply_receipts) \
+                 VALUES (CAST(X'3030303030303033ff' AS TEXT), ?, 'callee', 'ended', 1, 1, 0, 0, ?)")
+        .bind(CALL).bind(&receipts).execute(db.pool()).await.unwrap();
+    let bad_rows = || sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM call_state WHERE peer = CAST(X'3030303030303033ff' AS TEXT) AND free_reply_receipts IS NOT NULL");
+
+    let mut sweeps = 0;
+    while holding(&db).await.len() > 256 {
+        sweeps += 1;
+        assert!(sweeps <= 3, "rows behind a page holding an unreadable key were never reached");
+        konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    }
+    assert_eq!(holding(&db).await.len(), 256, "a kept receipt was released");
+    assert_eq!(bad_rows().fetch_one(db.pool()).await.unwrap(), 1, "the row with an unreadable key was dropped");
+    let far = konsensus_api::calls::now_ms() + 3 * TOMBSTONE_MS;
+    store.call_sweep(far, 1_000).await.unwrap();
+    assert_eq!(bad_rows().fetch_one(db.pool()).await.unwrap(), 1, "a sweep dropped the row with an unreadable key");
+}
+
+#[tokio::test]
+async fn after_an_exactly_full_last_page_the_next_sweep_starts_over_at_once() {
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let mut state = common::test_state();
+    Arc::get_mut(&mut state).unwrap().storage = db.clone();
+    let store = state.storage.as_ref();
+    // Exactly one full page of kept rows.
+    for n in 1..=256u32 {
+        held(store, &peer(n), &format!("held-{n}")).await;
+    }
+    konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    // A releasable receipt before all of them: the very next sweep, finding
+    // nothing after the last page, starts over and reaches it.
+    store.call_put(&peer(0), CALL, &row(&peer(0), "gone")).await.unwrap();
+    konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    assert_eq!(store.call_get(&peer(0), CALL).await.unwrap().unwrap().free_reply_receipts, vec![],
+        "a sweep after an exactly full last page visited nothing");
+    assert_eq!(holding(&db).await.len(), 256);
 }

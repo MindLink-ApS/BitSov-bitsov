@@ -28,13 +28,13 @@ async fn round_trip(db: &dyn Storage) {
     let with = ended(0, vec![receipt("a"), receipt("b")]);
     db.call_put(&peer, CALL, &with).await.unwrap();
     assert_eq!(db.call_get(&peer, CALL).await.unwrap(), Some(with.clone()));
-    assert_eq!(db.call_with_free_reply_receipts(None, 10).await.unwrap(), vec![(peer.to_hex(), CALL.to_string(), Some((peer, with.clone())))]);
-    assert!(db.call_with_free_reply_receipts(Some((&peer.to_hex(), CALL)), 10).await.unwrap().is_empty());
+    assert_eq!(db.call_with_free_reply_receipts(None, 10).await.unwrap().rows, vec![(peer.to_hex(), CALL.to_string(), Some((peer, with.clone())))]);
+    assert!(db.call_with_free_reply_receipts(Some((peer.to_hex().as_bytes(), CALL.as_bytes())), 10).await.unwrap().rows.is_empty());
     // Clearing them is one ordinary write of the row.
     let without = ended(0, Vec::new());
     db.call_put(&peer, CALL, &without).await.unwrap();
     assert_eq!(db.call_get(&peer, CALL).await.unwrap(), Some(without));
-    assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().is_empty());
+    assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().rows.is_empty());
 }
 
 #[tokio::test]
@@ -55,7 +55,7 @@ async fn a_row_written_before_receipts_existed_reads_with_none() {
     assert!(entry.free_reply_receipts.is_empty());
     assert_eq!(entry.pending.unwrap().operation_id, "op");
     assert_eq!(db.call_pending().await.unwrap().len(), 1);
-    assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().is_empty());
+    assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().rows.is_empty());
 }
 
 #[tokio::test]
@@ -103,7 +103,7 @@ async fn receipt_pages_follow_row_keys_and_list_undecodable_rows() {
     // Without receipts: never listed.
     db.call_put(&NodeId::from_bytes([0; 32]), CALL, &ended(0, Vec::new())).await.unwrap();
     let keys = |rows: &[konsensus_storage::FreeReplyReceiptRow]| rows.iter().map(|(p, c, _)| (p.clone(), c.clone())).collect::<Vec<_>>();
-    let all = db.call_with_free_reply_receipts(None, 10).await.unwrap();
+    let all = db.call_with_free_reply_receipts(None, 10).await.unwrap().rows;
     let mut sorted = calls.to_vec();
     sorted.sort();
     let expected: Vec<(String, String)> = std::iter::once((low.to_hex(), CALL.to_string()))
@@ -111,18 +111,18 @@ async fn receipt_pages_follow_row_keys_and_list_undecodable_rows() {
     assert_eq!(keys(&all), expected);
     assert!(all.iter().all(|(_, _, e)| e.is_some()));
     // The bound, then the rest after the cursor, across one peer's calls.
-    let first = db.call_with_free_reply_receipts(None, 2).await.unwrap();
+    let first = db.call_with_free_reply_receipts(None, 2).await.unwrap().rows;
     assert_eq!(keys(&first), expected[..2].to_vec());
     let (p, c, _) = first.last().unwrap();
-    let rest = db.call_with_free_reply_receipts(Some((p.as_str(), c.as_str())), 2).await.unwrap();
+    let rest = db.call_with_free_reply_receipts(Some((p.as_bytes(), c.as_bytes())), 2).await.unwrap().rows;
     assert_eq!(keys(&rest), expected[2..].to_vec());
     let (p, c, _) = rest.last().unwrap();
-    assert!(db.call_with_free_reply_receipts(Some((p.as_str(), c.as_str())), 2).await.unwrap().is_empty());
+    assert!(db.call_with_free_reply_receipts(Some((p.as_bytes(), c.as_bytes())), 2).await.unwrap().rows.is_empty());
 
     // An undecodable row keeps its place and its column, and survives sweeps.
     sqlx::query("UPDATE call_state SET free_reply_receipts = '{not json' WHERE peer = ? AND call_id = ?")
         .bind(high.to_hex()).bind(sorted[1]).execute(db.pool()).await.unwrap();
-    let listed = db.call_with_free_reply_receipts(None, 10).await.unwrap();
+    let listed = db.call_with_free_reply_receipts(None, 10).await.unwrap().rows;
     assert_eq!(keys(&listed), expected);
     assert_eq!(listed.iter().map(|(_, _, e)| e.is_some()).collect::<Vec<_>>(), vec![true, true, false, true]);
     let far = 10 * TOMBSTONE_MS;
@@ -145,11 +145,11 @@ async fn a_mistyped_column_fails_only_its_own_row() {
     }
     sqlx::query("UPDATE call_state SET deadline_ms = 'not a number' WHERE peer = ?").bind(peers[1].to_hex())
         .execute(db.pool()).await.unwrap();
-    let listed = db.call_with_free_reply_receipts(None, 10).await.unwrap();
+    let listed = db.call_with_free_reply_receipts(None, 10).await.unwrap().rows;
     assert_eq!(listed.iter().map(|(p, c, e)| (p.clone(), c.clone(), e.is_some())).collect::<Vec<_>>(),
         peers.iter().map(|p| (p.to_hex(), CALL.to_string(), *p != peers[1])).collect::<Vec<_>>());
     assert_eq!(listed[0].2, Some((peers[0], ended(0, vec![receipt("op0")]))));
-    let page = db.call_with_free_reply_receipts(Some((&peers[0].to_hex(), CALL)), 1).await.unwrap();
+    let page = db.call_with_free_reply_receipts(Some((peers[0].to_hex().as_bytes(), CALL.as_bytes())), 1).await.unwrap().rows;
     assert_eq!((page.len(), page[0].0.clone(), page[0].2.is_none()), (1, peers[1].to_hex(), true));
     let far = 10 * TOMBSTONE_MS;
     db.call_evict_burned(Some(&peers[1]), far, far, 10).await.unwrap();
@@ -158,4 +158,35 @@ async fn a_mistyped_column_fails_only_its_own_row() {
         .bind(peers[1].to_hex()).fetch_one(db.pool()).await.unwrap();
     assert!(kept.0.is_some());
     assert_eq!(kept.1, "not a number");
+}
+
+/// A row whose key is not readable text still counts toward the page and
+/// gives the cursor its raw key, in the same byte order the query pages by,
+/// so the next page continues right after it.
+#[tokio::test]
+async fn a_row_with_an_unreadable_key_still_advances_the_page() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let (low, high) = (NodeId::from_bytes([1; 32]), NodeId::from_bytes([2; 32]));
+    db.call_put(&low, CALL, &ended(0, vec![receipt("low")])).await.unwrap();
+    db.call_put(&high, CALL, &ended(0, vec![receipt("high")])).await.unwrap();
+    // Sorts between the two: "01" then an invalid byte, before "0202...".
+    let bad_peer = [b'0', b'1', 0xff];
+    let receipts = serde_json::to_string(&vec![receipt("bad")]).unwrap();
+    sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, next_block_seq, unpaid_notice_used, free_reply_receipts) \
+                 VALUES (CAST(? AS TEXT), ?, 'callee', 'ended', 1, 1, 0, 0, ?)")
+        .bind(&bad_peer[..]).bind(CALL).bind(&receipts).execute(db.pool()).await.unwrap();
+    let first = db.call_with_free_reply_receipts(None, 2).await.unwrap();
+    assert_eq!(first.scanned, 2);
+    assert_eq!(first.rows.iter().map(|(p, _, _)| p.clone()).collect::<Vec<_>>(), vec![low.to_hex()]);
+    assert_eq!(first.last_key, Some((bad_peer.to_vec(), CALL.as_bytes().to_vec())));
+    let (p, c) = first.last_key.unwrap();
+    let rest = db.call_with_free_reply_receipts(Some((&p, &c)), 2).await.unwrap();
+    assert_eq!((rest.scanned, rest.rows.len(), rest.rows[0].0.clone()), (1, 1, high.to_hex()));
+    let (p, c) = rest.last_key.unwrap();
+    assert_eq!(db.call_with_free_reply_receipts(Some((&p, &c)), 2).await.unwrap(), konsensus_storage::FreeReplyReceiptPage::default());
+    // Never swept away.
+    db.call_sweep(10 * TOMBSTONE_MS, 10).await.unwrap();
+    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_state WHERE peer = CAST(? AS TEXT) AND free_reply_receipts IS NOT NULL")
+        .bind(&bad_peer[..]).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(kept, 1);
 }

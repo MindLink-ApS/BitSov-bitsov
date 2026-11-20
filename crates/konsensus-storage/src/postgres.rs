@@ -2309,28 +2309,33 @@ impl Storage for PostgresStorage {
         }).collect()
     }
 
-    async fn call_with_free_reply_receipts(&self, after: Option<(&str, &str)>, max: u32) -> Result<Vec<crate::FreeReplyReceiptRow>, StorageError> {
-        // Untyped rows: a column holding a value of the wrong type must fail
-        // only its own row, never the page. Query errors stay errors.
+    async fn call_with_free_reply_receipts(&self, after: Option<(&[u8], &[u8])>, max: u32) -> Result<crate::FreeReplyReceiptPage, StorageError> {
+        // Untyped rows keyed by their raw bytes, in byte order: every stored
+        // row has a usable key, and a column holding a value of the wrong type
+        // fails only its own row, never the page. Query errors stay errors.
         let rows = sqlx::query(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND ($1::TEXT IS NULL OR peer > $1 OR (peer = $1 AND call_id > $2)) ORDER BY peer, call_id LIMIT $3")
+            "SELECT convert_to(peer, 'UTF8'), convert_to(call_id, 'UTF8'), side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND ($1::BYTEA IS NULL OR convert_to(peer, 'UTF8') > $1 OR (convert_to(peer, 'UTF8') = $1 AND convert_to(call_id, 'UTF8') > $2)) ORDER BY convert_to(peer, 'UTF8'), convert_to(call_id, 'UTF8') LIMIT $3")
             .bind(after.map(|(p, _)| p)).bind(after.map(|(_, c)| c))
             .bind(i64::from(max)).fetch_all(&self.pool).await?;
-        let mut listed = Vec::with_capacity(rows.len());
+        let mut page = crate::FreeReplyReceiptPage { rows: Vec::with_capacity(rows.len()), scanned: rows.len(), last_key: None };
         let mut unkeyed = 0usize;
         for row in &rows {
             use sqlx::Row;
-            let (Ok(peer), Ok(id)) = (row.try_get::<String, _>(0), row.try_get::<String, _>(1)) else {
-                unkeyed += 1;
-                continue;
-            };
-            let entry = free_reply_receipt_entry(row, &peer);
-            listed.push((peer, id, entry));
+            let peer_key: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(0).ok().flatten().unwrap_or_default();
+            let call_key: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(1).ok().flatten().unwrap_or_default();
+            match (String::from_utf8(peer_key.clone()), String::from_utf8(call_key.clone())) {
+                (Ok(peer), Ok(id)) => {
+                    let entry = free_reply_receipt_entry(row, &peer);
+                    page.rows.push((peer, id, entry));
+                }
+                _ => unkeyed += 1,
+            }
+            page.last_key = Some((peer_key, call_key));
         }
         if unkeyed > 0 {
             tracing::warn!(rows = unkeyed, "call rows holding free-reply receipts have unreadable keys; left untouched");
         }
-        Ok(listed)
+        Ok(page)
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
@@ -4456,7 +4461,7 @@ mod migration_recovery_tests {
         let old = db.call_get(&old_peer, call_id).await.unwrap().unwrap();
         assert!(old.free_reply_receipts.is_empty());
         assert_eq!(old.pending.as_ref().map(|p| p.operation_id.as_str()), Some("op"));
-        assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().is_empty());
+        assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().rows.is_empty());
 
         let receipt = |peer: &NodeId, op: &str| FreeReplyReceipt {
             peer: peer.to_hex(), call_id: call_id.into(), kind: 401, operation_id: op.into(),
@@ -4473,22 +4478,22 @@ mod migration_recovery_tests {
         }
         // Exact round trip, then key-ordered pages after a cursor.
         assert_eq!(db.call_get(&peers[0], call_id).await.unwrap(), Some(held(&peers[0], "op0")));
-        let first = db.call_with_free_reply_receipts(None, 2).await.unwrap();
+        let first = db.call_with_free_reply_receipts(None, 2).await.unwrap().rows;
         assert_eq!(first.iter().map(|(p, _, _)| p.clone()).collect::<Vec<_>>(), peers[..2].iter().map(|p| p.to_hex()).collect::<Vec<_>>());
         let (last_peer, last_call, _) = first.last().unwrap();
-        let rest = db.call_with_free_reply_receipts(Some((last_peer.as_str(), last_call.as_str())), 2).await.unwrap();
+        let rest = db.call_with_free_reply_receipts(Some((last_peer.as_bytes(), last_call.as_bytes())), 2).await.unwrap().rows;
         assert_eq!(rest, vec![(peers[2].to_hex(), call_id.to_owned(), Some((peers[2], held(&peers[2], "op2"))))]);
         // A second call of one peer pages in call id order.
         let later_call = "fedcba9876543210fedcba9876543210";
         db.call_put(&peers[1], later_call, &held(&peers[1], "op1b")).await.unwrap();
-        let after_first = db.call_with_free_reply_receipts(Some((peers[1].to_hex().as_str(), call_id)), 1).await.unwrap();
+        let after_first = db.call_with_free_reply_receipts(Some((peers[1].to_hex().as_bytes(), call_id.as_bytes())), 1).await.unwrap().rows;
         assert_eq!(after_first.iter().map(|(p, c, _)| (p.clone(), c.clone())).collect::<Vec<_>>(), vec![(peers[1].to_hex(), later_call.to_owned())]);
         db.call_put(&peers[1], later_call, &CallEntry { free_reply_receipts: Vec::new(), ..held(&peers[1], "op1b") }).await.unwrap();
         // An undecodable row is listed without its entry, keeps its column, and
         // a sweep never drops it.
         sqlx::query("UPDATE call_state SET free_reply_receipts = '{not json' WHERE peer = $1").bind(peers[2].to_hex())
             .execute(&db.pool).await.unwrap();
-        let listed = db.call_with_free_reply_receipts(None, 10).await.unwrap();
+        let listed = db.call_with_free_reply_receipts(None, 10).await.unwrap().rows;
         assert_eq!(listed.iter().map(|(p, _, e)| (p.clone(), e.is_some())).collect::<Vec<_>>(),
             peers.iter().map(|p| (p.to_hex(), *p != peers[2])).collect::<Vec<_>>());
         db.call_sweep(10 * TOMBSTONE_MS, 10).await.unwrap();
@@ -4509,7 +4514,7 @@ mod migration_recovery_tests {
         assert!(db.call_get(&peers[0], call_id).await.unwrap().is_none());
         db.pool.close().await;
         let db = PostgresStorage::connect(&db_url).await.unwrap();
-        assert_eq!(db.call_with_free_reply_receipts(None, 10).await.unwrap().len(), 2);
+        assert_eq!(db.call_with_free_reply_receipts(None, 10).await.unwrap().rows.len(), 2);
         assert_eq!(db.call_get(&peers[1], call_id).await.unwrap(), Some(held(&peers[1], "op1")));
         db.pool.close().await;
         sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();

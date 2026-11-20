@@ -2118,28 +2118,33 @@ impl Storage for SqliteStorage {
         }).collect()
     }
 
-    async fn call_with_free_reply_receipts(&self, after: Option<(&str, &str)>, max: u32) -> Result<Vec<crate::FreeReplyReceiptRow>, StorageError> {
-        // Untyped rows: a column holding a value of the wrong type must fail
-        // only its own row, never the page. Query errors stay errors.
+    async fn call_with_free_reply_receipts(&self, after: Option<(&[u8], &[u8])>, max: u32) -> Result<crate::FreeReplyReceiptPage, StorageError> {
+        // Untyped rows keyed by their raw bytes, in byte order: every stored
+        // row has a usable key, and a column holding a value of the wrong type
+        // fails only its own row, never the page. Query errors stay errors.
         let rows = sqlx::query(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND (? IS NULL OR peer > ? OR (peer = ? AND call_id > ?)) ORDER BY peer, call_id LIMIT ?")
+            "SELECT CAST(peer AS BLOB), CAST(call_id AS BLOB), side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND (? IS NULL OR CAST(peer AS BLOB) > ? OR (CAST(peer AS BLOB) = ? AND CAST(call_id AS BLOB) > ?)) ORDER BY CAST(peer AS BLOB), CAST(call_id AS BLOB) LIMIT ?")
             .bind(after.map(|(p, _)| p)).bind(after.map(|(p, _)| p)).bind(after.map(|(p, _)| p)).bind(after.map(|(_, c)| c))
             .bind(i64::from(max)).fetch_all(&self.pool).await?;
-        let mut listed = Vec::with_capacity(rows.len());
+        let mut page = crate::FreeReplyReceiptPage { rows: Vec::with_capacity(rows.len()), scanned: rows.len(), last_key: None };
         let mut unkeyed = 0usize;
         for row in &rows {
             use sqlx::Row;
-            let (Ok(peer), Ok(id)) = (row.try_get::<String, _>(0), row.try_get::<String, _>(1)) else {
-                unkeyed += 1;
-                continue;
-            };
-            let entry = free_reply_receipt_entry(row, &peer);
-            listed.push((peer, id, entry));
+            let peer_key: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(0).ok().flatten().unwrap_or_default();
+            let call_key: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(1).ok().flatten().unwrap_or_default();
+            match (String::from_utf8(peer_key.clone()), String::from_utf8(call_key.clone())) {
+                (Ok(peer), Ok(id)) => {
+                    let entry = free_reply_receipt_entry(row, &peer);
+                    page.rows.push((peer, id, entry));
+                }
+                _ => unkeyed += 1,
+            }
+            page.last_key = Some((peer_key, call_key));
         }
         if unkeyed > 0 {
             tracing::warn!(rows = unkeyed, "call rows holding free-reply receipts have unreadable keys; left untouched");
         }
-        Ok(listed)
+        Ok(page)
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {

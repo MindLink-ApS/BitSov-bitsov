@@ -980,7 +980,7 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_awaiting().await
     }
 
-    async fn call_with_free_reply_receipts(&self, after: Option<(&str, &str)>, max: u32) -> Result<Vec<crate::FreeReplyReceiptRow>, StorageError> {
+    async fn call_with_free_reply_receipts(&self, after: Option<(&[u8], &[u8])>, max: u32) -> Result<crate::FreeReplyReceiptPage, StorageError> {
         self.inner.call_with_free_reply_receipts(after, max).await
     }
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
