@@ -318,6 +318,17 @@ async fn a_relation_grant_does_not_read_as_granted_for_a_spend_request() {
     assert_eq!(body["status"], "pending", "{body}");
     assert_eq!(body["owner_confirmation_required"], true);
     assert!(op["owner_action"].as_str().unwrap().contains("konsensus grant"), "{op}");
+
+    // Nor does it answer a spend request without a budget: that asks for
+    // general spend, and the relation grant pays only its recipients.
+    let (status, op) =
+        fx.call("POST", "/api/v1/pair/elevation-request", Some(json!({"scopes": ["spend"]})), Some(&read)).await;
+    assert_eq!(status, StatusCode::OK, "{op}");
+    let (status, body) =
+        fx.call("GET", &format!("/api/v1/pair/elevation/{}", op["op_id"].as_str().unwrap()), None, Some(&read)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "pending", "a no-budget spend request read as granted over a relation grant: {body}");
+    assert_eq!(body["owner_confirmation_required"], true, "{body}");
 }
 
 #[tokio::test]

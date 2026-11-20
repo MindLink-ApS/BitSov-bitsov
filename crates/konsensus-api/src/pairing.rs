@@ -4718,16 +4718,19 @@ pub enum ElevationStatus {
 /// still-pending request asks for: at least the budget (what is left of it),
 /// the per-call limit and the duration counted from the request, and no
 /// narrower payee, recipient or liquidity-fee terms. A request without a
-/// budget asks only for the `spend` scope, which any live window carries.
+/// budget asks only for the `spend` scope, which any live window carries
+/// unless it pays only its own recipients.
 fn owner_window_covers(g: &SpendGrant, op: &PendingElevation) -> bool {
     let Some(budget) = g.budget.as_ref() else {
         return false;
     };
+    if budget.recipients_only {
+        return false;
+    }
     let Some(terms) = op.proposed_terms.as_ref() else {
         return true;
     };
-    if budget.recipients_only
-        || budget.remaining_msat() < terms.budget_msat
+    if budget.remaining_msat() < terms.budget_msat
         || budget.per_call_max_msat < terms.per_call_max_msat
         || g.expires_at < op.created_at.saturating_add(terms.ttl_secs)
         || (terms.allow_liquidity_fees && !budget.allow_liquidity_fees)
