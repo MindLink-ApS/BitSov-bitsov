@@ -1108,14 +1108,15 @@ pub(crate) async fn release_free_reply_receipt(store: Store<'_>, peer: &NodeId, 
 const RECEIPT_SWEEP_ROWS: u32 = 256;
 
 /// Where the next receipt cleanup sweep of each store resumes, by row key.
-fn receipt_sweep_cursor() -> &'static Mutex<HashMap<usize, (NodeId, String)>> {
-    static CURSOR: OnceLock<Mutex<HashMap<usize, (NodeId, String)>>> = OnceLock::new();
+fn receipt_sweep_cursor() -> &'static Mutex<HashMap<usize, (String, String)>> {
+    static CURSOR: OnceLock<Mutex<HashMap<usize, (String, String)>>> = OnceLock::new();
     CURSOR.get_or_init(Default::default)
 }
 
 /// Release receipts whose saved reply can no longer be recovered (it was
 /// queued, withdrawn, or its operation is gone). A receipt whose operation
-/// may still be recovered is always kept; a read error keeps that row's.
+/// may still be recovered is always kept; a read error keeps that row's, and
+/// a row that cannot be decoded is passed over untouched (it stays held).
 /// Each sweep visits at most [`RECEIPT_SWEEP_ROWS`] rows, resuming after the
 /// last row the previous sweep visited and wrapping at the end, so rows whose
 /// receipts must be kept never keep a later row from being reached.
@@ -1123,20 +1124,25 @@ pub(crate) async fn prune_free_reply_receipts(state: &AppState) -> Result<usize,
     let store = state.storage.as_ref();
     let key = std::sync::Arc::as_ptr(&state.storage) as *const () as usize;
     let after = receipt_sweep_cursor().lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
-    let rows = store.call_with_free_reply_receipts(after.as_ref().map(|(p, c)| (p, c.as_str())), RECEIPT_SWEEP_ROWS).await?;
+    let rows = store.call_with_free_reply_receipts(after.as_ref().map(|(p, c)| (p.as_str(), c.as_str())), RECEIPT_SWEEP_ROWS).await?;
     {
         let mut cursor = receipt_sweep_cursor().lock().unwrap_or_else(|e| e.into_inner());
         match rows.last() {
-            Some((peer, call_id, _)) if rows.len() == RECEIPT_SWEEP_ROWS as usize => { cursor.insert(key, (*peer, call_id.clone())); }
+            Some((peer, call_id, _)) if rows.len() == RECEIPT_SWEEP_ROWS as usize => { cursor.insert(key, (peer.clone(), call_id.clone())); }
             _ => { cursor.remove(&key); }
         }
     }
-    let mut released = 0;
-    for (peer, call_id, _) in rows {
+    let (mut released, mut undecodable, mut unread) = (0, 0usize, 0usize);
+    for (_, call_id, entry) in rows {
+        let Some((peer, _)) = entry else { undecodable += 1; continue };
         match prune_row(store, &peer, &call_id).await {
             Ok(n) => released += n,
-            Err(error) => tracing::debug!(%error, "free call reply receipt cleanup skipped a row"),
+            Err(_) => unread += 1,
         }
+    }
+    if undecodable + unread > 0 {
+        // One line per sweep, however many rows were passed over.
+        tracing::warn!(undecodable, unread, "free call reply receipt cleanup passed over rows it could not read; they keep their receipts");
     }
     Ok(released)
 }

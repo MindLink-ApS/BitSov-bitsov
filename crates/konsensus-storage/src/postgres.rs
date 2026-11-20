@@ -2309,15 +2309,18 @@ impl Storage for PostgresStorage {
         }).collect()
     }
 
-    async fn call_with_free_reply_receipts(&self, after: Option<(&konsensus_core::NodeId, &str)>, max: u32) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+    async fn call_with_free_reply_receipts(&self, after: Option<(&str, &str)>, max: u32) -> Result<Vec<crate::FreeReplyReceiptRow>, StorageError> {
         let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
             "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND ($1::TEXT IS NULL OR peer > $1 OR (peer = $1 AND call_id > $2)) ORDER BY peer, call_id LIMIT $3")
-            .bind(after.map(|(p, _)| p.to_hex())).bind(after.map(|(_, c)| c.to_string()))
+            .bind(after.map(|(p, _)| p)).bind(after.map(|(_, c)| c))
             .bind(i64::from(max)).fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
-            let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
-        }).collect()
+        // Decode row by row: one undecodable row must not hide the rest.
+        Ok(rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
+            let entry = konsensus_core::NodeId::from_hex(&peer).ok().and_then(|node| {
+                call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)).ok().map(|e| (node, e))
+            });
+            (peer, id, entry)
+        }).collect())
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
@@ -4461,10 +4464,28 @@ mod migration_recovery_tests {
         // Exact round trip, then key-ordered pages after a cursor.
         assert_eq!(db.call_get(&peers[0], call_id).await.unwrap(), Some(held(&peers[0], "op0")));
         let first = db.call_with_free_reply_receipts(None, 2).await.unwrap();
-        assert_eq!(first.iter().map(|(p, _, _)| *p).collect::<Vec<_>>(), peers[..2].to_vec());
+        assert_eq!(first.iter().map(|(p, _, _)| p.clone()).collect::<Vec<_>>(), peers[..2].iter().map(|p| p.to_hex()).collect::<Vec<_>>());
         let (last_peer, last_call, _) = first.last().unwrap();
-        let rest = db.call_with_free_reply_receipts(Some((last_peer, last_call)), 2).await.unwrap();
-        assert_eq!(rest, vec![(peers[2], call_id.to_owned(), held(&peers[2], "op2"))]);
+        let rest = db.call_with_free_reply_receipts(Some((last_peer.as_str(), last_call.as_str())), 2).await.unwrap();
+        assert_eq!(rest, vec![(peers[2].to_hex(), call_id.to_owned(), Some((peers[2], held(&peers[2], "op2"))))]);
+        // A second call of one peer pages in call id order.
+        let later_call = "fedcba9876543210fedcba9876543210";
+        db.call_put(&peers[1], later_call, &held(&peers[1], "op1b")).await.unwrap();
+        let after_first = db.call_with_free_reply_receipts(Some((peers[1].to_hex().as_str(), call_id)), 1).await.unwrap();
+        assert_eq!(after_first.iter().map(|(p, c, _)| (p.clone(), c.clone())).collect::<Vec<_>>(), vec![(peers[1].to_hex(), later_call.to_owned())]);
+        db.call_put(&peers[1], later_call, &CallEntry { free_reply_receipts: Vec::new(), ..held(&peers[1], "op1b") }).await.unwrap();
+        // An undecodable row is listed without its entry, keeps its column, and
+        // a sweep never drops it.
+        sqlx::query("UPDATE call_state SET free_reply_receipts = '{not json' WHERE peer = $1").bind(peers[2].to_hex())
+            .execute(&db.pool).await.unwrap();
+        let listed = db.call_with_free_reply_receipts(None, 10).await.unwrap();
+        assert_eq!(listed.iter().map(|(p, _, e)| (p.clone(), e.is_some())).collect::<Vec<_>>(),
+            peers.iter().map(|p| (p.to_hex(), *p != peers[2])).collect::<Vec<_>>());
+        db.call_sweep(10 * TOMBSTONE_MS, 10).await.unwrap();
+        let raw: Option<String> = sqlx::query_scalar("SELECT free_reply_receipts FROM call_state WHERE peer = $1")
+            .bind(peers[2].to_hex()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(raw.as_deref(), Some("{not json"));
+        db.call_put(&peers[2], call_id, &held(&peers[2], "op2")).await.unwrap();
         // Held rows survive sweep and eviction long after their tombstone.
         let far = 10 * TOMBSTONE_MS;
         db.call_evict_burned(Some(&peers[0]), far, far, 10).await.unwrap();

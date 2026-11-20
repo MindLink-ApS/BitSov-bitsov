@@ -23,6 +23,11 @@ pub use calendar::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
 pub use contacts::{ContactRepo, ContactRow, PostgresContactRepo, SqliteContactRepo};
 pub use encrypted::EncryptedStorage;
 pub use error::StorageError;
+
+/// One call row holding free-reply receipts, from
+/// [`traits::Storage::call_with_free_reply_receipts`]: its key (peer as hex,
+/// call id) and its entry, or `None` when the row cannot be decoded.
+pub type FreeReplyReceiptRow = (String, String, Option<(konsensus_core::NodeId, konsensus_core::payloads::call::CallEntry)>);
 pub use fiat_snapshots::FiatRateSnapshot;
 pub use invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,

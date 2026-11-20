@@ -62,3 +62,55 @@ async fn kept_receipts_never_starve_cleanup_of_a_later_row() {
         assert_eq!(store.call_get(&peer(n), CALL).await.unwrap().unwrap().free_reply_receipts.len(), 1, "row {n}");
     }
 }
+
+/// Rows still holding receipts, in key order (peer hex, call id).
+async fn holding(db: &SqliteStorage) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT peer, call_id FROM call_state WHERE free_reply_receipts IS NOT NULL ORDER BY peer, call_id")
+        .fetch_all(db.pool()).await.unwrap()
+}
+
+#[tokio::test]
+async fn an_undecodable_row_is_kept_and_never_stalls_cleanup_of_later_rows() {
+    let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let mut state = common::test_state();
+    Arc::get_mut(&mut state).unwrap().storage = db.clone();
+    let store = state.storage.as_ref();
+    // 300 rows whose receipts can all be released (their operations are gone),
+    // one of them, inside the first page, with receipts that cannot be decoded.
+    for n in 0..300u32 {
+        store.call_put(&peer(n), CALL, &row(&peer(n), &format!("gone-{n}"))).await.unwrap();
+    }
+    let corrupt = peer(5).to_hex();
+    sqlx::query("UPDATE call_state SET free_reply_receipts = '{not json' WHERE peer = ?").bind(&corrupt)
+        .execute(db.pool()).await.unwrap();
+
+    // One sweep visits exactly the first 256 rows in key order: the corrupt
+    // one is skipped and kept, the other 255 are released.
+    konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    let left = holding(&db).await;
+    let expected: Vec<(String, String)> = std::iter::once(5).chain(256..300)
+        .map(|n| (peer(n).to_hex(), CALL.to_string())).collect();
+    assert_eq!(left, expected, "the first sweep did not visit exactly the first 256 rows past the corrupt one");
+    // The next sweep continues after it and reaches the end.
+    konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    assert_eq!(holding(&db).await, vec![(corrupt.clone(), CALL.to_string())], "rows behind the corrupt one were not reached");
+
+    // Having reached the end, cleanup starts over: a releasable receipt on a
+    // row before the corrupt one is reached again.
+    store.call_put(&peer(0), CALL, &row(&peer(0), "gone-again")).await.unwrap();
+    let mut sweeps = 0;
+    while holding(&db).await.len() > 1 {
+        sweeps += 1;
+        assert!(sweeps <= 2, "cleanup never wrapped back to the start");
+        konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+    }
+
+    // The corrupt row is held: never rewritten, never swept or evicted.
+    let raw: Option<String> = sqlx::query_scalar("SELECT free_reply_receipts FROM call_state WHERE peer = ?").bind(&corrupt)
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(raw.as_deref(), Some("{not json"));
+    let far = konsensus_api::calls::now_ms() + 3 * TOMBSTONE_MS;
+    store.call_sweep(far, 1_000).await.unwrap();
+    store.call_evict_burned(Some(&peer(5)), far, far, 1_000).await.unwrap();
+    assert_eq!(holding(&db).await, vec![(corrupt, CALL.to_string())], "the undecodable row was dropped");
+}

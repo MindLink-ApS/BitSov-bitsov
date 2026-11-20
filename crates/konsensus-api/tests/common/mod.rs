@@ -307,20 +307,21 @@ impl Storage for MemStorage {
 
     async fn call_with_free_reply_receipts(
         &self,
-        after: Option<(&NodeId, &str)>,
+        after: Option<(&str, &str)>,
         max: u32,
-    ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
+    ) -> Result<Vec<konsensus_storage::FreeReplyReceiptRow>, StorageError>
     {
-        let mut rows: Vec<_> = self
+        // Rows are held decoded in memory, so every listed row has its entry.
+        let mut rows: Vec<konsensus_storage::FreeReplyReceiptRow> = self
             .calls
             .lock()
             .unwrap()
             .iter()
             .filter(|((peer, id), e)| !e.free_reply_receipts.is_empty()
-                && after.is_none_or(|(p, c)| (peer.to_hex(), id.as_str()) > (p.to_hex(), c)))
-            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
+                && after.is_none_or(|(p, c)| (peer.to_hex().as_str(), id.as_str()) > (p, c)))
+            .map(|((peer, id), entry)| (peer.to_hex(), id.clone(), Some((*peer, entry.clone()))))
             .collect();
-        rows.sort_by_key(|(peer, id, _)| (peer.to_hex(), id.clone()));
+        rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         rows.truncate(max as usize);
         Ok(rows)
     }

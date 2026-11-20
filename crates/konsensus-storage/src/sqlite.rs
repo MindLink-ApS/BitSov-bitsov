@@ -2118,15 +2118,18 @@ impl Storage for SqliteStorage {
         }).collect()
     }
 
-    async fn call_with_free_reply_receipts(&self, after: Option<(&konsensus_core::NodeId, &str)>, max: u32) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+    async fn call_with_free_reply_receipts(&self, after: Option<(&str, &str)>, max: u32) -> Result<Vec<crate::FreeReplyReceiptRow>, StorageError> {
         let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
             "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND (? IS NULL OR peer > ? OR (peer = ? AND call_id > ?)) ORDER BY peer, call_id LIMIT ?")
-            .bind(after.map(|(p, _)| p.to_hex())).bind(after.map(|(p, _)| p.to_hex())).bind(after.map(|(p, _)| p.to_hex())).bind(after.map(|(_, c)| c.to_string()))
+            .bind(after.map(|(p, _)| p)).bind(after.map(|(p, _)| p)).bind(after.map(|(p, _)| p)).bind(after.map(|(_, c)| c))
             .bind(i64::from(max)).fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
-            let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
-        }).collect()
+        // Decode row by row: one undecodable row must not hide the rest.
+        Ok(rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
+            let entry = konsensus_core::NodeId::from_hex(&peer).ok().and_then(|node| {
+                call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)).ok().map(|e| (node, e))
+            });
+            (peer, id, entry)
+        }).collect())
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {

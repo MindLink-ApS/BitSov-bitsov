@@ -1429,10 +1429,12 @@ pub trait Storage: Send + Sync {
         Ok(0)
     }
 
-    /// Up to `max` call rows holding free-reply receipts, in `(peer, call_id)`
-    /// order after `after` (from the start when `None`), for pruning the
-    /// receipts whose saved reply can no longer be recovered page by page.
-    async fn call_with_free_reply_receipts(&self, _after: Option<(&konsensus_core::NodeId, &str)>, _max: u32) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+    /// Up to `max` call rows holding free-reply receipts, in `(peer hex,
+    /// call_id)` order after `after` (from the start when `None`), for pruning
+    /// the receipts whose saved reply can no longer be recovered page by page.
+    /// A row that cannot be decoded is still listed, without its entry, so a
+    /// scan moves past it; it keeps its receipts column and its row.
+    async fn call_with_free_reply_receipts(&self, _after: Option<(&str, &str)>, _max: u32) -> Result<Vec<crate::FreeReplyReceiptRow>, StorageError> {
         Ok(Vec::new())
     }
 
