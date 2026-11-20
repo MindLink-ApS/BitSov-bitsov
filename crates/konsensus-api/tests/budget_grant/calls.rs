@@ -735,6 +735,8 @@ mod settlement;
 mod continuity;
 #[path = "calls_free_reply.rs"]
 mod free_reply;
+#[path = "calls_free_reply_receipts.rs"]
+mod free_reply_receipts;
 
 #[tokio::test]
 async fn an_answer_recovered_after_an_ambiguous_payment_keeps_its_media_client() {

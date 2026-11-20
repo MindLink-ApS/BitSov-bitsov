@@ -980,6 +980,9 @@ impl<S: Storage> Storage for EncryptedStorage<S> {
         self.inner.call_awaiting().await
     }
 
+    async fn call_with_free_reply_receipts(&self, max: u32) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        self.inner.call_with_free_reply_receipts(max).await
+    }
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
         self.inner.call_sweep(now_ms, max).await
     }

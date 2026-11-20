@@ -524,7 +524,7 @@ async fn production_admission_requires_paid_live_blocks_and_fails_closed() {
     let store = Arc::new(SqliteStorage::in_memory().await.unwrap());
     let admission = super::PaidCallAdmission::new(store.clone());
     let live = CallEntry { side: Side::Caller, phase: Phase::Live, deadline_ms: 100_000,
-        pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false };
+        pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new() };
     assert!(!admission.call_media_admitted(&peer(), CALL, 1_000).await);
     store.call_put(&peer(), CALL, &live).await.unwrap();
     assert!(!admission.call_media_admitted(&peer(), CALL, 1_000).await, "answered is not paid");
@@ -576,7 +576,7 @@ async fn idle_paid_route_expires_after_grace_without_media() {
     let now = super::now_ms();
     store.call_put(&peer(), CALL, &CallEntry {
         side: Side::Caller, phase: Phase::Live, deadline_ms: now + 200,
-        pending: None, paid_until_ms: Some(now - 9_800), next_block_seq: 1, end_reason: None, unpaid_notice_used: false,
+        pending: None, paid_until_ms: Some(now - 9_800), next_block_seq: 1, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     }).await.unwrap();
     let f = fixture();
     let router = CallMediaRouter::new(f.link, Arc::new(super::PaidCallAdmission::new(store)));
@@ -740,7 +740,7 @@ async fn callee_detach_ends_the_call_and_preserves_paid_evidence() {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: Some(Pending { operation_id: "pending-signal".into(), kind: 402, request_hash: "request".into() }),
         paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     let f = fixture();
@@ -773,7 +773,7 @@ async fn caller_detach_keeps_the_existing_paid_deadline() {
     let paid = CallEntry {
         side: Side::Caller, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     let f = fixture();
@@ -793,7 +793,7 @@ async fn callee_detach_after_unpaid_expiry_prevents_late_resume() {
     let paid = CallEntry {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     let f = fixture();
@@ -825,7 +825,7 @@ async fn old_callee_attachment_drop_keeps_its_replacement_live() {
     let paid = CallEntry {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     let f = fixture();
@@ -853,7 +853,7 @@ async fn callee_detach_retries_a_failed_state_write() {
     store.call_put(&peer(), CALL, &CallEntry {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     }).await.unwrap();
     sqlx::query("CREATE TRIGGER fail_detach BEFORE UPDATE ON call_state BEGIN SELECT RAISE(ABORT, 'temporary write failure'); END")
         .execute(store.pool()).await.unwrap();
@@ -883,7 +883,7 @@ async fn reconnect_before_detach_retry_keeps_the_replacement_live() {
     let paid = CallEntry {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     sqlx::query("CREATE TRIGGER fail_detach BEFORE UPDATE ON call_state BEGIN SELECT RAISE(ABORT, 'temporary write failure'); END")
@@ -920,7 +920,7 @@ async fn drop_after_not_admitted_prevents_late_resume() {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: Some(Pending { operation_id: "pending-signal".into(), kind: 403, request_hash: "request".into() }),
         paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     let f = fixture();
@@ -976,7 +976,7 @@ async fn transient_read_error_then_socket_drop(overdue: bool) {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: Some(Pending { operation_id: "pending-signal".into(), kind: 403, request_hash: "request".into() }),
         paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     let admission = Arc::new(ObservedAdmission {
@@ -1040,7 +1040,7 @@ async fn callee_detach_stops_retrying_a_persistent_state_write_failure() {
     let paid = CallEntry {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     sqlx::query("CREATE TRIGGER fail_detach BEFORE UPDATE ON call_state BEGIN SELECT RAISE(ABORT, 'persistent write failure'); END")
@@ -1094,7 +1094,7 @@ async fn reconnect_waits_for_an_in_progress_detach_write() {
     store.call_put(&peer(), CALL, &CallEntry {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     }).await.unwrap();
     let admission = Arc::new(ObservedAdmission {
         paid: super::PaidCallAdmission::new(store.clone()), detaching: tokio::sync::Notify::new(),
@@ -1133,7 +1133,7 @@ async fn unpaid_media_cut_keeps_reason_and_refuses_settled_block() {
         let paid = CallEntry {
             side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
             pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-            end_reason: None, unpaid_notice_used: false,
+            end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
         };
         store.call_put(&peer(), CALL, &paid).await.unwrap();
         let f = fixture();
@@ -1183,7 +1183,7 @@ async fn unpaid_detach_preserves_minimum_burn_lifetime() {
     let expired = CallEntry {
         side: Side::Callee, phase: Phase::Ended, deadline_ms: now + rules::TOMBSTONE_MS,
         pending: None, paid_until_ms: Some(now - rules::CALL_BLOCK_GRACE_MS), next_block_seq: 1,
-        end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: false,
+        end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &expired).await.unwrap();
     let detach = MediaDetach {
@@ -1211,7 +1211,7 @@ async fn socket_drop_after_paid_deadline_preserves_unpaid() {
     let paid = CallEntry {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now - 1,
         pending: None, paid_until_ms: Some(now - 10_001), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     let mut detach = MediaDetach {
@@ -1266,7 +1266,7 @@ async fn durable_detach_recovery(restart: bool) {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: Some(Pending { operation_id: "signal".into(), kind: 403, request_hash: "binding".into() }),
         paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     let mut operation = konsensus_storage::OutboxOperation::prepared("signal".into(), peer().to_hex(), 403, "binding".into());
@@ -1313,7 +1313,7 @@ async fn node_restart_ends_attached_callee_live_call() {
     let paid = CallEntry {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     let f = fixture();
@@ -1360,7 +1360,7 @@ async fn durable_detach_postgres_replays_exhaustion_and_restart() {
         let paid = CallEntry {
             side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
             pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-            end_reason: None, unpaid_notice_used: false,
+            end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
         };
         store.call_put(&peer(), call_id, &paid).await.unwrap();
         sqlx::raw_sql("CREATE FUNCTION fail_detach_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'write unavailable'; END $$; CREATE TRIGGER fail_detach BEFORE UPDATE ON call_state FOR EACH ROW EXECUTE FUNCTION fail_detach_write();")
@@ -1409,7 +1409,7 @@ async fn durable_detach_unavailable_publication_refuses_the_socket() {
     let paid = CallEntry {
         side: Side::Callee, phase: Phase::Live, deadline_ms: now + 70_000,
         pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     store.call_put(&peer(), CALL, &paid).await.unwrap();
     sqlx::query("CREATE TRIGGER fail_publish BEFORE INSERT ON call_media_detach_intents BEGIN SELECT RAISE(ABORT, 'journal unavailable'); END")

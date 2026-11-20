@@ -4336,27 +4336,42 @@ pub(super) async fn compose_peer(
 
         let envelope = if free_reply {
             // Free: save the signed reply first, then publish the call
-            // transition, then queue the reply. A stop or failed write before
-            // the transition leaves the call ringing and the reply unsent;
-            // after it, recovery queues the saved reply.
-            let envelope = operation.sealed_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
-            let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
-            if let Err(e) = crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await {
-                // Unsent only once the saved reply is taken back. Otherwise
-                // it is still saved and recovery sends it after moving the
-                // call, so the outcome is unresolved, as for a paid send.
-                if let Err(error) = operation.unseal().await {
-                    tracing::warn!(%error, "free call reply kept saved; recovery sends it");
+            // transition with this reply's receipt, then queue the reply. A
+            // stop or failed write before the transition leaves the call
+            // ringing and the reply unsent; after it, recovery queues the
+            // saved reply. A call that moved on without it never gets it.
+            let call_id = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?.call_id;
+            let envelope = operation.sealed_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat), &call_id).await?;
+            match operation.free_reply_transition(auth.user.pairing.as_ref()).await? {
+                super::operations::FreeReplyGate::Queue(call_id) => operation.publish_sealed(&envelope, &call_id).await?,
+                super::operations::FreeReplyGate::Withdrawn => {
+                    return Err(ApiError::NotDispatched(
+                        "the call is no longer ringing; the reply was not sent and nothing was paid".into(),
+                    ).with_reason("call_reply_expired"));
+                }
+                super::operations::FreeReplyGate::NotApplied => {
+                    // Unsent only once the saved reply is taken back. Otherwise
+                    // it is still saved and recovery sends it after moving the
+                    // call, so the outcome is unresolved, as for a paid send.
+                    if let Err(error) = operation.unseal().await {
+                        tracing::warn!(%error, "free call reply kept saved; recovery sends it");
+                        return Err(ApiError::PaymentUnresolved(
+                            "the call could not be updated and the saved reply could not be withdrawn; \
+                             it may still be sent, nothing was paid — read the operation before acting again".into()
+                        ).with_reason("call_reply_unresolved"));
+                    }
+                    return Err(ApiError::NotDispatched(
+                        "the call could not be updated; the reply was not sent and nothing was paid".into()
+                    ).with_reason("call_reply_unavailable"));
+                }
+                super::operations::FreeReplyGate::Unresolved { why, .. } => {
                     return Err(ApiError::PaymentUnresolved(format!(
-                        "the call could not be updated ({e}) and the saved reply could not be withdrawn; \
-                         it may still be sent, nothing was paid — read the operation before acting again"
+                        "the call could not be confirmed ({why}); the saved reply is not sent now but may be later, \
+                         nothing was paid — read the operation before acting again"
                     )).with_reason("call_reply_unresolved"));
                 }
-                return Err(ApiError::NotDispatched(format!(
-                    "the call could not be updated ({e}); the reply was not sent and nothing was paid"
-                )).with_reason("call_reply_unavailable"));
             }
-            operation.publish_sealed(&envelope).await?;
             envelope
         } else {
             if crate::calls::is_call_kind(req.kind) {

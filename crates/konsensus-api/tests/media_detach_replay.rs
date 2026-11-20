@@ -30,6 +30,7 @@ fn paid() -> CallEntry {
         next_block_seq: 1,
         end_reason: None,
         unpaid_notice_used: false,
+        free_reply_receipts: Vec::new(),
     }
 }
 fn intent(generation: u64, only_unpaid: bool, may_hangup_live: bool) -> PendingMediaDetach {
@@ -803,7 +804,7 @@ async fn publication_samples_time_after_its_final_storage_read() {
     original.paid_until_ms = Some(now + 50_000);
     store.call_put(&peer(), CALL, &original).await.unwrap();
     // Force a slow real read without replacing the storage implementation.
-    sqlx::raw_sql("ALTER TABLE call_state RENAME TO delayed_call_state; CREATE VIEW call_state AS SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms + (WITH RECURSIVE delay(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM delay WHERE x < 5000000) SELECT SUM(x)*0 FROM delay) AS paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM delayed_call_state; CREATE TRIGGER shorten_after_publish AFTER INSERT ON call_media_heads BEGIN UPDATE delayed_call_state SET paid_until_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 9900, deadline_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) + 100; END;")
+    sqlx::raw_sql("ALTER TABLE call_state RENAME TO delayed_call_state; CREATE VIEW call_state AS SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms + (WITH RECURSIVE delay(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM delay WHERE x < 5000000) SELECT SUM(x)*0 FROM delay) AS paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM delayed_call_state; CREATE TRIGGER shorten_after_publish AFTER INSERT ON call_media_heads BEGIN UPDATE delayed_call_state SET paid_until_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 9900, deadline_ms = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) + 100; END;")
         .execute(db.pool()).await.unwrap();
     assert_eq!(
         store.call_get(&peer(), CALL).await.unwrap().unwrap(),
@@ -1047,7 +1048,7 @@ async fn cancelled_publication_preserves_paid_live_during_maintenance() {
     let store: Arc<dyn Storage> = db.clone();
     let original = paid();
     store.call_put(&peer(), CALL, &original).await.unwrap();
-    sqlx::raw_sql("ALTER TABLE call_state RENAME TO saved_call_state; CREATE VIEW call_state AS SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms + CASE WHEN EXISTS (SELECT 1 FROM call_media_heads) THEN (WITH RECURSIVE delay(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM delay WHERE x < 5000000) SELECT SUM(x)*0 FROM delay) ELSE 0 END AS paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM saved_call_state;")
+    sqlx::raw_sql("ALTER TABLE call_state RENAME TO saved_call_state; CREATE VIEW call_state AS SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms + CASE WHEN EXISTS (SELECT 1 FROM call_media_heads) THEN (WITH RECURSIVE delay(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM delay WHERE x < 5000000) SELECT SUM(x)*0 FROM delay) ELSE 0 END AS paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM saved_call_state;")
         .execute(db.pool()).await.unwrap();
     let publishing = store.clone();
     let task =

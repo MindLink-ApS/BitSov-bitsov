@@ -66,7 +66,13 @@ pub struct MemStorage {
     pub call_offer_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub fail_call_get_for: Mutex<Option<String>>,
     pub fail_call_put_for: Mutex<Option<String>>,
+    /// The next write of this call lands, but reports a failure (a lost acknowledgement).
+    pub lose_call_put_ack_for: Mutex<Option<String>>,
+    /// Runs once, before the next read of an outbox operation.
+    pub outbox_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub call_get_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once, right after the next listing of pending call reservations.
+    pub call_pending_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs before every outbox operation write; an error fails that write.
     #[allow(clippy::type_complexity)]
     pub outbox_write_hook: Mutex<Option<Box<dyn FnMut(&konsensus_storage::OutboxOperation) -> Result<(), StorageError> + Send>>>,
@@ -100,6 +106,12 @@ impl MemStorage {
         }
     }
 
+    /// Replace a stored call row directly, as another task's committed write would.
+    #[allow(dead_code)]
+    pub fn set_call(&self, peer: &NodeId, call_id: &str, entry: konsensus_core::payloads::call::CallEntry) {
+        self.calls.lock().unwrap().insert((*peer, call_id.to_string()), entry);
+    }
+
     /// A stored call's phase, read without the async storage path (from a hook).
     #[allow(dead_code)]
     pub fn call_phase(&self, peer: &NodeId, call_id: &str) -> Option<konsensus_core::payloads::call::Phase> {
@@ -115,7 +127,10 @@ impl MemStorage {
             call_offer_dispatch_gate: Mutex::new(None),
             fail_call_get_for: Mutex::new(None),
             fail_call_put_for: Mutex::new(None),
+            lose_call_put_ack_for: Mutex::new(None),
+            outbox_read_hook: Mutex::new(None),
             call_get_hook: Mutex::new(None),
+            call_pending_hook: Mutex::new(None),
             outbox_write_hook: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
             call_offers: Mutex::new(HashMap::new()),
@@ -193,6 +208,13 @@ impl Storage for MemStorage {
             .lock()
             .unwrap()
             .insert((*peer, call_id.to_owned()), entry.clone());
+        let lost = {
+            let mut lose = self.lose_call_put_ack_for.lock().unwrap();
+            if lose.as_deref() == Some(call_id) { lose.take() } else { None }
+        };
+        if lost.is_some() {
+            return Err(StorageError::Serialization("injected lost call write acknowledgement".into()));
+        }
         Ok(())
     }
 
@@ -268,12 +290,33 @@ impl Storage for MemStorage {
         &self,
     ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
     {
-        Ok(self
+        let pending = self
             .calls
             .lock()
             .unwrap()
             .iter()
             .filter(|(_, e)| e.pending.is_some())
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
+            .collect();
+        let hook = self.call_pending_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        Ok(pending)
+    }
+
+    async fn call_with_free_reply_receipts(
+        &self,
+        max: u32,
+    ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
+    {
+        Ok(self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| !e.free_reply_receipts.is_empty())
+            .take(max as usize)
             .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
             .collect())
     }
@@ -398,6 +441,10 @@ impl Storage for MemStorage {
         &self,
         id: &str,
     ) -> Result<Option<konsensus_storage::OutboxOperation>, StorageError> {
+        let hook = self.outbox_read_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         Ok(self.outbox.lock().unwrap().get(id).cloned())
     }
     async fn list_recoverable_operations(

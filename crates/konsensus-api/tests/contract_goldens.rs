@@ -448,6 +448,7 @@ async fn call_invite_and_call_state_match_goldens() {
                 next_block_seq: 0,
                 end_reason: None,
                 unpaid_notice_used: false,
+                free_reply_receipts: Vec::new(),
             },
         )
         .await
@@ -479,6 +480,7 @@ async fn call_invite_and_call_state_match_goldens() {
                     kind: 400,
                     request_hash: "offer-hash".into(),
                 }),
+                free_reply_receipts: Vec::new(),
             },
         )
         .await

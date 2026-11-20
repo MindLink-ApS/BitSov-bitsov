@@ -380,6 +380,41 @@ impl Pending {
     }
 }
 
+/// At most this many free-reply receipts on one call row. A free reply moves
+/// its call out of ringing, so a row normally holds one; a full set refuses
+/// another transition instead of dropping a receipt.
+pub const MAX_FREE_REPLY_RECEIPTS: usize = 4;
+
+/// Durable proof that one saved free reply (answer or decline) moved its call.
+/// Written in the same call-row write as the transition it certifies, so a
+/// reply saved before that write can tell, after any stop, whether its own
+/// transition happened. Bound to the exact peer, call, reply kind, operation
+/// and request digest; a matching phase alone proves nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeReplyReceipt {
+    /// The peer, as hex.
+    pub peer: String,
+    pub call_id: String,
+    pub kind: u16,
+    pub operation_id: String,
+    /// The operation journal's request digest; never empty.
+    pub request_hash: String,
+    /// The phase the reply moved the call to.
+    #[serde(default)]
+    pub phase: String,
+    /// When the transition was applied.
+    #[serde(default)]
+    pub applied_ms: u64,
+}
+
+impl FreeReplyReceipt {
+    /// The same operation, request, peer, call and kind as `other`.
+    pub fn binds(&self, other: &FreeReplyReceipt) -> bool {
+        self.peer == other.peer && self.call_id == other.call_id && self.kind == other.kind
+            && self.operation_id == other.operation_id && self.request_hash == other.request_hash
+    }
+}
+
 /// The state of one `(peer, call_id)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallEntry {
@@ -395,6 +430,10 @@ pub struct CallEntry {
     pub end_reason: Option<HangupReason>,
     /// Unpaid notice received (caller) or reserved/sent (callee). Survives restart.
     pub unpaid_notice_used: bool,
+    /// Free replies whose transition moved this call, kept until their saved
+    /// reply can no longer be recovered. Rows written before receipts existed
+    /// have none. A row holding one is never aged out or evicted.
+    pub free_reply_receipts: Vec<FreeReplyReceipt>,
 }
 
 impl CallEntry {
@@ -432,7 +471,7 @@ impl CallEntry {
     /// window; payment reconciliation lives independently in the outbox journal.
     pub fn at(self, now_ms: u64) -> Option<CallEntry> {
         match self.phase {
-            Phase::Ended if self.deadline_ms <= now_ms && (self.pending.is_none()
+            Phase::Ended if self.deadline_ms <= now_ms && self.free_reply_receipts.is_empty() && (self.pending.is_none()
                 || (self.side == Side::Caller && self.pending.as_ref().is_some_and(|p| p.kind == KIND_CALL_BLOCK))) => None,
             Phase::Ended if self.side == Side::Caller
                 && self.pending.as_ref().is_some_and(|p| p.kind == KIND_CALL_BLOCK)
@@ -475,7 +514,7 @@ pub fn reserve(entry: Option<CallEntry>, kind: u16, operation_id: &str, request_
     let mine = |e: &CallEntry| e.pending.as_ref().is_some_and(|p| p.is(operation_id, request_hash) && p.kind == kind);
     match kind {
         KIND_CALL_INVITE => match entry {
-            None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending), paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false }),
+            None => Ok(CallEntry { side: Side::Caller, phase: Phase::Reserved, deadline_ms: now_ms.saturating_add(RING_TIMEOUT_MS), pending: Some(pending), paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new() }),
             Some(e) if e.phase == Phase::Reserved && mine(&e) => Ok(e),
             Some(_) => Err(CallRefusal::Replayed),
         },
@@ -545,6 +584,75 @@ pub fn commit(entry: CallEntry, operation_id: &str, now_ms: u64) -> Result<CallE
     })
 }
 
+/// Where a saved free reply stands against its call row (see
+/// [`free_reply_transition`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreeReplyCheck {
+    /// Its exact reservation is current: store this entry, which carries the
+    /// transition and the reply's receipt, in one write.
+    Apply(CallEntry),
+    /// Its receipt is already on the row: the transition happened.
+    AlreadyApplied,
+    /// Definitely not applied and no longer applicable: no receipt for this
+    /// operation, and its reservation is gone, replaced by another
+    /// operation's, or the call is not in a phase this reply may move.
+    Invalid,
+    /// The evidence contradicts itself: an empty digest, an unknown kind, a
+    /// receipt for this operation naming another request, peer or call, or a
+    /// reservation under this operation's id for another request or kind.
+    Corrupt,
+    /// The row already holds [`MAX_FREE_REPLY_RECEIPTS`]; nothing is dropped.
+    Full,
+}
+
+/// Check a saved free reply against the stored (not yet aged) call row and,
+/// if its own reservation is current, apply its transition with its receipt.
+/// An answer moves only a ringing call to live; a decline only a ringing or
+/// device-waiting call to ended. A generic commit that leaves the state
+/// unchanged, an ended call, or a missing reservation is never treated as
+/// this reply's transition.
+pub fn free_reply_transition(entry: Option<CallEntry>, receipt: &FreeReplyReceipt, now_ms: u64) -> FreeReplyCheck {
+    if receipt.request_hash.is_empty() || receipt.operation_id.is_empty()
+        || !matches!(receipt.kind, KIND_CALL_ANSWER | KIND_CALL_HANGUP)
+    {
+        return FreeReplyCheck::Corrupt;
+    }
+    let Some(raw) = entry else { return FreeReplyCheck::Invalid };
+    let mut same = raw.free_reply_receipts.iter().filter(|r| r.operation_id == receipt.operation_id);
+    match (same.next(), same.next()) {
+        (None, _) => {}
+        (Some(found), None) if found.binds(receipt) => return FreeReplyCheck::AlreadyApplied,
+        _ => return FreeReplyCheck::Corrupt,
+    }
+    let Some(e) = raw.at(now_ms) else { return FreeReplyCheck::Invalid };
+    let exact = Pending { operation_id: receipt.operation_id.clone(), kind: receipt.kind, request_hash: receipt.request_hash.clone() };
+    match e.pending.as_ref() {
+        Some(p) if *p == exact => {}
+        // This operation's id on another request or kind: neither ours nor another's.
+        Some(p) if p.operation_id == receipt.operation_id => return FreeReplyCheck::Corrupt,
+        _ => return FreeReplyCheck::Invalid,
+    }
+    if e.side != Side::Callee {
+        return FreeReplyCheck::Invalid;
+    }
+    let (eligible, to) = match receipt.kind {
+        KIND_CALL_ANSWER => (e.phase == Phase::Ringing, Phase::Live),
+        _ => (matches!(e.phase, Phase::Ringing | Phase::AwaitingDevice), Phase::Ended),
+    };
+    if !eligible {
+        return FreeReplyCheck::Invalid;
+    }
+    if e.free_reply_receipts.len() >= MAX_FREE_REPLY_RECEIPTS {
+        return FreeReplyCheck::Full;
+    }
+    let Ok(mut next) = commit(e, &receipt.operation_id, now_ms) else { return FreeReplyCheck::Invalid };
+    if next.phase != to || next.pending.is_some() {
+        return FreeReplyCheck::Invalid;
+    }
+    next.free_reply_receipts.push(FreeReplyReceipt { phase: to.as_str().into(), applied_ms: now_ms, ..receipt.clone() });
+    FreeReplyCheck::Apply(next)
+}
+
 /// The reserved signal was definitely not paid: undo the reservation. An
 /// offer that never went out is forgotten (`None`); other signals just drop
 /// their pending mark.
@@ -566,7 +674,7 @@ pub fn release(entry: CallEntry, operation_id: &str) -> Option<CallEntry> {
 pub fn receive(entry: Option<CallEntry>, kind: u16, reason: Option<HangupReason>, now_ms: u64) -> Result<CallEntry, CallRefusal> {
     match kind {
         KIND_CALL_INVITE => match entry {
-            None => Ok(CallEntry { side: Side::Callee, phase: Phase::AwaitingDevice, deadline_ms: now_ms.saturating_add(DEVICE_WAIT_MS), pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false }),
+            None => Ok(CallEntry { side: Side::Callee, phase: Phase::AwaitingDevice, deadline_ms: now_ms.saturating_add(DEVICE_WAIT_MS), pending: None, paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new() }),
             Some(_) => Err(CallRefusal::Replayed),
         },
         KIND_CALL_ANSWER => {
@@ -1010,6 +1118,113 @@ mod tests {
             assert_eq!(settlement(Some(s)), Settlement::Ambiguous);
         }
     }
+
+    fn free_receipt(kind: u16, op: &str, hash: &str) -> FreeReplyReceipt {
+        FreeReplyReceipt { peer: "ab".into(), call_id: ID.into(), kind, operation_id: op.into(), request_hash: hash.into(), phase: String::new(), applied_ms: 0 }
+    }
+
+    /// A callee row ringing (or still waiting for a device) with this reply reserved.
+    fn reserved_reply(kind: u16, op: &str, hash: &str, fetched: bool) -> CallEntry {
+        let mut entry = receive(None, 400, None, 0).unwrap();
+        if fetched { entry = entry.device_fetched(0).unwrap(); }
+        reserve(Some(entry), kind, op, hash, 0).unwrap()
+    }
+
+    #[test]
+    fn a_free_reply_moves_only_its_own_reserved_call_and_records_its_receipt() {
+        for (kind, fetched, to) in [(401u16, true, Phase::Live), (403, true, Phase::Ended), (403, false, Phase::Ended)] {
+            let receipt = free_receipt(kind, "op", "hash");
+            let FreeReplyCheck::Apply(next) = free_reply_transition(Some(reserved_reply(kind, "op", "hash", fetched)), &receipt, 5) else {
+                panic!("{kind}/{fetched}: the exact reservation must apply");
+            };
+            assert_eq!((next.phase, next.pending.clone()), (to, None), "{kind}/{fetched}");
+            assert_eq!(next.free_reply_receipts.len(), 1);
+            assert!(next.free_reply_receipts[0].binds(&receipt));
+            assert_eq!((next.free_reply_receipts[0].phase.as_str(), next.free_reply_receipts[0].applied_ms), (to.as_str(), 5));
+            // Applying again finds the receipt: the transition is not repeated.
+            assert_eq!(free_reply_transition(Some(next.clone()), &receipt, 6), FreeReplyCheck::AlreadyApplied);
+            // A later end keeps the historical receipt.
+            let later = CallEntry { phase: Phase::Ended, deadline_ms: 7 + TOMBSTONE_MS, end_reason: Some(HangupReason::Hangup), ..next };
+            assert_eq!(free_reply_transition(Some(later), &receipt, 8), FreeReplyCheck::AlreadyApplied);
+        }
+    }
+
+    #[test]
+    fn a_free_reply_without_its_receipt_or_reservation_is_invalid() {
+        let receipt = free_receipt(401, "op", "hash");
+        // No call, a call ended another way, another request's reservation.
+        assert_eq!(free_reply_transition(None, &receipt, 1), FreeReplyCheck::Invalid);
+        let ringing = receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap();
+        let hung_up = receive(Some(reserved_reply(401, "op", "hash", true)), 403, Some(HangupReason::Hangup), 1).unwrap();
+        assert_eq!(free_reply_transition(Some(hung_up), &receipt, 2), FreeReplyCheck::Invalid);
+        assert_eq!(free_reply_transition(Some(ringing.clone()), &receipt, 1), FreeReplyCheck::Invalid);
+        for kind in [401u16, 403] {
+            let entry = reserve(Some(ringing.clone()), kind, "other", "hash", 0).unwrap();
+            assert_eq!(free_reply_transition(Some(entry), &receipt, 1), FreeReplyCheck::Invalid, "{kind}");
+        }
+        // The ring window closed while the reply was reserved.
+        assert_eq!(free_reply_transition(Some(reserved_reply(401, "op", "hash", true)), &receipt, RING_TIMEOUT_MS), FreeReplyCheck::Invalid);
+        // An answer cannot move a call still waiting for a device.
+        let waiting = CallEntry { pending: Some(Pending { operation_id: "op".into(), kind: 401, request_hash: "hash".into() }), ..receive(None, 400, None, 0).unwrap() };
+        assert_eq!(free_reply_transition(Some(waiting), &receipt, 1), FreeReplyCheck::Invalid);
+        // A caller row is never a free reply's call.
+        let caller = CallEntry { side: Side::Caller, ..reserved_reply(401, "op", "hash", true) };
+        assert_eq!(free_reply_transition(Some(caller), &receipt, 1), FreeReplyCheck::Invalid);
+    }
+
+    #[test]
+    fn a_hangup_that_only_clears_an_unpaid_notice_is_not_a_decline() {
+        let live = CallEntry { phase: Phase::Live, unpaid_notice_used: true, deadline_ms: 100,
+            pending: Some(Pending { operation_id: "op".into(), kind: 403, request_hash: "hash".into() }),
+            ..receive(None, 400, None, 0).unwrap() };
+        assert_eq!(free_reply_transition(Some(live), &free_receipt(403, "op", "hash"), 1), FreeReplyCheck::Invalid);
+    }
+
+    #[test]
+    fn contradictory_free_reply_evidence_is_corrupt_not_applied() {
+        let entry = reserved_reply(401, "op", "hash", true);
+        assert_eq!(free_reply_transition(Some(entry.clone()), &free_receipt(401, "op", ""), 1), FreeReplyCheck::Corrupt);
+        // This operation's id reserved for another request or kind, or without
+        // a digest (a legacy reservation is not this request's proof).
+        let ringing = receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap();
+        for (kind, hash) in [(401u16, "other"), (403, "hash"), (401, "")] {
+            let other = CallEntry { pending: Some(Pending { operation_id: "op".into(), kind, request_hash: hash.into() }), ..ringing.clone() };
+            assert_eq!(free_reply_transition(Some(other), &free_receipt(401, "op", "hash"), 1), FreeReplyCheck::Corrupt, "{kind}/{hash}");
+        }
+        assert_eq!(free_reply_transition(Some(entry.clone()), &free_receipt(400, "op", "hash"), 1), FreeReplyCheck::Corrupt);
+        let FreeReplyCheck::Apply(applied) = free_reply_transition(Some(entry), &free_receipt(401, "op", "hash"), 1) else { panic!() };
+        // A receipt for this operation that names another request, call or peer.
+        for other in [free_receipt(401, "op", "other"), FreeReplyReceipt { call_id: "x".into(), ..free_receipt(401, "op", "hash") },
+            FreeReplyReceipt { peer: "cd".into(), ..free_receipt(401, "op", "hash") }] {
+            assert_eq!(free_reply_transition(Some(applied.clone()), &other, 2), FreeReplyCheck::Corrupt);
+        }
+        // Two receipts for one operation.
+        let doubled = CallEntry { free_reply_receipts: vec![applied.free_reply_receipts[0].clone(); 2], ..applied };
+        assert_eq!(free_reply_transition(Some(doubled), &free_receipt(401, "op", "hash"), 2), FreeReplyCheck::Corrupt);
+    }
+
+    #[test]
+    fn the_receipt_bound_refuses_a_transition_and_never_drops_a_receipt() {
+        let held: Vec<_> = (0..MAX_FREE_REPLY_RECEIPTS).map(|i| free_receipt(403, &format!("held{i}"), "hash")).collect();
+        let full = CallEntry { free_reply_receipts: held.clone(), ..reserved_reply(401, "op", "hash", true) };
+        assert_eq!(free_reply_transition(Some(full.clone()), &free_receipt(401, "op", "hash"), 1), FreeReplyCheck::Full);
+        assert_eq!(full.free_reply_receipts, held);
+        for receipt in &held {
+            assert_eq!(free_reply_transition(Some(full.clone()), receipt, 1), FreeReplyCheck::AlreadyApplied);
+        }
+    }
+
+    #[test]
+    fn a_row_holding_a_receipt_is_never_aged_out() {
+        let FreeReplyCheck::Apply(declined) = free_reply_transition(Some(reserved_reply(403, "op", "hash", true)), &free_receipt(403, "op", "hash"), 0) else { panic!() };
+        let after = declined.replay_until_ms() + TOMBSTONE_MS;
+        let kept = declined.clone().at(after).expect("the receipt keeps its row");
+        assert_eq!((kept.phase, kept.free_reply_receipts.len()), (Phase::Ended, 1));
+        // The id stays burned while the row is kept.
+        assert_eq!(receive(Some(kept), 400, None, after), Err(CallRefusal::Replayed));
+        assert!(CallEntry { free_reply_receipts: Vec::new(), ..declined }.at(after).is_none());
+    }
+
 }
 
 
