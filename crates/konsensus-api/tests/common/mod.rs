@@ -307,18 +307,24 @@ impl Storage for MemStorage {
 
     async fn call_with_free_reply_receipts(
         &self,
+        after: Option<(&[u8], &[u8])>,
         max: u32,
-    ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
+    ) -> Result<konsensus_storage::FreeReplyReceiptPage, StorageError>
     {
-        Ok(self
+        // Rows are held decoded in memory, so every listed row has its entry.
+        let mut rows: Vec<konsensus_storage::FreeReplyReceiptRow> = self
             .calls
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, e)| !e.free_reply_receipts.is_empty())
-            .take(max as usize)
-            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
-            .collect())
+            .filter(|((peer, id), e)| !e.free_reply_receipts.is_empty()
+                && after.is_none_or(|(p, c)| (peer.to_hex().as_bytes(), id.as_bytes()) > (p, c)))
+            .map(|((peer, id), entry)| (peer.to_hex(), id.clone(), Some((*peer, entry.clone()))))
+            .collect();
+        rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        rows.truncate(max as usize);
+        let last_key = rows.last().map(|(p, c, _)| (p.clone().into_bytes(), c.clone().into_bytes()));
+        Ok(konsensus_storage::FreeReplyReceiptPage { scanned: rows.len(), last_key, rows })
     }
 
     async fn insert_channel_open_operation(
