@@ -108,6 +108,7 @@ async fn start_node_with(
 
     let audit = Arc::new(konsensus_api::audit::AuditLog::open(dir.path().join("audit.log")).unwrap());
     let state = Arc::new(konsensus_api::AppState {
+        call_hangup_invoice: false,
         starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::clone(&storage),

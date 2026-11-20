@@ -422,6 +422,9 @@ pub struct Debit {
     direct: bool,
     call_block: Option<(konsensus_core::NodeId, String)>,
     call_offer: Option<(konsensus_core::NodeId, String)>,
+    /// A hangup paid only through the invoice its recipient issues for this
+    /// call while it is live there: the invoice request purpose.
+    call_hangup: Option<String>,
     call_spend: Option<(String, String)>,
     /// A paid call signal: rechecked against the grant on every guarded poll.
     call_payment: Option<crate::spend_budget::CallPayment>,
@@ -446,6 +449,14 @@ impl Debit {
 
     pub(crate) fn is_call_block(&self) -> bool { self.call_block.is_some() }
 
+    /// Pay this hangup only through a call-bound invoice requested with `purpose`.
+    pub(crate) fn for_call_hangup(mut self, purpose: String) -> Self {
+        self.call_hangup = Some(purpose);
+        self
+    }
+
+    pub(crate) fn is_call_hangup(&self) -> bool { self.call_hangup.is_some() }
+
     /// Mark a paid call signal of `kind` (400 to 404), whether or not it
     /// draws on a hold; any other kind is left unmarked.
     pub(crate) fn for_call_payment(mut self, kind: u16) -> Self {
@@ -463,6 +474,9 @@ impl Debit {
     /// Call blocks name their call and sequence; other messages name their
     /// kind so the recipient can price the invoice locally (#403).
     pub(crate) fn invoice_purpose(&self, kind: Option<u16>) -> String {
+        if let Some(purpose) = &self.call_hangup {
+            return purpose.clone();
+        }
         self.call_block.as_ref().and_then(|(_, plaintext)|
             konsensus_core::payloads::call::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, plaintext).ok()
         ).map(|signal| format!("{}{}:{}", konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX,
@@ -545,12 +559,12 @@ impl Debit {
 
     /// Owner-only paths have no grant to revalidate.
     pub(crate) fn unmetered() -> Self {
-        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, call_payment: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
+        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_hangup: None, call_spend: None, call_payment: None, fees: Default::default(), held: None, call_reserved_msat: std::sync::Mutex::new(0) }
     }
 
     fn reserved(service: Arc<PairingService>, reservation: Reservation) -> Self {
         let total = reservation.charges.iter().map(|c| c.amount_msat).sum();
-        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_spend: None, call_payment: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
+        Self { operation: None, max_routing_fee_msat: None, direct: false, call_block: None, call_offer: None, call_hangup: None, call_spend: None, call_payment: None, fees: Default::default(), held: Some((service, reservation)), call_reserved_msat: std::sync::Mutex::new(total) }
     }
 
     /// Whether this debit is held against a budget grant.

@@ -606,7 +606,7 @@ fn response(backend: &str, op: &OutboxOperation, delivered: bool) -> Result<Comp
     })
 }
 fn contextual(error: ApiError, op: &OutboxOperation) -> ApiError {
-    let retry_allowed = !call_price_changed(&error) && matches!(
+    let retry_allowed = !call_price_changed(&error) && !unpaid_hangup_ended(&error) && matches!(
         op.state.as_str(),
         "prepared" | "released" | "paid" | "sent" | "rejected_retryable"
     );
@@ -733,6 +733,11 @@ pub(super) async fn compose_call(
         }
     }
     crate::calls::resolve_outgoing(&state, &peer, &plaintext, &id, &request_hash).await;
+    if result.as_ref().err().is_some_and(unpaid_hangup_ended) {
+        if let Err(error) = crate::calls::end_after_unpaid_hangup(&state, &peer, &plaintext).await {
+            tracing::warn!(%error, "unpaid hangup: ending the call deferred");
+        }
+    }
     if ends_on_failure && call_payment_failed(&state, &id, result.as_ref().err()).await {
         let owner_price_change = spend_client.is_none() && result.as_ref().err().is_some_and(call_price_changed);
         let owns_call_spend = match (spend_client.as_ref(), state.pairing.as_ref(),
@@ -771,6 +776,19 @@ async fn call_payment_failed(state: &AppState, id: &str, error: Option<&ApiError
     if price_changed(error) { return true; }
     let Ok(Some(op)) = state.storage.get_outbox_operation(id).await else { return false };
     definite_call_payment_failure(&op)
+}
+
+/// A call-bound hangup refused before payment because the call is over on
+/// the other side, or unanswered there: the call ended here, nothing was paid,
+/// and sending it again cannot change that.
+fn unpaid_hangup_ended(error: &ApiError) -> bool {
+    match error {
+        ApiError::Reasoned { reason, .. }
+            if *reason == super::caps::CALL_ENDED || *reason == super::caps::CALL_HANGUP_UNANSWERED => true,
+        ApiError::Operation { source, .. } | ApiError::RoutingFee { source, .. }
+            | ApiError::Reasoned { source, .. } => unpaid_hangup_ended(source),
+        _ => false,
+    }
 }
 
 fn call_price_changed(error: &ApiError) -> bool {

@@ -7480,6 +7480,7 @@ async fn recovery_reconnect_start_session_handler(
     let (pending_tx, pending_rx) = tokio::sync::mpsc::channel(8);
     let (auto_channel_tx, auto_rx) = tokio::sync::mpsc::channel(8);
     let deps = crate::session_handler::SessionHandlerDeps {
+        call_hangup_invoice: false,
         content_server: None, front_door: Default::default(), privacy: Default::default(), peer_exchange_floor: 0,
         transport, session_manager: sessions, storage, our_node_id: *id.node_id(), identity: id,
         audit_log: Arc::new(AuditLog::open(audit_path).unwrap()), min_admission_cost_msat: 1000,

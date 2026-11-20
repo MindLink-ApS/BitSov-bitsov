@@ -331,6 +331,7 @@ async fn worker(
     let (auto, _) = mpsc::channel(8);
     let handle = tokio::spawn(crate::session_handler::run(
         crate::session_handler::SessionHandlerDeps {
+        call_hangup_invoice: false,
         content_server: None,
         front_door: Default::default(),
             min_admission_cost_msat: 0,

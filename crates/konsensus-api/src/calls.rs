@@ -580,6 +580,71 @@ pub async fn validate_call_block_invoice(store: Store<'_>, peer: &NodeId, call_i
     Ok(entry.deadline_ms.saturating_add(rules::CALL_BLOCK_RESUME_MS))
 }
 
+/// The recipient's check before it issues a call-bound hangup invoice, under
+/// the call lock: its own row for this call is live, on the other side from
+/// the `sender`, and (as callee) its media is still attached. Wallet work runs
+/// after this returns; the caller repeats it before publishing the invoice.
+/// `UnknownCall` or `WrongSide` means the call is over here; `Invalid` means
+/// its state could not be read. The result is the binding's retention deadline.
+pub async fn validate_call_hangup_invoice(store: Store<'_>, peer: &NodeId, call_id: &str, sender: rules::Side) -> Result<u64, CallRefusal> {
+    let _guard = lock().lock().await;
+    let unavailable = |_| CallRefusal::Invalid("call state unavailable");
+    let now = now_ms();
+    let entry = store.call_get(peer, call_id).await.map_err(unavailable)?.and_then(|e| e.at(now));
+    rules::validate_hangup_invoice(entry.as_ref(), sender)?;
+    if sender == rules::Side::Caller
+        && media_detach::media_attachment_stopped(store, peer, call_id).await.map_err(unavailable)? {
+        return Err(CallRefusal::UnknownCall);
+    }
+    // Long enough for a paid hangup still being resent to find its binding.
+    Ok(now.saturating_add(rules::TOMBSTONE_MS))
+}
+
+/// Sending side: the invoice purpose this hangup goes out under, or `None`
+/// for the existing path. Only with `[calls] call_hangup_invoice_v1` on, to a
+/// connected peer that advertised
+/// [`konsensus_core::payloads::call::HANGUP_INVOICE_CAPABILITY`], and for an
+/// ordinary hangup of a call this node holds live. Such a hangup is paid only
+/// through the invoice the peer issues for this call; never by keysend.
+pub(crate) async fn hangup_invoice_purpose(state: &AppState, peer: &NodeId, kind: u16, plaintext: &str)
+    -> Result<Option<String>, ApiError> {
+    if !state.call_hangup_invoice || kind != konsensus_core::kind::KIND_CALL_HANGUP {
+        return Ok(None);
+    }
+    let Ok(signal) = CallSignal::parse(kind, plaintext) else { return Ok(None) };
+    let wanted = format!("Custom({:?})", rules::HANGUP_INVOICE_CAPABILITY);
+    if !state.transport.peer_info(peer).await.is_some_and(|info| info.capabilities.contains(&wanted)) {
+        return Ok(None);
+    }
+    let entry = state.storage.call_get(peer, &signal.call_id).await
+        .map_err(|e| ApiError::Storage(e.to_string()))?
+        .and_then(|e| e.at(now_ms()));
+    Ok(entry.filter(|e| rules::hangup_uses_invoice(Some(e), signal.reason))
+        .map(|e| rules::hangup_invoice_purpose(&signal.call_id, e.side)))
+}
+
+/// The peer answered a call-bound hangup's invoice request with "call ended",
+/// or did not answer it: nothing was paid. End the call here too, so it holds
+/// no media and no hold, and a retry is refused before any payment.
+pub(crate) async fn end_after_unpaid_hangup(state: &AppState, peer: &NodeId, plaintext: &str)
+    -> Result<(), konsensus_storage::StorageError> {
+    let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return Ok(()) };
+    let _guard = lock().lock().await;
+    let Some(entry) = state.storage.call_get(peer, &signal.call_id).await? else { return Ok(()) };
+    if entry.phase == rules::Phase::Ended {
+        return Ok(());
+    }
+    let next = CallEntry {
+        phase: rules::Phase::Ended,
+        end_reason: Some(signal.reason.unwrap_or(rules::HangupReason::Hangup)),
+        deadline_ms: now_ms().saturating_add(rules::TOMBSTONE_MS),
+        // Only this hangup can be reserved here, and it was refused unpaid.
+        pending: entry.pending.clone().filter(|p| p.kind != konsensus_core::kind::KIND_CALL_HANGUP),
+        ..entry
+    };
+    state.storage.call_put(peer, &signal.call_id, &next).await
+}
+
 /// Check a payment-validated block before consuming its nonce/payment proof.
 /// Retain the guard through acceptance and commit. An unserviceable settled
 /// block still consumes its proof and becomes an audited overpayment.
@@ -716,11 +781,16 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     signal.check_leg(peer, own)?;
     let _g = lock().lock().await;
     let now = now_ms();
-    admit_locked(store, peer, kind, &signal, now, now).await?;
+    admit_locked(store, peer, kind, &signal, now, now, None).await?;
     Ok(signal)
 }
 
-async fn admit_locked(store: Store<'_>, peer: &NodeId, kind: u16, signal: &CallSignal, now: u64, arrived: u64) -> Result<(), CallRefusal> {
+/// `payment_hash` is the paid envelope's: a hangup paid through an invoice
+/// this node bound to the call is delivered even if the call ended here
+/// between issuing that invoice and the hangup arriving, since this node
+/// already accepted it by issuing the invoice. Nothing about the call changes.
+async fn admit_locked(store: Store<'_>, peer: &NodeId, kind: u16, signal: &CallSignal, now: u64, arrived: u64,
+    payment_hash: Option<&[u8; 32]>) -> Result<(), CallRefusal> {
     let unavailable = |_| CallRefusal::Invalid("call state unavailable");
     let raw = store.call_get(peer, &signal.call_id).await.map_err(unavailable)?;
     let entry = raw.clone().and_then(|e| e.at(now));
@@ -750,7 +820,19 @@ async fn admit_locked(store: Store<'_>, peer: &NodeId, kind: u16, signal: &CallS
     } else {
         // The device wait runs from arrival, not from when admission got the lock.
         let transition_time = if kind == konsensus_core::kind::KIND_CALL_INVITE { arrived } else { now };
-        rules::receive(entry, kind, signal.reason, transition_time)?
+        let ended = entry.as_ref().is_some_and(|e| e.phase == rules::Phase::Ended);
+        match rules::receive(entry, kind, signal.reason, transition_time) {
+            Err(CallRefusal::UnknownCall) if kind == konsensus_core::kind::KIND_CALL_HANGUP && ended => {
+                let bound = match payment_hash {
+                    Some(hash) => store.has_call_block_invoice(peer, &signal.call_id, rules::HANGUP_INVOICE_SEQ, hash)
+                        .await.map_err(unavailable)?,
+                    None => false,
+                };
+                if bound { return Ok(()); }
+                return Err(CallRefusal::UnknownCall);
+            }
+            other => other?,
+        }
     };
     write(store, peer, &signal.call_id, Some(&next)).await.map_err(unavailable)?;
     Ok(())

@@ -334,6 +334,7 @@ async fn start_node(spec: Spec<'_>) -> SimNode {
     }));
 
     let state = Arc::new(konsensus_api::AppState {
+        call_hangup_invoice: false,
         starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::clone(&storage),
@@ -423,6 +424,7 @@ async fn start_node(spec: Spec<'_>) -> SimNode {
     let (auto_channel_tx, auto_rx) = mpsc::channel(64);
     std::mem::forget(auto_rx);
     tokio::spawn(tracing::Instrument::instrument(run_session_handler(SessionHandlerDeps {
+        call_hangup_invoice: false,
         content_server: Some(content_server.clone()),
         front_door: front_door.clone(),
         min_admission_cost_msat: 0,
