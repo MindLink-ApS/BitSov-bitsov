@@ -731,6 +731,8 @@ async fn recovered_failure_cannot_repay_when_call_cleanup_write_fails() {
 mod consent;
 #[path = "calls_settlement.rs"]
 mod settlement;
+#[path = "calls_continuity.rs"]
+mod continuity;
 #[path = "calls_free_reply.rs"]
 mod free_reply;
 

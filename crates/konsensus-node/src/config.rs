@@ -1385,6 +1385,16 @@ pub struct CallsConfig {
     /// against one budget and the socket closes past it, as it always has.
     #[serde(default)]
     pub media_drop_bulk_over_share: bool,
+    /// Live-call continuity. When a paired app's spend grant expires or the
+    /// owner replaces it during a call, the call admitted under it keeps its
+    /// media socket and keeps paying its minutes from the hold reserved at
+    /// admission, up to that hold and its minute limit. Nothing new is
+    /// reserved and no new call is admitted on the ended grant. A revocation,
+    /// epoch bump, removed pairing or identity change still ends the call's
+    /// media within a second. Off by default; only the value `true` turns it
+    /// on, and any other value leaves it off.
+    #[serde(default, deserialize_with = "deserialize_fail_closed_switch", skip_serializing_if = "std::ops::Not::not")]
+    pub call_continuity_v1: bool,
     /// Free call replies. This node answers a call, or declines it, at no
     /// charge when the caller's node advertises the same switch, and accepts
     /// such an answer or decline at no charge when it replies to this node's
@@ -1463,6 +1473,7 @@ impl Default for CallsConfig {
             media_max_frames_per_second: default_media_max_frames_per_second(),
             media_max_bytes_per_second: default_media_max_bytes_per_second(),
             media_drop_bulk_over_share: false,
+            call_continuity_v1: false,
             call_reply_free_v1: false,
         }
     }

@@ -19,7 +19,7 @@ use rand::{Rng, TryRng};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use super::{Inner, PairingError, PairingRefusal, PairingService, SpendGrant, ELEVATION_TTL_SECS};
+use super::{GrantEnd, Inner, PairingError, PairingRefusal, PairingService, SpendGrant, ELEVATION_TTL_SECS};
 use crate::auth::Scope;
 use crate::spend_budget::{GrantBudget, GrantView, MAX_SPEND_GRANT_TTL_SECS};
 
@@ -1228,6 +1228,7 @@ impl PairingService {
                 && grant.budget.as_ref().is_some_and(|b| b.recipients_only)
             {
                 grant.budget = None;
+                grant.ended = Some(GrantEnd::Revoked);
             }
         }
     }
@@ -1395,7 +1396,8 @@ impl PairingService {
                 "a live console grant must be revoked through the owner console before opening a relation grant".into(),
             ), "console_grant_live"));
         }
-        let before = (inner.file.grants.clone(), inner.file.intent_nonces.clone());
+        // The whole file: a new relation window can also move call funding.
+        let before = inner.file.clone();
 
         let nonce_key = format!("{}:{}", key.key_id, intent.nonce);
         inner
@@ -1431,14 +1433,9 @@ impl PairingService {
             None => {
                 // Retire expired grants before opening a new relation window.
                 // A live console budget was refused above.
-                for old in &mut inner.file.grants {
-                    if old.client_id == client_id {
-                        old.budget = None;
-                    }
-                }
                 let mut op = [0u8; 12];
                 rand::rng().fill_bytes(&mut op);
-                inner.file.grants.push(SpendGrant {
+                let mut grant = SpendGrant {
                     owner_approval: None,
                     op_id: format!("rel-{}", hex::encode(op)),
                     client_id: client_id.to_string(),
@@ -1449,10 +1446,16 @@ impl PairingService {
                     epoch,
                     granted_by: format!("device:{}", key.key_id),
                     budget: Some(GrantBudget::relations()),
-                });
+                    ended: None,
+                };
+                if !self.call_continuity {
+                    inner.file.replace_grants(&mut grant, false);
+                }
+                inner.file.grants.push(grant);
                 inner.file.grants.len() - 1
             }
         };
+        let fresh = live_idx.is_none();
         let grant = &mut inner.file.grants[idx];
         let budget = grant
             .budget
@@ -1472,14 +1475,25 @@ impl PairingService {
         grant.granted_at = now;
         grant.expires_at = last;
         grant.granted_by = format!("device:{}", key.key_id);
+        // With continuity, retire the earlier grants only now that the new
+        // window's envelope is open, so a call to this peer can be checked
+        // against it before its hold is carried over.
+        let idx = if fresh && self.call_continuity {
+            let mut grant = inner.file.grants.remove(idx);
+            inner.file.replace_grants(&mut grant, true);
+            inner.file.grants.push(grant);
+            inner.file.grants.len() - 1
+        } else { idx };
+        let grant = &inner.file.grants[idx];
         let view = super::grant_view(grant).ok_or(PairingError::Io("grant vanished".into()))?;
         inner.file.intent_nonces.insert(
             nonce_key,
             (client_id.to_string(), intent.issued_at.max(now)),
         );
         if let Err(e) = self.persist(&mut inner.file) {
-            // Never leave authority live in memory that the disk did not take.
-            (inner.file.grants, inner.file.intent_nonces) = before;
+            // Never leave authority live in memory that the disk did not take,
+            // nor call funding pointing at a grant that was not written.
+            inner.file = before;
             return Err(e.into());
         }
         tracing::info!(
