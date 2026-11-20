@@ -281,12 +281,16 @@ async fn a_page_listing_more_rows_than_it_covered_is_still_swept() {
     for n in 0..3u32 {
         store.call_put(&peer(n), CALL, &row(&peer(n), &format!("gone-{n}"))).await.unwrap();
     }
+    // On the same page: a receipt whose saved reply can still be recovered.
+    held(store, &peer(3), "held-3").await;
+    let kept = store.call_get(&peer(3), CALL).await.unwrap();
     // A store whose count of covered rows falls short of the rows it lists.
     *mem.receipt_page_hook.lock().unwrap() = Some(Box::new(|page| page.scanned = 0));
     konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
     for n in 0..3u32 {
         assert_eq!(store.call_get(&peer(n), CALL).await.unwrap().unwrap().free_reply_receipts, vec![], "row {n}");
     }
+    assert_eq!(store.call_get(&peer(3), CALL).await.unwrap(), kept, "a receipt that must be kept was released");
 }
 
 #[tokio::test]
@@ -320,4 +324,75 @@ async fn a_stored_empty_receipt_list_is_cleared_once_and_no_longer_listed() {
     for (p, entry) in before.iter().zip(entries) {
         assert_eq!(store.call_get(p, CALL).await.unwrap(), Some(entry));
     }
+}
+
+/// Every column of a PostgreSQL call row but its receipts, and its receipts as
+/// stored.
+async fn pg_row(pool: &sqlx::PgPool, peer: &NodeId) -> (String, Option<String>) {
+    sqlx::query_as("SELECT (to_jsonb(c) - 'free_reply_receipts')::TEXT, free_reply_receipts FROM call_state c WHERE peer = $1 AND call_id = $2")
+        .bind(peer.to_hex()).bind(CALL).fetch_one(pool).await.unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+async fn postgres_sweep_clears_stored_empty_receipt_lists_and_keeps_recoverable_ones() {
+    let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let name = format!("receipt_sweep_{}", uuid::Uuid::new_v4().simple());
+    sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+    let db_url = format!("{}/{name}", url.rsplit_once('/').unwrap().0);
+    {
+        let db = Arc::new(konsensus_storage::PostgresStorage::connect(&db_url).await.unwrap());
+        let mut state = common::test_state();
+        Arc::get_mut(&mut state).unwrap().storage = db.clone();
+        let store = state.storage.as_ref();
+        let pool = db.pool();
+
+        // peer 0: no receipts, stored as NULL.
+        let mut none = row(&peer(0), "unused");
+        none.free_reply_receipts.clear();
+        store.call_put(&peer(0), CALL, &none).await.unwrap();
+        // peers 1 and 2: an empty list, as only a damaged or hand-edited database could hold.
+        for (n, stored) in [(1u32, "[]"), (2, " [ ] ")] {
+            store.call_put(&peer(n), CALL, &row(&peer(n), &format!("gone-{n}"))).await.unwrap();
+            sqlx::query("UPDATE call_state SET free_reply_receipts = $1 WHERE peer = $2").bind(stored).bind(peer(n).to_hex())
+                .execute(pool).await.unwrap();
+        }
+        // peer 3: a receipt whose saved reply can still be recovered.
+        held(store, &peer(3), "held-3").await;
+        // peer 4: two receipts whose operations are gone.
+        let mut two = row(&peer(4), "gone-4a");
+        let mut second = two.free_reply_receipts[0].clone();
+        second.operation_id = "gone-4b".into();
+        two.free_reply_receipts.push(second);
+        store.call_put(&peer(4), CALL, &two).await.unwrap();
+
+        let peers: Vec<NodeId> = (0..5u32).map(peer).collect();
+        let mut before = Vec::new();
+        for p in &peers {
+            before.push(pg_row(pool, p).await);
+        }
+        assert_eq!(before[0].1, None);
+        assert_eq!(before[1].1.as_deref(), Some("[]"));
+        assert_eq!(before[2].1.as_deref(), Some(" [ ] "));
+        assert!(before[3].1.is_some() && before[4].1.is_some());
+        assert_eq!(store.call_with_free_reply_receipts(None, 256).await.unwrap().scanned, 4);
+
+        konsensus_api::handlers::messages::reconcile_operations(&state).await.unwrap();
+
+        for (n, (p, (fields, receipts))) in peers.iter().zip(&before).enumerate() {
+            let (after_fields, after_receipts) = pg_row(pool, p).await;
+            assert_eq!(&after_fields, fields, "row {n}: a field other than its receipts changed");
+            if n == 3 {
+                assert_eq!(&after_receipts, receipts, "a receipt that must be kept was changed or released");
+            } else {
+                assert_eq!(after_receipts, None, "row {n} is still listed as holding receipts");
+            }
+        }
+        let page = store.call_with_free_reply_receipts(None, 256).await.unwrap();
+        assert_eq!(page.scanned, 1, "a row holding an empty receipt list stays listed by every sweep");
+        db.pool().close().await;
+    }
+    sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
+    admin.close().await;
 }

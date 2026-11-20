@@ -124,6 +124,19 @@ jobs:
             fi
           done
 
+      - name: cargo test (pinned API PostgreSQL checks)
+        run: |
+          set -o pipefail
+          for name in \
+            postgres_sweep_clears_stored_empty_receipt_lists_and_keeps_recoverable_ones
+          do
+            cargo test -p konsensus-api --locked --test free_reply_receipt_sweep -- --ignored --exact "${name}" 2>&1 | tee pinned-api.log
+            if ! grep -qxF "test ${name} ... ok" pinned-api.log || ! grep -qE '^test result: ok\. 1 passed; 0 failed' pinned-api.log; then
+              echo "::error title=Pinned PostgreSQL check did not pass::${name}"
+              exit 1
+            fi
+          done
+
       - name: cargo test (ignored PostgreSQL tests)
         run: |
           set -o pipefail
