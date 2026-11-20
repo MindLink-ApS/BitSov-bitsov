@@ -374,6 +374,7 @@ async fn start_node(spec: Spec<'_>) -> SimNode {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -387,6 +388,7 @@ async fn start_node(spec: Spec<'_>) -> SimNode {
     tokio::spawn(tracing::Instrument::instrument(run_msg_handler(MsgHandlerDeps {
         transport: Arc::clone(&transport),
         call_devices: state.call_devices.clone(),
+        call_reply_free: false,
         transport_ack: Arc::clone(&transport),
         storage: Arc::clone(&storage),
         gate,

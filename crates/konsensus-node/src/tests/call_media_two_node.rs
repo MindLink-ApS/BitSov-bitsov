@@ -150,6 +150,7 @@ async fn start_node_with(
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: Some(router as Arc<dyn konsensus_api::call_media::CallMediaPort>),

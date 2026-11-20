@@ -1703,6 +1703,7 @@ async fn rejected_envelope_disclosures(privileged: bool) {
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         call_devices: Default::default(),
+        call_reply_free: false,
         ws_tx,
         audit_log: Arc::new(AuditLog::open(&audit_path).unwrap()),
         admission_mode: ReachabilityMode::PriceOpen,
@@ -2074,6 +2075,7 @@ async fn paid_acceptance_retry_case(
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         call_devices: Default::default(),
+        call_reply_free: false,
         ws_tx,
         audit_log: audit.clone(),
         admission_mode: ReachabilityMode::PriceOpen,
@@ -3265,6 +3267,7 @@ async fn paid_call_signalling_is_single_use_and_forwarded_only_for_a_live_call()
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         call_devices: devices.clone(),
+        call_reply_free: false,
         ws_tx: ws_tx.clone(),
         audit_log: audit.clone(),
         admission_mode: ReachabilityMode::PriceOpen,
@@ -4037,6 +4040,7 @@ async fn room_chats_stay_hidden_until_their_binding_is_admitted() {
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         call_devices: Default::default(),
+        call_reply_free: false,
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -4737,6 +4741,7 @@ async fn over_cap_calendar_invite_is_refused_withdrawn_and_terminal_for_the_send
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         call_devices: Default::default(),
+        call_reply_free: false,
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -5253,6 +5258,7 @@ async fn uncertain_paid_acceptance_keeps_the_calendar_hold() {
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         call_devices: Default::default(),
+        call_reply_free: false,
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -5436,6 +5442,7 @@ async fn sweep_winning_against_opaque_admission_or_replay_check_never_acknowledg
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         call_devices: Default::default(),
+        call_reply_free: false,
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -5620,6 +5627,7 @@ async fn receive_loop_ordered(lower_sender: bool) -> ReceiveLoop {
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         call_devices: Default::default(),
+        call_reply_free: false,
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -7300,6 +7308,7 @@ async fn recovery_reconnect_receive_loop(pricing: Arc<dyn konsensus_core::traits
         identity: bob.clone(),
         plaintext_cipher: Arc::new(PlaintextCacheCipher::new(bob.aes_key())),
         call_devices: Default::default(),
+        call_reply_free: false,
         ws_tx,
         audit_log: audit,
         admission_mode: ReachabilityMode::PriceOpen,
@@ -8078,4 +8087,48 @@ async fn failed_media_publication_keeps_paid_block_retryable() {
         Some(renewed)
     );
     net.stop().await;
+}
+
+#[tokio::test]
+async fn free_call_reply_passes_the_receive_gate_only_when_bound_and_switched_on() {
+    use konsensus_core::kind::{KIND_CALL_ANSWER, KIND_CALL_INVITE};
+    let caller = bob_identity();
+    let callee = alice_identity();
+    let call_id = "0123456789abcdef0123456789abcdef";
+    let store = Arc::new(konsensus_storage::SqliteStorage::in_memory().await.unwrap());
+    let offer = serde_json::json!({"v": 1, "call_id": call_id, "sdp": "offer", "media": "audio"}).to_string();
+    konsensus_api::calls::reserve_outgoing(store.as_ref(), caller.node_id(), callee.node_id(), KIND_CALL_INVITE, &offer, "op", "hash")
+        .await.unwrap();
+    konsensus_api::calls::commit_outgoing(store.as_ref(), callee.node_id(), &offer, "op", "hash").await.unwrap();
+    store.call_offer_bind(callee.node_id(), call_id, &MessageId::from_bytes([4; 32])).await.unwrap();
+    let nonce = konsensus_storage::StorageNonceAdapter::new(store.clone());
+    let registry = tokio::sync::RwLock::new(PeerRegistry::new());
+    let pricing = BlockingPricing {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Semaphore::new(16)),
+    };
+    let gate = PaymentGate::new();
+    let membrane = konsensus_api::membrane::Membrane::default();
+    let preimage = [77u8; 32];
+    let mut reply = UkmEnvelopeBuilder::new(KIND_CALL_ANSWER, *callee.node_id(), Recipient::Node(*caller.node_id()),
+        b"sealed answer".to_vec(), PaymentProof::new(Sha256::digest(preimage).into(), preimage, 0))
+        .references(vec![konsensus_core::payloads::call::free_reply_reference(call_id)])
+        .build();
+    reply.signature = Signature::from_ed25519(&callee.sign(&reply.signable_bytes()));
+    let verify = |enabled: bool| {
+        let receipts = FreeCallReplies { inner: &nonce, storage: store.as_ref(), enabled };
+        let (reply, membrane, registry, gate, pricing) = (&reply, &membrane, &registry, &gate, &pricing);
+        let caller = *caller.node_id();
+        async move {
+            whitelist_then_verify(reply, membrane, registry, gate, &receipts, pricing, None, 0.0, Some(&caller),
+                konsensus_message::ReachabilityMode::PriceOpen, true).await
+        }
+    };
+    // Off: the zero-amount answer meets the price floor, as before.
+    assert!(matches!(verify(false).await,
+        Err(konsensus_core::gate::GateRejection::InsufficientPayment { paid_msat: 0, .. })));
+    // On: bound to our ringing offer, admitted without any payment.
+    verify(true).await.expect("a bound free answer passes the receive gate");
+    // Once only.
+    assert!(verify(true).await.is_err(), "the same free reply was admitted twice");
 }

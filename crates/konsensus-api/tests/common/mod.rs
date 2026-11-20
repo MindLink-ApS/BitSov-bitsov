@@ -67,6 +67,9 @@ pub struct MemStorage {
     pub fail_call_get_for: Mutex<Option<String>>,
     pub fail_call_put_for: Mutex<Option<String>>,
     pub call_get_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs before every outbox operation write; an error fails that write.
+    #[allow(clippy::type_complexity)]
+    pub outbox_write_hook: Mutex<Option<Box<dyn FnMut(&konsensus_storage::OutboxOperation) -> Result<(), StorageError> + Send>>>,
     calls: Mutex<HashMap<(NodeId, String), konsensus_core::payloads::call::CallEntry>>,
     call_offers: Mutex<HashMap<(NodeId, String), MessageId>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
@@ -89,6 +92,20 @@ pub struct MemStorage {
 }
 
 impl MemStorage {
+    /// Move a stored call's deadline, as the clock passing it would.
+    #[allow(dead_code)]
+    pub fn set_call_deadline(&self, peer: &NodeId, call_id: &str, deadline_ms: u64) {
+        if let Some(entry) = self.calls.lock().unwrap().get_mut(&(*peer, call_id.to_string())) {
+            entry.deadline_ms = deadline_ms;
+        }
+    }
+
+    /// A stored call's phase, read without the async storage path (from a hook).
+    #[allow(dead_code)]
+    pub fn call_phase(&self, peer: &NodeId, call_id: &str) -> Option<konsensus_core::payloads::call::Phase> {
+        self.calls.lock().unwrap().get(&(*peer, call_id.to_string())).map(|e| e.phase)
+    }
+
     pub fn new() -> Self {
         Self {
             peer_upsert_gate: Mutex::new(None),
@@ -99,6 +116,7 @@ impl MemStorage {
             fail_call_get_for: Mutex::new(None),
             fail_call_put_for: Mutex::new(None),
             call_get_hook: Mutex::new(None),
+            outbox_write_hook: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
             call_offers: Mutex::new(HashMap::new()),
             outbox: Mutex::new(HashMap::new()),
@@ -344,6 +362,14 @@ impl Storage for MemStorage {
         &self,
         op: &konsensus_storage::OutboxOperation,
     ) -> Result<bool, StorageError> {
+        // Taken out while it runs: a hook that panics (a node stopping) leaves
+        // no poisoned lock behind.
+        let hook = self.outbox_write_hook.lock().unwrap().take();
+        if let Some(mut hook) = hook {
+            let result = hook(op);
+            *self.outbox_write_hook.lock().unwrap() = Some(hook);
+            result?;
+        }
         let dispatching = op.state == "paying" && serde_json::from_slice::<serde_json::Value>(&op.recovery)
             .is_ok_and(|data| data["dispatched"] == true);
         let gate = if dispatching { self.outbox_dispatch_gate.lock().unwrap().take() } else { None };
@@ -1453,6 +1479,7 @@ pub fn test_state() -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1523,6 +1550,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1581,6 +1609,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1649,6 +1678,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1707,6 +1737,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1993,6 +2024,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2257,6 +2289,7 @@ pub fn test_state_with_lightning_and_storage(
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,

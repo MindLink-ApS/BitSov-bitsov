@@ -608,6 +608,105 @@ pub async fn prepare_incoming_block<'a>(store: Store<'a>, peer: &NodeId, plainte
     Ok(IncomingBlock { _guard: guard, store, peer: *peer, signal, next })
 }
 
+/// Receiving side of free call replies, at the payment gate: whether a
+/// free-reply-shaped envelope from `sender` names, by its reference, a call
+/// this node placed to `sender`, whose paid offer is bound and which is still
+/// ringing at `now`. Always false while `[calls] call_reply_free_v1` is off.
+pub async fn free_reply_bound(enabled: bool, store: Store<'_>, envelope: &konsensus_core::UkmEnvelope,
+    now: u64) -> Result<bool, konsensus_storage::StorageError> {
+    if !enabled || !rules::is_free_reply_shape(envelope) {
+        return Ok(false);
+    }
+    for (call_id, entry) in store.call_open_by_peer(&envelope.sender, now).await? {
+        let ringing = entry.at(now).is_some_and(|e| e.side == rules::Side::Caller && e.phase == rules::Phase::Ringing);
+        if ringing && [rules::free_reply_reference(&call_id)] == envelope.references.as_slice()
+            && store.call_offer(&envelope.sender, &call_id).await?.is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Receiving side, after decryption: a zero-amount answer or hangup was
+/// accepted only as a free reply, so its payload must be exactly that reply,
+/// to the call its reference names: an answer, or a hangup whose reason is
+/// `declined`, to this node's own ringing offer. Anything else is refused and
+/// withdrawn; it was never paid, so the refusal costs the sender nothing more.
+pub async fn check_free_reply(store: Store<'_>, envelope: &konsensus_core::UkmEnvelope,
+    plaintext: Option<&str>) -> Result<(), CallRefusal> {
+    if !rules::is_free_reply_shape(envelope) {
+        return Ok(());
+    }
+    let signal = CallSignal::parse(envelope.kind, plaintext.ok_or(CallRefusal::Invalid("undecryptable"))?)?;
+    if [rules::free_reply_reference(&signal.call_id)] != envelope.references.as_slice() {
+        return Err(CallRefusal::Invalid("a free reply names another call"));
+    }
+    if envelope.kind == konsensus_core::kind::KIND_CALL_HANGUP && signal.reason != Some(rules::HangupReason::Declined) {
+        return Err(CallRefusal::Invalid("only a declined hangup is a free reply"));
+    }
+    let entry = store.call_get(&envelope.sender, &signal.call_id).await
+        .map_err(|_| CallRefusal::Invalid("call state unavailable"))?
+        .and_then(|e| e.at(now_ms()));
+    match entry {
+        Some(e) if e.side == rules::Side::Caller && e.phase == rules::Phase::Ringing => Ok(()),
+        Some(_) => Err(CallRefusal::NotRinging),
+        None => Err(CallRefusal::UnknownCall),
+    }
+}
+
+/// Sending side: whether this answer or declined hangup goes out free. Only
+/// with the switch on, to a connected peer that advertised
+/// [`konsensus_core::payloads::call::FREE_REPLY_CAPABILITY`], for a call this
+/// node is ringing for as callee (a decline also while the call waits for a
+/// device), and with no other reference. The legacy paid path is used only
+/// for compatibility: switch off, a peer that does not advertise it, or a
+/// signal that is not an answer or decline. Once both nodes offer the free
+/// reply, a call that cannot be read or is no longer ringing refuses the
+/// reply unsent; it is never paid instead.
+pub(crate) async fn free_reply_allowed(state: &AppState, peer: &NodeId, kind: u16, plaintext: &str,
+    references: &[konsensus_core::MessageId]) -> Result<bool, ApiError> {
+    if !state.call_reply_free || !references.is_empty() {
+        return Ok(false);
+    }
+    let Ok(signal) = CallSignal::parse(kind, plaintext) else { return Ok(false) };
+    let answer = kind == konsensus_core::kind::KIND_CALL_ANSWER;
+    let decline = kind == konsensus_core::kind::KIND_CALL_HANGUP && signal.reason == Some(rules::HangupReason::Declined);
+    if !answer && !decline {
+        return Ok(false);
+    }
+    let wanted = format!("Custom({:?})", rules::FREE_REPLY_CAPABILITY);
+    if !state.transport.peer_info(peer).await.is_some_and(|info| info.capabilities.contains(&wanted)) {
+        return Ok(false);
+    }
+    // Both nodes offer the free reply: from here on it is free or not sent.
+    // Never fall back to paying it because the call could not be read, or
+    // because its ring window closed after the reply was reserved.
+    free_reply_still_eligible(state, peer, &signal.call_id, decline).await?;
+    Ok(true)
+}
+
+/// The call this free reply answers is still ours to answer: this node is
+/// its callee and it is ringing (a decline also while it waits for a
+/// device). Otherwise the reply is refused unsent, with nothing paid. Read
+/// when deciding and again right before the reply is dispatched.
+pub(crate) async fn free_reply_still_eligible(state: &AppState, peer: &NodeId, call_id: &str, decline: bool)
+    -> Result<(), ApiError> {
+    let entry = state.storage.call_get(peer, call_id).await
+        .map_err(|_| ApiError::NotDispatched(
+            "the call could not be read; the reply was not sent and nothing was paid".into(),
+        ).with_reason("call_reply_unavailable"))?
+        .and_then(|e| e.at(now_ms()));
+    let eligible = entry.is_some_and(|e| e.side == rules::Side::Callee
+        && (e.phase == rules::Phase::Ringing || (decline && e.phase == rules::Phase::AwaitingDevice)));
+    if !eligible {
+        return Err(ApiError::NotDispatched(
+            "the call is no longer ringing; the reply was not sent and nothing was paid".into(),
+        ).with_reason("call_reply_expired"));
+    }
+    Ok(())
+}
+
 /// Admit a signal this node (`own`) received from `peer` (after the payment
 /// gate). A refusal means it must not reach the app (the caller also
 /// withdraws the stored message). A meeting leg must come from the earlier
@@ -875,6 +974,24 @@ pub async fn settle_operation(state: &AppState, op: &konsensus_storage::OutboxOp
             }
         }
     }
+}
+
+/// A saved free call reply is about to be queued by recovery: publish its
+/// call transition first if it is still missing, so the reply is never
+/// delivered ahead of it. A failed write keeps the reply unqueued; the next
+/// sweep or a retry of the same operation tries again.
+pub(crate) async fn commit_saved_reply(state: &AppState, op: &konsensus_storage::OutboxOperation)
+    -> Result<(), konsensus_storage::StorageError> {
+    let store = state.storage.as_ref();
+    let peer = NodeId::from_hex(&op.recipient)
+        .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+    for (p, call_id, entry) in store.call_pending().await? {
+        if p == peer && entry.pending.is_some_and(|x| x.is(&op.operation_id, &op.request_hash) && i64::from(x.kind) == op.kind) {
+            settle(store, &peer, &call_id, &op.operation_id, &op.request_hash, Settlement::Paid,
+                state.pairing.as_deref().map(|service| (service, None))).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Release every reservation of a durably abandoned operation. The caller

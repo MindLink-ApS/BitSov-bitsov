@@ -733,6 +733,8 @@ mod consent;
 mod settlement;
 #[path = "calls_continuity.rs"]
 mod continuity;
+#[path = "calls_free_reply.rs"]
+mod free_reply;
 
 #[tokio::test]
 async fn an_answer_recovered_after_an_ambiguous_payment_keeps_its_media_client() {
@@ -1445,6 +1447,7 @@ async fn relation_call_with_held_invoice(per_act: u64)
                 Some(invoice_for(peer, amount))
             })),
         max_call_minutes: 1,
+        call_reply_free: false,
         ..(*fx.state).clone()
     });
     let (fx, token, _, renewal) =

@@ -473,6 +473,9 @@ async fn status(
             if state.starter.config.enabled {
                 capabilities.push("starter_channel_request_v1");
             }
+            if state.call_reply_free {
+                capabilities.push(konsensus_core::payloads::call::FREE_REPLY_CAPABILITY);
+            }
             if state
                 .pairing
                 .as_ref()

@@ -555,6 +555,34 @@ async fn recv_kind(
     .unwrap_or_else(|_| panic!("timeout waiting for kind {kind}"))
 }
 
+/// Wait for `app` to receive the call invite for `call_id` from `from`, then
+/// fetch it as `app`'s paired device does, through the authenticated messages
+/// endpoint. An incoming invite waits for that device fetch; the internal feed
+/// alone does not ring it. Returns once the call is ringing.
+#[cfg(unix)]
+async fn device_rings(
+    app: &mut app::App,
+    from: &konsensus_core::NodeId,
+    call_id: &str,
+) -> Arc<konsensus_api::state::WsMessage> {
+    let invite = recv_kind(app, from, konsensus_core::kind::KIND_CALL_INVITE).await;
+    let (status, body) = app
+        .get(&format!("/api/v1/messages/{}", invite.envelope.id.to_hex()), false)
+        .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "paired device fetch: {body}");
+    let storage = app.state.storage.clone();
+    wait("the fetched call invite rings", || {
+        let storage = storage.clone();
+        async move {
+            storage.call_get(from, call_id).await.unwrap().is_some_and(|entry| {
+                entry.phase == konsensus_core::payloads::call::Phase::Ringing
+            })
+        }
+    })
+    .await;
+    invite
+}
+
 /// 1:1 call signalling over real LDK on regtest (overnight ticket A, step 2).
 /// Same A -- C -- B topology as `real_ldk_regtest_e2e`. The offer (400) pays
 /// B's `call_msat` (10,000 msat default) once; answer/ICE/hangup pay the

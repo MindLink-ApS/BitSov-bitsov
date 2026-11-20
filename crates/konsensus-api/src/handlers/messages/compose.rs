@@ -3900,11 +3900,24 @@ pub(super) async fn compose_peer(
         reconcile_admission_budget(&state, &peer_id, None).await?;
         let mut admission = FirstContactCharge { operation: Some(operation.clone()), ..Default::default() };
         let recipient = Recipient::Node(peer_id);
+        // An answer or a decline to a call this node is ringing for, sent to a
+        // caller that accepts it free (`[calls] call_reply_free_v1` on both
+        // nodes): no quote, no invoice, no grant debit, no reservation and no
+        // payment. It is bound to that call and to the open session below.
+        let free_reply = state.session_manager.has_session(&peer_id).await
+            && crate::calls::free_reply_allowed(&state, &peer_id, req.kind, &req.plaintext, &references).await?;
+        let references = if free_reply {
+            let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            vec![konsensus_core::payloads::call::free_reply_reference(&signal.call_id)]
+        } else { references };
 
         let mut tip = if state.lightning.money_ready().await && !state.session_manager.has_session(&peer_id).await {
             Some(crate::error::observe_tip(&state).await?)
         } else { None };
-        let mut price_msat = if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
+        let mut price_msat = if free_reply {
+            0
+        } else if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
             crate::handlers::browse::page_price(&state, peer_id, &req.plaintext, req.max_routing_fee_msat, &mut tip).await?
         } else {
             quoted_price(&state, &peer_id, req.kind, &mut tip).await?
@@ -4101,7 +4114,9 @@ pub(super) async fn compose_peer(
 
         // Reject budget limits before advancing the ratchet or requesting an invoice.
         let peer_key = peer_id.to_hex();
-        let debit = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+        let debit = if free_reply {
+            Ok(crate::metered::Debit::unmetered())
+        } else if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
             let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             auth.debit_call_block(&state, &signal, &peer_key, price_msat,
@@ -4300,19 +4315,58 @@ pub(super) async fn compose_peer(
             forbidden: !policy.allow_readmission,
             ..Readmission::for_cap(readmission_cap)
         };
-        let (payment_hash, preimage_bytes, amount_msat) =
-            create_metered_payment_proof(&state, price_msat, &peer_id, &debit, &readmission, Some(req.kind), &mut admission, tip.as_ref()).await?;
+        let (payment_hash, preimage_bytes, amount_msat) = if free_reply {
+            // Judged free: it stays free or is not sent. Recheck the call
+            // right before it goes out; a closed ring window refuses it.
+            let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            let decline = req.kind == konsensus_core::kind::KIND_CALL_HANGUP;
+            crate::calls::free_reply_still_eligible(&state, &peer_id, &signal.call_id, decline).await?;
+            // Not a payment: a fresh preimage only makes the envelope's replay
+            // keys unique. The caller's gate binds the reply to its ringing
+            // offer instead of to a settlement.
+            let preimage: [u8; 32] = rand::random();
+            (sha2::Sha256::digest(preimage).into(), preimage, 0)
+        } else {
+            create_metered_payment_proof(&state, price_msat, &peer_id, &debit, &readmission, Some(req.kind), &mut admission, tip.as_ref()).await?
+        };
         admission.message_settled = amount_msat;
         let proof =
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
 
-        if crate::calls::is_call_kind(req.kind) {
-            // Paid: publish the call transition before the envelope goes out.
+        let envelope = if free_reply {
+            // Free: save the signed reply first, then publish the call
+            // transition, then queue the reply. A stop or failed write before
+            // the transition leaves the call ringing and the reply unsent;
+            // after it, recovery queues the saved reply.
+            let envelope = operation.sealed_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
             let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
-            crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await
-                .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
-        }
-        let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
+            if let Err(e) = crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await {
+                // Unsent only once the saved reply is taken back. Otherwise
+                // it is still saved and recovery sends it after moving the
+                // call, so the outcome is unresolved, as for a paid send.
+                if let Err(error) = operation.unseal().await {
+                    tracing::warn!(%error, "free call reply kept saved; recovery sends it");
+                    return Err(ApiError::PaymentUnresolved(format!(
+                        "the call could not be updated ({e}) and the saved reply could not be withdrawn; \
+                         it may still be sent, nothing was paid — read the operation before acting again"
+                    )).with_reason("call_reply_unresolved"));
+                }
+                return Err(ApiError::NotDispatched(format!(
+                    "the call could not be updated ({e}); the reply was not sent and nothing was paid"
+                )).with_reason("call_reply_unavailable"));
+            }
+            operation.publish_sealed(&envelope).await?;
+            envelope
+        } else {
+            if crate::calls::is_call_kind(req.kind) {
+                // Paid: publish the call transition before the envelope goes out.
+                let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
+                crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await
+                    .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
+            }
+            operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?
+        };
 
         // A paid web request's outstanding-reply row was committed by
         // `settled_envelope` in the same transaction as the envelope, and every
