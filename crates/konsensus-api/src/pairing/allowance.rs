@@ -248,6 +248,13 @@ pub struct StandingAllowance {
     /// paying them again. Dropped once the payment settles.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub payment_ids_in_flight: std::collections::BTreeMap<String, Vec<String>>,
+    /// Every payment identity paid from this allowance's windows, settled
+    /// or not, with the window that paid it, so no later window pays the
+    /// same one again. Kept while that window is still recorded in the
+    /// ledger (until a day after it can last have spent, plus the longest
+    /// call).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub consumed_payment_ids: std::collections::BTreeMap<String, String>,
 }
 
 /// Why an allowance did not open a window. The request then takes the usual
@@ -294,6 +301,7 @@ impl StandingAllowance {
             carried_breakers: None,
             call_offers_msat: Default::default(),
             payment_ids_in_flight: Default::default(),
+            consumed_payment_ids: Default::default(),
         }
     }
 
@@ -305,12 +313,14 @@ impl StandingAllowance {
         let carried = self.carried_breakers.take();
         let offers = std::mem::take(&mut self.call_offers_msat);
         let in_flight = std::mem::take(&mut self.payment_ids_in_flight);
+        let consumed = std::mem::take(&mut self.consumed_payment_ids);
         let observed = self.observed_at;
         *self = next;
         self.windows = windows;
         self.carried_breakers = carried;
         self.call_offers_msat = offers;
         self.payment_ids_in_flight = in_flight;
+        self.consumed_payment_ids = consumed;
         self.observed_at = self.observed_at.max(observed);
     }
 
@@ -366,28 +376,6 @@ impl StandingAllowance {
             kept.insert(0, merged);
         }
         self.windows = kept;
-    }
-
-    /// Check a proposal against the terms, at `now`, given that the window
-    /// with `replacing` op id (if any) is about to end having used
-    /// `replacing_used_msat`. Returns the window length to grant.
-    pub fn admit(
-        &mut self,
-        terms: &GrantTerms,
-        replacing: Option<(&str, u64)>,
-        now: i64,
-    ) -> Result<i64, NoWindow> {
-        let ttl = self.admit_terms(terms, now)?;
-        let overrides: std::collections::BTreeMap<String, u64> = replacing
-            .into_iter()
-            .filter(|(op, _)| self.windows.iter().any(|w| w.op_id == *op && w.ended_at.is_none()))
-            .map(|(op, used)| (op.to_string(), used))
-            .collect();
-        let remaining = self.room(&overrides, now);
-        if terms.budget_msat > remaining {
-            return Err(NoWindow::OverDailyCap { remaining_msat: remaining });
-        }
-        Ok(ttl)
     }
 
     /// Every check of a proposal except room under the daily cap, at `now`
@@ -683,6 +671,10 @@ impl super::PairingFile {
                     window.committed_msat = window.committed_msat.max(budget.used_msat);
                 }
             }
+            // A paid identity is remembered while its window is recorded.
+            let recorded: std::collections::BTreeSet<&str> =
+                allowance.windows.iter().map(|w| w.op_id.as_str()).collect();
+            allowance.consumed_payment_ids.retain(|_, op| recorded.contains(op.as_str()));
             // Identities of payments that settled are no longer carried.
             allowance.payment_ids_in_flight.retain(|id, _| {
                 grants.iter().filter_map(|g| g.budget.as_ref()).any(|b| b.pending.contains_key(id))
@@ -1103,20 +1095,35 @@ impl super::PairingService {
     pub(super) fn record_allowance_payment_ids(
         file: &mut super::PairingFile,
         client_id: &str,
+        window_op_id: &str,
         reservation_id: &str,
         ids: Vec<String>,
     ) -> bool {
         file.allowances
             .get_mut(client_id)
-            .map(|a| a.payment_ids_in_flight.insert(reservation_id.to_string(), ids))
+            .map(|a| {
+                for id in &ids {
+                    a.consumed_payment_ids.insert(id.clone(), window_op_id.to_string());
+                }
+                a.payment_ids_in_flight.insert(reservation_id.to_string(), ids)
+            })
             .is_some()
     }
 
     /// Undo [`Self::record_allowance_payment_ids`].
     pub(super) fn unrecord_allowance_payment_ids(file: &mut super::PairingFile, client_id: &str, reservation_id: &str) {
         if let Some(a) = file.allowances.get_mut(client_id) {
-            a.payment_ids_in_flight.remove(reservation_id);
+            for id in a.payment_ids_in_flight.remove(reservation_id).unwrap_or_default() {
+                a.consumed_payment_ids.remove(&id);
+            }
         }
+    }
+
+    /// Whether any of `ids` was already paid from the allowance's windows.
+    pub(super) fn allowance_payment_consumed(file: &super::PairingFile, client_id: &str, ids: &[String]) -> bool {
+        file.allowances
+            .get(client_id)
+            .is_some_and(|a| ids.iter().any(|id| a.consumed_payment_ids.contains_key(id)))
     }
 
     /// Undo [`Self::record_allowance_offer`].

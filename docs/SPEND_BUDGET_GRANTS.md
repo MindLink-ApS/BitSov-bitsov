@@ -511,8 +511,10 @@ While a window the owner wrote (at the console, by device approval or a
 relation envelope) is live for the app, the owner's window governs: the
 allowance opens nothing and never replaces or ends it, and the request takes
 the owner path. A new allowance window replaces only earlier allowance
-windows. Payments still in flight move with their payment identities, so the
-next window refuses paying the same one again. A new
+windows. Payments still in flight move with their payment identities, and a
+payment identity paid from any of the allowance's windows, settled or not,
+stays used for as long as that window is still counted in the day's record,
+so no later window pays the same one again. A new
 window replaces the app's previous one, as every window does.
 
 In a window the allowance opened, the per-call cap bounds **the whole call**:
