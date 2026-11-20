@@ -157,6 +157,17 @@ async fn ask_with(fx: &Fx, read: &str, budget: Value) -> (Value, Value) {
     (op, body)
 }
 
+/// [`ask_with`], then withdraw the request so the next one has room: a
+/// pairing may hold only a few pending requests at once. Returns the status.
+async fn status_of(fx: &Fx, read: &str, budget: Value) -> Value {
+    let (op, body) = ask_with(fx, read, budget).await;
+    let (status, gone) = fx
+        .call("DELETE", &format!("/api/v1/pair/elevation/{}", op["op_id"].as_str().unwrap()), None, Some(read))
+        .await;
+    assert!(status.is_success(), "{gone}");
+    body
+}
+
 fn owner_window(fx: &Fx, client: &str) -> pairing::SpendGrant {
     let grants: Vec<_> = fx
         .service
@@ -205,13 +216,19 @@ async fn a_live_owner_window_smaller_than_the_request_does_not_read_granted() {
         let pending = fx.service.snapshot().pending_elevations;
         assert!(pending.iter().any(|e| Some(e.op_id.as_str()) == op["op_id"].as_str()), "switch {switch}");
 
-        // Each term counts on its own: a larger per-call limit, or a longer
-        // window, is not in force either.
+        // Each term counts on its own: a larger per-call limit, a longer
+        // window or a larger budget is not in force either. Each case asks for
+        // more than the window on exactly one term; the control below asks
+        // for the same within every term and reads granted.
+        let body =
+            status_of(&fx, &read, json!({"budget_msat": 250_000, "per_call_max_msat": 200_000, "ttl_secs": 1_200})).await;
+        assert_eq!(body["status"], "granted", "switch {switch}: {body}");
         for budget in [
-            json!({"budget_msat": 250_000, "per_call_max_msat": 250_000, "ttl_secs": 3_600}),
+            json!({"budget_msat": 250_000, "per_call_max_msat": 250_000, "ttl_secs": 1_200}),
             json!({"budget_msat": 100_000, "per_call_max_msat": 100_000, "ttl_secs": 86_400}),
+            json!({"budget_msat": 400_000, "per_call_max_msat": 100_000, "ttl_secs": 1_200}),
         ] {
-            let (_, body) = ask_with(&fx, &read, budget.clone()).await;
+            let body = status_of(&fx, &read, budget.clone()).await;
             assert_eq!(body["status"], "pending", "switch {switch}: {budget} -> {body}");
             assert_eq!(body["owner_confirmation_required"], true, "switch {switch}: {budget}");
         }
