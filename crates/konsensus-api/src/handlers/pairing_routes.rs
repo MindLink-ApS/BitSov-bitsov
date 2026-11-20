@@ -489,7 +489,14 @@ async fn elevation_request(
             body.budget.map(BudgetProposal::into_terms),
         )
         .map_err(map_err)?;
-    let owner_action = if svc.owner_control_enabled() {
+    // A window the node opened inside the owner's standing allowance needs
+    // nothing from the owner.
+    let opened_by_allowance = svc.standing_allowance_enabled()
+        && matches!(svc.elevation_status(&binding.client_id, &op.op_id), Ok(ElevationStatus::Granted))
+        && svc.snapshot().pending_elevations.iter().all(|e| e.op_id != op.op_id);
+    let owner_action = if opened_by_allowance {
+        "none: opened within the owner's standing allowance".to_string()
+    } else if svc.owner_control_enabled() {
         svc.owner_grant_command(&op.op_id)
     } else {
         "unavailable in this deployment: the node was not started in owner-run mode, so there \

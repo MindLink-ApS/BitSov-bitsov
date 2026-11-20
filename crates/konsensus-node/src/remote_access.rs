@@ -41,6 +41,9 @@ struct ActivePairingCode {
     expires_at: tokio::time::Instant,
     content_digest: blake3::Hash,
     content_len: usize,
+    /// Owner allowance terms bound to exactly this code, read when the
+    /// ticket is loaded. Never part of the link.
+    allowance: Option<konsensus_api::pairing::allowance::AllowanceTerms>,
 }
 
 struct HomeTickets {
@@ -84,6 +87,7 @@ impl konsensus_api::bootstrap::setup::SetupTickets for HomeTickets {
             expires_at: tokio::time::Instant::now() + ttl,
             content_digest: blake3::hash(uri.as_bytes()),
             content_len: uri.len(),
+            allowance: None,
         });
         Ok(uri)
     }
@@ -677,11 +681,17 @@ fn reload_pairing_code(
         remaining <= Duration::from_secs(365 * 86400),
         "invalid ticket expiry"
     );
+    let allowance = konsensus_api::pairing::allowance::read_ticket_allowance(
+        pairing.dir(),
+        &link.code,
+        chrono::Utc::now().timestamp(),
+    );
     *active = Some(ActivePairingCode {
         value: link.code,
         expires_at: tokio::time::Instant::now() + remaining,
         content_digest,
         content_len,
+        allowance,
     });
     Ok(())
 }
@@ -1135,6 +1145,7 @@ fn authenticate_ticket(
     if blake3::hash(code.as_bytes()) != blake3::hash(active.value.as_bytes()) {
         anyhow::bail!("pairing code did not match");
     }
+    let allowance = active.allowance.clone();
 
     *code_guard = None;
     if remove_file {
@@ -1147,7 +1158,13 @@ fn authenticate_ticket(
     let client = if node_id.is_empty() {
         pairing.create_bootstrap_ticket_pairing(name, pubkey_hex, remote_static)
     } else {
-        pairing.create_ticket_remote_pairing(name, pubkey_hex, remote_static)
+        pairing.create_ticket_remote_pairing_with_allowance(
+            name,
+            pubkey_hex,
+            remote_static,
+            code,
+            allowance.as_ref(),
+        )
     }
     .map_err(anyhow::Error::from)?;
     Ok(client)
@@ -2034,6 +2051,7 @@ mod tests {
             expires_at: tokio::time::Instant::now() + PAIRING_CODE_TTL,
             content_digest: blake3::hash(code.as_bytes()),
             content_len: code.len(),
+            allowance: None,
         }));
         let requests =
             [94, 95].map(|n| request(&node, &[n; 32], &code, &SigningKey::from_bytes(&[n; 32])));
@@ -2730,6 +2748,7 @@ mod tests {
             expires_at: tokio::time::Instant::now() + PAIRING_CODE_TTL,
             content_digest: blake3::hash(value.as_bytes()),
             content_len: value.len(),
+            allowance: None,
         }))
     }
 
@@ -2756,6 +2775,52 @@ mod tests {
             client_name: Some("remote test".into()),
             client_pubkey: Some(pubkey),
             signature: Some(URL_SAFE_NO_PAD.encode(key.sign(proof.as_bytes()).to_bytes())),
+        }
+    }
+
+    /// Owner terms bound to a ticket attach to the pairing it creates, once,
+    /// only on an owner-run node with the switch on.
+    #[test]
+    fn a_ticket_allowance_attaches_once_and_only_where_honoured() {
+        use konsensus_api::pairing::allowance::AllowanceTerms;
+        let terms = AllowanceTerms::owner_defaults(chrono::Utc::now().timestamp());
+        for (owner_control, switch, attached) in [(true, true, true), (true, false, false), (false, true, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let node = identity();
+            let fingerprint = konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
+            let pairing = PairingService::open(dir.path(), fingerprint, owner_control)
+                .unwrap()
+                .with_standing_allowance(switch);
+            let code = active_code("allowance-code");
+            code.lock().unwrap().as_mut().unwrap().allowance = Some(terms.clone());
+            let transport = [0x41u8; 32];
+            let key = SigningKey::from_bytes(&[0x42u8; 32]);
+            let paired = authenticate(
+                &request(&node, &transport, "allowance-code", &key),
+                &transport,
+                &node.node_id().to_hex(),
+                &pairing,
+                &code,
+            )
+            .unwrap();
+            let view = pairing.allowance_view(&paired.client_id);
+            assert_eq!(view.is_some(), attached, "{owner_control} {switch}");
+            if let Some(view) = view {
+                assert_eq!((view.daily_msat, view.per_call_max_msat, view.set_by.as_str()), (2_500_000, 700_000, "cli"));
+            }
+            // A replay by another app gives nothing: the code is spent.
+            let other = SigningKey::from_bytes(&[0x43u8; 32]);
+            let transport2 = [0x44u8; 32];
+            assert!(authenticate(
+                &request(&node, &transport2, "allowance-code", &other),
+                &transport2,
+                &node.node_id().to_hex(),
+                &pairing,
+                &code,
+            )
+            .is_err());
+            assert_eq!(pairing.list_clients().len(), 1);
+            assert!(pairing.snapshot().allowances.len() <= 1);
         }
     }
 
