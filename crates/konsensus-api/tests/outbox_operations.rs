@@ -2049,7 +2049,7 @@ async fn a_send_refused_before_paying_is_released_despite_an_older_operations_ad
         f.db.call_put(&f.peer, CALL, &konsensus_core::payloads::call::CallEntry {
             side: konsensus_core::payloads::call::Side::Caller, phase: konsensus_core::payloads::call::Phase::Live,
             deadline_ms: now + 15_000, pending: None, paid_until_ms: Some(now + 15_000), next_block_seq: 1,
-            end_reason: None, unpaid_notice_used: false,
+            end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
         }).await.unwrap();
         let (status, body) = f.post_kind(kind, plaintext).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{kind}: {body}");
@@ -2076,7 +2076,7 @@ async fn a_minute_refused_by_a_callee_catching_up_is_released_despite_an_older_o
     f.db.call_put(&f.peer, CALL, &konsensus_core::payloads::call::CallEntry {
         side: konsensus_core::payloads::call::Side::Caller, phase: konsensus_core::payloads::call::Phase::Live,
         deadline_ms: now + 25_000, pending: None, paid_until_ms: Some(now + 15_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     }).await.unwrap();
     let (prices, peer) = (f.state.peer_prices.clone(), f.peer);
     let answering = tokio::spawn(async move {

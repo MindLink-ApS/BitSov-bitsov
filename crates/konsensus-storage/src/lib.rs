@@ -23,6 +23,24 @@ pub use calendar::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
 pub use contacts::{ContactRepo, ContactRow, PostgresContactRepo, SqliteContactRepo};
 pub use encrypted::EncryptedStorage;
 pub use error::StorageError;
+
+/// One call row holding free-reply receipts, from
+/// [`traits::Storage::call_with_free_reply_receipts`]: its key (peer as hex,
+/// call id) and its entry, or `None` when the row cannot be decoded.
+pub type FreeReplyReceiptRow = (String, String, Option<(konsensus_core::NodeId, konsensus_core::payloads::call::CallEntry)>);
+
+/// One page of [`traits::Storage::call_with_free_reply_receipts`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FreeReplyReceiptPage {
+    /// The rows whose key is readable text, in key order.
+    pub rows: Vec<FreeReplyReceiptRow>,
+    /// How many stored rows the page covered, including rows whose key is
+    /// not readable text (they are left out of `rows` and left untouched).
+    pub scanned: usize,
+    /// The raw key bytes `(peer, call_id)` of the last row covered: the
+    /// cursor for the next page.
+    pub last_key: Option<(Vec<u8>, Vec<u8>)>,
+}
 pub use fiat_snapshots::FiatRateSnapshot;
 pub use invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,

@@ -534,6 +534,7 @@ impl PostgresStorage {
     (39, "envelope deferral expiry", include_str!("../migrations/039_envelope_deferral_expiry.sql")),
     (40, "call media detach intents", include_str!("../migrations/postgres/040_call_media_detach_intents.sql")),
     (41, "call offer binding", include_str!("../migrations/041_call_offer_binding.sql")),
+    (42, "call free reply receipts", include_str!("../migrations/042_call_free_reply_receipts.sql")),
         ]
     }
 
@@ -2119,22 +2120,22 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
-        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE peer = $1 AND call_id = $2")
+        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE peer = $1 AND call_id = $2")
             .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
         row.map(call_entry_from_row).transpose()
     }
 
     async fn call_open_by_peer(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
-        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
-            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state \
+        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state \
              WHERE peer = $1 AND (pending_operation_id IS NOT NULL OR (phase <> 'ended' AND (CASE WHEN phase = 'live' THEN deadline_ms >= $2 ELSE deadline_ms > $2 END))) \
              ORDER BY CASE WHEN pending_operation_id IS NOT NULL THEN 0 ELSE 1 END, call_id LIMIT $3")
             .bind(peer.to_hex()).bind(now)
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS_PER_PEER as i64)
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
-            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
+            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
         }).collect()
     }
 
@@ -2228,7 +2229,7 @@ impl Storage for PostgresStorage {
                 COALESCE(SUM(CASE WHEN open = 0 AND peer = $2 THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN open = 0 THEN 1 ELSE 0 END), 0) \
              FROM (SELECT peer, CASE WHEN pending_operation_id IS NOT NULL OR (phase <> 'ended' AND (CASE WHEN phase = 'live' THEN deadline_ms >= $3 ELSE deadline_ms > $3 END)) THEN 1 ELSE 0 END AS open \
-                   FROM call_state WHERE replay_until_ms > $4 OR pending_operation_id IS NOT NULL OR EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0)) AS rows")
+                   FROM call_state WHERE replay_until_ms > $4 OR pending_operation_id IS NOT NULL OR free_reply_receipts IS NOT NULL OR EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0)) AS rows")
             .bind(peer.to_hex()).bind(peer.to_hex()).bind(now).bind(now).fetch_one(&self.pool).await?;
         let n = |v: i64| u64::try_from(v).unwrap_or(0);
         Ok(konsensus_core::payloads::call::CallCounts { open_peer: n(open_peer), open_total: n(open_total), burned_peer: n(burned_peer), burned_total: n(burned_total) })
@@ -2238,7 +2239,7 @@ impl Storage for PostgresStorage {
         let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call time overflow".into()));
         let done = sqlx::query(
             "DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state \
-             WHERE ($1::TEXT IS NULL OR peer = $2) AND pending_operation_id IS NULL AND (phase = 'ended' OR deadline_ms <= $3) \
+             WHERE ($1::TEXT IS NULL OR peer = $2) AND pending_operation_id IS NULL AND free_reply_receipts IS NULL AND (phase = 'ended' OR deadline_ms <= $3) \
              AND replay_until_ms <= $4 AND NOT EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0) ORDER BY replay_until_ms LIMIT $5)")
             .bind(peer.map(|p| p.to_hex())).bind(peer.map(|p| p.to_hex()))
             .bind(ms(now_ms)?).bind(ms(replay_until_at_most)?).bind(ms(max)?)
@@ -2247,22 +2248,22 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE pending_operation_id IS NOT NULL")
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE pending_operation_id IS NOT NULL")
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
         }).collect()
     }
 
     async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE phase = 'live' ORDER BY deadline_ms LIMIT $1")
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE phase = 'live' ORDER BY deadline_ms LIMIT $1")
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS as i64).fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
         }).collect()
     }
 
@@ -2299,13 +2300,42 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_awaiting(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE side = 'callee' AND phase = 'awaiting_device' ORDER BY peer, call_id LIMIT $1")
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE side = 'callee' AND phase = 'awaiting_device' ORDER BY peer, call_id LIMIT $1")
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS as i64).fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
         }).collect()
+    }
+
+    async fn call_with_free_reply_receipts(&self, after: Option<(&[u8], &[u8])>, max: u32) -> Result<crate::FreeReplyReceiptPage, StorageError> {
+        // Untyped rows keyed by their raw bytes, in byte order: every stored
+        // row has a usable key, and a column holding a value of the wrong type
+        // fails only its own row, never the page. Query errors stay errors.
+        let rows = sqlx::query(
+            "SELECT convert_to(peer, 'UTF8'), convert_to(call_id, 'UTF8'), side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND ($1::BYTEA IS NULL OR convert_to(peer, 'UTF8') > $1 OR (convert_to(peer, 'UTF8') = $1 AND convert_to(call_id, 'UTF8') > $2)) ORDER BY convert_to(peer, 'UTF8'), convert_to(call_id, 'UTF8') LIMIT $3")
+            .bind(after.map(|(p, _)| p)).bind(after.map(|(_, c)| c))
+            .bind(i64::from(max)).fetch_all(&self.pool).await?;
+        let mut page = crate::FreeReplyReceiptPage { rows: Vec::with_capacity(rows.len()), scanned: rows.len(), last_key: None };
+        let mut unkeyed = 0usize;
+        for row in &rows {
+            use sqlx::Row;
+            let peer_key: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(0).ok().flatten().unwrap_or_default();
+            let call_key: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(1).ok().flatten().unwrap_or_default();
+            match (String::from_utf8(peer_key.clone()), String::from_utf8(call_key.clone())) {
+                (Ok(peer), Ok(id)) => {
+                    let entry = free_reply_receipt_entry(row, &peer);
+                    page.rows.push((peer, id, entry));
+                }
+                _ => unkeyed += 1,
+            }
+            page.last_key = Some((peer_key, call_key));
+        }
+        if unkeyed > 0 {
+            tracing::warn!(rows = unkeyed, "call rows holding free-reply receipts have unreadable keys; left untouched");
+        }
+        Ok(page)
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
@@ -2319,7 +2349,7 @@ impl Storage for PostgresStorage {
             .execute(&self.pool).await?;
         sqlx::query("DELETE FROM call_block_invoices WHERE payment_hash IN (SELECT payment_hash FROM call_block_invoices WHERE retain_until_ms < $1 ORDER BY retain_until_ms LIMIT $2)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
-        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= $1 AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) AND NOT EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0) ORDER BY replay_until_ms LIMIT $2)")
+        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= $1 AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) AND free_reply_receipts IS NULL AND NOT EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0) ORDER BY replay_until_ms LIMIT $2)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         Ok(done.rows_affected())
     }
@@ -4401,6 +4431,96 @@ mod migration_recovery_tests {
         admin.close().await;
     }
 
+    /// Free-reply receipts on Postgres: a row written before migration 042
+    /// reads with none; receipts round-trip exactly, page by row key, keep
+    /// their row through sweep and eviction, and survive a reconnect.
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn call_free_reply_receipts_upgrade_round_trip_and_page() {
+        use konsensus_core::payloads::call::{CallEntry, FreeReplyReceipt, Phase, Side, TOMBSTONE_MS};
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+        let admin = PgPool::connect(&url).await.unwrap();
+        let name = format!("call_receipts_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+        let db_url = format!("{}/{name}", url.rsplit_once('/').unwrap().0);
+        let call_id = "0123456789abcdef0123456789abcdef";
+        let old_peer = NodeId::from_bytes([1; 32]);
+        // A row written by a node before migration 042.
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .execute(&pool).await.unwrap();
+        for (version, description, sql) in PostgresStorage::pg_migrations().into_iter().filter(|(v, _, _)| *v < 42) {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO _konsensus_migrations VALUES ($1, $2)")
+                .bind(version).bind(description).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash) VALUES ($1, $2, 'callee', 'ringing', 5000, 86405000, 'op', 401, 'digest')")
+            .bind(old_peer.to_hex()).bind(call_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        let db = PostgresStorage::connect(&db_url).await.unwrap();
+        let old = db.call_get(&old_peer, call_id).await.unwrap().unwrap();
+        assert!(old.free_reply_receipts.is_empty());
+        assert_eq!(old.pending.as_ref().map(|p| p.operation_id.as_str()), Some("op"));
+        assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().rows.is_empty());
+
+        let receipt = |peer: &NodeId, op: &str| FreeReplyReceipt {
+            peer: peer.to_hex(), call_id: call_id.into(), kind: 401, operation_id: op.into(),
+            request_hash: "digest".into(), phase: "live".into(), applied_ms: 1_000,
+        };
+        let held = |peer: &NodeId, op: &str| CallEntry {
+            side: Side::Callee, phase: Phase::Ended, deadline_ms: TOMBSTONE_MS, pending: None,
+            paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false,
+            free_reply_receipts: vec![receipt(peer, op)],
+        };
+        let peers: Vec<NodeId> = (2..=4u8).map(|b| NodeId::from_bytes([b; 32])).collect();
+        for (n, peer) in peers.iter().enumerate() {
+            db.call_put(peer, call_id, &held(peer, &format!("op{n}"))).await.unwrap();
+        }
+        // Exact round trip, then key-ordered pages after a cursor.
+        assert_eq!(db.call_get(&peers[0], call_id).await.unwrap(), Some(held(&peers[0], "op0")));
+        let first = db.call_with_free_reply_receipts(None, 2).await.unwrap().rows;
+        assert_eq!(first.iter().map(|(p, _, _)| p.clone()).collect::<Vec<_>>(), peers[..2].iter().map(|p| p.to_hex()).collect::<Vec<_>>());
+        let (last_peer, last_call, _) = first.last().unwrap();
+        let rest = db.call_with_free_reply_receipts(Some((last_peer.as_bytes(), last_call.as_bytes())), 2).await.unwrap().rows;
+        assert_eq!(rest, vec![(peers[2].to_hex(), call_id.to_owned(), Some((peers[2], held(&peers[2], "op2"))))]);
+        // A second call of one peer pages in call id order.
+        let later_call = "fedcba9876543210fedcba9876543210";
+        db.call_put(&peers[1], later_call, &held(&peers[1], "op1b")).await.unwrap();
+        let after_first = db.call_with_free_reply_receipts(Some((peers[1].to_hex().as_bytes(), call_id.as_bytes())), 1).await.unwrap().rows;
+        assert_eq!(after_first.iter().map(|(p, c, _)| (p.clone(), c.clone())).collect::<Vec<_>>(), vec![(peers[1].to_hex(), later_call.to_owned())]);
+        db.call_put(&peers[1], later_call, &CallEntry { free_reply_receipts: Vec::new(), ..held(&peers[1], "op1b") }).await.unwrap();
+        // An undecodable row is listed without its entry, keeps its column, and
+        // a sweep never drops it.
+        sqlx::query("UPDATE call_state SET free_reply_receipts = '{not json' WHERE peer = $1").bind(peers[2].to_hex())
+            .execute(&db.pool).await.unwrap();
+        let listed = db.call_with_free_reply_receipts(None, 10).await.unwrap().rows;
+        assert_eq!(listed.iter().map(|(p, _, e)| (p.clone(), e.is_some())).collect::<Vec<_>>(),
+            peers.iter().map(|p| (p.to_hex(), *p != peers[2])).collect::<Vec<_>>());
+        db.call_sweep(10 * TOMBSTONE_MS, 10).await.unwrap();
+        let raw: Option<String> = sqlx::query_scalar("SELECT free_reply_receipts FROM call_state WHERE peer = $1")
+            .bind(peers[2].to_hex()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(raw.as_deref(), Some("{not json"));
+        db.call_put(&peers[2], call_id, &held(&peers[2], "op2")).await.unwrap();
+        // Held rows survive sweep and eviction long after their tombstone.
+        let far = 10 * TOMBSTONE_MS;
+        db.call_evict_burned(Some(&peers[0]), far, far, 10).await.unwrap();
+        db.call_sweep(far, 10).await.unwrap();
+        assert_eq!(db.call_get(&peers[0], call_id).await.unwrap(), Some(held(&peers[0], "op0")));
+        let counts = db.call_counts(&peers[0], far).await.unwrap();
+        assert_eq!((counts.open_peer, counts.burned_peer), (0, 1));
+        // Released: swept like any other row. The others survive a reconnect.
+        db.call_put(&peers[0], call_id, &CallEntry { free_reply_receipts: Vec::new(), ..held(&peers[0], "op0") }).await.unwrap();
+        db.call_sweep(far, 10).await.unwrap();
+        assert!(db.call_get(&peers[0], call_id).await.unwrap().is_none());
+        db.pool.close().await;
+        let db = PostgresStorage::connect(&db_url).await.unwrap();
+        assert_eq!(db.call_with_free_reply_receipts(None, 10).await.unwrap().rows.len(), 2);
+        assert_eq!(db.call_get(&peers[1], call_id).await.unwrap(), Some(held(&peers[1], "op1")));
+        db.pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
+        admin.close().await;
+    }
+
 
     /// #129 R1/R2 on Postgres: the outstanding web request survives a reconnect,
     /// is taken once, and expired rows are swept with a bound.
@@ -4789,7 +4909,7 @@ mod schema_parity_tests {
             .collect();
         assert_eq!(
             versions,
-            (1..=41).filter(|v| !matches!(v, 7..=9 | 34)).collect::<Vec<_>>()
+            (1..=42).filter(|v| !matches!(v, 7..=9 | 34)).collect::<Vec<_>>()
         );
         let sql = include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql");
         assert!(
@@ -5590,8 +5710,8 @@ fn outstanding_from_row(
 /// Insert or replace one call row, on the pool or inside a transaction.
 fn call_upsert<'q>(peer: &konsensus_core::NodeId, call_id: &'q str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>, StorageError> {
     let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
-    Ok(sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
-            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used")
+    Ok(sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used, free_reply_receipts = excluded.free_reply_receipts")
         .bind(peer.to_hex()).bind(call_id)
         .bind(entry.side.as_str()).bind(entry.phase.as_str())
         .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
@@ -5601,14 +5721,30 @@ fn call_upsert<'q>(peer: &konsensus_core::NodeId, call_id: &'q str, entry: &kons
         .bind(entry.paid_until_ms.map(ms).transpose()?)
         .bind(i64::from(entry.next_block_seq))
         .bind(entry.end_reason.map(|reason| reason.as_str()))
-        .bind(i64::from(entry.unpaid_notice_used)))
+        .bind(i64::from(entry.unpaid_notice_used))
+        .bind(if entry.free_reply_receipts.is_empty() { None } else {
+            Some(serde_json::to_string(&entry.free_reply_receipts).map_err(|e| StorageError::Conversion(format!("call state: free reply receipts: {e}")))?)
+        }))
 }
 
 /// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash)` of `call_state`.
-type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64);
+type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>);
+
+/// The entry of one listed receipt row, decoded column by column; `None`
+/// when any column (or the peer) cannot be decoded.
+fn free_reply_receipt_entry(row: &sqlx::postgres::PgRow, peer: &str) -> Option<(konsensus_core::NodeId, konsensus_core::payloads::call::CallEntry)> {
+    use sqlx::Row;
+    let node = konsensus_core::NodeId::from_hex(peer).ok()?;
+    let columns: CallRow = (
+        row.try_get(2).ok()?, row.try_get(3).ok()?, row.try_get(4).ok()?, row.try_get(5).ok()?,
+        row.try_get(6).ok()?, row.try_get(7).ok()?, row.try_get(8).ok()?, row.try_get(9).ok()?,
+        row.try_get(10).ok()?, row.try_get(11).ok()?, row.try_get(12).ok()?,
+    );
+    call_entry_from_row(columns).ok().map(|entry| (node, entry))
+}
 
 /// A stored call row. A corrupt row is an error, never a call.
-fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
+fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
     use konsensus_core::payloads::call::{CallEntry, Pending, Phase, Side};
     let bad = |what: &str| StorageError::Conversion(format!("call state: bad {what}"));
     let pending = match (op, kind) {
@@ -5625,6 +5761,8 @@ fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason
         end_reason: reason.map(|v| konsensus_core::payloads::call::HangupReason::parse(&v).ok_or_else(|| bad("end reason"))).transpose()?,
         unpaid_notice_used: match notice { 0 => false, 1 => true, _ => return Err(bad("unpaid notice")) },
         pending,
+        // NULL on rows written before receipts existed.
+        free_reply_receipts: receipts.map(|v| serde_json::from_str(&v).map_err(|_| bad("free reply receipts"))).transpose()?.unwrap_or_default(),
     })
 }
 

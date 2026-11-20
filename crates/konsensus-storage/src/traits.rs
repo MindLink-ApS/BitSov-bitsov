@@ -1429,6 +1429,17 @@ pub trait Storage: Send + Sync {
         Ok(0)
     }
 
+    /// Up to `max` call rows holding free-reply receipts, in key order after
+    /// the raw key `after` (from the start when `None`), for pruning the
+    /// receipts whose saved reply can no longer be recovered page by page.
+    /// A row whose columns cannot be decoded is still listed, without its
+    /// entry; one whose key is not readable text is only counted in
+    /// `scanned` and `last_key`. Either way a scan moves past it, and it keeps
+    /// its receipts column and its row.
+    async fn call_with_free_reply_receipts(&self, _after: Option<(&[u8], &[u8])>, _max: u32) -> Result<crate::FreeReplyReceiptPage, StorageError> {
+        Ok(crate::FreeReplyReceiptPage::default())
+    }
+
     /// An envelope the gate accepted and stored was refused by the application
     /// (a call signal for no live call): remove the message and its cached
     /// plaintext and mark its receipt application-rejected (`accepted = -1`), so

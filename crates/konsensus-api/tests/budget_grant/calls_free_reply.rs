@@ -5,11 +5,11 @@
 //! same fixtures with the switch off, keep the paid path.
 use super::*;
 
-const FREE: &str = "Custom(\"call_reply_free_v1\")";
+pub(super) const FREE: &str = "Custom(\"call_reply_free_v1\")";
 
 /// A paired app on a node with free replies `on`, ringing for an incoming
 /// call `call_id` from the contact, which advertises `peer_caps`.
-async fn ringing(on: bool, peer_caps: &[&str], call_id: &str) -> (Fx, String, Arc<ConnectedStubTransport>) {
+pub(super) async fn ringing(on: bool, peer_caps: &[&str], call_id: &str) -> (Fx, String, Arc<ConnectedStubTransport>) {
     let (fx, token, transport) = awaiting_device(on, peer_caps, call_id).await;
     let fetched = fx.state.storage.call_get(&fx.peer, call_id).await.unwrap().unwrap()
         .device_fetched(konsensus_api::calls::now_ms()).unwrap();
@@ -18,7 +18,7 @@ async fn ringing(on: bool, peer_caps: &[&str], call_id: &str) -> (Fx, String, Ar
 }
 
 /// As [`ringing`], before any device fetched the offer: the call waits for one.
-async fn awaiting_device(on: bool, peer_caps: &[&str], call_id: &str) -> (Fx, String, Arc<ConnectedStubTransport>) {
+pub(super) async fn awaiting_device(on: bool, peer_caps: &[&str], call_id: &str) -> (Fx, String, Arc<ConnectedStubTransport>) {
     let (mut fx, token) = prepared().await;
     let peer = fx.peer;
     let transport = Arc::new(ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
@@ -37,7 +37,7 @@ async fn awaiting_device(on: bool, peer_caps: &[&str], call_id: &str) -> (Fx, St
     (fx, token, transport)
 }
 
-fn reply(fx: &Fx, kind: u16, call_id: &str, operation_id: &str) -> Value {
+pub(super) fn reply(fx: &Fx, kind: u16, call_id: &str, operation_id: &str) -> Value {
     let plaintext = if kind == 401 {
         json!({"v": 1, "call_id": call_id, "sdp": "answer"})
     } else {
@@ -51,14 +51,14 @@ fn reply(fx: &Fx, kind: u16, call_id: &str, operation_id: &str) -> Value {
 
 /// Everything that could show a charge: payments dispatched, invoices asked
 /// for, the grant's spending and its open reservations.
-fn ledger(fx: &Fx, transport: &ConnectedStubTransport) -> (usize, usize, u64, u64, usize) {
+pub(super) fn ledger(fx: &Fx, transport: &ConnectedStubTransport) -> (usize, usize, u64, u64, usize) {
     let grant = fx.service.grant_view_for(&fx.client_id).unwrap();
     let pending = fx.service.snapshot().grants.iter()
         .filter_map(|g| g.budget.as_ref()).map(|b| b.pending.len()).sum();
     (fx.wallet.money(), transport.raw_frames.lock().unwrap().len(), grant.used_msat, fx.wallet.left(), pending)
 }
 
-fn sent(transport: &ConnectedStubTransport, kind: u16) -> Vec<konsensus_core::UkmEnvelope> {
+pub(super) fn sent(transport: &ConnectedStubTransport, kind: u16) -> Vec<konsensus_core::UkmEnvelope> {
     transport.sent_envelopes.lock().unwrap().iter().filter(|(_, e)| e.kind == kind).map(|(_, e)| e.clone()).collect()
 }
 
@@ -525,6 +525,7 @@ async fn a_reply_that_cannot_be_taken_back_is_reported_unresolved_not_unsent() {
         assert_ne!(status, StatusCode::OK, "{kind}: {body}");
         // The reply is still saved and recovery will send it: not "unsent".
         assert_ne!(body["code"], "not_dispatched", "{kind}: a reply that may still go out was reported unsent: {body}");
+        assert_eq!(body["reason"], "call_reply_unresolved", "{kind}: {body}");
         assert_eq!(body["state"], "payment_unknown", "{kind}: {body}");
         assert_eq!(body["retry_allowed"], false, "{kind}: {body}");
         assert_eq!(phase(&fx).await, Phase::Ringing, "{kind}");

@@ -50,6 +50,18 @@ struct Recovery {
     /// transition: recovery sends it, a failure never resets it to unsent.
     #[serde(default)]
     free_reply: bool,
+    /// The call a sealed free reply answers, saved with it so recovery checks
+    /// that exact call. Absent on replies saved before it was recorded.
+    #[serde(default)]
+    free_reply_call: Option<String>,
+    /// The saved free reply's call moved on without it: withdrawn for good,
+    /// never queued. The operation is abandoned; the envelope is kept.
+    #[serde(default)]
+    free_reply_withdrawn: bool,
+    /// Whether the saved free reply's transition happened cannot be
+    /// established: kept, never queued, reported unresolved.
+    #[serde(default)]
+    free_reply_unresolved: bool,
     dispatched: bool,
     expected_msat: u64,
     settlement: Option<PaymentDetails>,
@@ -456,7 +468,7 @@ impl Operation {
         proof: PaymentProof,
         fee_ceiling_msat: u64,
     ) -> Result<UkmEnvelope, ApiError> {
-        let (mut op, env) = self.seal(proof, fee_ceiling_msat, false).await?;
+        let (mut op, env) = self.seal(proof, fee_ceiling_msat, None).await?;
         materialize(&self.state, &mut op, &env).await?;
         Ok(env)
     }
@@ -464,13 +476,22 @@ impl Operation {
     /// call transition, but not yet queued, so a stop or a failed write at
     /// any point leaves either an unsent reply on a still-ringing call, or a
     /// recorded one that recovery queues ([`reconcile`]) after the transition.
-    pub(crate) async fn sealed_envelope(&self, proof: PaymentProof, fee_ceiling_msat: u64) -> Result<UkmEnvelope, ApiError> {
-        self.seal(proof, fee_ceiling_msat, true).await.map(|(_, env)| env)
+    pub(crate) async fn sealed_envelope(&self, proof: PaymentProof, fee_ceiling_msat: u64, call_id: &str) -> Result<UkmEnvelope, ApiError> {
+        self.seal(proof, fee_ceiling_msat, Some(call_id)).await.map(|(_, env)| env)
     }
-    /// Queue a sealed envelope, once its call transition is published.
-    pub(crate) async fn publish_sealed(&self, env: &UkmEnvelope) -> Result<(), ApiError> {
+    /// The checked call transition of this operation's sealed free reply
+    /// (see [`free_reply_gate`]); the caller holds the operation lock.
+    pub(crate) async fn free_reply_transition(&self, binding: Option<&crate::auth::PairingBinding>) -> Result<FreeReplyGate, ApiError> {
         let mut op = self.load().await?;
-        materialize(&self.state, &mut op, env).await
+        free_reply_gate(&self.state, &mut op, binding).await
+    }
+    /// Queue a sealed free reply, once its call transition on `call_id` is
+    /// published, then release that transition's receipt.
+    pub(crate) async fn publish_sealed(&self, env: &UkmEnvelope, call_id: &str) -> Result<(), ApiError> {
+        let mut op = self.load().await?;
+        materialize(&self.state, &mut op, env).await?;
+        release_reply_receipt(&self.state, &op, call_id).await;
+        Ok(())
     }
     /// The call transition of a sealed free reply did not happen: take its
     /// evidence back, so the operation is plainly unsent and can be retried.
@@ -483,18 +504,21 @@ impl Operation {
         }
         data.envelope_ready = false;
         data.free_reply = false;
+        data.free_reply_call = None;
         op.payment_hash = None;
         op.settled_msat = 0;
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await
     }
-    async fn seal(&self, proof: PaymentProof, fee_ceiling_msat: u64, free_reply: bool) -> Result<(OutboxOperation, UkmEnvelope), ApiError> {
+    /// `free_reply`: the call a free reply answers; `None` for a paid send.
+    async fn seal(&self, proof: PaymentProof, fee_ceiling_msat: u64, free_reply: Option<&str>) -> Result<(OutboxOperation, UkmEnvelope), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
-        if free_reply && (data.dispatched || data.expected_msat > 0 || proof.amount_msat > 0) {
+        if free_reply.is_some() && (data.dispatched || data.expected_msat > 0 || proof.amount_msat > 0) {
             return Err(storage("a free reply carries no payment"));
         }
-        data.free_reply = free_reply;
+        data.free_reply = free_reply.is_some();
+        data.free_reply_call = free_reply.map(str::to_string);
         data.fee_ceiling_msat = fee_ceiling_msat;
         let mut env = data
             .draft
@@ -1219,6 +1243,123 @@ pub(super) async fn record_undispatched_admission(
     drain_resolutions(state, &mut op).await
 }
 
+/// What a sealed free reply may do after its checked call transition.
+pub(crate) enum FreeReplyGate {
+    /// Its transition happened (now or before): queue it, on this call.
+    Queue(String),
+    /// Its call moved on without it: durably withdrawn, never sent.
+    Withdrawn,
+    /// Its transition definitely did not happen and its own reservation
+    /// still stands (a failed call write): not queued, retryable.
+    NotApplied,
+    /// Not established either way: not queued. `held` once it is kept
+    /// unresolved for good, with its evidence.
+    Unresolved { why: &'static str, held: bool },
+}
+
+/// The one gate between a sealed free reply and the outbox, for the send path
+/// and recovery alike; the caller holds the operation lock. Only a transition
+/// this operation applied, now or provably before, lets the reply be queued.
+/// A definite invalid reply is withdrawn for good (the operation is abandoned,
+/// releasing only its own reservation) before it is called unsent; a reply
+/// saved before receipts existed with no evidence either way is held
+/// unresolved, never inferred as sent or unsent.
+async fn free_reply_gate(state: &AppState, op: &mut OutboxOperation, binding: Option<&crate::auth::PairingBinding>)
+    -> Result<FreeReplyGate, ApiError> {
+    use crate::calls::{FreeReply, Unresolved};
+    let mut data = recovery(op)?;
+    if data.free_reply_unresolved {
+        return Ok(FreeReplyGate::Unresolved { why: "held", held: true });
+    }
+    let outcome = match data.free_reply_call.clone() {
+        Some(call_id) => Ok(call_id),
+        // Saved before its call was recorded with it: record the call its own
+        // reservation names first, so the transition below is never left
+        // without a way back to its receipt.
+        None => match crate::calls::locate_saved_reply(state.storage.as_ref(), op).await {
+            Ok(call_id) => {
+                let mut located = op.clone();
+                data.free_reply_call = Some(call_id.clone());
+                encode(&mut located, &data)?;
+                match save(state, &mut located).await {
+                    Ok(()) => { *op = located; Ok(call_id) }
+                    Err(_) => Err(Unresolved::Unreadable),
+                }
+            }
+            Err(why) => Err(why),
+        },
+    };
+    let outcome = match outcome {
+        Ok(call_id) => {
+            let owner = state.pairing.as_deref().map(|service| (service, binding));
+            let outcome = crate::calls::free_reply_transition(state, op, &call_id, owner).await;
+            (outcome, call_id)
+        }
+        Err(why) => (FreeReply::Unknown(why), String::new()),
+    };
+    match outcome {
+        (FreeReply::Applied | FreeReply::AlreadyApplied, call_id) => Ok(FreeReplyGate::Queue(call_id)),
+        (FreeReply::Invalid, _) => {
+            let mut withdrawn = op.clone();
+            let mut next = data;
+            next.envelope_ready = false;
+            next.free_reply_withdrawn = true;
+            withdrawn.state = "abandoned".into();
+            withdrawn.last_error = Some("free call reply withdrawn: its call moved on without it".into());
+            encode(&mut withdrawn, &next)?;
+            if let Err(error) = save(state, &mut withdrawn).await {
+                tracing::warn!(operation_id = %op.operation_id, %error, "free call reply withdrawal deferred");
+                return Ok(FreeReplyGate::Unresolved { why: "withdrawal_failed", held: false });
+            }
+            *op = withdrawn;
+            if let Err(error) = crate::calls::release_abandoned(state.storage.as_ref(), &op.operation_id).await {
+                tracing::warn!(operation_id = %op.operation_id, %error, "withdrawn free call reply: reservation release deferred");
+            }
+            Ok(FreeReplyGate::Withdrawn)
+        }
+        (FreeReply::Unknown(Unresolved::NotApplied), _) => Ok(FreeReplyGate::NotApplied),
+        (FreeReply::Unknown(why @ (Unresolved::NoEvidence | Unresolved::Corrupt)), _) => {
+            // Permanent: keep the evidence, report it once, never queue it.
+            let mut held = op.clone();
+            let mut next = data;
+            next.free_reply_unresolved = true;
+            held.state = "payment_unknown".into();
+            held.last_error = Some(format!("free call reply unresolved: {}", why.as_str()));
+            encode(&mut held, &next)?;
+            match save(state, &mut held).await {
+                Ok(()) => {
+                    *op = held;
+                    tracing::warn!(operation_id = %op.operation_id, reason = why.as_str(), "saved free call reply held unresolved; it is not sent");
+                    Ok(FreeReplyGate::Unresolved { why: why.as_str(), held: true })
+                }
+                Err(error) => {
+                    tracing::warn!(operation_id = %op.operation_id, %error, "free call reply hold deferred");
+                    Ok(FreeReplyGate::Unresolved { why: why.as_str(), held: false })
+                }
+            }
+        }
+        (FreeReply::Unknown(why), _) => Ok(FreeReplyGate::Unresolved { why: why.as_str(), held: false }),
+    }
+}
+
+/// Best effort after a free reply was queued; a later sweep prunes it.
+async fn release_reply_receipt(state: &AppState, op: &OutboxOperation, call_id: &str) {
+    let Ok(peer) = NodeId::from_hex(&op.recipient) else { return };
+    if let Err(error) = crate::calls::release_free_reply_receipt(state.storage.as_ref(), &peer, call_id, &op.operation_id).await {
+        tracing::debug!(%error, "free call reply receipt kept; a later sweep releases it");
+    }
+}
+
+/// Whether this operation may still be recovered as a sealed, unqueued free
+/// reply, so its call transition receipt must be kept. Unreadable: kept.
+pub(crate) fn free_reply_recoverable(op: &OutboxOperation) -> bool {
+    match recovery(op) {
+        Err(_) => true,
+        Ok(data) => data.free_reply && data.envelope_ready
+            && !matches!(op.state.as_str(), "paid" | "sent" | "acked" | "abandoned" | "rejected_retryable" | "failed_paid"),
+    }
+}
+
 async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
     recover_budget(state, op).await?;
     let mut data = recovery(op)?;
@@ -1330,12 +1471,21 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
             save(state, op).await?;
             return Ok(());
         };
+        let mut queued_reply = None;
         if data.free_reply {
-            // A saved free reply: its call transition is published before
+            // A saved free reply: its checked call transition comes before
             // the reply becomes visible to the outbox, as on the send path.
-            crate::calls::commit_saved_reply(state, op).await.map_err(storage)?;
+            match free_reply_gate(state, op, None).await? {
+                FreeReplyGate::Queue(call_id) => queued_reply = Some(call_id),
+                FreeReplyGate::Withdrawn | FreeReplyGate::Unresolved { held: true, .. } => return Ok(()),
+                FreeReplyGate::NotApplied => return Err(storage("free call reply transition not applied; retried later")),
+                FreeReplyGate::Unresolved { why, .. } => return Err(storage(format!("free call reply unresolved: {why}"))),
+            }
         }
         materialize(state, op, env).await?;
+        if let Some(call_id) = queued_reply {
+            release_reply_receipt(state, op, &call_id).await;
+        }
         recover_budget(state, op).await?;
         return Ok(());
     }
@@ -1575,6 +1725,9 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
         }
     }
     prune_paces(state, &ids);
+    if let Err(error) = crate::calls::prune_free_reply_receipts(state).await {
+        tracing::warn!(%error, "free call reply receipt cleanup deferred");
+    }
     compact_terminal_operations(state, &links).await
 }
 
