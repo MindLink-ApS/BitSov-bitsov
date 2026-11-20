@@ -58,6 +58,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, Scope, TokenError};
 
+pub mod allowance;
+#[cfg(test)]
+mod allowance_tests;
 pub mod approval;
 pub mod console;
 mod call_spend;
@@ -598,6 +601,10 @@ pub struct PairingFile {
     /// an hour for replay refusal and the per-client rate limit.
     #[serde(default)]
     pub intent_nonces: BTreeMap<String, (String, i64)>,
+    /// Owner-set standing allowances, by client id (see [`allowance`]).
+    /// Absent in files written before they existed, and while none is set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub allowances: BTreeMap<String, allowance::StandingAllowance>,
 }
 
 impl PairingFile {
@@ -620,6 +627,14 @@ impl PairingFile {
                 revoked += 1;
             }
         }
+        // A revocation also ends the standing allowance behind those grants,
+        // or the next request would simply open a new window.
+        match client_id {
+            Some(id) => {
+                self.allowances.remove(id);
+            }
+            None => self.allowances.clear(),
+        }
         revoked
     }
 
@@ -627,11 +642,15 @@ impl PairingFile {
     /// With `continuity`, an expired grant still funding an admitted call is
     /// not dead yet.
     fn has_dead_grant(&self, now: i64, continuity: bool) -> bool {
-        self.grants.iter().any(|g| !g.is_kept(now, continuity))
+        self.has_orphan_allowance_window()
+            || self.grants.iter().any(|g| !g.is_kept(now, continuity))
             || self.front_door_grants.iter().any(|g| !g.is_live(now))
     }
 
     fn retain_live_grants(&mut self, now: i64, continuity: bool) {
+        // Allowance windows are settled first, against the grants as they
+        // are, then the same keep rule as every grant applies.
+        self.settle_allowance_windows(now);
         self.grants.retain(|g| g.is_kept(now, continuity));
         for grant in self.grants.iter_mut().filter(|g| !g.is_live(now)) {
             grant.ended.get_or_insert(GrantEnd::Expired);
@@ -645,10 +664,20 @@ impl PairingFile {
     /// with their funding provenance; a revoked grant has no budget and
     /// carries nothing.
     fn replace_grants(&mut self, successor: &mut SpendGrant, carry_calls: bool) {
+        self.replace_grants_where(successor, carry_calls, |_| true);
+    }
+
+    /// [`Self::replace_grants`], for only the earlier grants `include` picks.
+    fn replace_grants_where(
+        &mut self,
+        successor: &mut SpendGrant,
+        carry_calls: bool,
+        include: impl Fn(&SpendGrant) -> bool,
+    ) {
         let now = chrono::Utc::now().timestamp();
         let mut moved = Vec::new();
         for old in &mut self.grants {
-            if old.client_id != successor.client_id {
+            if old.client_id != successor.client_id || !include(old) {
                 continue;
             }
             let same_pairing = old.epoch == successor.epoch
@@ -827,6 +856,9 @@ pub struct PairingService {
     local_owner_device: bool,
     second_device_enrollment: bool,
     second_device_claim_v1: bool,
+    /// `[pairing] standing_allowance_v1`: owner-set allowances may open spend
+    /// windows. Off unless the config says exactly `true`.
+    standing_allowance: bool,
     /// `[calls] call_continuity_v1`, off by default.
     call_continuity: bool,
     enrollment_audit: Option<std::sync::Arc<crate::audit::AuditLog>>,
@@ -1146,6 +1178,7 @@ impl PairingService {
             local_owner_device: false,
             second_device_enrollment: false,
             second_device_claim_v1: true,
+            standing_allowance: false,
             call_continuity: false,
             enrollment_audit: None,
             print_pairing_instruction: true,
@@ -1189,6 +1222,9 @@ impl PairingService {
 
     /// Deployment gate shared by scopes, grant views, staging, reservation and dispatch.
     fn permits_spend_grant(&self, grant: &SpendGrant) -> bool {
+        if grant.granted_by == allowance::ALLOWANCE_GRANTED_BY {
+            return grant.owner_approval.is_none() && self.allowance_windows_honoured();
+        }
         if let Some(receipt) = &grant.owner_approval {
             return (self.owner_control_enabled || self.local_owner_device)
                 && self.device_authority_off.is_none()
@@ -1626,6 +1662,7 @@ impl PairingService {
 
     /// Remove any live or stale remote pairing link.
     pub fn remove_remote_access_link(&self) -> Result<(), PairingError> {
+        allowance::remove_ticket_allowance(&self.dir)?;
         let path = self.dir.join("remote-access-link");
         match std::fs::remove_file(path) {
             Ok(()) => fsync_dir_strict(&self.dir)?,
@@ -2499,7 +2536,8 @@ impl PairingService {
             {
                 for s in &grant.scopes {
                     if !scopes.contains(s)
-                        && (self.owner_control_enabled
+                        && ((self.owner_control_enabled
+                            && grant.granted_by != allowance::ALLOWANCE_GRANTED_BY)
                             || (*s == Scope::Spend && self.permits_spend_grant(grant)))
                     {
                         scopes.push(*s);
@@ -2782,6 +2820,13 @@ impl PairingService {
             .find(|c| c.client_id == client_id)
             .cloned()
             .ok_or(PairingError::UnknownClient)?;
+        // Inside an owner-set standing allowance the node opens the window
+        // itself; anything outside it takes the owner path below, unchanged.
+        if let Some(terms) = proposed_terms.as_ref() {
+            if let Ok(op) = self.open_allowance_window(&mut inner, &client, &scopes, terms, now)? {
+                return Ok(op);
+            }
+        }
         if !self.owner_control_enabled {
             return Err(PairingError::OwnerApprovalUnavailable);
         }
@@ -2861,6 +2906,17 @@ impl PairingService {
             return Err(PairingError::UnknownOperation);
         }
         let now = chrono::Utc::now().timestamp();
+        // A window the node opened from a standing allowance has no pending
+        // record; it reads as granted while it authorizes spending.
+        if inner.file.grants.iter().any(|g| {
+            g.op_id == op_id
+                && g.client_id == client_id
+                && g.granted_by == allowance::ALLOWANCE_GRANTED_BY
+                && g.is_live(now)
+                && self.permits_spend_grant(g)
+        }) {
+            return Ok(ElevationStatus::Granted);
+        }
         if !self.owner_control_enabled {
             return Ok(
                 match inner
@@ -2891,11 +2947,13 @@ impl PairingService {
                     .iter()
                     .any(|g| g.client_id == op.client_id && g.is_live(now))
             } else {
-                inner
-                    .file
-                    .grants
-                    .iter()
-                    .any(|g| g.client_id == op.client_id && g.is_live(now))
+                inner.file.grants.iter().any(|g| {
+                    g.client_id == op.client_id
+                        && g.is_live(now)
+                        // A window the allowance opened never answers an
+                        // owner request: it stays pending until the owner acts.
+                        && g.granted_by != allowance::ALLOWANCE_GRANTED_BY
+                })
             };
             if granted {
                 return Ok(ElevationStatus::Granted);
@@ -2911,7 +2969,7 @@ impl PairingService {
             .file
             .grants
             .iter()
-            .any(|g| g.op_id == op_id && g.is_live(now))
+            .any(|g| g.op_id == op_id && g.is_live(now) && g.granted_by != allowance::ALLOWANCE_GRANTED_BY)
             || inner
                 .file
                 .front_door_grants
@@ -3469,6 +3527,14 @@ impl PairingService {
                 "grant does not authorize liquidity fees".into(),
             ));
         }
+        // Inside a standing allowance, the per-call cap bounds the whole call.
+        let allowance_offer = Self::check_allowance_call(
+            &inner.file,
+            &inner.file.grants[idx],
+            authority.call.as_ref(),
+            authority.call_offer.filter(|_| authority.call.is_none()).map(|(call_id, _)| call_id),
+            &charges,
+        )?;
         let call_binding = authority.call.as_ref().map(|terms| format!("{}:{}", terms.peer, terms.call_id));
         let before = inner.file.grants[idx].budget.clone();
         let op_id = inner.file.grants[idx].op_id.clone();
@@ -3562,6 +3628,13 @@ impl PairingService {
             tracing::warn!(client_id, grant_op_id = %op_id, reason = refusal.reason(), "grant reservation refused");
             return Err(refusal);
         }
+        let allowance_payment_ids = (!authority.payment_ids.is_empty()
+            && inner.file.grants[idx].granted_by == allowance::ALLOWANCE_GRANTED_BY)
+            .then(|| authority.payment_ids.clone());
+        let budget = inner.file.grants[idx]
+            .budget
+            .as_mut()
+            .ok_or(BudgetRefusal::NoGrant)?;
         budget.payment_ids.extend(authority.payment_ids);
         let mut recipients = std::collections::BTreeMap::new();
         for charge in &charges {
@@ -3592,10 +3665,22 @@ impl PairingService {
         }
         let previous_binding = call_binding.as_ref().and_then(|key|
             inner.file.call_spend_grants.insert(key.clone(), op_id.clone()));
+        let previous_offers = allowance_offer
+            .as_ref()
+            .map(|offer| Self::record_allowance_offer(&mut inner.file, offer));
+        let recorded_ids = allowance_payment_ids.is_some_and(|ids| {
+            Self::record_allowance_payment_ids(&mut inner.file, client_id, &reservation.id, ids)
+        });
         if in_memory {
             return Ok(reservation);
         }
         if let Err(e) = self.persist_with_clock(&mut inner.file, &mut clock) {
+            if let (Some(offer), Some(previous)) = (&allowance_offer, previous_offers) {
+                Self::unrecord_allowance_offer(&mut inner.file, offer, previous);
+            }
+            if recorded_ids {
+                Self::unrecord_allowance_payment_ids(&mut inner.file, client_id, &reservation.id);
+            }
             if let Some(key) = call_binding {
                 match previous_binding {
                     Some(previous) => { inner.file.call_spend_grants.insert(key, previous); },
@@ -4314,6 +4399,22 @@ impl PairingService {
                         && g.budget.as_ref().is_some_and(|b| {
                             b.pending.contains_key(&reservation.id) && b.holds_draw(&reservation.id)
                         })
+                })
+                .or(found);
+        }
+        // An ordinary payment that was open when an allowance opened the
+        // next window settles in the window it moved to, exactly once.
+        if found.is_none_or(|i| {
+            inner.file.grants[i].budget.as_ref().is_none_or(|b| !b.pending.contains_key(&reservation.id))
+        }) {
+            found = inner
+                .file
+                .grants
+                .iter()
+                .position(|g| {
+                    g.client_id == reservation.client_id
+                        && g.granted_by == allowance::ALLOWANCE_GRANTED_BY
+                        && g.budget.as_ref().is_some_and(|b| b.pending.contains_key(&reservation.id))
                 })
                 .or(found);
         }

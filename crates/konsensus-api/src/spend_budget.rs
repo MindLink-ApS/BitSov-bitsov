@@ -157,7 +157,7 @@ impl BreakerLimits {
         }
     }
 
-    fn valid(&self) -> bool {
+    pub(crate) fn valid(&self) -> bool {
         self.max_payments_per_minute > 0
             && self.max_payments_per_hour > 0
             && self.max_consecutive_failures > 0

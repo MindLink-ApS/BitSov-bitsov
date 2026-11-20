@@ -323,3 +323,94 @@ fn claim_code_cli_requires_owner_console_and_never_writes_secret_to_pipes() {
         secret
     );
 }
+
+#[test]
+fn an_allowance_binds_to_the_ticket_node_side_and_only_when_switched_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("konsensus.toml");
+    let base = r#"
+[identity]
+mnemonic_file = "absent.enc"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+[remote_access]
+listen_addr = "127.0.0.1:18443"
+advertised_endpoint = "node.example:18443"
+"#;
+    let pairing = dir.path().join("pairing");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_konsensus"))
+            .arg("pair-ticket")
+            .args(args)
+            .arg("--config")
+            .arg(&config)
+            .output()
+            .unwrap()
+    };
+    let code_of = |uri: &str| -> String {
+        let ticket: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(uri.trim().strip_prefix("bitsov://pair/").unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(ticket.get("allowance").is_none() && !uri.contains("allow"), "the terms are never in the link");
+        ticket["code"].as_str().unwrap().to_string()
+    };
+
+    // Off: refused, nothing published.
+    std::fs::write(&config, base).unwrap();
+    let output = run(&["--allow"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("standing allowances are off"));
+    assert!(!pairing.join("remote-access-link").exists());
+    assert!(!pairing.join("remote-access-allowance").exists());
+
+    // On: the owner defaults, bound to this ticket's code, on a short ticket.
+    std::fs::write(&config, format!("{base}[pairing]\nstanding_allowance_v1 = true\n")).unwrap();
+    let before = chrono::Utc::now().timestamp();
+    let output = run(&["--allow"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let uri = stdout.lines().next().unwrap();
+    let code = code_of(uri);
+    let terms = konsensus_api::pairing::allowance::read_ticket_allowance(&pairing, &code, before).unwrap();
+    assert_eq!((terms.daily_msat, terms.per_call_max_msat), (2_500_000, 700_000));
+    assert!((before + 30 * 86_400..=chrono::Utc::now().timestamp() + 30 * 86_400).contains(&terms.until));
+    assert!(konsensus_api::pairing::allowance::read_ticket_allowance(&pairing, "another-code", before).is_none());
+    let link: serde_json::Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD.decode(uri.trim().strip_prefix("bitsov://pair/").unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert!(link["expires_at"].as_i64().unwrap() <= chrono::Utc::now().timestamp() + 15 * 60);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(pairing.join("remote-access-allowance")).unwrap().permissions().mode();
+        assert_eq!(mode & 0o077, 0, "owner-only");
+    }
+
+    // Owner-chosen terms; per-call defaults to the cap when the cap is lower.
+    let output = run(&["--allow", "500", "--days", "7"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let code = code_of(String::from_utf8(output.stdout).unwrap().lines().next().unwrap());
+    let terms = konsensus_api::pairing::allowance::read_ticket_allowance(&pairing, &code, before).unwrap();
+    assert_eq!((terms.daily_msat, terms.per_call_max_msat), (500_000, 500_000));
+    assert!(terms.until <= chrono::Utc::now().timestamp() + 7 * 86_400);
+
+    // Refused terms publish nothing new.
+    for args in [&["--allow", "--ttl", "2h"][..], &["--allow", "100", "--per-call", "200"][..]] {
+        assert!(!run(args).status.success(), "{args:?}");
+    }
+    assert!(konsensus_api::pairing::allowance::read_ticket_allowance(&pairing, &code, before).is_some());
+
+    // A plain ticket clears earlier terms.
+    let output = run(&[]);
+    assert!(output.status.success());
+    assert!(!pairing.join("remote-access-allowance").exists());
+}

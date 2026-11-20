@@ -3116,6 +3116,8 @@ mod messaging_cap;
 
 #[path = "budget_grant/calls.rs"]
 mod call_reservations;
+#[path = "budget_grant/standing_allowance.rs"]
+mod standing_allowance;
 /// A `request_id` belongs to the caller that used it. Two paired apps, or an
 /// app and the owner, reusing the same string with identical parameters are
 /// two operations: each dispatches and is debited once, and neither can read
