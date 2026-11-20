@@ -183,9 +183,12 @@ With it on, two replies to a ringing call cost nothing:
   envelope carries amount 0, a fresh preimage that only keeps its replay keys
   unique, and one reference derived from the call id. It is journaled and
   resent like any other signal, so a double tap or a lost receipt still
-  sends one reply; it is never retried as a paid one. If the call cannot be
-  read when deciding, the reply is refused unsent, never paid instead. To any
-  other caller, and for every other signal, the paid path is unchanged.
+  sends one reply; it is never retried as a paid one. Once both nodes offer
+  the free reply, a call that cannot be read, or is no longer ringing when the
+  reply is judged or right before it goes out, refuses the reply unsent; it is
+  never paid instead. The paid path stays only for compatibility: the switch
+  off here, a caller that does not advertise it, or a signal that is not an
+  answer or decline.
 - **Receiving (caller).** The payment gate accepts such a reply without
   payment only when its sender is the callee of a call this node placed,
   whose paid offer is bound and which is still ringing, and its reference

@@ -4316,6 +4316,12 @@ pub(super) async fn compose_peer(
             ..Readmission::for_cap(readmission_cap)
         };
         let (payment_hash, preimage_bytes, amount_msat) = if free_reply {
+            // Judged free: it stays free or is not sent. Recheck the call
+            // right before it goes out; a closed ring window refuses it.
+            let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            let decline = req.kind == konsensus_core::kind::KIND_CALL_HANGUP;
+            crate::calls::free_reply_still_eligible(&state, &peer_id, &signal.call_id, decline).await?;
             // Not a payment: a fresh preimage only makes the envelope's replay
             // keys unique. The caller's gate binds the reply to its ringing
             // offer instead of to a settlement.

@@ -659,9 +659,11 @@ pub async fn check_free_reply(store: Store<'_>, envelope: &konsensus_core::UkmEn
 /// with the switch on, to a connected peer that advertised
 /// [`konsensus_core::payloads::call::FREE_REPLY_CAPABILITY`], for a call this
 /// node is ringing for as callee (a decline also while the call waits for a
-/// device), and with no other reference. Otherwise the legacy paid path is
-/// used unchanged. If the call cannot be read once both nodes offer the free
-/// reply, the reply is refused unsent, never paid instead.
+/// device), and with no other reference. The legacy paid path is used only
+/// for compatibility: switch off, a peer that does not advertise it, or a
+/// signal that is not an answer or decline. Once both nodes offer the free
+/// reply, a call that cannot be read or is no longer ringing refuses the
+/// reply unsent; it is never paid instead.
 pub(crate) async fn free_reply_allowed(state: &AppState, peer: &NodeId, kind: u16, plaintext: &str,
     references: &[konsensus_core::MessageId]) -> Result<bool, ApiError> {
     if !state.call_reply_free || !references.is_empty() {
@@ -677,17 +679,32 @@ pub(crate) async fn free_reply_allowed(state: &AppState, peer: &NodeId, kind: u1
     if !state.transport.peer_info(peer).await.is_some_and(|info| info.capabilities.contains(&wanted)) {
         return Ok(false);
     }
-    // Both nodes offer the free reply: never fall back to paying it because
-    // the call could not be read. Refuse it unsent instead.
-    let entry = state.storage.call_get(peer, &signal.call_id).await
+    // Both nodes offer the free reply: from here on it is free or not sent.
+    // Never fall back to paying it because the call could not be read, or
+    // because its ring window closed after the reply was reserved.
+    free_reply_still_eligible(state, peer, &signal.call_id, decline).await?;
+    Ok(true)
+}
+
+/// The call this free reply answers is still ours to answer: this node is
+/// its callee and it is ringing (a decline also while it waits for a
+/// device). Otherwise the reply is refused unsent, with nothing paid. Read
+/// when deciding and again right before the reply is dispatched.
+pub(crate) async fn free_reply_still_eligible(state: &AppState, peer: &NodeId, call_id: &str, decline: bool)
+    -> Result<(), ApiError> {
+    let entry = state.storage.call_get(peer, call_id).await
         .map_err(|_| ApiError::NotDispatched(
             "the call could not be read; the reply was not sent and nothing was paid".into(),
         ).with_reason("call_reply_unavailable"))?
         .and_then(|e| e.at(now_ms()));
-    // An answer needs a ringing device; a decline may also come while the
-    // call still waits for one. The caller's offer is ringing either way.
-    Ok(entry.is_some_and(|e| e.side == rules::Side::Callee
-        && (e.phase == rules::Phase::Ringing || (decline && e.phase == rules::Phase::AwaitingDevice))))
+    let eligible = entry.is_some_and(|e| e.side == rules::Side::Callee
+        && (e.phase == rules::Phase::Ringing || (decline && e.phase == rules::Phase::AwaitingDevice)));
+    if !eligible {
+        return Err(ApiError::NotDispatched(
+            "the call is no longer ringing; the reply was not sent and nothing was paid".into(),
+        ).with_reason("call_reply_expired"));
+    }
+    Ok(())
 }
 
 /// Admit a signal this node (`own`) received from `peer` (after the payment
