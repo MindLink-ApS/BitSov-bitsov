@@ -32,9 +32,11 @@
 //! not spent, never let more than the cap be spent in any 24 hours.
 //!
 //! The ledger is stored with the pairing, so a restart cannot reset it. A
-//! clock moving backward only keeps entries counting longer, and the highest
-//! time the allowance has seen is what `until` is compared against, so a
-//! clock moving backward cannot reopen an allowance that ended.
+//! clock moving backward only keeps entries counting longer. Entries are
+//! merged, never dropped, so a clock that jumps forward and comes back still
+//! counts them. Every evaluation records the time it saw, refusals included,
+//! and `until` is compared against the highest such time, so a clock moving
+//! backward cannot reopen an allowance that ended.
 //!
 //! Lowering the cap applies from the moment it is written: spending already
 //! recorded stays counted against the new, lower cap, and is never undone.
@@ -77,10 +79,14 @@ pub const ROLLING_SECS: i64 = 24 * 3600;
 /// the longest call, plus a minute.
 pub const CALL_TAIL_SECS: i64 = 240 * 60 + 60;
 
-/// Most windows the ledger keeps per pairing. Windows age out after at most
-/// two days; reaching this means windows are being opened far faster than any
-/// app needs, and the node stops opening more until older ones age out.
+/// Most counting windows per pairing. Windows stop counting after at most
+/// two days, and ended ones are then merged into one entry. Reaching this
+/// means windows are being opened far faster than any app needs, and the
+/// node stops opening more until older ones stop counting.
 pub const MAX_LEDGER_WINDOWS: usize = 512;
+
+/// `op_id` of the entry that merges ended windows (never a grant's id).
+const AGGREGATE_WINDOW: &str = "earlier-windows";
 
 /// File, next to the pairing link, that binds owner terms to one ticket.
 const TICKET_ALLOWANCE_FILE: &str = "remote-access-allowance";
@@ -312,20 +318,46 @@ impl StandingAllowance {
         self.terms.daily_msat.saturating_sub(self.committed_msat(now))
     }
 
-    /// Drop windows that no longer count.
+    /// Record that the allowance has seen `now`; returns whether that moved
+    /// its clock forward. Every evaluation records it, refusals included, so
+    /// a clock set back later cannot reopen what an earlier time closed.
+    pub fn observe(&mut self, now: i64) -> bool {
+        let before = self.observed_at;
+        self.observed_at = self.observed_at.max(now);
+        self.observed_at != before
+    }
+
+    /// Keep the ledger small without forgetting anything. Ended windows that
+    /// do not count at `now` are merged into one entry: the sum of what they
+    /// used, ending at the latest of their ends. A clock that jumped forward
+    /// and comes back finds that entry counting whenever any of them would,
+    /// so no spending is ever dropped on the word of the clock.
     pub fn forget_old_windows(&mut self, now: i64) {
-        self.windows.retain(|w| w.counts(now));
+        let (old, mut kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.windows)
+            .into_iter()
+            .partition(|w| w.ended_at.is_some() && !w.counts(now));
+        if let Some(first) = old.first() {
+            let merged = old.iter().skip(1).fold(first.clone(), |acc, w| AllowanceWindow {
+                op_id: AGGREGATE_WINDOW.to_string(),
+                opened_at: acc.opened_at.min(w.opened_at),
+                committed_msat: acc.committed_msat.saturating_add(w.committed_msat),
+                ended_at: acc.ended_at.max(w.ended_at),
+            });
+            kept.insert(0, merged);
+        }
+        self.windows = kept;
     }
 
     /// Check a proposal against the terms, at `now`, given that the window
     /// with `replacing` op id (if any) is about to end having used
     /// `replacing_used_msat`. Returns the window length to grant.
     pub fn admit(
-        &self,
+        &mut self,
         terms: &GrantTerms,
         replacing: Option<(&str, u64)>,
         now: i64,
     ) -> Result<i64, NoWindow> {
+        self.observe(now);
         let effective = self.effective_now(now);
         if effective >= self.terms.until {
             return Err(NoWindow::Ended);
@@ -523,7 +555,7 @@ impl super::PairingFile {
     /// Bring every allowance's ledger up to date with its grants: an open
     /// window whose grant expired is ended at its expiry with what it used;
     /// one whose grant was revoked, replaced elsewhere or is gone stays
-    /// counted in full. Windows past counting are dropped.
+    /// counted in full. Windows past counting are merged, never dropped.
     pub(super) fn settle_allowance_windows(&mut self, now: i64) {
         // A window whose allowance is gone (revoked, or dropped by a node
         // that did not know it) authorizes nothing more.
@@ -552,6 +584,8 @@ impl super::PairingFile {
                     _ => allowance.end_window(&op_id, now, None),
                 }
             }
+            // Every write records the time it saw (see `observe`).
+            allowance.observe(now);
             allowance.forget_old_windows(now);
         }
     }
@@ -612,6 +646,7 @@ impl super::PairingService {
         let Some(allowance) = inner.file.allowances.get(&client.client_id) else {
             return Ok(Err(NoWindow::None));
         };
+        let observed_before = allowance.observed_at;
         if !self.allowance_set_by_honoured(&allowance.set_by)
             || allowance.epoch != client.epoch
             || allowance.identity_fingerprint != inner.identity_fingerprint
@@ -619,7 +654,7 @@ impl super::PairingService {
         {
             return Ok(Err(NoWindow::Provenance));
         }
-        let previous = inner
+        let previous: Option<(String, GrantBudget)> = inner
             .file
             .grants
             .iter()
@@ -628,13 +663,34 @@ impl super::PairingService {
                     && g.granted_by == ALLOWANCE_GRANTED_BY
                     && g.is_live(now)
             })
-            .max_by_key(|g| g.granted_at);
-        let replacing = previous.and_then(|g| Some((g.op_id.as_str(), g.budget.as_ref()?.used_msat)));
-        let ttl = match allowance.admit(terms, replacing, now) {
+            .max_by_key(|g| g.granted_at)
+            .and_then(|g| Some((g.op_id.clone(), g.budget.clone()?)));
+        let replacing = previous.as_ref().map(|(op, budget)| (op.as_str(), budget.used_msat));
+        let allowance = inner
+            .file
+            .allowances
+            .get_mut(&client.client_id)
+            .expect("checked above under the same lock");
+        let admitted = allowance.admit(terms, replacing, now);
+        let ttl = match admitted {
             Ok(ttl) => ttl,
-            Err(why) => return Ok(Err(why)),
+            Err(why) => {
+                // A refusal still records the time it saw.
+                if allowance.observed_at != observed_before {
+                    let observed = allowance.observed_at;
+                    if let Err(error) = self.persist(&mut inner.file) {
+                        if let Some(a) = inner.file.allowances.get_mut(&client.client_id) {
+                            a.observed_at = observed_before;
+                        }
+                        return Err(error);
+                    }
+                    debug_assert!(inner.file.allowances.get(&client.client_id).is_none_or(|a| a.observed_at >= observed));
+                }
+                return Ok(Err(why));
+            }
         };
-        let budget = allowance.window_budget(terms, previous.and_then(|g| g.budget.as_ref()));
+        let allowance = &inner.file.allowances[&client.client_id];
+        let budget = allowance.window_budget(terms, previous.as_ref().map(|(_, budget)| budget));
         let mut op_bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut op_bytes);
         let op_id = hex::encode(op_bytes);

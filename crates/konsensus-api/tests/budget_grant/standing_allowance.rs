@@ -89,6 +89,13 @@ async fn the_app_asks_once_and_spends_inside_the_allowance_without_the_owner() {
     assert_eq!(status, StatusCode::OK, "{op}");
     assert!(op["owner_action"].as_str().unwrap().contains("konsensus grant"), "{op}");
     assert_eq!(fx.service.snapshot().pending_elevations.len(), 1);
+    // It stays pending until the owner acts, although a window is live.
+    let (status, body) = fx
+        .call("GET", &format!("/api/v1/pair/elevation/{}", op["op_id"].as_str().unwrap()), None, Some(&read))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "pending", "{body}");
+    assert_eq!(body["owner_confirmation_required"], true);
 }
 
 #[tokio::test]

@@ -493,8 +493,8 @@ fn until_ends_new_windows_and_a_clock_rollback_cannot_reopen_it() {
     book.open_window("w", 1_000, t0 + 1_800);
     assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 3_570), Err(NoWindow::Ended), "under a minute left");
     assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 3_600), Err(NoWindow::Ended));
-    // The node saw t0 + 3,600 once; a clock set back an hour changes nothing.
-    book.open_window("x", 0, t0 + 3_600);
+    // The node saw t0 + 3,600 once, through a refusal; a clock set back an
+    // hour changes nothing.
     assert!(!book.is_live(t0));
     assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0), Err(NoWindow::Ended));
 }
@@ -632,4 +632,106 @@ fn allowance_terms_refuse_what_cannot_be_enforced() {
         assert!(AllowanceTerms::from_sats(daily, per_call, days, t0).is_err(), "{daily} {per_call} {days}");
     }
     assert!(AllowanceTerms::from_sats(1, 1, 365, t0).is_ok());
+}
+
+// ── Review follow-ups: clock monotonicity, ledger retention, status ─────
+
+/// A request refused because the allowance ended records that time, so a
+/// clock set back afterwards cannot open a window.
+#[test]
+fn a_refusal_at_the_end_date_survives_a_clock_set_back() {
+    let t0 = 1_800_000_000;
+    let terms = AllowanceTerms { until: t0 + 3_600, ..AllowanceTerms::owner_defaults(t0) };
+    let mut book = StandingAllowance::new(terms, SET_BY_CLI, None, 1, "identity", t0);
+    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 3_600), Err(NoWindow::Ended));
+    assert_eq!(book.admit(&proposal(1_000, 1_000), None, t0 + 60), Err(NoWindow::Ended), "clock set back");
+    assert!(!book.is_live(t0));
+}
+
+#[test]
+fn a_refused_request_persists_the_time_it_saw() {
+    let real = now();
+    let until = real + 3_600;
+    let f = fixture(true, true, Some(AllowanceTerms { until, ..terms() }));
+    let open_at = |f: &Fixture, at: i64| {
+        let mut inner = f.svc.lock();
+        let client = inner.file.clients.iter().find(|c| c.client_id == f.client).unwrap().clone();
+        f.svc
+            .open_allowance_window(&mut inner, &client, &[Scope::Spend], &proposal(1_000, 1_000), at)
+            .unwrap()
+            .map(|op| op.op_id)
+    };
+    assert_eq!(open_at(&f, until), Err(NoWindow::Ended));
+    // The node restarts and its clock reads earlier than what it saw.
+    let f = reopen(f, true, true);
+    assert_eq!(open_at(&f, real + 60), Err(NoWindow::Ended));
+    assert!(allowance_grants(&f).is_empty());
+    assert!(ledger(&f).observed_at >= until);
+}
+
+/// A clock that jumps forward and comes back must not lose ledger entries
+/// that count again once it is back.
+#[test]
+fn a_forward_clock_jump_does_not_forget_spending() {
+    let t0 = 1_800_000_000;
+    let mut book = StandingAllowance::new(AllowanceTerms::owner_defaults(t0), SET_BY_CLI, None, 1, "identity", t0);
+    book.open_window("a", 2_000_000, t0);
+    let mut used = GrantBudget::from_terms(&GrantTerms::new(2_000_000));
+    used.used_msat = 2_000_000;
+    book.end_window("a", t0 + 60, Some(&used));
+    // Ten days ahead, the old window no longer counts, and the store tidies up.
+    let ahead = t0 + 10 * 86_400;
+    assert_eq!(book.remaining_msat(ahead), DAILY);
+    book.forget_old_windows(ahead);
+    book.open_window("b", 400_000, ahead);
+    // Back to the real time: both windows count.
+    let back = t0 + 120;
+    assert!(book.committed_msat(back) >= 2_400_000, "{}", book.committed_msat(back));
+    assert!(book.remaining_msat(back) <= DAILY - 2_400_000);
+    assert!(matches!(book.admit(&proposal(200_000, 200_000), None, back), Err(NoWindow::OverDailyCap { .. })));
+    // Tidying keeps the ledger small without losing anything that counts.
+    for i in 0..100 {
+        let op = format!("w{i}");
+        book.open_window(&op, 1, ahead + i);
+        book.end_window(&op, ahead + i, Some(&GrantBudget::from_terms(&GrantTerms::new(1))));
+    }
+    book.forget_old_windows(ahead + 30 * 86_400);
+    assert!(book.windows.len() <= 3, "{}", book.windows.len());
+    assert!(book.committed_msat(back) >= 2_400_000);
+}
+
+#[test]
+fn an_over_cap_request_stays_pending_while_a_window_is_live() {
+    let f = fixture(true, true, Some(terms()));
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+    let (op, outcome) = ask(&f, proposal(DAILY + 1, PER_CALL)).unwrap();
+    assert_eq!(outcome, Outcome::Owner);
+    assert_eq!(f.svc.elevation_status(&f.client, &op).unwrap(), ElevationStatus::Pending);
+    assert_eq!(allowance_grants(&f).len(), 1, "the live window is untouched");
+}
+
+/// The store's own sweep also records the time, so an allowance whose end the
+/// node has seen stays ended even if no request was made at that time.
+#[test]
+fn the_sweep_latches_the_end_date_without_a_request() {
+    let real = now();
+    let f = fixture(true, true, Some(terms()));
+    let until = real - 1;
+    {
+        let mut inner = f.svc.lock();
+        let allowance = inner.file.allowances.get_mut(&f.client).unwrap();
+        allowance.terms.until = until;
+        allowance.observed_at = until - 3_600;
+        f.svc.persist(&mut inner.file).unwrap();
+    }
+    let f = reopen(f, true, true);
+    assert!(ledger(&f).observed_at >= real, "the write recorded the time it saw");
+    let mut inner = f.svc.lock();
+    let client = inner.file.clients.iter().find(|c| c.client_id == f.client).unwrap().clone();
+    let opened = f
+        .svc
+        .open_allowance_window(&mut inner, &client, &[Scope::Spend], &proposal(1_000, 1_000), until - 1_800)
+        .unwrap()
+        .map(|op| op.op_id);
+    assert_eq!(opened, Err(NoWindow::Ended));
 }

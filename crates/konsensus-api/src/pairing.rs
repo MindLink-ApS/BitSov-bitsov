@@ -2818,8 +2818,9 @@ impl PairingService {
                 inner.file.grants.iter().any(|g| {
                     g.client_id == op.client_id
                         && g.is_live(now)
-                        && (g.granted_by != allowance::ALLOWANCE_GRANTED_BY
-                            || self.permits_spend_grant(g))
+                        // A window the allowance opened never answers an
+                        // owner request: it stays pending until the owner acts.
+                        && g.granted_by != allowance::ALLOWANCE_GRANTED_BY
                 })
             };
             if granted {

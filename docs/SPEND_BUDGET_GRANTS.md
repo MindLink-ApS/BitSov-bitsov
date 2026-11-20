@@ -505,7 +505,8 @@ only if:
 - the allowance has not ended. A window never lasts past the end date, and one
   with less than a minute left is not opened.
 
-Anything else takes the owner path, unchanged. A new window replaces the
+Anything else takes the owner path, unchanged, and its status stays `pending`
+until the owner acts, even while an earlier allowance window is live. A new window replaces the
 app's previous one, as every window does. Breakers are the allowance's and
 carry their history from one window to the next; a renewal never resets them.
 
@@ -516,9 +517,11 @@ An ended window keeps counting until 24 hours after its end, plus the longest
 call. A window opens only if its budget fits under the cap together with what
 is still counted. This may hold back sats that were not spent; it never lets
 more than the cap be spent in any 24 hours. The record is stored with the
-pairing, so a restart does not reset it. A clock moving backward keeps windows
-counting longer and cannot reopen an allowance whose end date the node has
-already seen. New terms for a pairing keep the record, so a lower cap applies
+pairing, so a restart does not reset it. Old entries are merged, never
+dropped, so a clock that jumps forward and comes back still finds them. Every
+request records the time it saw, refused ones included, and the end date is
+compared against the latest such time: a clock moving backward cannot reopen
+an allowance the node has already seen end. New terms for a pairing keep the record, so a lower cap applies
 from then on and counts what was already spent.
 
 **Only an owner channel writes an allowance.** No request body can set or
