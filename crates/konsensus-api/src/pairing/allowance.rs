@@ -243,6 +243,11 @@ pub struct StandingAllowance {
     /// once no window holds that call any more.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub call_offers_msat: std::collections::BTreeMap<String, u64>,
+    /// Payment identities of each payment still in flight in this
+    /// allowance's windows, by reservation id, so the next window refuses
+    /// paying them again. Dropped once the payment settles.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub payment_ids_in_flight: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Why an allowance did not open a window. The request then takes the usual
@@ -262,6 +267,9 @@ pub enum NoWindow {
     OutsideTerms(&'static str),
     /// The rolling 24-hour cap has no room for this budget.
     OverDailyCap { remaining_msat: u64 },
+    /// A live window the owner wrote governs this pairing; the allowance
+    /// does not replace it.
+    OwnerWindow,
 }
 
 impl StandingAllowance {
@@ -285,6 +293,7 @@ impl StandingAllowance {
             observed_at: now,
             carried_breakers: None,
             call_offers_msat: Default::default(),
+            payment_ids_in_flight: Default::default(),
         }
     }
 
@@ -295,11 +304,13 @@ impl StandingAllowance {
         let windows = std::mem::take(&mut self.windows);
         let carried = self.carried_breakers.take();
         let offers = std::mem::take(&mut self.call_offers_msat);
+        let in_flight = std::mem::take(&mut self.payment_ids_in_flight);
         let observed = self.observed_at;
         *self = next;
         self.windows = windows;
         self.carried_breakers = carried;
         self.call_offers_msat = offers;
+        self.payment_ids_in_flight = in_flight;
         self.observed_at = self.observed_at.max(observed);
     }
 
@@ -530,6 +541,26 @@ pub fn commit_ticket_allowance(pairing_dir: &Path, staged: &Path) -> std::io::Re
     result
 }
 
+/// Where the terms bound to the published ticket live.
+pub fn ticket_allowance_path(pairing_dir: &Path) -> std::path::PathBuf {
+    pairing_dir.join(TICKET_ALLOWANCE_FILE)
+}
+
+/// Put back exactly the terms that were published before (`None`: none were).
+pub fn restore_ticket_allowance(pairing_dir: &Path, previous: Option<&[u8]>) -> std::io::Result<()> {
+    let Some(bytes) = previous else {
+        return remove_ticket_allowance(pairing_dir);
+    };
+    let temporary = pairing_dir.join(format!(".remote-access-allowance-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        super::write_protected(&temporary, bytes)?;
+        std::fs::rename(&temporary, pairing_dir.join(TICKET_ALLOWANCE_FILE))?;
+        super::fsync_dir_strict(pairing_dir)
+    })();
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
 /// Remove any terms bound to a ticket.
 pub fn remove_ticket_allowance(pairing_dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(pairing_dir.join(TICKET_ALLOWANCE_FILE)) {
@@ -622,6 +653,10 @@ impl super::PairingFile {
                     window.committed_msat = window.committed_msat.max(budget.used_msat);
                 }
             }
+            // Identities of payments that settled are no longer carried.
+            allowance.payment_ids_in_flight.retain(|id, _| {
+                grants.iter().filter_map(|g| g.budget.as_ref()).any(|b| b.pending.contains_key(id))
+            });
             // Offer counts only matter while a window still holds the call.
             allowance.call_offers_msat.retain(|key, _| {
                 grants.iter().filter_map(|g| g.budget.as_ref()).any(|b| {
@@ -697,6 +732,17 @@ impl super::PairingService {
             || client.identity_fingerprint != inner.identity_fingerprint
         {
             return Ok(Err(NoWindow::Provenance));
+        }
+        // A live window the owner wrote (at the console, by device approval
+        // or a relation envelope) is the owner's decision: the allowance
+        // never replaces or ends it. The request takes the owner path.
+        if inner.file.grants.iter().any(|g| {
+            g.client_id == client.client_id
+                && g.granted_by != ALLOWANCE_GRANTED_BY
+                && g.budget.is_some()
+                && g.is_live(now)
+        }) {
+            return Ok(Err(NoWindow::OwnerWindow));
         }
         let previous: Option<(String, GrantBudget)> = inner
             .file
@@ -776,9 +822,12 @@ impl super::PairingService {
         // are taken out first, so that admitted calls are judged against the
         // new window alone. Only within the same pairing epoch and identity,
         // never from a revoked grant.
+        // Only windows the allowance itself opened are ended or replaced;
+        // an owner-written grant kept to finish a call stays as it is.
         let mut payments = Vec::new();
         for old in file.grants.iter_mut().filter(|old| {
             old.client_id == grant.client_id
+                && old.granted_by == ALLOWANCE_GRANTED_BY
                 && old.epoch == grant.epoch
                 && old.identity_fingerprint == grant.identity_fingerprint
                 && old.ended != Some(super::GrantEnd::Revoked)
@@ -787,14 +836,29 @@ impl super::PairingService {
                 payments.extend(budget.take_open_payments());
             }
         }
+        // Their payment identities go with them, so none is paid twice.
+        let carried_ids: Vec<String> = file
+            .allowances
+            .get(&client.client_id)
+            .map(|a| {
+                payments
+                    .iter()
+                    .filter_map(|p| a.payment_ids_in_flight.get(p.id()))
+                    .flatten()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         // 1. Admitted calls move first, when the new window can fund them
-        //    (continuity on); as every budget window does, it replaces the
-        //    client's old one.
-        file.replace_grants(&mut grant, continuity);
+        //    (continuity on); the new window replaces the allowance's
+        //    earlier ones.
+        file.replace_grants_where(&mut grant, continuity, |old| old.granted_by == ALLOWANCE_GRANTED_BY);
         // 2. Then the payments: already sent, they move whatever is left,
-        //    keep their failure slots and settle in the new window once.
+        //    keep their failure slots and identities, and settle in the new
+        //    window once.
         if let Some(next) = grant.budget.as_mut() {
             next.accept_open_payments(payments);
+            next.payment_ids.extend(carried_ids);
         }
         file.grants.push(grant);
         if let Err(error) = self.persist(&mut inner.file) {
@@ -918,6 +982,27 @@ impl super::PairingService {
         let previous = *entry;
         *entry = entry.saturating_add(offer.msat);
         Some(previous)
+    }
+
+    /// Remember the payment identities of a payment reserved in an
+    /// allowance window, by its reservation; returns whether it did.
+    pub(super) fn record_allowance_payment_ids(
+        file: &mut super::PairingFile,
+        client_id: &str,
+        reservation_id: &str,
+        ids: Vec<String>,
+    ) -> bool {
+        file.allowances
+            .get_mut(client_id)
+            .map(|a| a.payment_ids_in_flight.insert(reservation_id.to_string(), ids))
+            .is_some()
+    }
+
+    /// Undo [`Self::record_allowance_payment_ids`].
+    pub(super) fn unrecord_allowance_payment_ids(file: &mut super::PairingFile, client_id: &str, reservation_id: &str) {
+        if let Some(a) = file.allowances.get_mut(client_id) {
+            a.payment_ids_in_flight.remove(reservation_id);
+        }
     }
 
     /// Undo [`Self::record_allowance_offer`].

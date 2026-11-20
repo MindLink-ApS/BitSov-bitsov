@@ -664,10 +664,20 @@ impl PairingFile {
     /// with their funding provenance; a revoked grant has no budget and
     /// carries nothing.
     fn replace_grants(&mut self, successor: &mut SpendGrant, carry_calls: bool) {
+        self.replace_grants_where(successor, carry_calls, |_| true);
+    }
+
+    /// [`Self::replace_grants`], for only the earlier grants `include` picks.
+    fn replace_grants_where(
+        &mut self,
+        successor: &mut SpendGrant,
+        carry_calls: bool,
+        include: impl Fn(&SpendGrant) -> bool,
+    ) {
         let now = chrono::Utc::now().timestamp();
         let mut moved = Vec::new();
         for old in &mut self.grants {
-            if old.client_id != successor.client_id {
+            if old.client_id != successor.client_id || !include(old) {
                 continue;
             }
             let same_pairing = old.epoch == successor.epoch
@@ -3618,6 +3628,13 @@ impl PairingService {
             tracing::warn!(client_id, grant_op_id = %op_id, reason = refusal.reason(), "grant reservation refused");
             return Err(refusal);
         }
+        let allowance_payment_ids = (!authority.payment_ids.is_empty()
+            && inner.file.grants[idx].granted_by == allowance::ALLOWANCE_GRANTED_BY)
+            .then(|| authority.payment_ids.clone());
+        let budget = inner.file.grants[idx]
+            .budget
+            .as_mut()
+            .ok_or(BudgetRefusal::NoGrant)?;
         budget.payment_ids.extend(authority.payment_ids);
         let mut recipients = std::collections::BTreeMap::new();
         for charge in &charges {
@@ -3651,12 +3668,18 @@ impl PairingService {
         let previous_offers = allowance_offer
             .as_ref()
             .map(|offer| Self::record_allowance_offer(&mut inner.file, offer));
+        let recorded_ids = allowance_payment_ids.is_some_and(|ids| {
+            Self::record_allowance_payment_ids(&mut inner.file, client_id, &reservation.id, ids)
+        });
         if in_memory {
             return Ok(reservation);
         }
         if let Err(e) = self.persist_with_clock(&mut inner.file, &mut clock) {
             if let (Some(offer), Some(previous)) = (&allowance_offer, previous_offers) {
                 Self::unrecord_allowance_offer(&mut inner.file, offer, previous);
+            }
+            if recorded_ids {
+                Self::unrecord_allowance_payment_ids(&mut inner.file, client_id, &reservation.id);
             }
             if let Some(key) = call_binding {
                 match previous_binding {

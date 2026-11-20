@@ -506,7 +506,13 @@ only if:
   with less than a minute left is not opened.
 
 Anything else takes the owner path, unchanged, and its status stays `pending`
-until the owner acts, even while an earlier allowance window is live. A new
+until the owner acts, even while an earlier allowance window is live.
+While a window the owner wrote (at the console, by device approval or a
+relation envelope) is live for the app, the owner's window governs: the
+allowance opens nothing and never replaces or ends it, and the request takes
+the owner path. A new allowance window replaces only earlier allowance
+windows. Payments still in flight move with their payment identities, so the
+next window refuses paying the same one again. A new
 window replaces the app's previous one, as every window does.
 
 In a window the allowance opened, the per-call cap bounds **the whole call**:

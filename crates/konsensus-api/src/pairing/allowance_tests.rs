@@ -1194,3 +1194,91 @@ fn first_payment(f: &Fixture) -> Reservation {
         .clone();
     Reservation { id, client_id: f.client.clone(), op_id: grant.op_id, charges: vec![] }
 }
+
+// ── An allowance never replaces an owner-written window ─────────────────
+
+fn push_owner_grant(f: &Fixture, terms: GrantTerms, expires_in: i64) -> SpendGrant {
+    let mut inner = f.svc.lock();
+    let epoch = inner.file.clients.iter().find(|c| c.client_id == f.client).unwrap().epoch;
+    let now = now();
+    let grant = SpendGrant {
+        owner_approval: None,
+        op_id: "owner-window".into(),
+        client_id: f.client.clone(),
+        scopes: vec![Scope::Spend],
+        granted_at: now,
+        expires_at: now + expires_in,
+        identity_fingerprint: "identity".into(),
+        epoch,
+        granted_by: "cli".into(),
+        budget: Some(GrantBudget::from_terms(&terms)),
+        ended: None,
+    };
+    inner.file.grants.push(grant.clone());
+    f.svc.persist(&mut inner.file).unwrap();
+    grant
+}
+
+#[test]
+fn a_live_owner_window_is_never_replaced_by_the_allowance() {
+    for continuity in [false, true] {
+        let f = continuity_fixture(continuity);
+        let mut terms = GrantTerms::new(5_000_000).per_call(PER_CALL);
+        terms.allow_liquidity_fees = true;
+        let owner = push_owner_grant(&f, terms, 3_600);
+        payment(&f, 0).unwrap();
+        let before = f.svc.lock().file.grants.iter().find(|g| g.op_id == owner.op_id).cloned().unwrap();
+        // The app asks within its allowance: the owner's window governs, and
+        // the request takes the owner path.
+        let (_, outcome) = ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+        assert_eq!(outcome, Outcome::Owner, "{continuity}");
+        let after = f.svc.lock().file.grants.iter().find(|g| g.op_id == owner.op_id).cloned().unwrap();
+        assert_eq!(after, before, "the owner's window changed ({continuity})");
+        assert!(after.is_live(now()));
+        assert!(allowance_grants(&f).is_empty());
+        assert!(ledger(&f).windows.is_empty(), "nothing counted against the allowance");
+    }
+}
+
+#[test]
+fn the_allowance_opens_again_once_the_owner_window_is_over() {
+    let f = continuity_fixture(false);
+    push_owner_grant(&f, GrantTerms::new(5_000_000).per_call(PER_CALL), 3_600);
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Owner);
+    f.svc.revoke_grants(Some(&f.client)).ok();
+    // Revoking also removed the allowance: re-pairing is the owner's way back.
+    assert!(f.svc.allowance_view(&f.client).is_none());
+    let f = continuity_fixture(false);
+    push_owner_grant(&f, GrantTerms::new(5_000_000).per_call(PER_CALL), 3_600);
+    {
+        let mut inner = f.svc.lock_without_cleanup();
+        let g = inner.file.grants.iter_mut().find(|g| g.op_id == "owner-window").unwrap();
+        g.granted_at -= 7_200;
+        g.expires_at = now() - 1;
+    }
+    let _ = f.svc.reload_from_disk().unwrap();
+    assert_eq!(ask(&f, proposal(1_000_000, PER_CALL)).unwrap().1, Outcome::Window);
+}
+
+// ── Payment identities survive an automatic renewal ─────────────────────
+
+#[test]
+fn a_payment_in_flight_cannot_be_paid_again_after_a_renewal() {
+    for continuity in [false, true] {
+        let f = continuity_fixture(continuity);
+        ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+        let pay = |id: &str| f.svc.reserve_payment(&f.client, 1,
+            vec![Charge { recipient: "bb".repeat(33), amount_msat: 1_000 }], vec![id.to_string()]);
+        pay("payment-x").unwrap();
+        assert_eq!(pay("payment-x"), Err(BudgetRefusal::DuplicatePayment));
+        ask(&f, proposal(900_000, PER_CALL)).unwrap();
+        let used = window_used(&f);
+        assert_eq!(pay("payment-x"), Err(BudgetRefusal::DuplicatePayment), "{continuity}");
+        assert_eq!(window_used(&f), used, "no second debit ({continuity})");
+        // Through a second renewal as well.
+        ask(&f, proposal(800_000, PER_CALL)).unwrap();
+        assert_eq!(pay("payment-x"), Err(BudgetRefusal::DuplicatePayment), "{continuity}");
+        // Another identity still pays.
+        pay("payment-y").unwrap();
+    }
+}

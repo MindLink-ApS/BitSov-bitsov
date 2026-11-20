@@ -481,3 +481,10 @@ pub(crate) struct OpenPayment {
     recipients: BTreeMap<String, u64>,
     link: Option<OperationReservationLink>,
 }
+
+impl OpenPayment {
+    /// Its reservation id.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+}

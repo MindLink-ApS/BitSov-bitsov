@@ -290,6 +290,16 @@ pub fn cmd_pair_ticket_with_allowance(
         None => None,
     };
     let link_path = dir.join("remote-access-link");
+    let previous_terms = match std::fs::read(allowance::ticket_allowance_path(&dir)) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            if let Some(staged) = &staged {
+                let _ = std::fs::remove_file(staged);
+            }
+            return Err(e.into());
+        }
+    };
     let previous_link = match std::fs::read(&link_path) {
         Ok(bytes) => Some(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -336,13 +346,27 @@ pub fn cmd_pair_ticket_with_allowance(
             } else {
                 allowance::commit_ticket_allowance(&dir, staged)
             };
+            #[cfg(test)]
+            let published = published.and_then(|()| {
+                if FAIL_AFTER_TERMS_RENAME.with(|fail| fail.get()) {
+                    Err(std::io::Error::other("terms sync failed (test)"))
+                } else {
+                    Ok(())
+                }
+            });
             if let Err(error) = published {
-                let restored = match &previous_link {
+                // The new terms may already be in place (a failure after
+                // their rename): put back the previous terms and the previous
+                // ticket together.
+                let terms_restored = allowance::restore_ticket_allowance(&dir, previous_terms.as_deref())
+                    .map_err(anyhow::Error::from);
+                let link_restored = match &previous_link {
                     Some(bytes) => replace_link(bytes, false),
                     None => std::fs::remove_file(&link_path)
                         .map_err(anyhow::Error::from)
                         .and_then(|()| fsync_dir_strict(&dir).map_err(anyhow::Error::from)),
                 };
+                let restored = terms_restored.and(link_restored);
                 return Err(anyhow::Error::from(error).context(match restored {
                     Ok(()) => "could not publish the allowance; the previous ticket is back in place".to_string(),
                     Err(e) => format!("could not publish the allowance, nor put the previous ticket back ({e}); run pair-ticket again"),
@@ -383,6 +407,8 @@ thread_local! {
     static FAIL_LINK_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Test-only: make publishing the staged terms fail.
     static FAIL_TERMS_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: fail after the staged terms were renamed into place.
+    static FAIL_AFTER_TERMS_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn render_qr(uri: &str) -> Result<String> {
@@ -506,6 +532,26 @@ mod allowance_publish_tests {
             FAIL_TERMS_PUBLISH.with(|fail| fail.set(true));
             let result = ticket(&path, true);
             FAIL_TERMS_PUBLISH.with(|fail| fail.set(false));
+            assert!(result.is_err());
+            assert_eq!(published(dir.path()), before, "previous {previous:?}");
+        }
+    }
+
+    /// A failure after the new terms were renamed into place (for example
+    /// syncing the directory) puts back the previous ticket and the previous
+    /// terms together.
+    #[test]
+    fn a_failure_after_the_terms_rename_restores_the_previous_pair() {
+        for previous in [None, Some(false), Some(true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = node(dir.path());
+            if let Some(allow) = previous {
+                ticket(&path, allow).unwrap();
+            }
+            let before = published(dir.path());
+            FAIL_AFTER_TERMS_RENAME.with(|fail| fail.set(true));
+            let result = ticket(&path, true);
+            FAIL_AFTER_TERMS_RENAME.with(|fail| fail.set(false));
             assert!(result.is_err());
             assert_eq!(published(dir.path()), before, "previous {previous:?}");
         }
