@@ -628,7 +628,7 @@ pub(crate) async fn hangup_invoice_purpose(state: &AppState, peer: &NodeId, kind
 /// no media and no hold, and a retry is refused before any payment.
 pub(crate) async fn end_after_unpaid_hangup(state: &AppState, peer: &NodeId, plaintext: &str)
     -> Result<(), konsensus_storage::StorageError> {
-    let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return Ok(()) };
+    let Ok(signal) = CallSignal::parse(konsensus_core::kind::KIND_CALL_HANGUP, plaintext) else { return Ok(()) };
     let _guard = lock().lock().await;
     let Some(entry) = state.storage.call_get(peer, &signal.call_id).await? else { return Ok(()) };
     if entry.phase == rules::Phase::Ended {

@@ -1286,6 +1286,12 @@ async fn create_payment_proof_via_invoice(
                 if error.recipient != *peer_id {
                     return ApiError::Lightning("invoice refusal came from another recipient".into());
                 }
+                // "Call ended" is honoured only as the answer to a call-bound
+                // hangup's own request. To anything else it is an ordinary
+                // refusal: retryable, and it never ends a call here.
+                if !hangup && error.reason == invoice_refusal::CALL_HANGUP_ENDED {
+                    return ApiError::Lightning(format!("Recipient refused the invoice request: {}", error.reason));
+                }
                 invoice_refused(peer_id, Some(error.reason))
             })
     };

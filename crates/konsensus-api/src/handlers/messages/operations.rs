@@ -707,6 +707,7 @@ pub(super) async fn compose_call(
     });
     let plaintext = req.plaintext.clone();
     let spend_client = auth.user.pairing.clone();
+    let hangup = req.kind == konsensus_core::kind::KIND_CALL_HANGUP;
     let ends_on_failure = matches!(req.kind, konsensus_core::kind::KIND_CALL_INVITE | konsensus_core::kind::KIND_CALL_BLOCK);
     if !paid {
         if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
@@ -733,7 +734,9 @@ pub(super) async fn compose_call(
         }
     }
     crate::calls::resolve_outgoing(&state, &peer, &plaintext, &id, &request_hash).await;
-    if result.as_ref().err().is_some_and(unpaid_hangup_ended) {
+    // Only a hangup's own refusal can end its call here; the reason is set
+    // only for a call-bound hangup's invoice request.
+    if hangup && result.as_ref().err().is_some_and(unpaid_hangup_ended) {
         if let Err(error) = crate::calls::end_after_unpaid_hangup(&state, &peer, &plaintext).await {
             tracing::warn!(%error, "unpaid hangup: ending the call deferred");
         }

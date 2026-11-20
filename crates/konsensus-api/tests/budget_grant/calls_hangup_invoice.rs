@@ -33,20 +33,26 @@ fn hangup_request(fx: &Fx, operation_id: &str) -> Value {
 
 /// A paid, answered call with block zero paid: live on this (caller) node.
 async fn live_call(on: bool, caps: &[&str], answer_as: Peer) -> (Fx, String, Arc<ConnectedStubTransport>) {
+    live_call_with(on, caps, move |purpose| {
+        if !purpose.starts_with(konsensus_core::payloads::call::CALL_HANGUP_INVOICE_PREFIX) {
+            return None;
+        }
+        match answer_as {
+            Peer::Issues => None,
+            Peer::Ended => Some(Some(konsensus_api::invoice_refusal::CALL_HANGUP_ENDED.into())),
+            Peer::Silent => Some(None),
+        }
+    }).await
+}
+
+/// [`live_call`] with the peer answering invoice requests through `refuser`.
+async fn live_call_with(on: bool, caps: &[&str], refuser: impl Fn(&str) -> Option<Option<String>> + Send + Sync + 'static)
+    -> (Fx, String, Arc<ConnectedStubTransport>) {
     let (mut fx, token) = prepared().await;
     let peer = fx.peer;
     let transport = Arc::new(ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
         .with_invoice_responder(move |_, amount| Some(invoice_for(peer, amount)))
-        .with_invoice_refuser(move |purpose| {
-            if !purpose.starts_with(konsensus_core::payloads::call::CALL_HANGUP_INVOICE_PREFIX) {
-                return None;
-            }
-            match answer_as {
-                Peer::Issues => None,
-                Peer::Ended => Some(Some(konsensus_api::invoice_refusal::CALL_HANGUP_ENDED.into())),
-                Peer::Silent => Some(None),
-            }
-        }));
+        .with_invoice_refuser(refuser));
     transport.advertise(peer, caps);
     fx.state = Arc::new(AppState { transport: transport.clone(), call_hangup_invoice: on, ..(*fx.state).clone() });
     let offer = json!({
@@ -122,6 +128,47 @@ async fn a_hangup_whose_invoice_request_goes_unanswered_ends_the_call_without_pa
     assert_eq!(fx.wallet.money(), money, "nothing was paid: {body}");
     assert!(hangups_sent(&transport).is_empty());
     assert_eq!(phase(&fx).await, Phase::Ended);
+    assert!(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).is_none_or(|hold| hold.closed), "the hold is released");
+    // A retry, of the same operation or a new one, asks nothing and pays nothing.
+    let operation = body["operation_id"].as_str().unwrap().to_string();
+    for operation in [operation, uuid::Uuid::new_v4().to_string()] {
+        let (status, body) = signal(&fx, &token, hangup_request(&fx, &operation)).await;
+        assert_ne!(status, StatusCode::OK, "{body}");
+        assert_eq!(fx.wallet.money(), money, "a retry paid: {body}");
+        assert_eq!(hangup_purposes(&transport).len(), 1, "a retry asked again: {body}");
+        assert!(hangups_sent(&transport).is_empty());
+    }
+}
+
+/// "Call ended" is honoured only as the answer to a call-bound hangup's own
+/// invoice request. The same answer to a block's invoice request is an
+/// ordinary refusal: nothing paid, the call stays live, the block retryable.
+#[tokio::test]
+async fn a_hangup_ended_answer_to_a_block_invoice_request_never_ends_the_call() {
+    let (fx, token, transport) = live_call_with(true, &[HANGUP_CAP], |purpose| {
+        purpose.starts_with(&format!("{}{CALL}:1", konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX))
+            .then(|| Some(konsensus_api::invoice_refusal::CALL_HANGUP_ENDED.into()))
+    }).await;
+    // Make block 1 due now, as 40 s of wall clock would.
+    let now = konsensus_api::calls::now_ms();
+    let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    fx.state.storage.call_put(&fx.peer, CALL, &konsensus_core::payloads::call::CallEntry {
+        paid_until_ms: Some(now + 10_000), deadline_ms: now + 20_000, ..entry
+    }).await.unwrap();
+    let money = fx.wallet.money();
+    let block = json!({
+        "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(), "kind": 404,
+        "plaintext": json!({"v": 1, "call_id": CALL, "seq": 1}).to_string(),
+        "max_routing_fee_msat": 0, "wait_ack_ms": 0,
+    });
+    let (status, body) = signal(&fx, &token, block).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["reason"], "call_ended", "{body}");
+    assert_ne!(body["retry_allowed"], false, "an ordinary refusal stays retryable: {body}");
+    assert_eq!(fx.wallet.money(), money, "nothing was paid");
+    assert!(transport.invoice_purposes.lock().unwrap().iter().any(|p| p.ends_with(&format!("{CALL}:1"))), "the block asked");
+    assert_eq!(phase(&fx).await, Phase::Live, "the peer's answer did not end the call");
+    assert!(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).is_some_and(|hold| !hold.closed), "the hold stays open");
 }
 
 #[tokio::test]
