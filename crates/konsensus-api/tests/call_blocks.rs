@@ -60,7 +60,7 @@ async fn zero_block_grant_preserves_unpaid_caller_and_pending_evidence() {
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let caller = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Live,
         deadline_ms: now + 30_000, paid_until_ms: None, next_block_seq: 0,
-        pending: None, end_reason: None, unpaid_notice_used: false };
+        pending: None, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new() };
     let pending = rules::reserve_block(Some(caller), 0, "zero-grant", "request", now).unwrap();
     let envelope = UkmEnvelopeBuilder::new(404, own, Recipient::Node(peer), vec![],
         PaymentProof::new([20; 32], [21; 32], 23_000)).build();
@@ -948,7 +948,7 @@ async fn explicit_hangup_after_local_unpaid_expiry_prevents_late_resume() {
     let ended = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Ended,
         deadline_ms: now - 1_000 + rules::TOMBSTONE_MS, paid_until_ms: None, next_block_seq: 0,
         pending: Some(rules::Pending { operation_id: "block".into(), kind: 404, request_hash: "hash".into() }),
-        end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: true };
+        end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: true, free_reply_receipts: Vec::new() };
     store.call_put(&peer, ID, &ended).await.unwrap();
     let hangup = format!(r#"{{"v":1,"call_id":"{ID}","reason":"hangup"}}"#);
     calls::admit_incoming(&store, &own, &peer, 403, Some(&hangup)).await.unwrap();
@@ -971,7 +971,7 @@ async fn legacy_ended_pending_blocks_are_reclaimed_by_settlement_and_sweep() {
     let ended = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Ended,
         deadline_ms: now + rules::TOMBSTONE_MS, paid_until_ms: None, next_block_seq: 0,
         pending: Some(rules::Pending { operation_id: "block".into(), kind: 404, request_hash: "hash".into() }),
-        end_reason: Some(HangupReason::Hangup), unpaid_notice_used: false };
+        end_reason: Some(HangupReason::Hangup), unpaid_notice_used: false, free_reply_receipts: Vec::new() };
     let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
     store.call_put(&peer, ID, &ended).await.unwrap();
     calls::commit_outgoing(&store, &peer, &body, "block", "hash").await.unwrap();
@@ -996,7 +996,7 @@ async fn callee_grant_resumes_caller_after_unpaid_notice_and_is_bound_to_paid_me
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let ended = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Ended,
         deadline_ms: now + rules::TOMBSTONE_MS, paid_until_ms: None, next_block_seq: 0,
-        pending: None, end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: true };
+        pending: None, end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: true, free_reply_receipts: Vec::new() };
     store.call_put(&peer, ID, &ended).await.unwrap();
     let envelope = UkmEnvelopeBuilder::new(404, own, Recipient::Node(peer), vec![], PaymentProof::new([24; 32], [25; 32], 23_000)).build();
     store.store_message(&envelope).await.unwrap();
@@ -1068,7 +1068,7 @@ async fn callee_grant_accepts_exact_resume_boundary_for_initial_and_renewal_bloc
         let before = rules::CallEntry {
             side: rules::Side::Caller, phase: Phase::Live, deadline_ms: deadline,
             paid_until_ms: previous_paid, next_block_seq: seq,
-            pending: None, end_reason: None, unpaid_notice_used: false,
+            pending: None, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
         };
         let callee = rules::CallEntry { side: rules::Side::Callee, ..before.clone() };
         let grant = rules::receive_block(Some(callee), seq, now).unwrap();
@@ -1113,7 +1113,7 @@ async fn callee_grant_clears_only_its_own_pending_block() {
     let before = rules::CallEntry {
         side: rules::Side::Caller, phase: Phase::Live, deadline_ms: now + 60_000,
         paid_until_ms: Some(now + 50_000), next_block_seq: 1,
-        pending: None, end_reason: None, unpaid_notice_used: false,
+        pending: None, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     let pending = rules::reserve_block(Some(before), 1, "block-grant", "request", now + 30_000).unwrap();
     // Dispatch happened on time, but a backwards clock step makes the local

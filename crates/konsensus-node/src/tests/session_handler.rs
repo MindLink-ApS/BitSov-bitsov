@@ -7277,7 +7277,7 @@ async fn call_block_ack_storage_failure_retains_delivery_until_grant_is_durable(
     let storage: Arc<dyn Storage> = db.clone();
     let ended = calls::CallEntry { side: calls::Side::Caller, phase: calls::Phase::Ended,
         deadline_ms: now + calls::TOMBSTONE_MS, pending: None, paid_until_ms: None,
-        next_block_seq: 0, end_reason: Some(calls::HangupReason::Unpaid), unpaid_notice_used: true };
+        next_block_seq: 0, end_reason: Some(calls::HangupReason::Unpaid), unpaid_notice_used: true, free_reply_receipts: Vec::new() };
     db.call_put(&peer, id, &ended).await.unwrap();
     let envelope = UkmEnvelopeBuilder::new(404, own, Recipient::Node(peer), vec![1],
         PaymentProof::new([2; 32], [3; 32], 23_000)).build();
@@ -7982,7 +7982,7 @@ async fn pending_media_invoice_refuses_stopped_media_until_replacement() {
     let paid = rules::CallEntry {
         side: rules::Side::Callee, phase: rules::Phase::Live, deadline_ms: now + 30_000,
         pending: None, paid_until_ms: Some(now + 20_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     rules::validate_block_invoice(&paid, 1, now).unwrap();
     storage.call_put(&peer, id, &paid).await.unwrap();
@@ -8018,7 +8018,7 @@ async fn pending_media_invoice_serializes_lifecycle_and_head_reads() {
     let paid = rules::CallEntry {
         side: rules::Side::Callee, phase: rules::Phase::Live, deadline_ms: now + 30_000,
         pending: None, paid_until_ms: Some(now + 20_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     rules::validate_block_invoice(&paid, 1, now).unwrap();
     storage.call_put(&peer, id, &paid).await.unwrap();

@@ -109,7 +109,7 @@ async fn every_released_prefix_upgrades_to_the_complete_schema() {
 async fn unknown_gap_and_future_versions_are_refused_without_pending_changes() {
     let dir = tempfile::tempdir().unwrap();
     // The unused historical slot and two newer-version boundaries.
-    for version in [34_i64, 42, i64::MAX] {
+    for version in [34_i64, 43, i64::MAX] {
         for applied in [1, EmbeddedMigrations::migrations().len()] {
             let path = dir
                 .path()

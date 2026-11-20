@@ -7931,7 +7931,7 @@ async fn media_state_read_failure_keeps_paid_block_retryable() {
         paid_until_ms: Some(now + 20_000),
         next_block_seq: 1,
         end_reason: None,
-        unpaid_notice_used: false,
+        unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     net.db
         .call_put(net.alice.node_id(), call_id, &original)
@@ -8005,7 +8005,7 @@ async fn failed_media_publication_keeps_paid_block_retryable() {
         paid_until_ms: Some(now + 20_000),
         next_block_seq: 1,
         end_reason: None,
-        unpaid_notice_used: false,
+        unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     net.db
         .call_put(net.alice.node_id(), call_id, &original)

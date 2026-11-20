@@ -976,22 +976,157 @@ pub async fn settle_operation(state: &AppState, op: &konsensus_storage::OutboxOp
     }
 }
 
-/// A saved free call reply is about to be queued by recovery: publish its
-/// call transition first if it is still missing, so the reply is never
-/// delivered ahead of it. A failed write keeps the reply unqueued; the next
-/// sweep or a retry of the same operation tries again.
-pub(crate) async fn commit_saved_reply(state: &AppState, op: &konsensus_storage::OutboxOperation)
-    -> Result<(), konsensus_storage::StorageError> {
-    let store = state.storage.as_ref();
-    let peer = NodeId::from_hex(&op.recipient)
-        .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
-    for (p, call_id, entry) in store.call_pending().await? {
-        if p == peer && entry.pending.is_some_and(|x| x.is(&op.operation_id, &op.request_hash) && i64::from(x.kind) == op.kind) {
-            settle(store, &peer, &call_id, &op.operation_id, &op.request_hash, Settlement::Paid,
-                state.pairing.as_deref().map(|service| (service, None))).await?;
+/// Where a saved free call reply stands after its checked call transition.
+/// Only [`FreeReply::Applied`] and [`FreeReply::AlreadyApplied`] let it be
+/// queued; nothing here ever pays for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreeReply {
+    /// Its transition and receipt were written now, in one call-row write.
+    Applied,
+    /// Its receipt was already on the call row: the transition happened.
+    AlreadyApplied,
+    /// Definitely not applied, and its call can no longer take it: no receipt,
+    /// and its reservation is gone, belongs to another request, or the call
+    /// left the phase the reply may move.
+    Invalid,
+    /// Not established either way; never queued.
+    Unknown(Unresolved),
+}
+
+/// Why a saved free reply is [`FreeReply::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unresolved {
+    /// The transition definitely did not happen: its write failed and a
+    /// reread shows this reply's reservation still in place, with no receipt.
+    NotApplied,
+    /// The call row could not be read, or a failed write could not be reread.
+    Unreadable,
+    /// Saved before receipts existed, with no receipt and no reservation of
+    /// its own left: whether its transition happened was never recorded.
+    NoEvidence,
+    /// Contradictory evidence: an empty digest, several candidate calls, or a
+    /// receipt for this operation naming another request, peer or call.
+    Corrupt,
+}
+
+impl Unresolved {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Unresolved::NotApplied => "not_applied",
+            Unresolved::Unreadable => "call_unreadable",
+            Unresolved::NoEvidence => "no_transition_evidence",
+            Unresolved::Corrupt => "evidence_mismatch",
         }
     }
+}
+
+/// The call of a free reply saved before its call was recorded with it: only
+/// its own remaining reservation can name it. None left is no evidence
+/// either way; more than one is contradictory.
+pub(crate) async fn locate_saved_reply(store: Store<'_>, op: &konsensus_storage::OutboxOperation) -> Result<String, Unresolved> {
+    let peer = NodeId::from_hex(&op.recipient).map_err(|_| Unresolved::Corrupt)?;
+    let pending = store.call_pending().await.map_err(|_| Unresolved::Unreadable)?;
+    let mut mine = pending.into_iter().filter(|(p, _, e)| *p == peer
+        && e.pending.as_ref().is_some_and(|x| x.operation_id == op.operation_id));
+    match (mine.next(), mine.next()) {
+        (Some((_, id, _)), None) => Ok(id),
+        (None, _) => Err(Unresolved::NoEvidence),
+        _ => Err(Unresolved::Corrupt),
+    }
+}
+
+/// The checked call transition of a saved free reply on `call_id`, the call
+/// recorded with it, shared by the send path and recovery: under the call
+/// lock, reread the call and either find this operation's receipt (already
+/// applied), or apply the transition of its own exact reservation together
+/// with its receipt in one write. `media_owner` is checked and promoted for
+/// an answer exactly as for a paid one.
+pub(crate) async fn free_reply_transition(state: &AppState, op: &konsensus_storage::OutboxOperation, call_id: &str,
+    media_owner: Option<(&crate::pairing::PairingService, Option<&crate::auth::PairingBinding>)>) -> FreeReply {
+    let store = state.storage.as_ref();
+    let (Ok(peer), Ok(kind)) = (NodeId::from_hex(&op.recipient), u16::try_from(op.kind)) else {
+        return FreeReply::Unknown(Unresolved::Corrupt);
+    };
+    let _g = lock().lock().await;
+    let now = now_ms();
+    let receipt = rules::FreeReplyReceipt {
+        peer: peer.to_hex(), call_id: call_id.to_string(), kind, operation_id: op.operation_id.clone(),
+        request_hash: op.request_hash.clone(), phase: String::new(), applied_ms: 0,
+    };
+    let Ok(raw) = store.call_get(&peer, call_id).await else {
+        return FreeReply::Unknown(Unresolved::Unreadable);
+    };
+    let next = match rules::free_reply_transition(raw, &receipt, now) {
+        rules::FreeReplyCheck::Apply(next) => next,
+        rules::FreeReplyCheck::AlreadyApplied => return FreeReply::AlreadyApplied,
+        rules::FreeReplyCheck::Invalid => return FreeReply::Invalid,
+        rules::FreeReplyCheck::Corrupt => return FreeReply::Unknown(Unresolved::Corrupt),
+        rules::FreeReplyCheck::Full => return FreeReply::Unknown(Unresolved::NotApplied),
+    };
+    if kind == konsensus_core::kind::KIND_CALL_ANSWER {
+        if let Some((service, binding)) = media_owner {
+            // As for a paid answer: an admitted call is never visible with
+            // another client's binding. Without this proof nothing moves.
+            if service.commit_call_client(binding, &peer.to_hex(), call_id, &op.operation_id, &op.request_hash).is_err() {
+                return FreeReply::Unknown(Unresolved::NotApplied);
+            }
+        }
+    }
+    if let Err(error) = store.call_put(&peer, call_id, &next).await {
+        // A failed acknowledgement may still have committed: reread.
+        let outcome = match store.call_get(&peer, call_id).await {
+            Ok(Some(row)) if row.free_reply_receipts.iter().any(|r| r.binds(&receipt)) => FreeReply::AlreadyApplied,
+            Ok(Some(row)) if row.pending.as_ref().is_some_and(|p| p.operation_id == receipt.operation_id
+                && p.kind == kind && p.request_hash == receipt.request_hash) => FreeReply::Unknown(Unresolved::NotApplied),
+            _ => FreeReply::Unknown(Unresolved::Unreadable),
+        };
+        tracing::warn!(%error, outcome = ?outcome, "free call reply transition write failed");
+        return outcome;
+    }
+    if let Some((service, _)) = media_owner {
+        service.finish_call_client(&peer.to_hex(), call_id, &op.operation_id, &op.request_hash);
+    }
+    FreeReply::Applied
+}
+
+/// A saved free reply was queued: its operation can no longer be recovered
+/// as a saved reply, so its receipt is released and its call row may age out
+/// again. A failure leaves the receipt for [`prune_free_reply_receipts`].
+pub(crate) async fn release_free_reply_receipt(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &str)
+    -> Result<(), konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(()) };
+    let before = entry.free_reply_receipts.len();
+    entry.free_reply_receipts.retain(|r| r.operation_id != operation_id);
+    if entry.free_reply_receipts.len() != before {
+        store.call_put(peer, call_id, &entry).await?;
+    }
     Ok(())
+}
+
+/// Release receipts whose saved reply can no longer be recovered (it was
+/// queued, withdrawn, or its operation is gone). A receipt whose operation
+/// may still be recovered is always kept; any read error keeps them all.
+pub(crate) async fn prune_free_reply_receipts(state: &AppState) -> Result<usize, konsensus_storage::StorageError> {
+    let store = state.storage.as_ref();
+    let mut released = 0;
+    for (peer, call_id, _) in store.call_with_free_reply_receipts(256).await? {
+        let _g = lock().lock().await;
+        let Some(mut entry) = store.call_get(&peer, &call_id).await? else { continue };
+        let mut keep = Vec::with_capacity(entry.free_reply_receipts.len());
+        for receipt in &entry.free_reply_receipts {
+            let op = store.get_outbox_operation(&receipt.operation_id).await?;
+            if op.as_ref().is_some_and(crate::handlers::messages::operations::free_reply_recoverable) {
+                keep.push(receipt.clone());
+            }
+        }
+        if keep.len() != entry.free_reply_receipts.len() {
+            released += entry.free_reply_receipts.len() - keep.len();
+            entry.free_reply_receipts = keep;
+            store.call_put(&peer, &call_id, &entry).await?;
+        }
+    }
+    Ok(released)
 }
 
 /// Release every reservation of a durably abandoned operation. The caller

@@ -30,6 +30,7 @@ fn paid() -> CallEntry {
         next_block_seq: 1,
         end_reason: None,
         unpaid_notice_used: false,
+        free_reply_receipts: Vec::new(),
     }
 }
 fn intent(generation: u64, only_unpaid: bool, may_hangup_live: bool) -> PendingMediaDetach {
