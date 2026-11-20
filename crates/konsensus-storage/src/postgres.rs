@@ -2310,17 +2310,27 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_with_free_reply_receipts(&self, after: Option<(&str, &str)>, max: u32) -> Result<Vec<crate::FreeReplyReceiptRow>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+        // Untyped rows: a column holding a value of the wrong type must fail
+        // only its own row, never the page. Query errors stay errors.
+        let rows = sqlx::query(
             "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND ($1::TEXT IS NULL OR peer > $1 OR (peer = $1 AND call_id > $2)) ORDER BY peer, call_id LIMIT $3")
             .bind(after.map(|(p, _)| p)).bind(after.map(|(_, c)| c))
             .bind(i64::from(max)).fetch_all(&self.pool).await?;
-        // Decode row by row: one undecodable row must not hide the rest.
-        Ok(rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
-            let entry = konsensus_core::NodeId::from_hex(&peer).ok().and_then(|node| {
-                call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)).ok().map(|e| (node, e))
-            });
-            (peer, id, entry)
-        }).collect())
+        let mut listed = Vec::with_capacity(rows.len());
+        let mut unkeyed = 0usize;
+        for row in &rows {
+            use sqlx::Row;
+            let (Ok(peer), Ok(id)) = (row.try_get::<String, _>(0), row.try_get::<String, _>(1)) else {
+                unkeyed += 1;
+                continue;
+            };
+            let entry = free_reply_receipt_entry(row, &peer);
+            listed.push((peer, id, entry));
+        }
+        if unkeyed > 0 {
+            tracing::warn!(rows = unkeyed, "call rows holding free-reply receipts have unreadable keys; left untouched");
+        }
+        Ok(listed)
     }
 
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
@@ -5714,6 +5724,19 @@ fn call_upsert<'q>(peer: &konsensus_core::NodeId, call_id: &'q str, entry: &kons
 
 /// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash)` of `call_state`.
 type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>);
+
+/// The entry of one listed receipt row, decoded column by column; `None`
+/// when any column (or the peer) cannot be decoded.
+fn free_reply_receipt_entry(row: &sqlx::postgres::PgRow, peer: &str) -> Option<(konsensus_core::NodeId, konsensus_core::payloads::call::CallEntry)> {
+    use sqlx::Row;
+    let node = konsensus_core::NodeId::from_hex(peer).ok()?;
+    let columns: CallRow = (
+        row.try_get(2).ok()?, row.try_get(3).ok()?, row.try_get(4).ok()?, row.try_get(5).ok()?,
+        row.try_get(6).ok()?, row.try_get(7).ok()?, row.try_get(8).ok()?, row.try_get(9).ok()?,
+        row.try_get(10).ok()?, row.try_get(11).ok()?, row.try_get(12).ok()?,
+    );
+    call_entry_from_row(columns).ok().map(|entry| (node, entry))
+}
 
 /// A stored call row. A corrupt row is an error, never a call.
 fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {

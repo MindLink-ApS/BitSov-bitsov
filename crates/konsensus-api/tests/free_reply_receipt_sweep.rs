@@ -71,6 +71,21 @@ async fn holding(db: &SqliteStorage) -> Vec<(String, String)> {
 
 #[tokio::test]
 async fn an_undecodable_row_is_kept_and_never_stalls_cleanup_of_later_rows() {
+    // Receipts that are not valid JSON.
+    undecodable_row_case("free_reply_receipts = '{not json'", "free_reply_receipts", "{not json").await;
+}
+
+#[tokio::test]
+async fn a_row_with_a_mistyped_column_is_kept_and_never_stalls_cleanup_of_later_rows() {
+    // SQLite keeps a text value in an integer column of a table that is not STRICT.
+    undecodable_row_case("deadline_ms = 'not a number'", "deadline_ms", "not a number").await;
+}
+
+/// 300 releasable rows, the sixth damaged by `corruption` (which leaves
+/// `column` holding `stored`): cleanup visits exactly the first 256 rows, keeps
+/// going behind the damaged one, wraps back to the start, and never changes
+/// or drops the damaged row.
+async fn undecodable_row_case(corruption: &str, column: &str, stored: &str) {
     let db = Arc::new(SqliteStorage::in_memory().await.unwrap());
     let mut state = common::test_state();
     Arc::get_mut(&mut state).unwrap().storage = db.clone();
@@ -81,7 +96,7 @@ async fn an_undecodable_row_is_kept_and_never_stalls_cleanup_of_later_rows() {
         store.call_put(&peer(n), CALL, &row(&peer(n), &format!("gone-{n}"))).await.unwrap();
     }
     let corrupt = peer(5).to_hex();
-    sqlx::query("UPDATE call_state SET free_reply_receipts = '{not json' WHERE peer = ?").bind(&corrupt)
+    sqlx::query(&format!("UPDATE call_state SET {corruption} WHERE peer = ?")).bind(&corrupt)
         .execute(db.pool()).await.unwrap();
 
     // One sweep visits exactly the first 256 rows in key order: the corrupt
@@ -106,9 +121,12 @@ async fn an_undecodable_row_is_kept_and_never_stalls_cleanup_of_later_rows() {
     }
 
     // The corrupt row is held: never rewritten, never swept or evicted.
-    let raw: Option<String> = sqlx::query_scalar("SELECT free_reply_receipts FROM call_state WHERE peer = ?").bind(&corrupt)
+    let raw: Option<String> = sqlx::query_scalar(&format!("SELECT CAST({column} AS TEXT) FROM call_state WHERE peer = ?")).bind(&corrupt)
         .fetch_one(db.pool()).await.unwrap();
-    assert_eq!(raw.as_deref(), Some("{not json"));
+    assert_eq!(raw.as_deref(), Some(stored));
+    let receipts: Option<String> = sqlx::query_scalar("SELECT free_reply_receipts FROM call_state WHERE peer = ?").bind(&corrupt)
+        .fetch_one(db.pool()).await.unwrap();
+    assert!(receipts.is_some(), "the damaged row lost its receipts");
     let far = konsensus_api::calls::now_ms() + 3 * TOMBSTONE_MS;
     store.call_sweep(far, 1_000).await.unwrap();
     store.call_evict_burned(Some(&peer(5)), far, far, 1_000).await.unwrap();

@@ -132,3 +132,30 @@ async fn receipt_pages_follow_row_keys_and_list_undecodable_rows() {
         .bind(high.to_hex()).bind(sorted[1]).fetch_one(db.pool()).await.unwrap();
     assert_eq!(raw.as_deref(), Some("{not json"));
 }
+
+/// A value of the wrong type in an integer column (SQLite does not enforce
+/// column types here) fails only its own row: the page is still listed, that
+/// row by its key without an entry, and sweeps keep it.
+#[tokio::test]
+async fn a_mistyped_column_fails_only_its_own_row() {
+    let db = SqliteStorage::in_memory().await.unwrap();
+    let peers: Vec<NodeId> = (1..=3u8).map(|b| NodeId::from_bytes([b; 32])).collect();
+    for (n, peer) in peers.iter().enumerate() {
+        db.call_put(peer, CALL, &ended(0, vec![receipt(&format!("op{n}"))])).await.unwrap();
+    }
+    sqlx::query("UPDATE call_state SET deadline_ms = 'not a number' WHERE peer = ?").bind(peers[1].to_hex())
+        .execute(db.pool()).await.unwrap();
+    let listed = db.call_with_free_reply_receipts(None, 10).await.unwrap();
+    assert_eq!(listed.iter().map(|(p, c, e)| (p.clone(), c.clone(), e.is_some())).collect::<Vec<_>>(),
+        peers.iter().map(|p| (p.to_hex(), CALL.to_string(), *p != peers[1])).collect::<Vec<_>>());
+    assert_eq!(listed[0].2, Some((peers[0], ended(0, vec![receipt("op0")]))));
+    let page = db.call_with_free_reply_receipts(Some((&peers[0].to_hex(), CALL)), 1).await.unwrap();
+    assert_eq!((page.len(), page[0].0.clone(), page[0].2.is_none()), (1, peers[1].to_hex(), true));
+    let far = 10 * TOMBSTONE_MS;
+    db.call_evict_burned(Some(&peers[1]), far, far, 10).await.unwrap();
+    db.call_sweep(far, 10).await.unwrap();
+    let kept: (Option<String>, String) = sqlx::query_as("SELECT free_reply_receipts, CAST(deadline_ms AS TEXT) FROM call_state WHERE peer = ?")
+        .bind(peers[1].to_hex()).fetch_one(db.pool()).await.unwrap();
+    assert!(kept.0.is_some());
+    assert_eq!(kept.1, "not a number");
+}
