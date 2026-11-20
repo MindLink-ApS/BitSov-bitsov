@@ -4,7 +4,7 @@
 use super::*;
 use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
-use konsensus_core::payloads::call::{CallEntry, HangupReason, Phase};
+use konsensus_core::payloads::call::{CallEntry, HangupReason, Phase, CALLER_ANSWER_WINDOW_MS};
 use konsensus_core::traits::lightning::LightningError;
 use konsensus_core::NodeId;
 use konsensus_crypto::SessionManager;
@@ -1169,7 +1169,9 @@ async fn client_detach_stops_renewals_and_unanswered_calls_still_expire() {
         json!({"v":1, "call_id":call_id, "media":"audio", "sdp":SDP}), SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "unanswered offer: {body}");
     device_rings(&mut lane.callee, &aid, call_id).await;
-    tokio::time::timeout(Duration::from_secs(90), async {
+    // The caller keeps an unanswered call until its own answer window ends; the callee does not
+    // tell it when the ring runs out. Wait for that window plus a margin, not a fixed time.
+    tokio::time::timeout(Duration::from_millis(CALLER_ANSWER_WINDOW_MS + 30_000), async {
         loop {
             let mut open = false;
             for (app, peer) in [(&lane.caller, bid), (&lane.callee, aid)] {
