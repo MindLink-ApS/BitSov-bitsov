@@ -18,7 +18,9 @@ also live on the corresponding GitHub pre-release pages.
   without `spend` may still pay that call's minute blocks on
   `POST /api/v1/messages/compose`, from the call's pinned hold only; nothing
   else moves without `spend`. `GET /api/v1/status` lists
-  `call_continuity_v1` only while it is on.
+  `call_continuity_v1` only while it is on. Independently of the switch, a
+  console grant whose write fails now leaves the pairing state in memory as
+  it was, instead of a new grant the disk never took.
 - Pay a contact by keysend only at a Lightning key their identity signed. A
   `LightningInfo` announcement now carries an Ed25519 signature by the node's
   identity key over a domain-separated binding of its Lightning pubkey; the

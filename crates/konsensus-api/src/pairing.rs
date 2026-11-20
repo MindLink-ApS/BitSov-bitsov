@@ -2989,12 +2989,19 @@ impl PairingService {
             owner_approval: None,
             ended: None,
         };
+        // Everything below changes together or not at all: a failed write
+        // must not leave the new grant, a retired old one or moved call
+        // holds in memory that the disk never took.
+        let before = inner.file.clone();
         inner.file.pending_elevations.retain(|e| e.op_id != op_id);
         // A new budget window replaces the client's old one. A live front-door
         // grant is a different authority and stays.
         inner.file.replace_grants(&mut grant, self.call_continuity);
         inner.file.grants.push(grant.clone());
-        self.persist(&mut inner.file)?;
+        if let Err(error) = self.persist(&mut inner.file) {
+            inner.file = before;
+            return Err(error);
+        }
         inner.owner_confirmations.remove(op_id);
         if !grant.is_live(chrono::Utc::now().timestamp()) {
             return Err(PairingError::Expired);

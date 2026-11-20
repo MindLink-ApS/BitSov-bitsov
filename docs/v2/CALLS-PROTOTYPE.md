@@ -192,7 +192,9 @@ survives that grant ending by expiry or by the owner writing a newer grant:
   the earlier grant, which is kept inert only until then. The newer grant's
   own limits apply from then on, so a lower per-payment value closes the hold.
   A renewal whose write fails leaves the hold and its funding exactly as
-  they were.
+  they were. This holds for console renewals too, with the switch on or
+  off: a failed write restores the whole pairing state in memory, so it
+  never differs from what is on disk.
 - On a device relation grant the same holds for the peer's envelope: its
   deadline ends new spending for that peer, but an admitted call's own hold
   keeps paying past it within the same bounds, unless revoked.
