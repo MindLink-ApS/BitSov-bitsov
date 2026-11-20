@@ -279,25 +279,84 @@ pub fn cmd_pair_ticket_with_allowance(
     };
     // Render before publication: oversized payloads must not replace a good ticket.
     let rendered = if qr { Some(render_qr(&uri)?) } else { None };
-    // The terms are bound to this ticket's code node-side, written before the
-    // ticket so the node never reads the ticket without them; a ticket
-    // without --allow clears any terms left from an earlier one.
-    match &allowance_terms {
-        Some(terms) => allowance::write_ticket_allowance(&dir, &link.code, terms)?,
-        None => allowance::remove_ticket_allowance(&dir)?,
+    // The published ticket and the terms bound to it change together: the
+    // terms are staged first, the ticket is replaced, and only then are the
+    // terms published (or, for a ticket without --allow, removed). The node
+    // reads both under the same lock this command holds. If replacing the
+    // ticket fails, the previous ticket and its terms stay as they were; if
+    // publishing the terms fails, the previous ticket is put back.
+    let staged = match &allowance_terms {
+        Some(terms) => Some(allowance::stage_ticket_allowance(&dir, &link.code, terms)?),
+        None => None,
+    };
+    let link_path = dir.join("remote-access-link");
+    let previous_link = match std::fs::read(&link_path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            if let Some(staged) = &staged {
+                let _ = std::fs::remove_file(staged);
+            }
+            return Err(e.into());
+        }
+    };
+    let replace_link = |bytes: &[u8], fail: bool| -> Result<()> {
+        let temporary = dir.join(format!(".remote-access-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            write_protected(&temporary, bytes)?;
+            if fail {
+                anyhow::bail!("ticket replace failed (test)");
+            }
+            std::fs::rename(&temporary, &link_path)?;
+            fsync_dir_strict(&dir)?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(temporary);
+        result
+    };
+    #[cfg(test)]
+    let fail_link = FAIL_LINK_REPLACE.with(|fail| fail.get());
+    #[cfg(not(test))]
+    let fail_link = false;
+    if let Err(error) = replace_link(uri.as_bytes(), fail_link) {
+        if let Some(staged) = &staged {
+            let _ = std::fs::remove_file(staged);
+        }
+        return Err(error);
     }
-    let temporary = dir.join(format!(".remote-access-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        write_protected(&temporary, uri.as_bytes())?;
-        std::fs::rename(&temporary, dir.join("remote-access-link"))?;
-        fsync_dir_strict(&dir)?;
-        Ok(())
-    })();
-    let _ = std::fs::remove_file(temporary);
-    if result.is_err() && allowance_terms.is_some() {
-        let _ = allowance::remove_ticket_allowance(&dir);
+    match &staged {
+        Some(staged) => {
+            #[cfg(test)]
+            let fail_terms = FAIL_TERMS_PUBLISH.with(|fail| fail.get());
+            #[cfg(not(test))]
+            let fail_terms = false;
+            let published = if fail_terms {
+                let _ = std::fs::remove_file(staged);
+                Err(std::io::Error::other("terms publish failed (test)"))
+            } else {
+                allowance::commit_ticket_allowance(&dir, staged)
+            };
+            if let Err(error) = published {
+                let restored = match &previous_link {
+                    Some(bytes) => replace_link(bytes, false),
+                    None => std::fs::remove_file(&link_path)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|()| fsync_dir_strict(&dir).map_err(anyhow::Error::from)),
+                };
+                return Err(anyhow::Error::from(error).context(match restored {
+                    Ok(()) => "could not publish the allowance; the previous ticket is back in place".to_string(),
+                    Err(e) => format!("could not publish the allowance, nor put the previous ticket back ({e}); run pair-ticket again"),
+                }));
+            }
+        }
+        None => {
+            // Terms left from an earlier ticket are bound to that ticket's
+            // code and never match this one; removing them is tidying.
+            if let Err(error) = allowance::remove_ticket_allowance(&dir) {
+                eprintln!("note: could not remove the terms of an earlier ticket ({error}); they do not apply to this one");
+            }
+        }
     }
-    result?;
     // Only this explicit operator command prints the secret link.
     println!("{uri}");
     if let Some(rendered) = rendered {
@@ -316,6 +375,14 @@ pub fn cmd_pair_ticket_with_allowance(
         println!("Older apps cannot complete this second-device QR; update the app first.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: make replacing the published ticket fail.
+    static FAIL_LINK_REPLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: make publishing the staged terms fail.
+    static FAIL_TERMS_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn render_qr(uri: &str) -> Result<String> {
@@ -361,5 +428,86 @@ mod second_device_tests {
             );
         }
         assert!(!dir.path().join("pairing/remote-access-link").exists());
+    }
+}
+
+#[cfg(test)]
+mod allowance_publish_tests {
+    use super::*;
+
+    fn node(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("konsensus.toml");
+        let mut config = NodeConfig::default_for_tier(crate::config::NodeTier::Light, dir.join("absent.enc"), dir);
+        config.remote_access = crate::config::RemoteAccessConfig {
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            advertised_endpoint: Some("node.example:9737".into()),
+            ..Default::default()
+        };
+        config.pairing.standing_allowance_v1 = true;
+        config.save(&path).unwrap();
+        path
+    }
+
+    fn published(dir: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let read = |name: &str| std::fs::read(dir.join("pairing").join(name)).ok();
+        (read("remote-access-link"), read("remote-access-allowance"))
+    }
+
+    fn ticket(path: &Path, allow: bool) -> Result<()> {
+        let args = allow.then_some(AllowanceArgs { daily_sats: 2_500, per_call_sats: None, days: None });
+        cmd_pair_ticket_with_allowance(path, false, Duration::from_secs(600), false, false, args)
+    }
+
+    /// A ticket that cannot be published leaves the published ticket and the
+    /// terms bound to it exactly as they were, with or without --allow.
+    #[test]
+    fn a_failed_publish_keeps_the_previous_ticket_and_its_terms() {
+        for (previous_allow, next_allow) in [(true, false), (true, true), (false, true), (false, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = node(dir.path());
+            ticket(&path, previous_allow).unwrap();
+            let before = published(dir.path());
+            assert!(before.0.is_some());
+            assert_eq!(before.1.is_some(), previous_allow);
+            FAIL_LINK_REPLACE.with(|fail| fail.set(true));
+            let result = ticket(&path, next_allow);
+            FAIL_LINK_REPLACE.with(|fail| fail.set(false));
+            assert!(result.is_err());
+            assert_eq!(published(dir.path()), before, "previous {previous_allow}, next {next_allow}");
+            // Nothing left over from the attempt.
+            let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("pairing")).unwrap()
+                .filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".tmp")).collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+            // And a working publish afterwards pairs link and terms again.
+            ticket(&path, next_allow).unwrap();
+            let after = published(dir.path());
+            assert_eq!(after.1.is_some(), next_allow);
+            if next_allow {
+                let uri = String::from_utf8(after.0.unwrap()).unwrap();
+                let code = konsensus_api::remote_access::PairLink::from_uri(uri.trim()).unwrap().code;
+                assert!(allowance::read_ticket_allowance(&dir.path().join("pairing"), &code, chrono::Utc::now().timestamp()).is_some());
+            }
+        }
+    }
+
+    /// If the terms cannot be published after the ticket was replaced, the
+    /// previous ticket is put back, so the published ticket and its terms
+    /// still belong together.
+    #[test]
+    fn a_failed_terms_publish_puts_the_previous_ticket_back() {
+        for previous in [None, Some(false), Some(true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = node(dir.path());
+            if let Some(allow) = previous {
+                ticket(&path, allow).unwrap();
+            }
+            let before = published(dir.path());
+            FAIL_TERMS_PUBLISH.with(|fail| fail.set(true));
+            let result = ticket(&path, true);
+            FAIL_TERMS_PUBLISH.with(|fail| fail.set(false));
+            assert!(result.is_err());
+            assert_eq!(published(dir.path()), before, "previous {previous:?}");
+        }
     }
 }

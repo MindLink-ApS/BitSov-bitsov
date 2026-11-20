@@ -4379,6 +4379,22 @@ impl PairingService {
                 })
                 .or(found);
         }
+        // An ordinary payment that was open when an allowance opened the
+        // next window settles in the window it moved to, exactly once.
+        if found.is_none_or(|i| {
+            inner.file.grants[i].budget.as_ref().is_none_or(|b| !b.pending.contains_key(&reservation.id))
+        }) {
+            found = inner
+                .file
+                .grants
+                .iter()
+                .position(|g| {
+                    g.client_id == reservation.client_id
+                        && g.granted_by == allowance::ALLOWANCE_GRANTED_BY
+                        && g.budget.as_ref().is_some_and(|b| b.pending.contains_key(&reservation.id))
+                })
+                .or(found);
+        }
         let Some(index) = found else {
             return Ok(());
         };

@@ -496,19 +496,37 @@ pub fn write_ticket_allowance(
     code: &str,
     terms: &AllowanceTerms,
 ) -> std::io::Result<()> {
+    let staged = stage_ticket_allowance(pairing_dir, code, terms)?;
+    commit_ticket_allowance(pairing_dir, &staged)
+}
+
+/// Write terms bound to `code` to a staged file next to the published ones,
+/// without replacing the published terms. Publish it with
+/// [`commit_ticket_allowance`], or delete it.
+pub fn stage_ticket_allowance(
+    pairing_dir: &Path,
+    code: &str,
+    terms: &AllowanceTerms,
+) -> std::io::Result<std::path::PathBuf> {
     let record = TicketAllowance {
         ticket_hash: ticket_hash(code),
         terms: terms.clone(),
     };
     let bytes = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
-    let path = pairing_dir.join(TICKET_ALLOWANCE_FILE);
     let temporary = pairing_dir.join(format!(".remote-access-allowance-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        super::write_protected(&temporary, &bytes)?;
-        std::fs::rename(&temporary, &path)?;
-        super::fsync_dir_strict(pairing_dir)
-    })();
-    let _ = std::fs::remove_file(temporary);
+    if let Err(error) = super::write_protected(&temporary, &bytes) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(temporary)
+}
+
+/// Replace the published terms with staged ones in one rename. On failure
+/// the published terms are unchanged and the staged file is removed.
+pub fn commit_ticket_allowance(pairing_dir: &Path, staged: &Path) -> std::io::Result<()> {
+    let result = std::fs::rename(staged, pairing_dir.join(TICKET_ALLOWANCE_FILE))
+        .and_then(|()| super::fsync_dir_strict(pairing_dir));
+    let _ = std::fs::remove_file(staged);
     result
 }
 
@@ -692,6 +710,9 @@ impl super::PairingService {
             .max_by_key(|g| g.granted_at)
             .and_then(|g| Some((g.op_id.clone(), g.budget.clone()?)));
         let replacing = previous.as_ref().map(|(op, budget)| (op.as_str(), budget.used_msat));
+        // What a failed write restores: everything as it was before this
+        // request, the allowance's clock included.
+        let before = inner.file.clone();
         let allowance = inner
             .file
             .allowances
@@ -734,7 +755,6 @@ impl super::PairingService {
             ended: None,
         };
         let mut grant = grant;
-        let before = inner.file.clone();
         let file = &mut inner.file;
         let allowance = file
             .allowances
@@ -751,6 +771,22 @@ impl super::PairingService {
             }
         }
         allowance.open_window(&op_id, terms.budget_msat, now);
+        // Payments of the replaced windows whose outcome is still unknown
+        // move to the new one: their failure slots stay taken, and a late
+        // outcome is recorded where they now live. Only within the same
+        // pairing epoch and identity, never from a revoked grant.
+        if let Some(next) = grant.budget.as_mut() {
+            for old in file.grants.iter_mut().filter(|old| {
+                old.client_id == grant.client_id
+                    && old.epoch == grant.epoch
+                    && old.identity_fingerprint == grant.identity_fingerprint
+                    && old.ended != Some(super::GrantEnd::Revoked)
+            }) {
+                if let Some(budget) = old.budget.as_mut() {
+                    budget.move_open_payments_to(next);
+                }
+            }
+        }
         // A new window replaces the client's old one, as every budget window
         // does, carrying admitted calls over when continuity is on.
         file.replace_grants(&mut grant, self.call_continuity_enabled());

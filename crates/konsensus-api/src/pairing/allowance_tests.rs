@@ -1049,3 +1049,102 @@ fn a_failed_write_changes_nothing() {
     assert_eq!(after.call_spend_grants, before.call_spend_grants);
     assert!(allowance_grants(&f).iter().any(|g| g.op_id == first));
 }
+
+// ── Unresolved payments across automatic renewals ───────────────────────
+// A payment whose outcome is unknown holds a failure slot of the breaker.
+// Opening the next allowance window must not free those slots, and the
+// payment's late outcome must still count where its slot now lives.
+
+fn payment(f: &Fixture, n: u32) -> Result<Reservation, BudgetRefusal> {
+    f.svc.reserve_operation_spend(&f.client, 1, vec![Charge { recipient: "aa".repeat(32), amount_msat: 10 }],
+        offer_link(&format!("payment-{n}")))
+}
+
+fn live_breakers(f: &Fixture) -> crate::spend_budget::BreakerStatus {
+    allowance_grants(f)
+        .into_iter()
+        .find(|g| g.is_live(now()))
+        .unwrap()
+        .budget
+        .unwrap()
+        .breaker_status(now())
+}
+
+/// Five unresolved payments fill the five failure slots of the default breakers.
+fn fill_failure_slots(f: &Fixture) -> Vec<Reservation> {
+    let slots = terms().breakers.max_consecutive_failures as u32;
+    let open: Vec<_> = (0..slots).map(|n| payment(f, n).unwrap()).collect();
+    assert_eq!(payment(f, 99), Err(BudgetRefusal::FailuresPending));
+    open
+}
+
+#[test]
+fn a_renewal_does_not_free_the_failure_slots_of_unresolved_payments() {
+    for continuity in [false, true] {
+        let f = continuity_fixture(continuity);
+        ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+        fill_failure_slots(&f);
+        assert_eq!(ask(&f, proposal(900_000, PER_CALL)).unwrap().1, Outcome::Window);
+        assert_eq!(live_breakers(&f).unresolved_payments, 5, "{continuity}");
+        assert_eq!(payment(&f, 100), Err(BudgetRefusal::FailuresPending), "{continuity}");
+        // Nor does a second renewal.
+        ask(&f, proposal(800_000, PER_CALL)).unwrap();
+        assert_eq!(payment(&f, 101), Err(BudgetRefusal::FailuresPending), "{continuity}");
+    }
+}
+
+#[test]
+fn an_old_window_payment_that_fails_after_renewal_counts_and_trips_the_breaker() {
+    for continuity in [false, true] {
+        let f = continuity_fixture(continuity);
+        ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+        let open = fill_failure_slots(&f);
+        ask(&f, proposal(900_000, PER_CALL)).unwrap();
+        let peer = "aa".repeat(32);
+        f.svc.try_resolve_spend(&open[0], &peer, 0).unwrap();
+        f.svc.try_resolve_spend(&open[0], &peer, 0).unwrap();
+        let status = live_breakers(&f);
+        assert_eq!((status.consecutive_failures, status.unresolved_payments), (1, 4), "{continuity}");
+        for reservation in &open[1..] {
+            f.svc.try_resolve_spend(reservation, &peer, 0).unwrap();
+        }
+        assert!(live_breakers(&f).paused, "five failures pause the window ({continuity})");
+        assert_eq!(payment(&f, 100), Err(BudgetRefusal::GrantPaused));
+        // The paused state carries into the next window too.
+        ask(&f, proposal(800_000, PER_CALL)).unwrap();
+        assert_eq!(payment(&f, 101), Err(BudgetRefusal::GrantPaused), "{continuity}");
+    }
+}
+
+#[test]
+fn an_old_window_payment_that_succeeds_after_renewal_frees_its_slot() {
+    for continuity in [false, true] {
+        let f = continuity_fixture(continuity);
+        ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+        let open = fill_failure_slots(&f);
+        ask(&f, proposal(900_000, PER_CALL)).unwrap();
+        let peer = "aa".repeat(32);
+        f.svc.try_resolve_spend(&open[0], &peer, 0).unwrap();
+        f.svc.try_resolve_spend(&open[1], &peer, 10).unwrap();
+        let status = live_breakers(&f);
+        assert_eq!((status.consecutive_failures, status.unresolved_payments), (0, 3), "a success clears ({continuity})");
+        payment(&f, 100).expect("the freed slot can be used");
+        let next = allowance_grants(&f).into_iter().find(|g| g.is_live(now())).unwrap().budget.unwrap();
+        // The settled payment is paid once, in the window that holds it.
+        assert_eq!(next.used_msat, 3 * 10 + 10 + 10, "{continuity}");
+    }
+}
+
+#[test]
+fn a_carried_call_and_carried_payments_are_each_counted_once() {
+    let f = continuity_fixture(true);
+    ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+    admit_call(&f, "call");
+    for n in 0..4 {
+        payment(&f, n).unwrap();
+    }
+    assert_eq!(live_breakers(&f).unresolved_payments, 5);
+    ask(&f, proposal(900_000, PER_CALL)).unwrap();
+    assert_eq!(live_breakers(&f).unresolved_payments, 5);
+    assert_eq!(payment(&f, 100), Err(BudgetRefusal::FailuresPending));
+}

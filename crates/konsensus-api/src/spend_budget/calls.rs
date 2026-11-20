@@ -319,6 +319,38 @@ impl GrantBudget {
     }
 
     /// Whether reservation `id` is a block drawn from one of this grant's calls.
+    /// Move every ordinary payment whose outcome is still unknown (not a
+    /// call hold or one of its blocks) to `successor`, with its operation
+    /// link, once. Each keeps its failure slot there and settles there, and
+    /// its amount counts against the successor as it did here. Returns the
+    /// moved reservation ids.
+    pub(crate) fn move_open_payments_to(&mut self, successor: &mut GrantBudget) -> Vec<String> {
+        let ids: Vec<String> = self
+            .pending
+            .keys()
+            .filter(|id| {
+                !self.call_reservations.contains_key(*id)
+                    && !self.holds_draw(id)
+                    && !successor.pending.contains_key(*id)
+            })
+            .cloned()
+            .collect();
+        for id in &ids {
+            let recipients = self.pending.remove(id).expect("listed payment");
+            for (recipient, amount) in &recipients {
+                self.resolve(recipient, *amount, 0);
+                successor.used_msat = successor.used_msat.saturating_add(*amount);
+                let used = successor.used_by_recipient.entry(recipient.clone()).or_insert(0);
+                *used = used.saturating_add(*amount);
+            }
+            successor.pending.insert(id.clone(), recipients);
+            if let Some(link) = self.operation_links.remove(id) {
+                successor.operation_links.insert(id.clone(), link);
+            }
+        }
+        ids
+    }
+
     pub(crate) fn holds_draw(&self, id: &str) -> bool {
         self.call_reservations.values().any(|call| call.draws.contains_key(id))
     }

@@ -516,6 +516,9 @@ or offer that would go past the cap is refused before anything is reserved.
 In a window the owner wrote, the per-call maximum keeps its meaning as the
 limit on each payment. Breakers are the allowance's and
 carry their history from one window to the next; a renewal never resets them.
+Payments whose outcome is not yet known move to the new window with their
+failure slots, and their outcome is recorded there when it arrives, so a
+renewal cannot free slots the breaker is holding.
 
 **The daily cap counts any 24 hours, not each window.** Every window is
 recorded with the most it could spend: its whole budget while it can spend,
