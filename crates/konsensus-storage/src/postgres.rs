@@ -2309,9 +2309,10 @@ impl Storage for PostgresStorage {
         }).collect()
     }
 
-    async fn call_with_free_reply_receipts(&self, max: u32) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+    async fn call_with_free_reply_receipts(&self, after: Option<(&konsensus_core::NodeId, &str)>, max: u32) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL ORDER BY peer, call_id LIMIT $1")
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND ($1::TEXT IS NULL OR peer > $1 OR (peer = $1 AND call_id > $2)) ORDER BY peer, call_id LIMIT $3")
+            .bind(after.map(|(p, _)| p.to_hex())).bind(after.map(|(_, c)| c.to_string()))
             .bind(i64::from(max)).fetch_all(&self.pool).await?;
         rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;

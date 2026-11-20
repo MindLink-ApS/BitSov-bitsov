@@ -1104,27 +1104,57 @@ pub(crate) async fn release_free_reply_receipt(store: Store<'_>, peer: &NodeId, 
     Ok(())
 }
 
+/// Rows visited per receipt cleanup sweep.
+const RECEIPT_SWEEP_ROWS: u32 = 256;
+
+/// Where the next receipt cleanup sweep of each store resumes, by row key.
+fn receipt_sweep_cursor() -> &'static Mutex<HashMap<usize, (NodeId, String)>> {
+    static CURSOR: OnceLock<Mutex<HashMap<usize, (NodeId, String)>>> = OnceLock::new();
+    CURSOR.get_or_init(Default::default)
+}
+
 /// Release receipts whose saved reply can no longer be recovered (it was
 /// queued, withdrawn, or its operation is gone). A receipt whose operation
-/// may still be recovered is always kept; any read error keeps them all.
+/// may still be recovered is always kept; a read error keeps that row's.
+/// Each sweep visits at most [`RECEIPT_SWEEP_ROWS`] rows, resuming after the
+/// last row the previous sweep visited and wrapping at the end, so rows whose
+/// receipts must be kept never keep a later row from being reached.
 pub(crate) async fn prune_free_reply_receipts(state: &AppState) -> Result<usize, konsensus_storage::StorageError> {
     let store = state.storage.as_ref();
+    let key = std::sync::Arc::as_ptr(&state.storage) as *const () as usize;
+    let after = receipt_sweep_cursor().lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+    let rows = store.call_with_free_reply_receipts(after.as_ref().map(|(p, c)| (p, c.as_str())), RECEIPT_SWEEP_ROWS).await?;
+    {
+        let mut cursor = receipt_sweep_cursor().lock().unwrap_or_else(|e| e.into_inner());
+        match rows.last() {
+            Some((peer, call_id, _)) if rows.len() == RECEIPT_SWEEP_ROWS as usize => { cursor.insert(key, (*peer, call_id.clone())); }
+            _ => { cursor.remove(&key); }
+        }
+    }
     let mut released = 0;
-    for (peer, call_id, _) in store.call_with_free_reply_receipts(256).await? {
-        let _g = lock().lock().await;
-        let Some(mut entry) = store.call_get(&peer, &call_id).await? else { continue };
-        let mut keep = Vec::with_capacity(entry.free_reply_receipts.len());
-        for receipt in &entry.free_reply_receipts {
-            let op = store.get_outbox_operation(&receipt.operation_id).await?;
-            if op.as_ref().is_some_and(crate::handlers::messages::operations::free_reply_recoverable) {
-                keep.push(receipt.clone());
-            }
+    for (peer, call_id, _) in rows {
+        match prune_row(store, &peer, &call_id).await {
+            Ok(n) => released += n,
+            Err(error) => tracing::debug!(%error, "free call reply receipt cleanup skipped a row"),
         }
-        if keep.len() != entry.free_reply_receipts.len() {
-            released += entry.free_reply_receipts.len() - keep.len();
-            entry.free_reply_receipts = keep;
-            store.call_put(&peer, &call_id, &entry).await?;
+    }
+    Ok(released)
+}
+
+async fn prune_row(store: Store<'_>, peer: &NodeId, call_id: &str) -> Result<usize, konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(0) };
+    let mut keep = Vec::with_capacity(entry.free_reply_receipts.len());
+    for receipt in &entry.free_reply_receipts {
+        let op = store.get_outbox_operation(&receipt.operation_id).await?;
+        if op.as_ref().is_some_and(crate::handlers::messages::operations::free_reply_recoverable) {
+            keep.push(receipt.clone());
         }
+    }
+    let released = entry.free_reply_receipts.len() - keep.len();
+    if released > 0 {
+        entry.free_reply_receipts = keep;
+        store.call_put(peer, call_id, &entry).await?;
     }
     Ok(released)
 }

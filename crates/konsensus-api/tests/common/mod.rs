@@ -307,18 +307,22 @@ impl Storage for MemStorage {
 
     async fn call_with_free_reply_receipts(
         &self,
+        after: Option<(&NodeId, &str)>,
         max: u32,
     ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
     {
-        Ok(self
+        let mut rows: Vec<_> = self
             .calls
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, e)| !e.free_reply_receipts.is_empty())
-            .take(max as usize)
+            .filter(|((peer, id), e)| !e.free_reply_receipts.is_empty()
+                && after.is_none_or(|(p, c)| (peer.to_hex(), id.as_str()) > (p.to_hex(), c)))
             .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
-            .collect())
+            .collect();
+        rows.sort_by_key(|(peer, id, _)| (peer.to_hex(), id.clone()));
+        rows.truncate(max as usize);
+        Ok(rows)
     }
 
     async fn insert_channel_open_operation(

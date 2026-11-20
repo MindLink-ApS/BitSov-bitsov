@@ -28,12 +28,13 @@ async fn round_trip(db: &dyn Storage) {
     let with = ended(0, vec![receipt("a"), receipt("b")]);
     db.call_put(&peer, CALL, &with).await.unwrap();
     assert_eq!(db.call_get(&peer, CALL).await.unwrap(), Some(with.clone()));
-    assert_eq!(db.call_with_free_reply_receipts(10).await.unwrap(), vec![(peer, CALL.to_string(), with.clone())]);
+    assert_eq!(db.call_with_free_reply_receipts(None, 10).await.unwrap(), vec![(peer, CALL.to_string(), with.clone())]);
+    assert!(db.call_with_free_reply_receipts(Some((&peer, CALL)), 10).await.unwrap().is_empty());
     // Clearing them is one ordinary write of the row.
     let without = ended(0, Vec::new());
     db.call_put(&peer, CALL, &without).await.unwrap();
     assert_eq!(db.call_get(&peer, CALL).await.unwrap(), Some(without));
-    assert!(db.call_with_free_reply_receipts(10).await.unwrap().is_empty());
+    assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -54,7 +55,7 @@ async fn a_row_written_before_receipts_existed_reads_with_none() {
     assert!(entry.free_reply_receipts.is_empty());
     assert_eq!(entry.pending.unwrap().operation_id, "op");
     assert_eq!(db.call_pending().await.unwrap().len(), 1);
-    assert!(db.call_with_free_reply_receipts(10).await.unwrap().is_empty());
+    assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().is_empty());
 }
 
 #[tokio::test]
