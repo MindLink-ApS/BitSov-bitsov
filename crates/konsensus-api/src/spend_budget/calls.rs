@@ -318,39 +318,51 @@ impl GrantBudget {
         self.call_reservations.values().any(|call| !call.closed || !call.draws.is_empty())
     }
 
-    /// Whether reservation `id` is a block drawn from one of this grant's calls.
-    /// Move every ordinary payment whose outcome is still unknown (not a
-    /// call hold or one of its blocks) to `successor`, with its operation
-    /// link, once. Each keeps its failure slot there and settles there, and
-    /// its amount counts against the successor as it did here. Returns the
-    /// moved reservation ids.
-    pub(crate) fn move_open_payments_to(&mut self, successor: &mut GrantBudget) -> Vec<String> {
+    /// Take out every ordinary payment whose outcome is still unknown (not
+    /// a call hold or one of its blocks), with its operation link, and
+    /// release its amount here. Give them to the successor with
+    /// [`Self::accept_open_payments`]: they are already sent, so they move
+    /// whatever the successor has left, keep their failure slots there and
+    /// settle there once.
+    pub(crate) fn take_open_payments(&mut self) -> Vec<OpenPayment> {
         let ids: Vec<String> = self
             .pending
             .keys()
-            .filter(|id| {
-                !self.call_reservations.contains_key(*id)
-                    && !self.holds_draw(id)
-                    && !successor.pending.contains_key(*id)
-            })
+            .filter(|id| !self.call_reservations.contains_key(*id) && !self.holds_draw(id))
             .cloned()
             .collect();
-        for id in &ids {
-            let recipients = self.pending.remove(id).expect("listed payment");
-            for (recipient, amount) in &recipients {
-                self.resolve(recipient, *amount, 0);
-                successor.used_msat = successor.used_msat.saturating_add(*amount);
-                let used = successor.used_by_recipient.entry(recipient.clone()).or_insert(0);
-                *used = used.saturating_add(*amount);
-            }
-            successor.pending.insert(id.clone(), recipients);
-            if let Some(link) = self.operation_links.remove(id) {
-                successor.operation_links.insert(id.clone(), link);
-            }
-        }
-        ids
+        ids.into_iter()
+            .map(|id| {
+                let recipients = self.pending.remove(&id).expect("listed payment");
+                for (recipient, amount) in &recipients {
+                    self.resolve(recipient, *amount, 0);
+                }
+                let link = self.operation_links.remove(&id);
+                OpenPayment { id, recipients, link }
+            })
+            .collect()
     }
 
+    /// Take over payments from [`Self::take_open_payments`]. Their amounts
+    /// count here even past the budget, which only leaves less for new ones.
+    pub(crate) fn accept_open_payments(&mut self, payments: Vec<OpenPayment>) {
+        for payment in payments {
+            if self.pending.contains_key(&payment.id) {
+                continue;
+            }
+            for (recipient, amount) in &payment.recipients {
+                self.used_msat = self.used_msat.saturating_add(*amount);
+                let used = self.used_by_recipient.entry(recipient.clone()).or_insert(0);
+                *used = used.saturating_add(*amount);
+            }
+            if let Some(link) = payment.link {
+                self.operation_links.insert(payment.id.clone(), link);
+            }
+            self.pending.insert(payment.id, payment.recipients);
+        }
+    }
+
+    /// Whether reservation `id` is a block drawn from one of this grant's calls.
     pub(crate) fn holds_draw(&self, id: &str) -> bool {
         self.call_reservations.values().any(|call| call.draws.contains_key(id))
     }
@@ -461,4 +473,11 @@ impl GrantBudget {
             self.prune_call_tombstones(chrono::Utc::now().timestamp());
         }
     }
+}
+
+/// An ordinary payment in flight, moving between windows.
+pub(crate) struct OpenPayment {
+    id: String,
+    recipients: BTreeMap<String, u64>,
+    link: Option<OperationReservationLink>,
 }

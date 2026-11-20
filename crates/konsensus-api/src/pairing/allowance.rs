@@ -755,13 +755,14 @@ impl super::PairingService {
             ended: None,
         };
         let mut grant = grant;
+        let continuity = self.call_continuity_enabled();
         let file = &mut inner.file;
         let allowance = file
             .allowances
             .get_mut(&client.client_id)
             .expect("checked above under the same lock");
         // The allowance's own earlier window ends now with what it used,
-        // counted before any open call moves out of it.
+        // counted before anything moves out of it.
         for old in &file.grants {
             if old.client_id == client.client_id
                 && old.granted_by == ALLOWANCE_GRANTED_BY
@@ -772,24 +773,29 @@ impl super::PairingService {
         }
         allowance.open_window(&op_id, terms.budget_msat, now);
         // Payments of the replaced windows whose outcome is still unknown
-        // move to the new one: their failure slots stay taken, and a late
-        // outcome is recorded where they now live. Only within the same
-        // pairing epoch and identity, never from a revoked grant.
-        if let Some(next) = grant.budget.as_mut() {
-            for old in file.grants.iter_mut().filter(|old| {
-                old.client_id == grant.client_id
-                    && old.epoch == grant.epoch
-                    && old.identity_fingerprint == grant.identity_fingerprint
-                    && old.ended != Some(super::GrantEnd::Revoked)
-            }) {
-                if let Some(budget) = old.budget.as_mut() {
-                    budget.move_open_payments_to(next);
-                }
+        // are taken out first, so that admitted calls are judged against the
+        // new window alone. Only within the same pairing epoch and identity,
+        // never from a revoked grant.
+        let mut payments = Vec::new();
+        for old in file.grants.iter_mut().filter(|old| {
+            old.client_id == grant.client_id
+                && old.epoch == grant.epoch
+                && old.identity_fingerprint == grant.identity_fingerprint
+                && old.ended != Some(super::GrantEnd::Revoked)
+        }) {
+            if let Some(budget) = old.budget.as_mut() {
+                payments.extend(budget.take_open_payments());
             }
         }
-        // A new window replaces the client's old one, as every budget window
-        // does, carrying admitted calls over when continuity is on.
-        file.replace_grants(&mut grant, self.call_continuity_enabled());
+        // 1. Admitted calls move first, when the new window can fund them
+        //    (continuity on); as every budget window does, it replaces the
+        //    client's old one.
+        file.replace_grants(&mut grant, continuity);
+        // 2. Then the payments: already sent, they move whatever is left,
+        //    keep their failure slots and settle in the new window once.
+        if let Some(next) = grant.budget.as_mut() {
+            next.accept_open_payments(payments);
+        }
         file.grants.push(grant);
         if let Err(error) = self.persist(&mut inner.file) {
             inner.file = before;

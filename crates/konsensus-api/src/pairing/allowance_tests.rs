@@ -1148,3 +1148,43 @@ fn a_carried_call_and_carried_payments_are_each_counted_once() {
     assert_eq!(live_breakers(&f).unresolved_payments, 5);
     assert_eq!(payment(&f, 100), Err(BudgetRefusal::FailuresPending));
 }
+
+// ── Carried calls first, then carried payments ──────────────────────────
+
+#[test]
+fn a_live_call_is_carried_before_payments_take_the_next_window() {
+    let f = continuity_fixture(true);
+    ask(&f, proposal(1_000_000, PER_CALL)).unwrap();
+    // A call holding 600,000 msat, and four payments still in flight.
+    let peer = "aa".repeat(32);
+    let big = crate::spend_budget::CallSpendTerms::new(&peer, "call", 2_000, 500, 240).unwrap();
+    assert_eq!(big.reserved_msat, 600_000);
+    f.svc.reserve_call_spend(&f.client, 1, big, u64::MAX / 4).unwrap();
+    for n in 0..4 {
+        payment(&f, n).unwrap();
+    }
+    // The next window fits the call on its own, not the call plus payments.
+    let (next, outcome) = ask(&f, proposal(600_020, 600_020)).unwrap();
+    assert_eq!(outcome, Outcome::Window);
+    let budget = allowance_grants(&f).into_iter().find(|g| g.op_id == next).unwrap().budget.unwrap();
+    assert_eq!(budget.call_reservations.len(), 1, "the admitted call was dropped");
+    // The payments moved too, past the budget: they are already sent.
+    assert_eq!(budget.used_msat, 600_000 + 40);
+    assert_eq!(budget.breaker_status(now()).unresolved_payments, 5);
+    assert_eq!(payment(&f, 100), Err(BudgetRefusal::FailuresPending));
+    // Nothing new fits until something settles.
+    f.svc.try_resolve_spend(&first_payment(&f), &peer, 10).ok();
+    assert!(window_used(&f) >= 600_000);
+}
+
+fn first_payment(f: &Fixture) -> Reservation {
+    let grant = allowance_grants(f).into_iter().find(|g| g.is_live(now())).unwrap();
+    let budget = grant.budget.unwrap();
+    let id = budget
+        .pending
+        .keys()
+        .find(|id| !budget.call_reservations.contains_key(*id))
+        .unwrap()
+        .clone();
+    Reservation { id, client_id: f.client.clone(), op_id: grant.op_id, charges: vec![] }
+}
