@@ -1148,7 +1148,9 @@ pub(crate) async fn prune_free_reply_receipts(state: &AppState) -> Result<usize,
             _ => { cursors.remove(&key); }
         }
     }
-    let unkeyed = page.scanned - page.rows.len();
+    // A store that lists more rows than it says it covered is not trusted to
+    // count: never underflow on it.
+    let unkeyed = page.scanned.saturating_sub(page.rows.len());
     let (mut released, mut undecodable, mut unread) = (0, 0usize, 0usize);
     for (_, call_id, entry) in page.rows {
         let Some((peer, _)) = entry else { undecodable += 1; continue };
@@ -1175,7 +1177,10 @@ async fn prune_row(store: Store<'_>, peer: &NodeId, call_id: &str) -> Result<usi
         }
     }
     let released = entry.free_reply_receipts.len() - keep.len();
-    if released > 0 {
+    // A row listed as holding receipts that decodes to none (a stored empty
+    // list, which writes never produce) is rewritten once as holding none, so
+    // later sweeps stop listing it and it can age out like any other row.
+    if released > 0 || entry.free_reply_receipts.is_empty() {
         entry.free_reply_receipts = keep;
         store.call_put(peer, call_id, &entry).await?;
     }
