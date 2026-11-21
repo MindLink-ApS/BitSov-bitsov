@@ -116,4 +116,16 @@ async fn a_bound_hangup_for_a_live_call_ends_it_once() {
     assert_eq!((entry.phase, entry.end_reason), (Phase::Ended, Some(HangupReason::Hangup)));
     // No second invoice can be issued for the same call.
     assert_eq!(calls::validate_call_hangup_invoice(&fx.store, &peer, CALL, Side::Caller).await, Err(CallRefusal::UnknownCall));
+
+    // The same hangup admitted again changes nothing: the call stays ended,
+    // exactly as the first admission left it, and its binding is not added to.
+    let again = devices.admit(&fx.store, &fx.own, &bound, Some(&plaintext()), calls::now_ms() + 1, || calls::now_ms() + 1).await;
+    assert_eq!(again.map(|s| s.call_id), Ok(CALL.to_string()));
+    assert_eq!(fx.store.call_get(&peer, CALL).await.unwrap(), Some(entry.clone()), "a second admission reopened or rewrote the call");
+    assert_eq!(fx.store.call_block_invoice_count(&peer, CALL, HANGUP_INVOICE_SEQ).await.unwrap(), 1);
+    // Another hangup, not paid through that binding, is refused.
+    let other = hangup(&fx, [2; 32]);
+    let refused = devices.admit(&fx.store, &fx.own, &other, Some(&plaintext()), calls::now_ms() + 1, || calls::now_ms() + 1).await;
+    assert_eq!(refused.unwrap_err(), CallRefusal::UnknownCall);
+    assert_eq!(fx.store.call_get(&peer, CALL).await.unwrap(), Some(entry));
 }

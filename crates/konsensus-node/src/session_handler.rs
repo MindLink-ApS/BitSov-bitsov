@@ -3387,7 +3387,9 @@ async fn prepare_call_hangup_invoice(
     if amount_msat > konsensus_core::gate::price_with_floor_msat(price, min_admission_cost_msat) {
         return Err(refusal::PRICE_CHANGED);
     }
-    // One hangup per call: the binding cap stops a repeat filling the wallet.
+    // The binding cap bounds how many invoices one call's hangup may hold, so
+    // retries and repeated requests for that hangup cannot fill the wallet.
+    // It reuses the limit each call block has; at most one hangup is admitted.
     let outstanding = storage
         .call_block_invoice_count(peer, &call_id, calls::HANGUP_INVOICE_SEQ)
         .await
