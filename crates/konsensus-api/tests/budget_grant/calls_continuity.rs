@@ -354,3 +354,125 @@ async fn after_expiry_a_hangup_priced_above_its_closing_reserve_is_refused_unpai
     assert_eq!(entry.phase, konsensus_core::payloads::call::Phase::Live);
     assert!(entry.pending.is_none(), "the refused hangup holds no reservation");
 }
+
+/// The hangup's payment waits in the wallet while `change` runs, then resumes.
+async fn hangup_across(fx: &Fx, token: &str, change: impl FnOnce()) -> (StatusCode, Value) {
+    fx.wallet.pause_dispatch.store(true, Ordering::SeqCst);
+    let (result, ()) = tokio::join!(hangup_with(fx, token, CALL, Some("hangup")), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), fx.wallet.entered.notified())
+            .await.expect("the hangup reached the wallet");
+        change();
+        fx.wallet.pause_dispatch.store(false, Ordering::SeqCst);
+        fx.wallet.resume.notify_one();
+    });
+    result
+}
+
+#[tokio::test]
+async fn after_expiry_a_hangup_admitted_before_a_revocation_or_new_pairing_epoch_is_not_paid() {
+    for re_pair in [false, true] {
+        let (fx, _) = live_call(true).await;
+        let token = expire(&fx).await;
+        let (money, left) = (fx.wallet.money(), fx.wallet.left());
+        // Admitted and reserved on the app's binding; the owner revokes or
+        // re-pairs while its payment is still in the wallet.
+        let (status, body) = hangup_across(&fx, &token, || {
+            if re_pair {
+                fx.service.bump_epoch(&fx.client_id).unwrap();
+            } else {
+                fx.service.revoke_grants(Some(&fx.client_id)).unwrap();
+            }
+        }).await;
+        assert_ne!(status, StatusCode::OK, "re_pair={re_pair}: {body}");
+        assert_eq!(fx.wallet.money(), money, "re_pair={re_pair}: the hangup was paid on a stale binding");
+        assert_eq!(fx.wallet.left(), left, "re_pair={re_pair}");
+    }
+}
+
+#[tokio::test]
+async fn after_expiry_two_simultaneous_hangups_pay_the_closing_reserve_once() {
+    let (fx, _) = live_call(true).await;
+    let reserved = hold(&fx).reserved_msat;
+    let token = expire(&fx).await;
+    let (money, left) = (fx.wallet.money(), fx.wallet.left());
+    // The first hangup to reach the wallet waits there while the other one
+    // goes as far as it can; neither is a retry of the other.
+    fx.wallet.pause_dispatch.store(true, Ordering::SeqCst);
+    let done = AtomicUsize::new(0);
+    let finish = |result: (StatusCode, Value)| {
+        done.fetch_add(1, Ordering::SeqCst);
+        result
+    };
+    let (one, two, ()) = tokio::join!(
+        async { finish(hangup_with(&fx, &token, CALL, Some("hangup")).await) },
+        async { finish(hangup_with(&fx, &token, CALL, None).await) },
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), fx.wallet.entered.notified())
+                .await.expect("a hangup reached the wallet");
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            fx.wallet.pause_dispatch.store(false, Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while done.load(Ordering::SeqCst) < 2 {
+                assert!(std::time::Instant::now() < deadline, "the hangups did not finish");
+                fx.wallet.resume.notify_waiters();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        },
+    );
+    let paid = [&one, &two].iter().filter(|(status, _)| *status == StatusCode::OK).count();
+    assert_eq!(paid, 1, "exactly one hangup is paid: {one:?} {two:?}");
+    assert_eq!(fx.wallet.money(), money + 1, "one payment reached the wallet: {one:?} {two:?}");
+    assert_eq!(fx.wallet.left(), left + 1_000, "at most one hangup price left the wallet");
+    let hangups = fx.state.storage.get_node_messages_of_kind(&fx.state.identity.node_id().to_hex(), 403, 10, None).await.unwrap();
+    assert_eq!(hangups.len(), 1);
+    match fx.service.call_spend_status(&fx.peer.to_hex(), CALL) {
+        Some(view) => {
+            assert!(view.closed, "{view:?}");
+            assert_eq!(view.spent_msat, BLOCK + 1_000, "block 0 and one hangup");
+            assert_eq!(view.spent_msat + view.released_msat, reserved);
+        }
+        None => assert!(fx.service.reload_from_disk().unwrap().grants.is_empty()),
+    }
+    let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(entry.phase, konsensus_core::payloads::call::Phase::Ended);
+}
+
+#[tokio::test]
+async fn after_expiry_a_hangup_quote_that_rises_above_the_closing_reserve_is_never_paid_above_it() {
+    // Admission pinned a 1 sat closing reserve. The callee's hangup quote
+    // then rises 1 msat above it: refused, unpaid, the call still live.
+    let (fx, _) = live_call(true).await;
+    let token = expire(&fx).await;
+    assert_eq!(hold(&fx).reserved_msat - u64::from(MINUTES) * BLOCK, 1_000, "a 1 sat closing reserve");
+    let (money, left) = (fx.wallet.money(), fx.wallet.left());
+    fx.state.peer_prices.update_kind_price(fx.peer, 403, 1_001, 850_000).await;
+    let (status, body) = send_priced_with_closing(&fx, &token, 1_000, BLOCK, 1_001, json!({
+        "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(), "kind": 403,
+        "plaintext": json!({"v": 1, "call_id": CALL, "reason": "hangup"}).to_string(),
+        "max_routing_fee_msat": 0, "wait_ack_ms": 0,
+    })).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.money(), money, "a quote above the reserve is not paid: {body}");
+    assert_eq!(fx.wallet.left(), left);
+    assert_eq!(hold(&fx).spent_msat, BLOCK);
+    let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(entry.phase, konsensus_core::payloads::call::Phase::Live);
+    assert!(entry.pending.is_none(), "the refused hangup holds no reservation");
+
+    // The background quote rises from 1 to 2 sat while the request runs:
+    // whichever quote it reads, at most the 1 sat reserve leaves the wallet.
+    let (fx, _) = live_call(true).await;
+    let reserved = hold(&fx).reserved_msat;
+    let token = expire(&fx).await;
+    let left = fx.wallet.left();
+    fx.state.peer_prices.update_kind_price(fx.peer, 403, 1_000, 850_000).await;
+    let (status, body) = send_priced_with_closing(&fx, &token, 1_000, BLOCK, 2_000, json!({
+        "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(), "kind": 403,
+        "plaintext": json!({"v": 1, "call_id": CALL, "reason": "hangup"}).to_string(),
+        "max_routing_fee_msat": 0, "wait_ack_ms": 0,
+    })).await;
+    let out = fx.wallet.left() - left;
+    assert!(out == 0 || (out == 1_000 && status == StatusCode::OK), "{out} msat left: {status} {body}");
+    let spent = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).map_or(BLOCK + out, |view| view.spent_msat);
+    assert!(spent <= reserved && spent - BLOCK <= 1_000, "{spent}");
+}

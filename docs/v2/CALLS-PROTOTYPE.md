@@ -216,7 +216,10 @@ up that call once: a hangup (kind 403) with no reason or reason `hangup` is
 paid from the closing reserve the hold set aside at admission, within that
 reserve and the per-payment limit a closing signal is held to, exactly as the
 node's own closing notice would be. Nothing new is reserved, and a price above
-the reserve is refused unpaid. Once the hangup is paid the call ends, its
+the reserve is refused unpaid. The hangup pays the callee's latest hangup
+quote as read when the request starts; that quote is not pinned, the reserve
+is what bounds it. A revocation or re-pairing after the hangup was admitted
+still stops its payment, and two hangups sent at once pay one. Once the hangup is paid the call ends, its
 minutes stop and the rest of the hold is released; a second hangup is refused
 unpaid. Any other request
 without `spend` on that route (another call, a new call, an offer, another

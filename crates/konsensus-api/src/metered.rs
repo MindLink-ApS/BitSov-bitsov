@@ -42,6 +42,15 @@ enum Meter {
     Grant { client_id: String, epoch: u64 },
     /// Maintenance can charge only the grant that funded this call. This
     /// identity remains metered even after that grant has been removed.
+    ///
+    /// It carries no client id or epoch: the grant is pinned to one pairing
+    /// epoch, and both the draw on its closing reserve
+    /// (`PairingService::reserve_call_closing_spend`) and every dispatch poll
+    /// (`PairingService::with_call_payment_authority`) take the pairing from
+    /// that grant under the ledger lock and require it still current: same
+    /// epoch and identity, grant not revoked. A revocation, epoch bump,
+    /// pairing removal or identity change after admission therefore pays
+    /// nothing.
     CallClosing { grant_op_id: Option<String>, peer: String, call_id: String },
     /// Live-call continuity only (see [`ComposeSpend`]): a paired client
     /// without `spend` paying the next minute block of the one call it owns,
@@ -409,6 +418,17 @@ impl ComposeSpend {
             if req.kind == KIND_CALL_HANGUP {
                 // The grant that holds this call now; its closing reserve
                 // pays the hangup, bounded as the node's own closing notice.
+                //
+                // Its price is not pinned here. The hangup pays the callee's
+                // hangup quote as read once when this request starts (the
+                // background quote loop's latest), and the payment is for
+                // exactly that amount. The draw refuses it, routing ceiling
+                // included, above the closing reserve pinned at admission
+                // or above the grant's per-payment limit for a call signal
+                // (`draw_call_spend_for_grant`). A quote that rose past the
+                // reserve is refused unpaid; the reserve, not the quote,
+                // bounds what this hangup can cost. One signal per call is
+                // in flight at a time, and the closing sequence draws once.
                 let grant_op_id = service.call_spend_grant(&peer, &signal.call_id)?;
                 return Some(Meter::CallClosing { grant_op_id: Some(grant_op_id), peer, call_id: signal.call_id });
             }
