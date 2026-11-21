@@ -613,22 +613,70 @@ async fn expired_hangup_http_identity_or_pairing_removal_stops_dispatch() {
         // never settled, the call still live with that hangup pending.
         assert_eq!(body["state"], "payment_unknown", "{end}: {body}");
         assert_eq!(body["retry_allowed"], false, "{end}: {body}");
-        let key = format!("{}:{CALL}", fx.peer.to_hex());
+        // Held before reconciliation and after each full pass, the last included.
+        assert_unknown_hangup_held(&fx, &body, &format!("{end} before reconciliation")).await;
         for round in 0..2 {
-            let op = operation(&fx, &body).await;
-            assert_eq!(op.state, "payment_unknown", "{end} round {round}");
-            assert!(op.accounting_pending, "{end} round {round}");
-            assert_eq!((op.settled_msat, op.payment_hash.as_deref()), (0, None), "{end} round {round}");
-            let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
-            assert_eq!(entry.phase, konsensus_core::payloads::call::Phase::Live, "{end} round {round}");
-            assert_eq!(entry.pending.as_ref().map(|p| (p.operation_id.as_str(), p.kind)),
-                Some((body["operation_id"].as_str().unwrap(), 403)), "{end} round {round}");
-            assert!(fx.service.reload_from_disk().unwrap().call_spend_grants.contains_key(&key),
-                "{end} round {round}: the call's funding record is kept");
             konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
             konsensus_api::calls::reconcile_call_spend(&fx.state, chrono::Utc::now().timestamp_millis() as u64).await.unwrap();
+            assert_unknown_hangup_held(&fx, &body, &format!("{end} after pass {}", round + 1)).await;
+            assert_eq!((fx.wallet.money(), fx.wallet.left()), (money, left), "{end} pass {}: reconciliation paid nothing", round + 1);
         }
-        assert_eq!((fx.wallet.money(), fx.wallet.left()), (money, left), "{end}: reconciliation paid nothing");
+    }
+}
+
+/// The hangup whose payment outcome is unknown is still held, durably: never
+/// released or settled, the call live with it pending, its funding kept.
+async fn assert_unknown_hangup_held(fx: &Fx, body: &Value, at: &str) {
+    let op = operation(fx, body).await;
+    assert_eq!(op.operation_id.as_str(), body["operation_id"].as_str().unwrap(), "{at}");
+    assert_eq!(op.state, "payment_unknown", "{at}");
+    assert!(op.accounting_pending, "{at}");
+    assert_eq!((op.settled_msat, op.payment_hash.as_deref()), (0, None), "{at}");
+    let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(entry.phase, konsensus_core::payloads::call::Phase::Live, "{at}");
+    assert_eq!(entry.pending.as_ref().map(|p| (p.operation_id.as_str(), p.kind)),
+        Some((body["operation_id"].as_str().unwrap(), 403)), "{at}");
+    let key = format!("{}:{CALL}", fx.peer.to_hex());
+    assert!(fx.service.reload_from_disk().unwrap().call_spend_grants.contains_key(&key),
+        "{at}: the call's funding record is kept");
+}
+
+#[tokio::test]
+async fn expired_hangup_extreme_routing_or_price_never_wraps_past_the_reserve() {
+    const CLOSING: u64 = 3_000;
+    const FEE: u64 = 100;
+    // A caller allowing u64::MAX of routing: the ordinary fee policy clamps it,
+    // and the clamped fee on top of the price is still checked against the
+    // reserve. A quote that would reach the reserve only with a smaller fee is
+    // refused, unpaid. Then a callee quote of u64::MAX: price plus fee does not
+    // fit in u64, so it must be refused, never wrapped to a small total.
+    for (case, price, fee) in [("caller fee u64::MAX", CLOSING - FEE, u64::MAX), ("quote u64::MAX", u64::MAX, FEE)] {
+        let overflow = price == u64::MAX;
+        let (fx, _) = live_call_closing(true, CLOSING).await;
+        let token = expire(&fx).await;
+        let (money, left) = (fx.wallet.money(), fx.wallet.left());
+        fx.wallet.fee.store(FEE, Ordering::SeqCst);
+        let dispatched = fx.wallet.fee_limits.lock().unwrap().len();
+        let before = liability(&fx);
+        let (status, body) = hangup_with_fee(&fx, &token, price, fee).await;
+        assert_ne!(status, StatusCode::OK, "{case}: {body}");
+        if overflow {
+            // Refused by the all-in sum itself, before any reservation.
+            assert_eq!(body["code"], "price_cap_exceeded", "{case}: {body}");
+            assert!(body["error"].as_str().unwrap_or("").contains("overflow"), "{case}: {body}");
+        } else {
+            // The policy clamped the fee; price plus that fee is over the reserve.
+            assert_eq!((body["code"].as_str(), body["reason"].as_str()), (Some("budget_exceeded"), Some("per_call")), "{case}: {body}");
+            assert_eq!(body["max_routing_fee_msat"], 5_000, "{case}: the clamped routing ceiling: {body}");
+        }
+        assert_eq!(fx.wallet.money(), money, "{case}: nothing was paid: {body}");
+        assert_eq!(fx.wallet.left(), left, "{case}");
+        assert_eq!(fx.wallet.fee_limits.lock().unwrap().len(), dispatched, "{case}: the wallet was never asked");
+        assert_eq!(hold(&fx).spent_msat, BLOCK, "{case}");
+        assert_eq!(liability(&fx), before, "{case}: the refused hangup reserved nothing");
+        let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+        assert_eq!(entry.phase, konsensus_core::payloads::call::Phase::Live, "{case}");
+        assert!(entry.pending.is_none(), "{case}: the refused hangup holds no reservation");
     }
 }
 
