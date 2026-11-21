@@ -11,6 +11,12 @@ const BLOCK: u64 = 7_000;
 /// A paired app under a live grant on a node with continuity `on`, in a live
 /// call it placed (3 one-minute blocks pinned) with block 0 paid.
 async fn live_call(on: bool) -> (Fx, String) {
+    live_call_closing(on, 0).await
+}
+
+/// [`live_call`] whose callee quoted `closing` msat for a hangup at admission,
+/// so the hold pins that much (at least 1 sat) as its closing reserve.
+async fn live_call_closing(on: bool, closing: u64) -> (Fx, String) {
     let mut fx = fixture().await;
     let fingerprint = fx.service.bound_fingerprint();
     fx.service = Arc::new(
@@ -25,7 +31,12 @@ async fn live_call(on: bool) -> (Fx, String) {
     let mut terms = GrantTerms::new(5_000_000);
     terms.breakers.max_msat_per_10_minutes = 5_000_000;
     let token = fx.grant(None, terms).await;
-    let (status, body) = send(&fx, &token, 400, BLOCK, 0).await;
+    fx.state.peer_prices.update_kind_price(fx.peer, 403, closing, 850_000).await;
+    let (status, body) = send_priced_with_closing(&fx, &token, 1_000, BLOCK, closing, json!({
+        "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(), "kind": 400,
+        "plaintext": json!({"v": 1, "call_id": CALL, "sdp": "offer", "media": "audio"}).to_string(),
+        "max_routing_fee_msat": 0, "wait_ack_ms": 0,
+    })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     answer(&fx).await;
     due(&fx).await;
@@ -409,7 +420,14 @@ async fn after_expiry_two_simultaneous_hangups_pay_the_closing_reserve_once() {
         async {
             tokio::time::timeout(std::time::Duration::from_secs(5), fx.wallet.entered.notified())
                 .await.expect("a hangup reached the wallet");
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // The other hangup must finish (refused) while the first is still
+            // held in the wallet: if it could reach the wallet too, it would
+            // wait there and this times out.
+            let held = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while done.load(Ordering::SeqCst) < 1 {
+                assert!(std::time::Instant::now() < held, "the second hangup was not settled while the first was in the wallet");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             fx.wallet.pause_dispatch.store(false, Ordering::SeqCst);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while done.load(Ordering::SeqCst) < 2 {
@@ -472,7 +490,150 @@ async fn after_expiry_a_hangup_quote_that_rises_above_the_closing_reserve_is_nev
         "max_routing_fee_msat": 0, "wait_ack_ms": 0,
     })).await;
     let out = fx.wallet.left() - left;
-    assert!(out == 0 || (out == 1_000 && status == StatusCode::OK), "{out} msat left: {status} {body}");
+    match out {
+        0 => assert_ne!(status, StatusCode::OK, "nothing left the wallet, so the hangup must not read as paid: {body}"),
+        1_000 => assert_eq!(status, StatusCode::OK, "{body}"),
+        other => panic!("{other} msat left the wallet: {status} {body}"),
+    }
     let spent = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).map_or(BLOCK + out, |view| view.spent_msat);
     assert!(spent <= reserved && spent - BLOCK <= 1_000, "{spent}");
+}
+
+/// The grant's recorded liability: total used, used for `fx.peer`, and the
+/// ids of its outstanding reservations.
+fn liability(fx: &Fx) -> (u64, u64, Vec<String>) {
+    let file = fx.service.reload_from_disk().unwrap();
+    let budget = file.grants.first().and_then(|g| g.budget.as_ref());
+    (
+        budget.map_or(0, |b| b.used_msat),
+        budget.and_then(|b| b.used_by_recipient.get(&fx.peer.to_hex()).copied()).unwrap_or(0),
+        budget.map_or_else(Vec::new, |b| b.pending.keys().cloned().collect()),
+    )
+}
+
+#[tokio::test]
+async fn expired_relation_window_hangup_uses_only_its_closing_reserve_once() {
+    // A relation-funded call keeps paying its minutes past its recipient
+    // window, then hangs up after the window and the grant have both ended.
+    let (fx, _) = relation_call().await;
+    let reserved = hold(&fx).reserved_msat;
+    assert_eq!(reserved - u64::from(MINUTES) * BLOCK, 1_000, "a 1 sat closing reserve");
+    fx.service.end_recipient_windows_for_test(&fx.client_id);
+    let token = expire(&fx).await;
+    due(&fx).await;
+    assert_eq!(send(&fx, &token, 404, BLOCK, 1).await.0, StatusCode::OK, "a minute past the window");
+    let grants = fx.service.reload_from_disk().unwrap().grants.len();
+    let (used, by_peer, pending) = liability(&fx);
+    let (money, left) = (fx.wallet.money(), fx.wallet.left());
+
+    // One msat above the closing reserve: refused, unpaid, nothing new held.
+    let (status, body) = hangup_with_fee(&fx, &token, 1_001, 0).await;
+    assert_ne!(status, StatusCode::OK, "a hangup above the closing reserve: {body}");
+    assert_eq!((fx.wallet.money(), fx.wallet.left()), (money, left), "nothing was paid: {body}");
+    assert_eq!(liability(&fx), (used, by_peer, pending.clone()), "the refused hangup reserved nothing");
+
+    let (status, body) = hangup_with(&fx, &token, CALL, Some("hangup")).await;
+    assert_eq!(status, StatusCode::OK, "own hangup after the relation window: {body}");
+    assert_eq!(fx.wallet.money(), money + 1, "exactly one payment: the hangup");
+    assert_eq!(fx.wallet.left(), left + 1_000, "only the closing reserve left the wallet");
+    // Paid from the hold: no new recipient liability or reservation.
+    let (used_now, by_peer_now, pending_now) = liability(&fx);
+    assert!(used_now <= used, "the grant's usage grew: {used} -> {used_now}");
+    assert!(by_peer_now <= by_peer, "new recipient liability: {by_peer} -> {by_peer_now}");
+    assert!(pending_now.iter().all(|id| pending.contains(id)), "a new reservation: {pending:?} -> {pending_now:?}");
+    assert!(fx.service.reload_from_disk().unwrap().grants.len() <= grants, "no new grant");
+    match fx.service.call_spend_status(&fx.peer.to_hex(), CALL) {
+        Some(view) => {
+            assert!(view.closed, "{view:?}");
+            assert_eq!(view.spent_msat, 2 * BLOCK + 1_000, "two minutes and the hangup, all from the hold");
+            assert_eq!(view.spent_msat + view.released_msat, reserved, "the rest released once");
+        }
+        None => assert!(fx.service.reload_from_disk().unwrap().grants.is_empty()),
+    }
+
+    // A second hangup, a minute and a new call pay nothing.
+    due(&fx).await;
+    let (money, left) = (fx.wallet.money(), fx.wallet.left());
+    assert_ne!(hangup_with(&fx, &token, CALL, Some("hangup")).await.0, StatusCode::OK);
+    assert_ne!(hangup_with(&fx, &token, CALL, None).await.0, StatusCode::OK);
+    assert_ne!(send(&fx, &token, 404, BLOCK, 2).await.0, StatusCode::OK);
+    assert_ne!(send_id(&fx, &token, 400, BLOCK, 0, "99999999888877776666555544443333").await.0, StatusCode::OK);
+    for _ in 0..2 {
+        konsensus_api::calls::reconcile_call_spend(&fx.state, chrono::Utc::now().timestamp_millis() as u64).await.unwrap();
+    }
+    assert_eq!(fx.wallet.money(), money);
+    assert_eq!(fx.wallet.left(), left);
+    let hangups = fx.state.storage.get_node_messages_of_kind(&fx.state.identity.node_id().to_hex(), 403, 10, None).await.unwrap();
+    assert_eq!(hangups.len(), 1);
+}
+
+#[tokio::test]
+async fn expired_hangup_http_identity_or_pairing_removal_stops_dispatch() {
+    for end in ["pairing", "identity"] {
+        let (fx, _) = live_call(true).await;
+        let token = expire(&fx).await;
+        let (money, left) = (fx.wallet.money(), fx.wallet.left());
+        // Admitted and reserved on the app's binding; the pairing is removed
+        // or the node's identity replaced while its payment is in the wallet.
+        let (status, body) = hangup_across(&fx, &token, || match end {
+            "pairing" => fx.service.revoke(&fx.client_id).unwrap(),
+            _ => fx.service.rebind_to_identity("another-identity").unwrap(),
+        }).await;
+        assert_ne!(status, StatusCode::OK, "{end}: {body}");
+        assert_eq!(fx.wallet.money(), money, "{end}: the hangup was paid on a stale binding");
+        assert_eq!(fx.wallet.left(), left, "{end}");
+    }
+}
+
+/// A hangup priced `price` whose caller allows `fee` msat of routing.
+async fn hangup_with_fee(fx: &Fx, token: &str, price: u64, fee: u64) -> (StatusCode, Value) {
+    fx.state.peer_prices.update_kind_price(fx.peer, 403, price, 850_000).await;
+    send_priced_with_closing(fx, token, 1_000, BLOCK, price, json!({
+        "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(), "kind": 403,
+        "plaintext": json!({"v": 1, "call_id": CALL, "reason": "hangup"}).to_string(),
+        "max_routing_fee_msat": fee, "wait_ack_ms": 0,
+    })).await
+}
+
+#[tokio::test]
+async fn expired_hangup_price_plus_routing_fee_is_bounded_over_http() {
+    const FEE: u64 = 100;
+    const CLOSING: u64 = 3_000;
+    // Price plus routing fee exactly at a 3 sat closing reserve: paid.
+    let (fx, _) = live_call_closing(true, CLOSING).await;
+    let reserved = hold(&fx).reserved_msat;
+    let closing = reserved - u64::from(MINUTES) * BLOCK;
+    assert_eq!(closing, CLOSING, "the hangup quote at admission is the closing reserve");
+    let token = expire(&fx).await;
+    let (money, left) = (fx.wallet.money(), fx.wallet.left());
+    fx.wallet.fee.store(FEE, Ordering::SeqCst);
+    let (status, body) = hangup_with_fee(&fx, &token, closing - FEE, FEE).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.money(), money + 1);
+    assert_eq!(fx.wallet.left(), left + closing - FEE, "the hangup price left the wallet");
+    let limit = *fx.wallet.fee_limits.lock().unwrap().last().unwrap();
+    assert!(limit <= FEE && closing - FEE + limit <= closing, "routing limit {limit}");
+    match fx.service.call_spend_status(&fx.peer.to_hex(), CALL) {
+        Some(view) => {
+            assert!(view.closed, "{view:?}");
+            assert!(view.spent_msat <= BLOCK + closing, "{view:?}");
+            assert_eq!(view.spent_msat + view.released_msat, reserved, "{view:?}");
+        }
+        None => assert!(fx.service.reload_from_disk().unwrap().grants.is_empty()),
+    }
+
+    // One msat above the reserve: refused, unpaid, nothing reserved, the call live.
+    let (fx, _) = live_call_closing(true, CLOSING).await;
+    let token = expire(&fx).await;
+    let (money, left) = (fx.wallet.money(), fx.wallet.left());
+    let (_, _, pending) = liability(&fx);
+    let (status, body) = hangup_with_fee(&fx, &token, closing - FEE + 1, FEE).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.money(), money, "nothing was paid: {body}");
+    assert_eq!(fx.wallet.left(), left);
+    assert_eq!(hold(&fx).spent_msat, BLOCK);
+    assert_eq!(liability(&fx).2, pending, "the refused hangup reserved nothing");
+    let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(entry.phase, konsensus_core::payloads::call::Phase::Live);
+    assert!(entry.pending.is_none(), "the refused hangup holds no reservation");
 }
