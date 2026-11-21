@@ -71,6 +71,8 @@ pub struct MemStorage {
     /// Runs once, before the next read of an outbox operation.
     pub outbox_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub call_get_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Parks the next read of this call, after reading it, until the gate is released.
+    pub call_get_gate: Mutex<Option<(String, Arc<PeerWriteGate>)>>,
     /// Runs once, right after the next listing of pending call reservations.
     pub call_pending_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once, on the next page of rows holding free-reply receipts before it is returned.
@@ -133,6 +135,7 @@ impl MemStorage {
             lose_call_put_ack_for: Mutex::new(None),
             outbox_read_hook: Mutex::new(None),
             call_get_hook: Mutex::new(None),
+            call_get_gate: Mutex::new(None),
             call_pending_hook: Mutex::new(None),
             receipt_page_hook: Mutex::new(None),
             outbox_write_hook: Mutex::new(None),
@@ -189,12 +192,21 @@ impl Storage for MemStorage {
                 "injected call read failure".into(),
             ));
         }
-        Ok(self
+        let read = self
             .calls
             .lock()
             .unwrap()
             .get(&(*peer, call_id.to_owned()))
-            .cloned())
+            .cloned();
+        let gate = {
+            let mut gate = self.call_get_gate.lock().unwrap();
+            if gate.as_ref().is_some_and(|(id, _)| id == call_id) { gate.take() } else { None }
+        };
+        if let Some((_, gate)) = gate {
+            // Parked after the read: the caller gets the row as it was then.
+            gate.run().await?;
+        }
+        Ok(read)
     }
 
     async fn call_put(
