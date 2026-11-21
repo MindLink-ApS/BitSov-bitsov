@@ -21,6 +21,14 @@ pub const CALL_DIRECT_CHANNEL_LOST: &str = "call_direct_channel_lost";
 /// payment. Terminal for the call: its hold is closed and nothing more is paid.
 pub const CALL_ABOVE_PAYMENT_LIMIT: &str = "call_above_payment_limit";
 
+/// A call-bound hangup whose recipient answered that the call is no longer
+/// live there. Terminal: nothing was paid, and the call is ended here too.
+pub const CALL_ENDED: &str = "call_ended";
+
+/// A call-bound hangup whose recipient did not answer its invoice request.
+/// Terminal: nothing was paid, and the call is ended here.
+pub const CALL_HANGUP_UNANSWERED: &str = "call_hangup_unanswered";
+
 pub fn payable(price: u64) -> u64 { if price == 0 { 0 } else { price.max(1000) } }
 
 pub fn check(amount: u64, cap: Option<u64>) -> Result<(), ApiError> {

@@ -1969,6 +1969,7 @@ async fn start_node_services<'a>(
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
         max_call_minutes: config.calls.max_call_minutes,
         call_reply_free: config.calls.call_reply_free_v1,
+        call_hangup_invoice: config.calls.call_hangup_invoice_v1,
         stun_port: stun_socket
             .as_ref()
             .and_then(|s| s.local_addr().ok())
@@ -2255,6 +2256,7 @@ async fn start_node_services<'a>(
         content_server: content_server.clone(),
         front_door: api_state.front_door.clone(),
         min_admission_cost_msat: node.gate().min_admission_cost_msat(),
+        call_hangup_invoice: config.calls.call_hangup_invoice_v1,
         privacy: config.privacy.clone(),
         peer_exchange_floor: config.payment_gate.min_admission_cost_msat.unwrap_or(0),
         transport: Arc::clone(node.transport()),

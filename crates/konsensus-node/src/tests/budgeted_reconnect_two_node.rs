@@ -190,6 +190,7 @@ async fn start_sender(
     let pairing = grant.map(|terms| paired_client(&dir.join("pairing"), identity, terms));
     let invoice_requests: InvoiceRequests = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let state = Arc::new(konsensus_api::AppState {
+        call_hangup_invoice: false,
         starter: Default::default(),
         identity: Arc::clone(identity),
         storage: storage().await,

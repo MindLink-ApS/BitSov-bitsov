@@ -368,6 +368,7 @@ async fn start_node(identity: Arc<NodeIdentity>, peer: NodeId, ledger: &Path, na
     }));
 
     let state = Arc::new(konsensus_api::AppState {
+        call_hangup_invoice: false,
         starter: Default::default(),
         identity: Arc::clone(&identity),
         storage: Arc::clone(&storage),
@@ -452,6 +453,7 @@ async fn start_node(identity: Arc<NodeIdentity>, peer: NodeId, ledger: &Path, na
     std::mem::forget((pending_rx, auto_rx));
     tokio::spawn(
         run_session_handler(SessionHandlerDeps {
+            call_hangup_invoice: false,
             content_server: Some(content_server),
             front_door,
             min_admission_cost_msat: 0,

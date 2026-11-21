@@ -311,6 +311,7 @@ async fn status_stun_absent_matches_golden() {
         stun_port: None,
         max_call_minutes: 60,
         call_reply_free: false,
+        call_hangup_invoice: false,
         introduction: IntroductionSettings::fixed(Some("regtest"), None),
         ..(*common::test_state()).clone()
     });

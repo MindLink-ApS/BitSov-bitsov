@@ -172,6 +172,10 @@ const MAX_REFERENCES: usize = 100;
 /// Timeout for invoice request/response cycle.
 const INVOICE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a call-bound hangup waits for its recipient's invoice. Past it
+/// the call ends here unpaid: a hangup must not wait half a minute.
+const HANGUP_INVOICE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Maximum number of pending invoice requests before rejecting new ones.
 ///
 /// Prevents unbounded HashMap growth if many compose requests are in-flight
@@ -563,7 +567,9 @@ pub(crate) async fn create_metered_payment_proof(
         }
         None => None,
     };
-    if !debit.is_call_block() && !readmission.forbidden {
+    // A call-bound hangup is paid only through the invoice its recipient
+    // issues after checking the call is still live there: never by keysend.
+    if !debit.is_call_block() && !debit.is_call_hangup() && !readmission.forbidden {
         if let Some(ln_pubkey) = peer_ln_pubkey {
             match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit, tip).await {
                 Ok(KeysendOutcome::Settled(proof)) => return Ok(proof),
@@ -670,6 +676,9 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
         Some(invoice_refusal::PRICE_CHANGED) => ApiError::NotDispatched(
             "recipient lowered its prices since they were quoted; refresh its prices and retry; nothing was paid".into()
         ).with_reason("price_changed"),
+        Some(invoice_refusal::CALL_HANGUP_ENDED) => ApiError::NotDispatched(
+            "the call already ended on the other side; the hangup was not sent and nothing was paid".into()
+        ).with_reason(super::caps::CALL_ENDED),
         Some(invoice_refusal::CALL_BLOCK_UNPAYABLE) => ApiError::NotDispatched(
             "callee refused the call block invoice: deadline margin, call sequence or no E2EE session; nothing was paid".into()
         ).with_reason("call_block_unpayable"),
@@ -1245,29 +1254,43 @@ async fn create_payment_proof_via_invoice(
     // Only the prepayment exchange is cancellable by the promotion deadline.
     // Once an invoice is accepted below, dispatch and settlement keep their
     // existing financial outcome handling even if this deadline then elapses.
+    // A call-bound hangup that gets no invoice is never paid: no answer,
+    // however it fails, ends the call here instead (see `compose_call`).
+    let hangup = debit.is_call_hangup();
+    let unanswered = |error: ApiError| if hangup {
+        ApiError::NotDispatched(
+            "the other side did not answer the hangup; the call ended here and nothing was paid".into()
+        ).with_reason(super::caps::CALL_HANGUP_UNANSWERED)
+    } else { error };
     let response = async {
         debit.request_invoice(state.transport.send_raw_frame(peer_id, &frame_bytes))
             .await?
-            .map_err(|e| ApiError::Internal(format!(
+            .map_err(|e| unanswered(ApiError::Internal(format!(
                 "failed to send invoice request to peer: {e}"
-            )))?;
+            ))))?;
 
         tracing::info!(
             peer = %peer_id, %request_id, invoice_amount_msat, method = "invoice",
             "sent invoice request to recipient — awaiting response"
         );
 
-        tokio::time::timeout(INVOICE_REQUEST_TIMEOUT, rx)
+        tokio::time::timeout(if hangup { HANGUP_INVOICE_TIMEOUT } else { INVOICE_REQUEST_TIMEOUT }, rx)
             .await
-            .map_err(|_| ApiError::Internal(
+            .map_err(|_| unanswered(ApiError::Internal(
                 "Invoice request timed out — recipient did not respond within 30s".into()
-            ))?
-            .map_err(|_| ApiError::Lightning(
+            )))?
+            .map_err(|_| unanswered(ApiError::Lightning(
                 "Recipient could not create invoice — their Lightning wallet may be unavailable".into()
-            ))?
+            )))?
             .map_err(|error| {
                 if error.recipient != *peer_id {
                     return ApiError::Lightning("invoice refusal came from another recipient".into());
+                }
+                // "Call ended" is honoured only as the answer to a call-bound
+                // hangup's own request. To anything else it is an ordinary
+                // refusal: retryable, and it never ends a call here.
+                if !hangup && error.reason == invoice_refusal::CALL_HANGUP_ENDED {
+                    return ApiError::Lightning(format!("Recipient refused the invoice request: {}", error.reason));
                 }
                 invoice_refused(peer_id, Some(error.reason))
             })
@@ -3906,6 +3929,12 @@ pub(super) async fn compose_peer(
         // payment. It is bound to that call and to the open session below.
         let free_reply = state.session_manager.has_session(&peer_id).await
             && crate::calls::free_reply_allowed(&state, &peer_id, req.kind, &req.plaintext, &references).await?;
+        // A hangup of a live call, to a peer that issues call-bound hangup
+        // invoices (`[calls] call_hangup_invoice_v1` on both nodes): paid only
+        // through the invoice the peer issues while the call is live there.
+        let hangup_invoice = if free_reply { None } else {
+            crate::calls::hangup_invoice_purpose(&state, &peer_id, req.kind, &req.plaintext).await?
+        };
         let references = if free_reply {
             let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -4144,6 +4173,10 @@ pub(super) async fn compose_peer(
             .with_fee_limit(req.max_routing_fee_msat)
             .with_direct_channel(direct);
         let debit = debit.with_operation(operation.clone()).for_call_payment(req.kind);
+        let debit = match hangup_invoice {
+            Some(purpose) => debit.for_call_hangup(purpose),
+            None => debit,
+        };
         let debit = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
             debit.for_call_block(peer_id, req.plaintext.clone())
         } else if req.kind == konsensus_core::kind::KIND_CALL_INVITE && auth.is_metered() {

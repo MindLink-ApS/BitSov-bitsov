@@ -289,6 +289,11 @@ pub struct AppState {
     /// it, and accepts those replies at no charge to its own ringing offers.
     pub call_reply_free: bool,
 
+    /// `[calls] call_hangup_invoice_v1`, off by default. When on, this node
+    /// pays a hangup of a live call only through an invoice the peer issues
+    /// for that call (to a peer that advertises it), and issues such invoices.
+    pub call_hangup_invoice: bool,
+
     /// Validated `[network] stun_server` as `host:port` (no `stun:` prefix),
     /// used for `/status` `stun_url` when the node's own responder has no
     /// dialable public host. `None` when unset or invalid at config load.

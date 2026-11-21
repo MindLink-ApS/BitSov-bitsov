@@ -54,6 +54,8 @@ pub(crate) struct SessionHandlerDeps {
     pub identity: Arc<NodeIdentity>,
     pub audit_log: Arc<AuditLog>,
     pub min_admission_cost_msat: u64,
+    /// `[calls] call_hangup_invoice_v1`: issue call-bound hangup invoices.
+    pub call_hangup_invoice: bool,
     pub pricing: Arc<dyn konsensus_core::traits::pricing::PricingEngine>,
     pub chain: Arc<dyn ChainProvider>,
     pub peer_prices: Arc<PeerPriceCache>,
@@ -267,6 +269,7 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
         audit_log,
         pricing,
         min_admission_cost_msat,
+        call_hangup_invoice,
         chain,
         peer_prices,
         peer_registry,
@@ -542,6 +545,27 @@ pub(crate) async fn run(deps: SessionHandlerDeps) {
                     }
 
                     ControlEvent::InvoiceRequested { source_ip, peer_id, request_id, amount_msat, purpose, privileged } => {
+                        if purpose.starts_with(konsensus_core::payloads::call::CALL_HANGUP_INVOICE_PREFIX) {
+                            handle_call_hangup_invoice_requested(
+                                &peer_id,
+                                &request_id,
+                                amount_msat,
+                                &purpose,
+                                privileged,
+                                call_hangup_invoice,
+                                storage.as_ref(),
+                                pricing.as_ref(),
+                                &session_manager,
+                                lightning.as_ref(),
+                                min_admission_cost_msat,
+                                &transport,
+                                source_ip,
+                                &mut last_admission_refusal,
+                                &mut peer_invoices,
+                            )
+                            .await;
+                            continue;
+                        }
                         if purpose.starts_with(konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX) {
                             handle_call_block_invoice_requested(
                                 &peer_id,
@@ -2185,6 +2209,11 @@ async fn handle_invoice_requested(
         send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE).await;
         return;
     }
+    // Nor a generic invoice for a call-bound hangup: it must be bound.
+    if purpose.starts_with(konsensus_core::payloads::call::CALL_HANGUP_INVOICE_PREFIX) {
+        send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::INVOICE_UNAVAILABLE).await;
+        return;
+    }
     if !service_session_ready(session_manager, peer_id).await {
         if refusals.permit(source_ip, tokio::time::Instant::now()) {
             send_invoice_refusal(transport, peer_id, request_id, konsensus_api::invoice_refusal::SESSION_HANDOVER).await;
@@ -3256,6 +3285,156 @@ async fn prepare_call_block_invoice(
         .await
         .map_err(|_| REFUSED)?;
     // Storage can take time too. Never publish after the stop-early margin.
+    validate().await?;
+    Ok(invoice)
+}
+
+/// A call-bound hangup invoice: issued only while the call is live here for
+/// this pair, so a hangup for a call this node already ended is never paid.
+/// With the switch off nothing is issued (this node does not advertise it).
+#[allow(clippy::too_many_arguments)]
+async fn handle_call_hangup_invoice_requested(
+    peer_id: &NodeId,
+    request_id: &str,
+    amount_msat: u64,
+    purpose: &str,
+    privileged: bool,
+    enabled: bool,
+    storage: &dyn konsensus_storage::Storage,
+    pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
+    session_manager: &SessionManager,
+    lightning: &dyn LightningProvider,
+    min_admission_cost_msat: u64,
+    transport: &Arc<NoiseTransport>,
+    source_ip: std::net::IpAddr,
+    refusals: &mut crate::invoice_refusals::RefusalLimits,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+) {
+    let result = if !enabled {
+        Err(konsensus_api::invoice_refusal::INVOICE_UNAVAILABLE)
+    } else if !privileged {
+        Err(konsensus_api::invoice_refusal::ADMISSION_REQUIRED)
+    } else {
+        prepare_call_hangup_invoice(
+            storage, pricing, session_manager, peer_id, purpose, amount_msat, request_id,
+            lightning, min_admission_cost_msat, invoices,
+        )
+        .await
+    };
+    match result {
+        Ok(invoice) => {
+            let response = Frame::InvoiceResponse {
+                request_id: request_id.to_string(),
+                bolt11: invoice.bolt11,
+                payment_hash: invoice.payment_hash,
+            };
+            let _ = transport.send_frame(peer_id, &response).await;
+        }
+        Err(reason) => {
+            if refusals.permit(source_ip, tokio::time::Instant::now()) {
+                send_invoice_refusal(transport, peer_id, request_id, reason).await;
+            }
+        }
+    }
+}
+
+/// Check the call before the wallet and again before publishing. The price
+/// bounds are those of an ordinary hangup: above zero, at least the admission
+/// floor, at most this node's kind-403 price. A call that is not live here
+/// for this pair is answered `call_hangup_ended`: the sender pays nothing.
+/// The invoice is bound to the peer and call in the call invoice bindings
+/// (slot [`calls::HANGUP_INVOICE_SEQ`]) before it is returned, and carries
+/// the short call-invoice expiry.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_call_hangup_invoice(
+    storage: &dyn konsensus_storage::Storage,
+    pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
+    session_manager: &SessionManager,
+    peer: &NodeId,
+    purpose: &str,
+    amount_msat: u64,
+    request_id: &str,
+    lightning: &dyn LightningProvider,
+    min_admission_cost_msat: u64,
+    invoices: &mut crate::peer_invoices::PeerInvoiceBook,
+) -> Result<konsensus_core::traits::lightning::Invoice, &'static str> {
+    use konsensus_api::invoice_refusal as refusal;
+    if lightning.disk_status().is_some_and(|status| status.disk_low) {
+        return Err("disk_low");
+    }
+    let (call_id, sender) = calls::parse_hangup_invoice_purpose(purpose).ok_or(refusal::INVOICE_UNAVAILABLE)?;
+    let validate = async || {
+        match konsensus_api::calls::validate_call_hangup_invoice(storage, peer, &call_id, sender).await {
+            Ok(retain_until) => Ok(retain_until),
+            Err(calls::CallRefusal::Invalid(_)) => Err(refusal::INVOICE_UNAVAILABLE),
+            Err(_) => Err(refusal::CALL_HANGUP_ENDED),
+        }
+    };
+    validate().await?;
+    // The hangup could not be read without a session: the sender keeps its
+    // money and may ask again once the session is back.
+    if !service_session_ready(session_manager, peer).await {
+        return Err(refusal::SESSION_HANDOVER);
+    }
+    let floor = konsensus_core::gate::price_with_floor_msat(0, min_admission_cost_msat);
+    if amount_msat == 0 || amount_msat < floor {
+        return Err(refusal::BELOW_ADMISSION_FLOOR);
+    }
+    let price = pricing
+        .get_price_msat(konsensus_core::kind::KIND_CALL_HANGUP)
+        .await
+        .map_err(|_| "konsensus:price_unavailable")?;
+    if amount_msat > konsensus_core::gate::price_with_floor_msat(price, min_admission_cost_msat) {
+        return Err(refusal::PRICE_CHANGED);
+    }
+    // The binding cap bounds how many invoices one call's hangup may hold, so
+    // retries and repeated requests for that hangup cannot fill the wallet.
+    // It reuses the limit each call block has; at most one hangup is admitted.
+    let outstanding = storage
+        .call_block_invoice_count(peer, &call_id, calls::HANGUP_INVOICE_SEQ)
+        .await
+        .map_err(|_| refusal::INVOICE_UNAVAILABLE)?;
+    if outstanding >= calls::MAX_CALL_BLOCK_INVOICES {
+        return Err(refusal::INVOICE_LIMITED);
+    }
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Err(limit) = invoices.try_issue(peer, std::time::Instant::now(), now_unix) {
+        debug!(peer = %peer, %request_id, ?limit, "refusing call hangup invoice request");
+        return Err(limit.reason());
+    }
+    let invoice = match lightning
+        .create_invoice(amount_msat, &format!("konsensus:{request_id}"), calls::CALL_BLOCK_INVOICE_EXPIRY_SECS)
+        .await
+    {
+        Ok(invoice) => {
+            let expires_at = invoice.created_at.saturating_add(u64::from(invoice.expiry_secs));
+            invoices.commit(*peer, invoice.payment_hash.clone(), expires_at);
+            invoice
+        }
+        Err(error) => {
+            if !matches!(error, LightningError::InvoiceCreation(_)) {
+                invoices.hold_unconfirmed(
+                    *peer,
+                    request_id,
+                    now_unix.saturating_add(u64::from(calls::CALL_BLOCK_INVOICE_EXPIRY_SECS)),
+                );
+            }
+            return Err(invoice_refusal_reason(error));
+        }
+    };
+    let retain_until = validate().await?;
+    let hash: [u8; 32] = hex::decode(&invoice.payment_hash)
+        .map_err(|_| refusal::INVOICE_UNAVAILABLE)?
+        .try_into()
+        .map_err(|_| refusal::INVOICE_UNAVAILABLE)?;
+    storage
+        .record_call_block_invoice(peer, &call_id, calls::HANGUP_INVOICE_SEQ, &hash, retain_until)
+        .await
+        .map_err(|_| refusal::INVOICE_UNAVAILABLE)?;
+    // The call may have ended while the wallet and storage worked.
     validate().await?;
     Ok(invoice)
 }
