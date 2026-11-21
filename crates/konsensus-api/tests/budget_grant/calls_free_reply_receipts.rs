@@ -732,6 +732,69 @@ async fn a_receipt_left_after_its_reply_was_queued_is_released_by_a_sweep() {
     assert_eq!(sent(&transport, 403).len(), 1);
 }
 
+// Receipt retention: a cleanup sweep that read a row holding a releasable
+// receipt never writes that stale read back over a free reply's transition
+// and receipt that landed after it. The sweep is parked between its read and
+// its write while the reply is tapped.
+#[tokio::test]
+async fn a_receipt_cleanup_sweep_never_overwrites_a_racing_free_reply_transition() {
+    let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+    let store = Arc::new(common::MemStorage::new());
+    // The ringing row also holds a receipt whose operation is gone, so the
+    // sweep lists it and rewrites it.
+    let mut entry = row(&fx, &fx.peer, CALL).await.unwrap();
+    entry.free_reply_receipts.push(konsensus_core::payloads::call::FreeReplyReceipt {
+        peer: fx.peer.to_hex(), call_id: CALL.into(), kind: 401, operation_id: "gone".into(),
+        request_hash: "digest".into(), phase: "ringing".into(), applied_ms: konsensus_api::calls::now_ms(),
+    });
+    konsensus_storage::Storage::call_put(store.as_ref(), &fx.peer, CALL, &entry).await.unwrap();
+    fx.state = Arc::new(AppState { storage: store.clone(), ..(*fx.state).clone() });
+    // Once the reply is queued, releasing its receipt fails, so the receipt
+    // stays on the row where it can be checked.
+    let failing = Arc::clone(&store);
+    *store.outbox_write_hook.lock().unwrap() = Some(Box::new(move |op| {
+        let data: Value = serde_json::from_slice(&op.recovery).unwrap_or_default();
+        if data["free_reply"] == true && matches!(op.state.as_str(), "paid" | "sent" | "acked") {
+            *failing.fail_call_put_for.lock().unwrap() = Some(CALL.into());
+        }
+        Ok(())
+    }));
+
+    let gate = Arc::new(common::PeerWriteGate::default());
+    *store.call_get_gate.lock().unwrap() = Some((CALL.into(), Arc::clone(&gate)));
+    let sweep = tokio::spawn({
+        let state = Arc::clone(&fx.state);
+        async move { konsensus_api::handlers::messages::reconcile_operations(&state).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified()).await
+        .expect("the sweep never read the row");
+    let id = uuid::Uuid::new_v4().to_string();
+    let send = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &id));
+    tokio::pin!(send);
+    // The tap runs while the sweep is parked; it completes only if nothing
+    // holds it back until the sweep is done.
+    let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut send).await;
+    let clear = || {
+        *store.outbox_write_hook.lock().unwrap() = None;
+        *store.fail_call_put_for.lock().unwrap() = None;
+    };
+    if early.is_ok() {
+        // Done first: the parked sweep's write must not be refused either.
+        clear();
+    }
+    gate.release.notify_one();
+    let (status, body) = match early { Ok(done) => done, Err(_) => send.await };
+    sweep.await.unwrap().unwrap();
+    clear();
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(sent(&transport, 401).len(), 1);
+    let after = row(&fx, &fx.peer, CALL).await.unwrap();
+    assert_eq!((after.phase, after.pending), (Phase::Live, None), "the sweep wrote back a stale row over the transition");
+    let ops: Vec<_> = after.free_reply_receipts.iter().map(|r| r.operation_id.as_str()).collect();
+    assert_eq!(ops, vec![id.as_str()], "the reply's receipt was lost or the released one kept");
+}
+
 /// Every distinct reply this node queued or sent for `kind`.
 async fn distinct_sent(transport: &ConnectedStubTransport, kind: u16) -> std::collections::HashSet<konsensus_core::MessageId> {
     sent(transport, kind).iter().map(|e| e.id).collect()
