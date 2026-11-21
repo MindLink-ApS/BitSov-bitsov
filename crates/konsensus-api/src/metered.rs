@@ -346,9 +346,9 @@ impl MeteredSpend {
 /// [`MeteredSpend`] as on every other paid route, or, with live-call
 /// continuity on, a paired caller whose token has no `spend` because its
 /// grant ended by expiry. That caller may pay only the next minute block of
-/// the one call it owns, from that call's existing hold (see
-/// [`ComposeSpend::for_request`]); every other request gets the refusal
-/// [`MeteredSpend`] gave.
+/// the one call it owns, or that call's one hangup, from that call's existing
+/// hold (see [`ComposeSpend::for_request`]); every other request gets the
+/// refusal [`MeteredSpend`] gave.
 pub(crate) enum ComposeSpend {
     Metered(MeteredSpend),
     CallBlockOnly { user: AuthUser, refusal: Response },
@@ -375,30 +375,46 @@ impl FromRequestParts<Arc<AppState>> for ComposeSpend {
 
 impl ComposeSpend {
     /// The authority for this request. A caller without `spend` passes only
-    /// for a 1:1 minute block (kind 404) of a call its pairing owns (the
-    /// binding that placed it, same epoch and identity) while that call's
-    /// hold is still funded (`PairingService::call_hold_live`). The block is
-    /// then drawn on that hold alone, at its pinned price, fee, minute limit
-    /// and amount. Anything else gets the original refusal.
+    /// for a 1:1 minute block (kind 404), or a plain hangup (kind 403 with no
+    /// reason or `hangup`), of a call its pairing owns (the binding that
+    /// placed it, same epoch and identity) while that call's hold is still
+    /// funded (`PairingService::call_hold_live`). A block is then drawn on
+    /// that hold alone, at its pinned price, fee, minute limit and amount. A
+    /// hangup is drawn on the closing reserve the hold set aside for it at
+    /// admission, as the node's own closing notice would be: at most that
+    /// reserve, at most once per call. Anything else gets the original refusal.
     pub(crate) fn for_request(self, state: &AppState, req: &crate::handlers::messages::ComposeRequest)
         -> Result<MeteredSpend, Box<Response>> {
+        use konsensus_core::kind::{KIND_CALL_BLOCK, KIND_CALL_HANGUP};
+        use konsensus_core::payloads::call::{CallSignal, HangupReason};
         let (user, refusal) = match self {
             Self::Metered(auth) => return Ok(auth),
             Self::CallBlockOnly { user, refusal } => (user, refusal),
         };
         let allowed = (|| {
-            if req.kind != konsensus_core::kind::KIND_CALL_BLOCK || req.is_room {
+            if !matches!(req.kind, KIND_CALL_BLOCK | KIND_CALL_HANGUP) || req.is_room {
                 return None;
             }
             let peer = konsensus_core::NodeId::from_hex(&req.recipient).ok()?.to_hex();
-            let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext).ok()?;
+            let signal = CallSignal::parse(req.kind, &req.plaintext).ok()?;
+            if req.kind == KIND_CALL_HANGUP && !matches!(signal.reason, None | Some(HangupReason::Hangup)) {
+                return None;
+            }
             let binding = user.pairing.as_ref()?;
             let service = state.pairing.as_ref()?;
-            (service.call_hold_live(binding, &peer, &signal.call_id)
-                && service.owns_call_media(binding, &peer, &signal.call_id))
-                .then(|| Meter::CallBlock {
-                    client_id: binding.client_id.clone(), epoch: binding.epoch, peer, call_id: signal.call_id,
-                })
+            if !(service.call_hold_live(binding, &peer, &signal.call_id)
+                && service.owns_call_media(binding, &peer, &signal.call_id)) {
+                return None;
+            }
+            if req.kind == KIND_CALL_HANGUP {
+                // The grant that holds this call now; its closing reserve
+                // pays the hangup, bounded as the node's own closing notice.
+                let grant_op_id = service.call_spend_grant(&peer, &signal.call_id)?;
+                return Some(Meter::CallClosing { grant_op_id: Some(grant_op_id), peer, call_id: signal.call_id });
+            }
+            Some(Meter::CallBlock {
+                client_id: binding.client_id.clone(), epoch: binding.epoch, peer, call_id: signal.call_id,
+            })
         })();
         match allowed {
             Some(meter) => Ok(MeteredSpend { user, meter }),

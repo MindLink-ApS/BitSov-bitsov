@@ -211,11 +211,20 @@ After an expiry with no renewal the app's fresh token has no `spend`. On
 `POST /api/v1/messages/compose`, and only there, such a paired token may still
 send a minute block (kind 404) of a call its pairing owns, while that call's
 hold is funded as above. The block is drawn on that hold alone, at its pinned
-price, routing ceiling, minute limit and amount. Any other request without
-`spend` on that route (another call, a new call, an offer, a hangup, a chat
-message) and every other paid route refuse it exactly as before. With the
-switch off the route refuses it too. A renewal gives the token `spend` again,
-on the same hold.
+price, routing ceiling, minute limit and amount. The same token may also hang
+up that call once: a hangup (kind 403) with no reason or reason `hangup` is
+paid from the closing reserve the hold set aside at admission, within that
+reserve and the per-payment limit a closing signal is held to, exactly as the
+node's own closing notice would be. Nothing new is reserved, and a price above
+the reserve is refused unpaid. Once the hangup is paid the call ends, its
+minutes stop and the rest of the hold is released; a second hangup is refused
+unpaid. Any other request
+without `spend` on that route (another call, a new call, an offer, another
+call's hangup, a hangup with any other reason, a chat message) and every other
+paid route refuse it exactly as before. With the switch off the route refuses
+it too. A renewal gives the token `spend` again, on the same hold.
+Only the party that placed a call holds a hold for it, so only that party's app
+can pay a minute block or this hangup without `spend`.
 ## Free call replies
 
 `[calls] call_reply_free_v1` is off by default. Only the value `true` turns it

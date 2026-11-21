@@ -71,8 +71,13 @@ pub struct MemStorage {
     /// Runs once, before the next read of an outbox operation.
     pub outbox_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub call_get_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Parks the next read of this call, after reading it, until the gate is released.
+    pub call_get_gate: Mutex<Option<(String, Arc<PeerWriteGate>)>>,
     /// Runs once, right after the next listing of pending call reservations.
     pub call_pending_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once, on the next page of rows holding free-reply receipts before it is returned.
+    #[allow(clippy::type_complexity)]
+    pub receipt_page_hook: Mutex<Option<Box<dyn FnOnce(&mut konsensus_storage::FreeReplyReceiptPage) + Send>>>,
     /// Runs before every outbox operation write; an error fails that write.
     #[allow(clippy::type_complexity)]
     pub outbox_write_hook: Mutex<Option<Box<dyn FnMut(&konsensus_storage::OutboxOperation) -> Result<(), StorageError> + Send>>>,
@@ -130,7 +135,9 @@ impl MemStorage {
             lose_call_put_ack_for: Mutex::new(None),
             outbox_read_hook: Mutex::new(None),
             call_get_hook: Mutex::new(None),
+            call_get_gate: Mutex::new(None),
             call_pending_hook: Mutex::new(None),
+            receipt_page_hook: Mutex::new(None),
             outbox_write_hook: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
             call_offers: Mutex::new(HashMap::new()),
@@ -185,12 +192,21 @@ impl Storage for MemStorage {
                 "injected call read failure".into(),
             ));
         }
-        Ok(self
+        let read = self
             .calls
             .lock()
             .unwrap()
             .get(&(*peer, call_id.to_owned()))
-            .cloned())
+            .cloned();
+        let gate = {
+            let mut gate = self.call_get_gate.lock().unwrap();
+            if gate.as_ref().is_some_and(|(id, _)| id == call_id) { gate.take() } else { None }
+        };
+        if let Some((_, gate)) = gate {
+            // Parked after the read: the caller gets the row as it was then.
+            gate.run().await?;
+        }
+        Ok(read)
     }
 
     async fn call_put(
@@ -307,18 +323,32 @@ impl Storage for MemStorage {
 
     async fn call_with_free_reply_receipts(
         &self,
+        after: Option<(&[u8], &[u8])>,
         max: u32,
-    ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
+    ) -> Result<konsensus_storage::FreeReplyReceiptPage, StorageError>
     {
-        Ok(self
+        // Rows are held decoded in memory, so every listed row has its entry.
+        // An empty receipt list here is the SQL backends' NULL column: their
+        // writes store no receipts as NULL, never as an empty list, so this
+        // filter and their `IS NOT NULL` list the same rows.
+        let mut rows: Vec<konsensus_storage::FreeReplyReceiptRow> = self
             .calls
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, e)| !e.free_reply_receipts.is_empty())
-            .take(max as usize)
-            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
-            .collect())
+            .filter(|((peer, id), e)| !e.free_reply_receipts.is_empty()
+                && after.is_none_or(|(p, c)| (peer.to_hex().as_bytes(), id.as_bytes()) > (p, c)))
+            .map(|((peer, id), entry)| (peer.to_hex(), id.clone(), Some((*peer, entry.clone()))))
+            .collect();
+        rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        rows.truncate(max as usize);
+        let last_key = rows.last().map(|(p, c, _)| (p.clone().into_bytes(), c.clone().into_bytes()));
+        let mut page = konsensus_storage::FreeReplyReceiptPage { scanned: rows.len(), last_key, rows };
+        let hook = self.receipt_page_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(&mut page);
+        }
+        Ok(page)
     }
 
     async fn insert_channel_open_operation(

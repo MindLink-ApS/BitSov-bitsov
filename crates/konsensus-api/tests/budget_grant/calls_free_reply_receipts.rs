@@ -731,3 +731,329 @@ async fn a_receipt_left_after_its_reply_was_queued_is_released_by_a_sweep() {
     assert_eq!(fx.state.storage.call_sweep(far, 100).await.unwrap(), 1);
     assert_eq!(sent(&transport, 403).len(), 1);
 }
+
+// Receipt retention: a cleanup sweep that read a row holding a releasable
+// receipt never writes that stale read back over a free reply's transition
+// and receipt that landed after it. The sweep is parked between its read and
+// its write while the reply is tapped.
+#[tokio::test]
+async fn a_receipt_cleanup_sweep_never_overwrites_a_racing_free_reply_transition() {
+    let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+    let store = Arc::new(common::MemStorage::new());
+    // The ringing row also holds a receipt whose operation is gone, so the
+    // sweep lists it and rewrites it.
+    let mut entry = row(&fx, &fx.peer, CALL).await.unwrap();
+    entry.free_reply_receipts.push(konsensus_core::payloads::call::FreeReplyReceipt {
+        peer: fx.peer.to_hex(), call_id: CALL.into(), kind: 401, operation_id: "gone".into(),
+        request_hash: "digest".into(), phase: "ringing".into(), applied_ms: konsensus_api::calls::now_ms(),
+    });
+    konsensus_storage::Storage::call_put(store.as_ref(), &fx.peer, CALL, &entry).await.unwrap();
+    fx.state = Arc::new(AppState { storage: store.clone(), ..(*fx.state).clone() });
+    // Once the reply is queued, releasing its receipt fails, so the receipt
+    // stays on the row where it can be checked.
+    let failing = Arc::clone(&store);
+    *store.outbox_write_hook.lock().unwrap() = Some(Box::new(move |op| {
+        let data: Value = serde_json::from_slice(&op.recovery).unwrap_or_default();
+        if data["free_reply"] == true && matches!(op.state.as_str(), "paid" | "sent" | "acked") {
+            *failing.fail_call_put_for.lock().unwrap() = Some(CALL.into());
+        }
+        Ok(())
+    }));
+
+    let gate = Arc::new(common::PeerWriteGate::default());
+    *store.call_get_gate.lock().unwrap() = Some((CALL.into(), Arc::clone(&gate)));
+    let sweep = tokio::spawn({
+        let state = Arc::clone(&fx.state);
+        async move { konsensus_api::handlers::messages::reconcile_operations(&state).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified()).await
+        .expect("the sweep never read the row");
+    let id = uuid::Uuid::new_v4().to_string();
+    let send = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &id));
+    tokio::pin!(send);
+    // The tap runs while the sweep is parked; it completes only if nothing
+    // holds it back until the sweep is done.
+    let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut send).await;
+    let clear = || {
+        *store.outbox_write_hook.lock().unwrap() = None;
+        *store.fail_call_put_for.lock().unwrap() = None;
+    };
+    if early.is_ok() {
+        // Done first: the parked sweep's write must not be refused either.
+        clear();
+    }
+    gate.release.notify_one();
+    let (status, body) = match early { Ok(done) => done, Err(_) => send.await };
+    sweep.await.unwrap().unwrap();
+    clear();
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(sent(&transport, 401).len(), 1);
+    let after = row(&fx, &fx.peer, CALL).await.unwrap();
+    assert_eq!((after.phase, after.pending), (Phase::Live, None), "the sweep wrote back a stale row over the transition");
+    let ops: Vec<_> = after.free_reply_receipts.iter().map(|r| r.operation_id.as_str()).collect();
+    assert_eq!(ops, vec![id.as_str()], "the reply's receipt was lost or the released one kept");
+}
+
+/// Every distinct reply this node queued or sent for `kind`.
+async fn distinct_sent(transport: &ConnectedStubTransport, kind: u16) -> std::collections::HashSet<konsensus_core::MessageId> {
+    sent(transport, kind).iter().map(|e| e.id).collect()
+}
+
+// F13: the same saved reply recovered by a sweep while the app taps again:
+// one reply, queued once, its receipt released, nothing paid.
+#[tokio::test]
+async fn f13_a_tap_racing_a_recovery_sweep_sends_the_saved_reply_once() {
+    for kind in [401u16, 403] {
+        for moved in [false, true] {
+            let what = format!("{kind} moved={moved}");
+            let (fx, token, transport, id, db) = if moved {
+                moved_before_queueing(kind).await
+            } else {
+                let (fx, token, transport, id) = saved_before_transition(kind, false).await;
+                let db = raw(&fx).await;
+                (fx, token, transport, id, db)
+            };
+            audit_queueing(&fx, &db).await;
+            let before = ledger(&fx, &transport);
+            let (tap, sweep) = tokio::join!(
+                send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &id)),
+                konsensus_api::handlers::messages::reconcile_operations(&fx.state),
+            );
+            sweep.unwrap();
+            assert!(tap.0 == StatusCode::OK || tap.0 == StatusCode::CONFLICT, "{what}: {tap:?}");
+            konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+            let ids = distinct_sent(&transport, kind).await;
+            assert_eq!(ids.len(), 1, "{what}: the saved reply was lost or doubled");
+            let audit = queued(&db).await;
+            assert_eq!(audit.len(), 1, "{what}: queued {} times", audit.len());
+            assert_eq!(audit[0].0, ids.iter().next().unwrap().to_hex(), "{what}");
+            assert!(fx.state.storage.get_pending_for_peer(&fx.peer).await.unwrap().len() <= 1, "{what}");
+            assert_eq!(receipts(&db, &fx.peer, CALL).await, Some(None), "{what}: the receipt was not released");
+            assert_eq!(ledger(&fx, &transport), before, "{what}: something was paid");
+            assert!(matches!(operation(&fx, &id).await.state.as_str(), "paid" | "sent" | "acked"), "{what}");
+        }
+    }
+}
+
+// F14: a second answer to the same ringing call never gets a reply out:
+// while the first is reserved it is refused before anything is saved, and
+// two taps at once move the call once.
+#[tokio::test]
+async fn f14_a_second_answer_to_one_ringing_call_is_refused_never_queued() {
+    // The first answer is saved, its transition not yet written.
+    let (fx, token, transport, first) = saved_before_transition(401, false).await;
+    let before = ledger(&fx, &transport);
+    let second = uuid::Uuid::new_v4().to_string();
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &second)).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["reason"], "call_signal_in_flight", "{body}");
+    assert!(fx.state.storage.get_outbox_operation(&second).await.unwrap().is_none(), "the second answer was saved");
+    assert_eq!(row(&fx, &fx.peer, CALL).await.unwrap().pending.map(|p| p.operation_id), Some(first.clone()));
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    assert_eq!(distinct_sent(&transport, 401).await.len(), 1);
+    assert_eq!(row(&fx, &fx.peer, CALL).await.unwrap().phase, Phase::Live);
+    assert_eq!(ledger(&fx, &transport), before);
+
+    // Two taps at once, distinct operations.
+    let (fx, token, transport) = ringing(true, &[FREE], CALL).await;
+    let before = ledger(&fx, &transport);
+    let (a, b) = (uuid::Uuid::new_v4().to_string(), uuid::Uuid::new_v4().to_string());
+    let (ra, rb) = tokio::join!(
+        send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &a)),
+        send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &b)),
+    );
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    assert_eq!([&ra, &rb].iter().filter(|r| r.0 == StatusCode::OK).count(), 1, "{ra:?} {rb:?}");
+    let (winner, loser) = if ra.0 == StatusCode::OK { (&a, &b) } else { (&b, &a) };
+    assert_eq!(distinct_sent(&transport, 401).await.len(), 1, "both answers went out");
+    let entry = row(&fx, &fx.peer, CALL).await.unwrap();
+    assert_eq!((entry.phase, entry.pending), (Phase::Live, None));
+    assert!(matches!(operation(&fx, winner).await.state.as_str(), "paid" | "sent" | "acked"));
+    if let Some(op) = fx.state.storage.get_outbox_operation(loser).await.unwrap() {
+        assert!(!matches!(op.state.as_str(), "paid" | "sent" | "acked"), "the losing answer was queued: {}", op.state);
+    }
+    assert_eq!(ledger(&fx, &transport), before);
+    let claims = konsensus_api::auth::validate_token(&token, &fx.state.jwt_secret).unwrap();
+    let binding = konsensus_api::auth::PairingBinding::from_claims(&claims).unwrap().unwrap();
+    assert!(fx.service.owns_call_media(&binding, &fx.peer.to_hex(), CALL));
+}
+
+// F15: a saved free reply never moves a call that went live and paid
+// another way; a paid answer never takes the free-reply gate.
+#[tokio::test]
+async fn f15_a_saved_free_reply_never_moves_a_paid_live_call() {
+    for kind in [401u16, 403] {
+        let (mut fx, token, transport, id) = saved_before_transition(kind, false).await;
+        let before = ledger(&fx, &transport);
+        let now = konsensus_api::calls::now_ms();
+        let entry = row(&fx, &fx.peer, CALL).await.unwrap();
+        let live = CallEntry { phase: Phase::Live, pending: None, paid_until_ms: Some(now + 50_000),
+            deadline_ms: now + 60_000, next_block_seq: 1, ..entry };
+        fx.state.storage.call_put(&fx.peer, CALL, &live).await.unwrap();
+        restart(&mut fx).await;
+        recover(&fx).await;
+        assert_eq!(row(&fx, &fx.peer, CALL).await, Some(live), "{kind}: the paid live call was changed");
+        assert_withdrawn(&fx, &token, &transport, kind, &id, before, &format!("{kind} live")).await;
+    }
+    // Switch on here, the peer without it: a paid answer, no receipt anywhere.
+    let (fx, token, transport) = ringing(true, &[], CALL).await;
+    let db = raw(&fx).await;
+    audit_queueing(&fx, &db).await;
+    let money = fx.wallet.money();
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &uuid::Uuid::new_v4().to_string())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.wallet.money(), money + 1, "the answer must be paid");
+    let out = sent(&transport, 401);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].payment_proof.amount_msat > 0 && out[0].references.is_empty());
+    let audit = queued(&db).await;
+    assert_eq!(audit.len(), 1);
+    assert_eq!((audit[0].1.as_deref(), audit[0].2.as_deref()), (Some("live"), None), "a paid answer wrote a free-reply receipt");
+    assert_eq!(receipts(&db, &fx.peer, CALL).await, Some(None));
+}
+
+// F16: a call row whose receipt set is full refuses the transition: nothing
+// queued or paid, every held receipt kept, the reply taken back unsent. The
+// transition definitely did not happen and the reservation still stands, so
+// this is the ordinary retryable refusal (`call_reply_unavailable`).
+#[tokio::test]
+async fn f16_a_full_receipt_set_refuses_the_reply_and_keeps_every_receipt() {
+    let (fx, token, transport) = ringing(true, &[FREE], CALL).await;
+    let db = raw(&fx).await;
+    audit_queueing(&fx, &db).await;
+    let held: Vec<_> = (0..konsensus_core::payloads::call::MAX_FREE_REPLY_RECEIPTS).map(|n| konsensus_core::payloads::call::FreeReplyReceipt {
+        peer: fx.peer.to_hex(), call_id: CALL.into(), kind: 403, operation_id: format!("held-{n}"),
+        request_hash: "digest".into(), phase: "ended".into(), applied_ms: 1,
+    }).collect();
+    let entry = row(&fx, &fx.peer, CALL).await.unwrap();
+    fx.state.storage.call_put(&fx.peer, CALL, &CallEntry { free_reply_receipts: held.clone(), ..entry }).await.unwrap();
+    let before = ledger(&fx, &transport);
+    let id = uuid::Uuid::new_v4().to_string();
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &id)).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["reason"], "call_reply_unavailable", "{body}");
+    assert_eq!(body["retry_allowed"], true, "{body}");
+    let after = row(&fx, &fx.peer, CALL).await.unwrap();
+    assert_eq!(after.free_reply_receipts, held, "a held receipt was dropped");
+    assert_eq!(after.phase, Phase::Ringing);
+    assert!(queued(&db).await.is_empty() && sent(&transport, 401).is_empty());
+    let op = operation(&fx, &id).await;
+    // Taken back: definitely unsent and nothing paid, so the journal says released.
+    assert_eq!((op.state.as_str(), data(&op)["envelope_ready"].clone()), ("released", json!(false)));
+    assert_eq!(ledger(&fx, &transport), before);
+}
+
+// F17: a real restart while the reply is saved and the call still rings:
+// recovery moves the call with this reply's receipt, then sends it once. A
+// restart ends a call still waiting for a device (the caller is told it was
+// not reachable), so a decline saved for it is withdrawn, never sent.
+#[tokio::test]
+async fn f17_a_restart_before_the_transition_sends_the_saved_reply_once() {
+    let (mut fx, token, transport, id) = saved_before_transition(403, true).await;
+    let before = ledger(&fx, &transport);
+    restart(&mut fx).await;
+    recover(&fx).await;
+    let entry = row(&fx, &fx.peer, CALL).await.unwrap();
+    assert_eq!((entry.phase, entry.pending), (Phase::Ended, None), "the restart did not end the device wait");
+    assert_withdrawn(&fx, &token, &transport, 403, &id, before, "403 waiting, restarted").await;
+
+    for (kind, waiting, to) in [(401u16, false, "live"), (403, false, "ended")] {
+        let what = format!("{kind} waiting={waiting}");
+        let (mut fx, token, transport, id) = saved_before_transition(kind, waiting).await;
+        let db = raw(&fx).await;
+        audit_queueing(&fx, &db).await;
+        let before = ledger(&fx, &transport);
+        restart(&mut fx).await;
+        recover(&fx).await;
+        let ids = distinct_sent(&transport, kind).await;
+        assert_eq!(ids.len(), 1, "{what}");
+        let audit = queued(&db).await;
+        assert_eq!(audit.len(), 1, "{what}");
+        assert_eq!(audit[0].1.as_deref(), Some(to), "{what}");
+        assert!(audit[0].2.as_deref().is_some_and(|r| r.contains(&id)), "{what}: queued without this reply's receipt");
+        assert_eq!(receipts(&db, &fx.peer, CALL).await, Some(None), "{what}");
+        assert_eq!(ledger(&fx, &transport), before, "{what}");
+        let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, kind, CALL, &id)).await;
+        assert_eq!(status, StatusCode::OK, "{what}: {body}");
+        assert_eq!(distinct_sent(&transport, kind).await, ids, "{what}");
+    }
+}
+
+/// Fault-injecting storage holding the ringing call; `at_seal` runs once,
+/// right when the signed reply is saved, before its call transition.
+async fn seal_hook(fx: &mut Fx, at_seal: impl FnOnce(&Arc<common::MemStorage>, &CallEntry) + Send + 'static) -> Arc<common::MemStorage> {
+    let store = Arc::new(common::MemStorage::new());
+    let entry = row(fx, &fx.peer, CALL).await.unwrap();
+    konsensus_storage::Storage::call_put(store.as_ref(), &fx.peer, CALL, &entry).await.unwrap();
+    fx.state = Arc::new(AppState { storage: store.clone(), ..(*fx.state).clone() });
+    let (hooked, mut action) = (Arc::clone(&store), Some(at_seal));
+    *store.outbox_write_hook.lock().unwrap() = Some(Box::new(move |op| {
+        let data: Value = serde_json::from_slice(&op.recovery).unwrap_or_default();
+        if op.state == "paying" && data["free_reply"] == true && data["envelope_ready"] == true {
+            if let Some(action) = action.take() { action(&hooked, &entry); }
+        }
+        Ok(())
+    }));
+    store
+}
+
+// F18: what the send path reports for each gate outcome.
+#[tokio::test]
+async fn f18_the_send_path_reports_each_gate_outcome() {
+    // Invalid: the call ended right after the reply was saved.
+    let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+    let peer = fx.peer;
+    let store = seal_hook(&mut fx, move |store, entry| store.set_call(&peer, CALL, CallEntry {
+        phase: Phase::Ended, pending: None, end_reason: Some(HangupReason::Hangup),
+        deadline_ms: konsensus_api::calls::now_ms() + TOMBSTONE_MS, ..entry.clone() })).await;
+    let before = ledger(&fx, &transport);
+    let id = uuid::Uuid::new_v4().to_string();
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &id)).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!((body["reason"].clone(), body["code"].clone()), (json!("call_reply_expired"), json!("not_dispatched")), "{body}");
+    assert_eq!(body["state"], "abandoned", "unsent reported before the withdrawal was saved: {body}");
+    assert_eq!(body["retry_allowed"], false, "{body}");
+    assert_eq!(store.call_phase(&peer, CALL), Some(Phase::Ended));
+    assert_withdrawn(&fx, &token, &transport, 401, &id, before, "ended after save").await;
+
+    // Unknown: the call cannot be read at the transition.
+    let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+    let store = seal_hook(&mut fx, |store, _| *store.fail_call_get_for.lock().unwrap() = Some(CALL.into())).await;
+    let before = ledger(&fx, &transport);
+    let id = uuid::Uuid::new_v4().to_string();
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &id)).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["reason"], "call_reply_unresolved", "{body}");
+    assert_ne!(body["code"], "not_dispatched", "{body}");
+    assert_eq!((body["state"].clone(), body["retry_allowed"].clone()), (json!("payment_unknown"), json!(false)), "{body}");
+    assert!(sent(&transport, 401).is_empty());
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &id)).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert!(sent(&transport, 401).is_empty(), "an unresolved reply went out on a retry while unreadable");
+    *store.fail_call_get_for.lock().unwrap() = None;
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    assert_eq!(distinct_sent(&transport, 401).await.len(), 1, "readable again: the reply is recovered once");
+    assert_eq!(ledger(&fx, &transport), before);
+
+    // NotApplied: the transition write fails; the reply is taken back.
+    let (mut fx, token, transport) = ringing(true, &[FREE], CALL).await;
+    seal_hook(&mut fx, |store, _| *store.fail_call_put_for.lock().unwrap() = Some(CALL.into())).await;
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &uuid::Uuid::new_v4().to_string())).await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+    assert_eq!((body["reason"].clone(), body["code"].clone()), (json!("call_reply_unavailable"), json!("not_dispatched")), "{body}");
+    assert_eq!((body["state"].clone(), body["retry_allowed"].clone()), (json!("released"), json!(true)), "{body}");
+    assert!(sent(&transport, 401).is_empty());
+
+    // Held unresolved (saved before receipts existed, call since ended): a
+    // retry is refused, not retryable, and sends nothing.
+    let (fx, token, transport, id) = saved_before_transition(401, false).await;
+    rewrite(&fx, &id, |data| { data.as_object_mut().unwrap().remove("free_reply_call"); }).await;
+    caller_hangs_up(&fx).await;
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    let (status, body) = send_request(&fx, &token, 7_000, reply(&fx, 401, CALL, &id)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!((body["state"].clone(), body["retry_allowed"].clone()), (json!("payment_unknown"), json!(false)), "{body}");
+    assert!(body.to_string().contains("payment_unresolved"), "{body}");
+    assert!(sent(&transport, 401).is_empty());
+}

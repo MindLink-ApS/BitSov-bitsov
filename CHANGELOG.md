@@ -32,8 +32,10 @@ also live on the corresponding GitHub pre-release pages.
   nodes ignore); a revocation, epoch bump, pairing removal or identity change
   still closes the media within a second. After an expiry the app's token
   without `spend` may still pay that call's minute blocks on
-  `POST /api/v1/messages/compose`, from the call's pinned hold only; nothing
-  else moves without `spend`. `GET /api/v1/status` lists
+  `POST /api/v1/messages/compose`, from the call's pinned hold only, and may
+  hang that call up once (kind 403, no reason or `hangup`), paid from the
+  closing reserve the hold set aside at admission; nothing else moves without
+  `spend`. `GET /api/v1/status` lists
   `call_continuity_v1` only while it is on. Independently of the switch, a
   console grant whose write fails now leaves the pairing state in memory as
   it was, instead of a new grant the disk never took.

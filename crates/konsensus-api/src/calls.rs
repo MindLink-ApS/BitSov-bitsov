@@ -1186,27 +1186,85 @@ pub(crate) async fn release_free_reply_receipt(store: Store<'_>, peer: &NodeId, 
     Ok(())
 }
 
+/// Rows visited per receipt cleanup sweep.
+const RECEIPT_SWEEP_ROWS: u32 = 256;
+
+/// Where the next receipt cleanup sweep of each store resumes: the raw key
+/// of the last row the previous sweep covered. Entries are keyed by the
+/// store's address and hold a weak reference to it, which keeps that address
+/// from being reused by another store while the entry exists; entries of
+/// dropped stores are discarded.
+type ReceiptCursor = (std::sync::Weak<dyn Storage>, (Vec<u8>, Vec<u8>));
+fn receipt_sweep_cursor() -> &'static Mutex<HashMap<usize, ReceiptCursor>> {
+    static CURSOR: OnceLock<Mutex<HashMap<usize, ReceiptCursor>>> = OnceLock::new();
+    CURSOR.get_or_init(Default::default)
+}
+
 /// Release receipts whose saved reply can no longer be recovered (it was
 /// queued, withdrawn, or its operation is gone). A receipt whose operation
-/// may still be recovered is always kept; any read error keeps them all.
+/// may still be recovered is always kept; a read error keeps that row's, and
+/// a row that cannot be decoded is passed over untouched (it stays held).
+/// Each sweep covers at most [`RECEIPT_SWEEP_ROWS`] stored rows, resuming
+/// after the last row the previous sweep covered and starting over once a
+/// page comes back short (at once, if nothing is left after the cursor), so
+/// rows whose receipts must be kept never keep a later row from being reached.
 pub(crate) async fn prune_free_reply_receipts(state: &AppState) -> Result<usize, konsensus_storage::StorageError> {
     let store = state.storage.as_ref();
-    let mut released = 0;
-    for (peer, call_id, _) in store.call_with_free_reply_receipts(256).await? {
-        let _g = lock().lock().await;
-        let Some(mut entry) = store.call_get(&peer, &call_id).await? else { continue };
-        let mut keep = Vec::with_capacity(entry.free_reply_receipts.len());
-        for receipt in &entry.free_reply_receipts {
-            let op = store.get_outbox_operation(&receipt.operation_id).await?;
-            if op.as_ref().is_some_and(crate::handlers::messages::operations::free_reply_recoverable) {
-                keep.push(receipt.clone());
+    let key = std::sync::Arc::as_ptr(&state.storage) as *const () as usize;
+    let after = {
+        let mut cursors = receipt_sweep_cursor().lock().unwrap_or_else(|e| e.into_inner());
+        cursors.retain(|_, (weak, _)| weak.strong_count() > 0);
+        cursors.get(&key).map(|(_, at)| at.clone())
+    };
+    let mut page = store.call_with_free_reply_receipts(after.as_ref().map(|(p, c)| (p.as_slice(), c.as_slice())), RECEIPT_SWEEP_ROWS).await?;
+    if after.is_some() && page.scanned == 0 {
+        // The previous page ended exactly at the last row: start over now.
+        page = store.call_with_free_reply_receipts(None, RECEIPT_SWEEP_ROWS).await?;
+    }
+    {
+        let mut cursors = receipt_sweep_cursor().lock().unwrap_or_else(|e| e.into_inner());
+        match page.last_key.take() {
+            Some(last) if page.scanned >= RECEIPT_SWEEP_ROWS as usize => {
+                cursors.insert(key, (std::sync::Arc::downgrade(&state.storage), last));
             }
+            _ => { cursors.remove(&key); }
         }
-        if keep.len() != entry.free_reply_receipts.len() {
-            released += entry.free_reply_receipts.len() - keep.len();
-            entry.free_reply_receipts = keep;
-            store.call_put(&peer, &call_id, &entry).await?;
+    }
+    // A store that lists more rows than it says it covered is not trusted to
+    // count: never underflow on it.
+    let unkeyed = page.scanned.saturating_sub(page.rows.len());
+    let (mut released, mut undecodable, mut unread) = (0, 0usize, 0usize);
+    for (_, call_id, entry) in page.rows {
+        let Some((peer, _)) = entry else { undecodable += 1; continue };
+        match prune_row(store, &peer, &call_id).await {
+            Ok(n) => released += n,
+            Err(_) => unread += 1,
         }
+    }
+    if undecodable + unread + unkeyed > 0 {
+        // One line per sweep, however many rows were passed over.
+        tracing::warn!(undecodable, unread, unkeyed, "free call reply receipt cleanup passed over rows it could not read; they keep their receipts");
+    }
+    Ok(released)
+}
+
+async fn prune_row(store: Store<'_>, peer: &NodeId, call_id: &str) -> Result<usize, konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(0) };
+    let mut keep = Vec::with_capacity(entry.free_reply_receipts.len());
+    for receipt in &entry.free_reply_receipts {
+        let op = store.get_outbox_operation(&receipt.operation_id).await?;
+        if op.as_ref().is_some_and(crate::handlers::messages::operations::free_reply_recoverable) {
+            keep.push(receipt.clone());
+        }
+    }
+    let released = entry.free_reply_receipts.len() - keep.len();
+    // A row listed as holding receipts that decodes to none (a stored empty
+    // list, which writes never produce) is rewritten once as holding none, so
+    // later sweeps stop listing it and it can age out like any other row.
+    if released > 0 || entry.free_reply_receipts.is_empty() {
+        entry.free_reply_receipts = keep;
+        store.call_put(peer, call_id, &entry).await?;
     }
     Ok(released)
 }

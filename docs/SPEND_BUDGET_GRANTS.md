@@ -511,8 +511,10 @@ While a window the owner wrote (at the console, by device approval or a
 relation envelope) is live for the app, the owner's window governs: the
 allowance opens nothing and never replaces or ends it, and the request takes
 the owner path. A new allowance window replaces only earlier allowance
-windows. Payments still in flight move with their payment identities, so the
-next window refuses paying the same one again. A new
+windows. Payments still in flight move with their payment identities, and a
+payment identity paid from any of the allowance's windows, settled or not,
+stays used for as long as that window is still counted in the day's record,
+so no later window pays the same one again. A new
 window replaces the app's previous one, as every window does.
 
 In a window the allowance opened, the per-call cap bounds **the whole call**:
@@ -528,10 +530,14 @@ renewal cannot free slots the breaker is holding.
 
 **The daily cap counts any 24 hours, not each window.** Every window is
 recorded with the most it could spend: its whole budget while it can spend,
-and what it used (settled, reserved or of unknown outcome) once it has ended.
-An ended window keeps counting until 24 hours after its end, plus the longest
-call. A window opens only if its budget fits under the cap together with what
-is still counted. This may hold back sats that were not spent; it never lets
+or more if it carries more, and what it used (settled, reserved or of unknown
+outcome) once it has ended. What a renewal moves to the next window (payments
+in flight, and with continuity the calls the next window now holds) counts on
+the next window only; what was paid, or did not move, stays counted where it
+was. An ended window keeps counting until 24 hours after its end, plus the
+longest call. A window opens only if what it will count fits under the cap
+together with what is still counted, worked out from the move it would
+make. This may hold back sats that were not spent; it never lets
 more than the cap be spent in any 24 hours. The record is stored with the
 pairing, so a restart does not reset it. Old entries are merged, never
 dropped, so a clock that jumps forward and comes back still finds them. Every
