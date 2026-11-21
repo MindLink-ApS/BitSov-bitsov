@@ -444,6 +444,7 @@ async fn the_owner_window_covers_a_request_up_to_each_term_exactly() {
         // Budget and per-call limit: equal is covered, one msat more is not.
         expect_statuses(&fx, &read, &format!("budget and per call, switch {switch}"), vec![
             (json!({"budget_msat": 300_000, "per_call_max_msat": 1_000, "ttl_secs": 600}), "granted"),
+            (json!({"budget_msat": 300_001, "per_call_max_msat": 1_000, "ttl_secs": 600}), "pending"),
             (json!({"budget_msat": 250_000, "per_call_max_msat": 200_000, "ttl_secs": 600}), "granted"),
             (json!({"budget_msat": 250_000, "per_call_max_msat": 200_001, "ttl_secs": 600}), "pending"),
         ])
@@ -502,6 +503,13 @@ async fn a_window_the_allowance_opened_does_not_answer_another_request() {
     assert!(window.remaining_msat() >= 1_000_000 && window.per_call_max_msat >= 500_000, "{window:?}");
     assert!(live[0].expires_at >= chrono::Utc::now().timestamp() + 3_000, "{:?}", live[0]);
     assert!(fx.service.snapshot().pending_elevations.iter().any(|e| Some(e.op_id.as_str()) == op["op_id"].as_str()));
+    assert_eq!(body["owner_confirmation_required"], true, "{body}");
+    // The request that hit the cap asked for the window's whole hour, so a
+    // second's tick alone could keep it pending. A request well inside the
+    // live window on every term, duration included, still is not answered.
+    let (short, body) = ask_with(&fx, &read, json!({"budget_msat": 1_000_000, "per_call_max_msat": 500_000, "ttl_secs": 600})).await;
+    assert!(short["owner_action"].as_str().unwrap().contains("konsensus grant"), "{short}");
+    assert!(live[0].expires_at >= chrono::Utc::now().timestamp() + 600 + 60, "{:?}", live[0]);
     assert_eq!(body["status"], "pending", "{body}");
     assert_eq!(body["owner_confirmation_required"], true, "{body}");
 }
