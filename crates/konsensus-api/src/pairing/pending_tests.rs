@@ -179,3 +179,47 @@ fn confirmation_unlink_failure_burns_authority_but_retains_cleanup() {
     ));
     assert!(service.lock().pending.is_empty());
 }
+
+/// A live owner window over fixed clock values: the exact boundary of each
+/// term, with no wall clock involved.
+#[test]
+fn owner_window_covers_each_term_up_to_its_exact_bound() {
+    const CREATED_AT: i64 = 1_700_000_000;
+    const TTL: i64 = 600;
+    let window = |expires_at: i64| SpendGrant {
+        owner_approval: None,
+        op_id: "grant".into(),
+        client_id: "client".into(),
+        scopes: vec![Scope::Spend],
+        granted_at: CREATED_AT - 60,
+        expires_at,
+        identity_fingerprint: "identity".into(),
+        epoch: 1,
+        granted_by: "cli".into(),
+        budget: Some(GrantBudget::from_terms(&GrantTerms::new(300_000).per_call(200_000))),
+        ended: None,
+    };
+    let request = |terms: GrantTerms| PendingElevation {
+        op_id: "request".into(),
+        client_id: "client".into(),
+        client_name: "app".into(),
+        scopes: vec![Scope::Spend],
+        created_at: CREATED_AT,
+        expires_at: CREATED_AT + ELEVATION_TTL_SECS,
+        proposed_terms: Some(terms),
+    };
+    let asked = |budget: u64, per_call: u64| GrantTerms::new(budget).per_call(per_call).for_secs(TTL);
+
+    // Duration: a request ending with the window is covered; a window that
+    // ends one second before the request would is not.
+    let fits = asked(100_000, 1_000);
+    assert!(owner_window_covers(&window(CREATED_AT + TTL), &request(fits.clone())));
+    assert!(!owner_window_covers(&window(CREATED_AT + TTL - 1), &request(fits)));
+
+    // Budget and per-call limit: equal is covered, one msat more is not.
+    let live = window(CREATED_AT + 1_800);
+    assert!(owner_window_covers(&live, &request(asked(300_000, 1_000))));
+    assert!(!owner_window_covers(&live, &request(asked(300_001, 1_000))));
+    assert!(owner_window_covers(&live, &request(asked(250_000, 200_000))));
+    assert!(!owner_window_covers(&live, &request(asked(250_000, 200_001))));
+}
