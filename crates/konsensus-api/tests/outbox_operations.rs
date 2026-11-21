@@ -31,11 +31,10 @@ async fn concurrent_operation_posts_pay_once_and_mismatch_never_pays() {
         .initiate_session(&peer, &target.prekey_bundle().await)
         .await
         .unwrap();
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer, format!("02{}", "ab".repeat(32)));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "ab".repeat(32))),
+    );
     let transport = Arc::new(common::ConnectedStubTransport::new(
         vec![peer],
         state.invoice_requests.clone(),
@@ -110,11 +109,10 @@ async fn paid_web_request_reply_row_is_committed_and_restored_on_resend() {
         .initiate_session(&peer, &target.prekey_bundle().await)
         .await
         .unwrap();
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer, format!("02{}", "ab".repeat(32)));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "ab".repeat(32))),
+    );
     let transport = Arc::new(common::ConnectedStubTransport::new(
         vec![peer],
         state.invoice_requests.clone(),
@@ -320,11 +318,10 @@ impl Fixture {
         });
         let mut state = common::test_state_with_lightning(wallet.clone());
         let peer = common::setup_e2ee_session(&state.session_manager).await;
-        state
-            .peer_ln_pubkeys
-            .lock()
-            .await
-            .insert(peer, format!("02{}", "ab".repeat(32)));
+        state.peer_ln_pubkeys.lock().await.insert(
+            peer,
+            konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "ab".repeat(32))),
+        );
         let transport = Arc::new(common::ConnectedStubTransport::new(
             vec![peer],
             state.invoice_requests.clone(),
@@ -1453,29 +1450,44 @@ async fn background_reconcile_commits_a_paid_call_offer_before_resending() {
     let answer = format!(r#"{{"v":1,"call_id":"{call}","sdp":"v=0"}}"#);
     // Dispatched, but the wallet cannot say yet whether it settled.
     f.wallet.mode.store(1, Ordering::SeqCst);
+    f.wallet.pause_next_status_poll.store(true, Ordering::SeqCst);
     let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
         .header("authorization", common::auth_header(&f.state)).header("content-type", "application/json")
         .body(Body::from(serde_json::json!({"operation_id": f.id, "recipient": peer.to_hex(), "kind": 400, "plaintext": offer, "wait_ack_ms": 0}).to_string()))
         .unwrap();
     let app = common::test_router(f.state.clone());
     let job = tokio::spawn(async move { app.oneshot(request).await });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while f.db.get_outbox_operation(&f.id).await.unwrap().is_none_or(|op| op.payment_hash.is_none()) {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
+    // A visible hash can precede another SQLite checkpoint still running on
+    // its worker thread. Cancel only at the post-checkpoint wallet status poll,
+    // so that write cannot race the recovery sweep's versioned paid commit.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.wallet.status_poll_started.notified(),
+    )
     .await
-    .unwrap();
+    .expect("compose must finish checkpointing before cancellation");
     job.abort();
     assert!(job.await.unwrap_err().is_cancelled());
     assert_eq!(f.wallet.calls.load(Ordering::SeqCst), 1);
     // Startup recovery keeps an ambiguous reservation; nobody is rung yet.
     assert_eq!(konsensus_api::calls::recover(f.db.as_ref()).await.unwrap(), (0, 0));
     assert_eq!(f.db.call_get(&peer, &call).await.unwrap().unwrap().phase, Phase::Reserved);
-    // It settles. The app only polls; the background sweep resolves it.
+    // It settles. The app only polls; the background sweep resolves it. A
+    // sweep skips an operation whose lock is still held (here, briefly, by the
+    // cancelled request), so sweep again until it commits, within a deadline.
     f.wallet.mode.store(0, Ordering::SeqCst);
-    konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
-    let state = f.op().await.state;
+    let state = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            konsensus_api::handlers::messages::reconcile_operations(&f.state).await.unwrap();
+            let state = f.op().await.state;
+            if state != "paying" {
+                break state;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the background sweep never resolved the paid offer");
     assert!(matches!(state.as_str(), "paid" | "sent" | "acked"), "{state}");
     let entry = f.db.call_get(&peer, &call).await.unwrap().unwrap();
     assert_eq!((entry.phase, entry.pending), (Phase::Ringing, None), "committed by the sweep");
@@ -1627,7 +1639,7 @@ async fn a_refused_signal_whose_cleanup_failed_stays_invisible_and_is_withdrawn(
     // As the receive path does it: hold, paid acceptance, plaintext, admission.
     assert!(konsensus_api::calls::hold_incoming(f.db.as_ref(), &env).await.unwrap());
     assert_eq!(f.db.accept_paid_envelope(&env).await.unwrap(), konsensus_storage::PaidAcceptance::Accepted);
-    f.db.store_message_plaintext(&env.id, &cipher.encrypt(text.as_bytes()).unwrap()).await.unwrap();
+    f.db.store_message_plaintext(&env.id, &cipher.encrypt(&env.id.to_hex(), text.as_bytes()).unwrap()).await.unwrap();
     assert!(konsensus_api::calls::admit_incoming(f.db.as_ref(), &own(), &f.peer, 402, Some(&text)).await.is_err());
     sqlx::raw_sql("CREATE TRIGGER cleanup_failure BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT, 'simulated storage failure'); END").execute(f.db.pool()).await.unwrap();
     assert!(f.db.reject_accepted_envelope(&env).await.is_err());
@@ -2037,7 +2049,7 @@ async fn a_send_refused_before_paying_is_released_despite_an_older_operations_ad
         f.db.call_put(&f.peer, CALL, &konsensus_core::payloads::call::CallEntry {
             side: konsensus_core::payloads::call::Side::Caller, phase: konsensus_core::payloads::call::Phase::Live,
             deadline_ms: now + 15_000, pending: None, paid_until_ms: Some(now + 15_000), next_block_seq: 1,
-            end_reason: None, unpaid_notice_used: false,
+            end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
         }).await.unwrap();
         let (status, body) = f.post_kind(kind, plaintext).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{kind}: {body}");
@@ -2064,7 +2076,7 @@ async fn a_minute_refused_by_a_callee_catching_up_is_released_despite_an_older_o
     f.db.call_put(&f.peer, CALL, &konsensus_core::payloads::call::CallEntry {
         side: konsensus_core::payloads::call::Side::Caller, phase: konsensus_core::payloads::call::Phase::Live,
         deadline_ms: now + 25_000, pending: None, paid_until_ms: Some(now + 15_000), next_block_seq: 1,
-        end_reason: None, unpaid_notice_used: false,
+        end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     }).await.unwrap();
     let (prices, peer) = (f.state.peer_prices.clone(), f.peer);
     let answering = tokio::spawn(async move {

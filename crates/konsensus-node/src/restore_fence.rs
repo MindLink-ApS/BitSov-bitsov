@@ -12,7 +12,7 @@ use std::{
 #[path = "restore_fence/host.rs"]
 mod host;
 
-const GUIDANCE: &str = "refusing state startup: this may be a restored copy. run konsensus recover in a fresh directory; see docs/v2/RECOVERY.md and docs/operations/home-node.md. Never start an old copied data directory";
+const GUIDANCE: &str = "refusing state startup: this may be a restored copy. run `konsensus recover` on the owner console in a fresh directory; see docs/v2/RECOVERY.md and docs/operations/home-node.md. Never start an old copied data directory";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -242,6 +242,37 @@ mod tests {
             assert!(err.contains("fresh directory"));
             assert_eq!(fs::read(copy.path().join("INSTANCE")).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn snapshot_copy_with_open_recovery_journal_refuses_rebind_without_prompting() {
+        let original = tempfile::tempdir().unwrap();
+        let snapshot = tempfile::tempdir().unwrap();
+        admit(original.path(), "host-a", "volume-a").unwrap();
+        fs::copy(
+            original.path().join("INSTANCE"),
+            snapshot.path().join("INSTANCE"),
+        )
+        .unwrap();
+        fs::write(snapshot.path().join("ldk_node_data.sqlite"), b"backup-copy").unwrap();
+        fs::write(
+            snapshot.path().join("recover.json"),
+            r#"{"version":1,"state":"open"}"#,
+        )
+        .unwrap();
+        let before = fs::read(snapshot.path().join("INSTANCE")).unwrap();
+        let err = rebind(snapshot.path(), "host-b", "volume-a", |_| {
+            panic!("must not prompt")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("konsensus recover"), "{err}");
+        assert!(err.contains("owner console"), "{err}");
+        assert_eq!(fs::read(snapshot.path().join("INSTANCE")).unwrap(), before);
+        assert_eq!(
+            fs::read(snapshot.path().join("ldk_node_data.sqlite")).unwrap(),
+            b"backup-copy"
+        );
     }
 
     #[test]

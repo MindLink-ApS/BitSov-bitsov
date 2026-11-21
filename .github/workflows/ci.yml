@@ -84,9 +84,16 @@ jobs:
               - 'Cargo.lock'
               - '**/Cargo.lock'
               - '.cargo/audit.toml'
+              - '.cargo/waiver-deadlines.toml'
+              - 'deny.toml'
+              - 'osv-scanner.toml'
               - 'SECURITY.md'
               - 'scripts/check-security-key.sh'
               - 'scripts/test-security-key.sh'
+              - 'scripts/check-waiver-deadlines.py'
+              - 'scripts/test-waiver-deadlines.py'
+              - 'scripts/security-report-status.sh'
+              - 'scripts/test-security-report-status.sh'
               - '.github/workflows/ci.yml'
               - '.github/workflows/security-scan.yml'
 
@@ -171,6 +178,9 @@ jobs:
       - name: Verify Rust toolchain pin
         run: bash scripts/test-rust-toolchain.sh && bash scripts/rust-toolchain-channel.sh --check
 
+      - name: Test compiler cache fallback
+        run: bash scripts/test-sccache.sh
+
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL 2>/dev/null || true
@@ -198,12 +208,12 @@ jobs:
           cache-workspace-crates: "true"
 
       - name: sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - name: Enable sccache for Cargo
-        run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Configure Cargo compiler cache
+        run: bash scripts/configure-sccache.sh '${{ steps.sccache.outcome }}'
 
       - name: Check disk space
         run: df -h /
@@ -267,11 +277,11 @@ jobs:
           shared-key: ldk-node-security-${{ hashFiles('vendor/ldk-node/Cargo.lock', 'vendor/lightning/Cargo.lock') }}
           cache-all-crates: "true"
       - name: sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-      - name: Enable sccache for Cargo
-        run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Configure Cargo compiler cache
+        run: bash scripts/configure-sccache.sh '${{ steps.sccache.outcome }}'
       # The vendor crate is excluded from --workspace and -p konsensus-*.
       # Run its private-handler regressions plus all existing local patch tests.
       - name: Test vendored ldk-node library
@@ -298,6 +308,12 @@ jobs:
       - name: Security key ↔ policy consistency
         run: bash scripts/test-security-key.sh && bash scripts/check-security-key.sh
 
+      - name: Advisory waiver deadlines
+        run: python3 scripts/test-waiver-deadlines.py && python3 scripts/check-waiver-deadlines.py
+
+      - name: Security report status
+        run: bash scripts/test-security-report-status.sh
+
       - name: Read Rust toolchain pin
         id: rust-toolchain
         run: echo "channel=$(bash scripts/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
@@ -305,7 +321,7 @@ jobs:
         with:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
 
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/
@@ -483,7 +499,7 @@ jobs:
           subject-path: artifacts/${{ matrix.artifact }}
 
       - name: Upload to Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           # Stage a DRAFT release. Tag CI builds the CLI binaries + checksums + SBOM,
           # but the release is not published until the operator attaches the GPG-signed

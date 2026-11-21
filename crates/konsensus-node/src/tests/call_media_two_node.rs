@@ -120,13 +120,14 @@ async fn start_node_with(
         session_manager: Arc::new(konsensus_crypto::SessionManager::new(Arc::clone(&identity))),
         jwt_secret: JWT_SECRET.into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: Some(service),
         cors_enabled: false,
         operator_probes_enabled: false,
         sensitive_identity_routes_enabled: false,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::mnemonic_reveal_default()),
@@ -149,6 +150,7 @@ async fn start_node_with(
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: Some(router as Arc<dyn konsensus_api::call_media::CallMediaPort>),
@@ -205,6 +207,9 @@ impl Node {
         let offer = serde_json::json!({"v":1,"call_id":CALL,"sdp":"offer","media":"audio"}).to_string();
         if side == Side::Callee {
             konsensus_api::calls::admit_incoming(self.storage.as_ref(), &self.id, peer, 400, Some(&offer)).await.unwrap();
+            // A paired device fetched the invite: it rings.
+            let fetched = self.storage.call_get(peer, CALL).await.unwrap().unwrap().device_fetched(konsensus_api::calls::now_ms()).unwrap();
+            self.storage.call_put(peer, CALL, &fetched).await.unwrap();
         }
         let signal = if side == Side::Caller { offer }
             else { serde_json::json!({"v":1,"call_id":CALL,"sdp":"answer"}).to_string() };
@@ -215,7 +220,7 @@ impl Node {
         konsensus_api::calls::commit_outgoing_for(&self.state, &user, peer, &signal, &operation, "ownership").await.unwrap();
         let now = chrono::Utc::now().timestamp_millis() as u64;
         self.storage
-            .call_put(peer, CALL, &CallEntry { side, phase: Phase::Live, deadline_ms: now + 70_000, pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1, end_reason: None, unpaid_notice_used: false })
+            .call_put(peer, CALL, &CallEntry { side, phase: Phase::Live, deadline_ms: now + 70_000, pending: None, paid_until_ms: Some(now + 60_000), next_block_seq: 1, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new() })
             .await
             .unwrap();
     }
@@ -242,7 +247,7 @@ impl Node {
 }
 
 fn packet(seq: u32, payload: &[u8]) -> Message {
-    Message::Binary([seq.to_be_bytes().as_slice(), payload].concat())
+    Message::Binary([seq.to_be_bytes().as_slice(), payload].concat().into())
 }
 
 async fn next_binary<S>(socket: &mut S) -> Vec<u8>
@@ -252,7 +257,7 @@ where
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match socket.next().await.expect("socket open").expect("socket ok") {
-                Message::Binary(bytes) => return bytes,
+                Message::Binary(bytes) => return bytes.to_vec(),
                 Message::Ping(_) | Message::Pong(_) | Message::Text(_) => continue,
                 other => panic!("unexpected message {other:?}"),
             }
@@ -460,7 +465,7 @@ async fn a_packet_into_node_a_s_socket_comes_out_of_node_b_s_socket() {
     assert_eq!(next_binary(&mut app_a).await, [&7u32.to_be_bytes()[..], b"hello from b"].concat());
 
     // A malformed app packet (no header) is dropped; the socket stays up.
-    app_a.send(Message::Binary(vec![1, 2])).await.unwrap();
+    app_a.send(Message::Binary(vec![1, 2].into())).await.unwrap();
     app_a.send(packet(21, b"still here")).await.unwrap();
     assert_eq!(next_binary(&mut app_b).await, [&21u32.to_be_bytes()[..], b"still here"].concat());
 

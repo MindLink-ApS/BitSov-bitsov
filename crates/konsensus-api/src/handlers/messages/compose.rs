@@ -27,10 +27,13 @@ use konsensus_crypto::ratchet_message_to_bytes;
 use konsensus_message::wire::Frame;
 
 use crate::audit::events;
-use crate::error::ApiError;
+use crate::error::{ApiError, ObservedTip};
 use crate::handlers::utils::generate_valid_proof;
 use crate::invoice_refusal;
-use crate::state::{AppState, InvoiceRequestOutcome, InvoiceResponseData};
+use crate::state::{AppState, InvoiceRequestOutcome, InvoiceResponseData, PeerLightningKey};
+use konsensus_core::lightning_binding::{
+    REASON_CONTACT_MUST_UPDATE, REASON_DESTINATION_MISMATCH, REASON_NO_BINDING,
+};
 
 /// Request to compose and send a message (node handles encryption + payment).
 ///
@@ -128,24 +131,34 @@ pub struct MemberPaymentOutcome {
     pub code: Option<&'static str>,
 }
 
-async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, height: u64) -> Result<u64, ApiError> {
+/// The peer's fresh price for `kind` at `height`, else this node's own.
+async fn peer_or_own_price(state: &AppState, peer: &NodeId, kind: u16, height: u64) -> Result<u64, ApiError> {
+    match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
+        Some(price) => Ok(price),
+        None => state.pricing.get_price_msat(kind).await.map_err(crate::error::pricing_error),
+    }
+}
+
+/// An established zero-price conversation needs no tip or money-ready wallet.
+/// Any price to pay is quoted again against this send's observed tip.
+async fn quoted_price(state: &AppState, peer: &NodeId, kind: u16, tip: &mut Option<ObservedTip>) -> Result<u64, ApiError> {
     let ready = state.lightning.money_ready().await;
     if !ready && !state.session_manager.has_session(peer).await {
         return Err(ApiError::NotReady);
     }
-    let quote = async {
-        match state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, MAX_PRICE_AGE).await {
-            Some(price) => Ok(price),
-            None => state.pricing.get_price_msat(kind).await.map_err(|e| ApiError::Internal(format!("pricing error: {e}"))),
-        }
-    };
-    // Preserve established zero-price conversations when a local quote is
-    // available. Never wait on dynamic chain pricing or assume a free price.
-    let price = if ready { quote.await? } else {
+    // A wallet that is not ready still needs an established local free price;
+    // do not wait on dynamic pricing or assume that a conversation is free.
+    // Height zero is only a check for a free send, never a price to pay.
+    let quote = peer_or_own_price(state, peer, kind, tip.as_ref().map_or(0, ObservedTip::height));
+    let mut price = if ready { quote.await? } else {
         tokio::time::timeout(Duration::from_millis(100), quote).await.map_err(|_| ApiError::NotReady)??
     };
     if super::caps::payable(price) > 0 || !state.session_manager.has_session(peer).await {
         crate::error::require_money_ready(state).await?;
+        if tip.is_none() {
+            *tip = Some(crate::error::observe_tip(state).await?);
+            price = peer_or_own_price(state, peer, kind, tip.as_ref().expect("observed tip").height()).await?;
+        }
     }
     Ok(super::caps::payable(price))
 }
@@ -408,12 +421,18 @@ async fn await_message_settlement(state: &AppState, debit: &Debit, updates: Sett
 /// Implements Principle 2 correctly: real economic flow from sender to recipient.
 ///
 /// **Keysend path** (fast, ~0ms round-trip): If the peer's Lightning pubkey is
-/// known (exchanged via `Frame::LightningInfo` after handshake), pushes sats
-/// directly to their node. No invoice request needed.
+/// known and its identity-key signature verified (exchanged via
+/// `Frame::LightningInfo` after handshake), pushes sats directly to that key.
+/// No invoice request needed. Keysend never targets a key the contact's
+/// identity did not sign.
 ///
 /// **Invoice path** (fallback, ~100-200ms round-trip): If the peer has no
 /// Lightning pubkey, or keysend is positively rejected before dispatch, use the
 /// RequestInvoice/InvoiceResponse/pay_invoice flow.
+///
+/// **Refused**: a peer that advertised a Lightning key without an identity
+/// signature (an older version) is paid by neither path. The call fails with
+/// the fixed reason [`REASON_CONTACT_MUST_UPDATE`] and nothing is dispatched.
 ///
 /// Returns (payment_hash, preimage, amount_msat). Never falls back to fake proofs.
 pub async fn create_payment_proof(
@@ -431,7 +450,7 @@ pub(crate) async fn create_payment_proof_with_fee_report(
 ) -> Result<(([u8; 32], [u8; 32], u64), u64, u64), ApiError> {
     let mut charge = FirstContactCharge::default();
     let readmission = Readmission::for_cap(None);
-    let result = create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), &readmission, None, &mut charge).await;
+    let result = create_metered_payment_proof(state, price_msat, peer_id, &Debit::unmetered(), &readmission, None, &mut charge, None).await;
     let message_msat = charge.message_authorized.unwrap_or(super::caps::payable(price_msat));
     let fee = state.lightning.routing_fee_policy().ceiling(message_msat, None);
     let ceiling = fee.saturating_add(readmission.fee_ceiling_msat());
@@ -485,6 +504,7 @@ impl Readmission {
 }
 
 /// Paired paid paths carry the original reservation through every fallback.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_metered_payment_proof(
     state: &AppState,
     price_msat: u64,
@@ -493,17 +513,26 @@ pub(crate) async fn create_metered_payment_proof(
     readmission: &Readmission,
     kind: Option<u16>,
     charge: &mut FirstContactCharge,
+    tip: Option<&ObservedTip>,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
-    // A zero price sends a zero-amount proof and pays nothing. No kind is free
-    // at the receiving gate: it floors every paid admission at 1,000 msat.
+    // A zero-amount proof never reaches the wallet and needs no chain tip.
     if price_msat == 0 {
         return Ok(generate_valid_proof(0));
     }
-
-    let _reconnect = state.transport.retain_peer(peer_id).await;
-
     // Recheck after quoting: readiness may have changed before dispatch.
     crate::error::require_money_ready(state).await?;
+    // Reuse the quote's observation where available. Every dispatcher checks
+    // it again after a long preparation before polling the wallet.
+    let observed;
+    let tip = match tip {
+        Some(tip) => tip,
+        None => {
+            observed = crate::error::observe_tip(state).await?;
+            &observed
+        }
+    };
+    let _reconnect = state.transport.retain_peer(peer_id).await;
+    tracing::debug!(peer = %peer_id, tip = tip.height(), "paying a peer against the chain tip");
 
     // Peer must be connected to receive the invoice request.
     if !state.transport.is_connected(peer_id).await {
@@ -520,10 +549,23 @@ pub(crate) async fn create_metered_payment_proof(
     // Call blocks require the callee's stop-early check and invoice binding.
     // A caller that forbids re-admission also needs the recipient's invoice
     // gate to refuse before any payment is dispatched.
-    let peer_ln_pubkey = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
+    //
+    // A contact whose Lightning key carries no identity signature runs a
+    // version that does not sign bindings yet. Neither path pays them: keysend
+    // would target an unbound key and the invoice fallback would pay the same
+    // unbound node. Refuse out loud until the contact updates.
+    let peer_ln_pubkey = match state.peer_ln_pubkeys.lock().await.get(peer_id) {
+        Some(PeerLightningKey::Verified(key)) => Some(key.clone()),
+        Some(PeerLightningKey::Unsigned) => {
+            return Err(ApiError::PeerNotReady {
+                reason: REASON_CONTACT_MUST_UPDATE,
+            });
+        }
+        None => None,
+    };
     if !debit.is_call_block() && !readmission.forbidden {
         if let Some(ln_pubkey) = peer_ln_pubkey {
-            match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit).await {
+            match try_keysend(state, &ln_pubkey, payment_amount_msat, peer_id, debit, tip).await {
                 Ok(KeysendOutcome::Settled(proof)) => return Ok(proof),
                 Ok(KeysendOutcome::NotDispatched) => {
                     tracing::warn!(
@@ -548,11 +590,34 @@ pub(crate) async fn create_metered_payment_proof(
     }
 
     // Invoice-request fallback (only reached when keysend was not dispatched).
-    match create_payment_proof_via_invoice(state, payment_amount_msat, peer_id, debit, None).await {
+    match create_payment_proof_via_invoice(state, payment_amount_msat, peer_id, debit, kind, None, tip).await {
         Err(e) if is_admission_refusal(&e) => {
-            readmit_then_pay(state, payment_amount_msat, peer_id, debit, readmission, kind, charge).await
+            readmit_then_pay(state, payment_amount_msat, peer_id, debit, readmission, kind, charge, tip).await
         }
         other => other,
+    }
+}
+
+/// The admission payment itself; it takes the tip this send read. The
+/// contact's binding is read again here, without waiting, when the wallet is
+/// handed the payment, so one that changed while the admission was being
+/// reserved refuses it as not dispatched. An invoice that no longer parses is
+/// refused the same way.
+fn pay_admission_invoice<'a>(
+    state: &'a AppState,
+    peer_id: &'a NodeId,
+    bolt11: &'a str,
+    fee_ceiling_msat: u64,
+    _tip: &crate::error::ObservedTip,
+) -> impl std::future::Future<Output = Result<PaymentDetails, LightningError>> + 'a {
+    async move {
+        let invoice = bolt11
+            .parse::<lightning_invoice::Bolt11Invoice>()
+            .map_err(|_| LightningError::PaymentNotDispatched(INVOICE_PAYEE_MISMATCH.to_owned()))?;
+        if let Err(reason) = invoice_payee_reason_now(state, peer_id, &invoice) {
+            return Err(LightningError::PaymentNotDispatched(reason.to_owned()));
+        }
+        state.lightning.pay_invoice_with_fee_limit(bolt11, fee_ceiling_msat).await
     }
 }
 
@@ -596,6 +661,15 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
     match refusal.as_deref() {
         Some(invoice_refusal::ADMISSION_REQUIRED) => admission_refusal(peer_id),
         Some("disk_low") => ApiError::NotDispatched("disk_low".into()),
+        Some(invoice_refusal::CALL_PRICE_CHANGED) => ApiError::BudgetExceeded(
+            crate::spend_budget::BudgetRefusal::CallPriceChanged,
+        ),
+        Some(invoice_refusal::SESSION_HANDOVER) => ApiError::NotDispatched(
+            "recipient session recovery handover is pending; retry shortly".into()
+        ).with_reason("session_handover"),
+        Some(invoice_refusal::PRICE_CHANGED) => ApiError::NotDispatched(
+            "recipient lowered its prices since they were quoted; refresh its prices and retry; nothing was paid".into()
+        ).with_reason("price_changed"),
         Some(invoice_refusal::CALL_BLOCK_UNPAYABLE) => ApiError::NotDispatched(
             "callee refused the call block invoice: deadline margin, call sequence or no E2EE session; nothing was paid".into()
         ).with_reason("call_block_unpayable"),
@@ -627,6 +701,7 @@ fn invoice_refused(peer_id: &NodeId, refusal: Option<String>) -> ApiError {
 /// is refused before payment. An uncapped request may use existing admission
 /// authority under the same G1 contact/call/grant limits. Mark and proof send
 /// stay generation-bound (#100).
+#[allow(clippy::too_many_arguments)]
 async fn readmit_then_pay(
     state: &AppState,
     amount_msat: u64,
@@ -635,6 +710,7 @@ async fn readmit_then_pay(
     readmission: &Readmission,
     kind: Option<u16>,
     charge: &mut FirstContactCharge,
+    tip: &crate::error::ObservedTip,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     let peer_key = peer_id.to_hex();
     if readmission.forbidden {
@@ -773,7 +849,7 @@ async fn readmit_then_pay(
         if tokio::time::Instant::now() >= deadline {
             return Err(admission_refusal(peer_id));
         }
-        match create_payment_proof_via_invoice(state, amount_msat, peer_id, debit, Some(deadline)).await {
+        match create_payment_proof_via_invoice(state, amount_msat, peer_id, debit, kind, Some(deadline), tip).await {
             // One wall-clock budget includes every prepayment request/response
             // and retry sleep. A payment already dispatched is never cancelled.
             Err(e) if is_admission_refusal(&e) => {
@@ -801,11 +877,39 @@ async fn try_keysend(
     amount_msat: u64,
     peer_id: &NodeId,
     debit: &Debit,
+    tip: &ObservedTip,
 ) -> Result<KeysendOutcome, ApiError> {
+    // Pay a contact only at the Lightning key their identity signed. Refuse
+    // early, before any journal or budget bookkeeping, when the caller's
+    // destination is not the contact's verified key.
+    require_verified_keysend_destination(state, peer_id, ln_pubkey).await?;
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
-    let details = match debit.dispatch_message(state, None, amount_msat, state
-        .lightning
-        .keysend_with_fee_limit(ln_pubkey, amount_msat, Some("konsensus message"), debit.fee_limit(state, amount_msat)))
+    let fee_limit = debit.fee_limit(state, amount_msat);
+    let destination = ln_pubkey.to_owned();
+    // The authorization point proper. `dispatch_message` awaits the journal
+    // and budget bookkeeping before it polls this future, so the binding is
+    // read again here, at the moment the backend is handed the payment. A
+    // rotation or removal that landed during those awaits refuses the
+    // payment instead of paying a key the identity no longer signs; the
+    // refusal is a positive not-dispatched, so the bookkeeping is rolled
+    // back and nothing is paid. The read does not wait: the first poll of
+    // this future is the backend's first poll.
+    let dispatch = async {
+        if let Err(reason) = keysend_destination_reason_now(state, peer_id, &destination) {
+            return Err(LightningError::PaymentNotDispatched(reason.to_owned()));
+        }
+        state
+            .lightning
+            .keysend_with_fee_limit(
+                &destination,
+                amount_msat,
+                Some("konsensus message"),
+                fee_limit,
+            )
+            .await
+    };
+    let details = match debit
+        .dispatch_message(state, None, amount_msat, tip, dispatch)
         .await?
     {
         Ok(details) => details,
@@ -814,6 +918,16 @@ async fn try_keysend(
             return Err(ApiError::NotDispatched(reason));
         }
         Err(LightningError::PaymentNotDispatched(reason)) => {
+            // A binding refusal never falls back to an invoice: the contact
+            // is paid at their verified key or not at all.
+            if let Some(fixed) = binding_refusal_reason(&reason) {
+                tracing::warn!(
+                    peer = %peer_id,
+                    reason = fixed,
+                    "keysend refused at dispatch: binding changed"
+                );
+                return Err(ApiError::PeerNotReady { reason: fixed });
+            }
             tracing::warn!(peer = %peer_id, %reason, "keysend rejected before dispatch");
             return Ok(KeysendOutcome::NotDispatched);
         }
@@ -855,6 +969,226 @@ async fn try_keysend(
     Ok(KeysendOutcome::Settled((hash_bytes, preimage_bytes, amount_msat)))
 }
 
+/// Refuse a keysend whose destination is not the contact's verified Lightning
+/// key. Fixed reasons; no payment is dispatched.
+///
+/// This is the authorization point for the destination: the binding is read
+/// under the map lock and compared with the exact string handed to the
+/// backend. The lock is not held across dispatch (the backend call awaits the
+/// network). A rotation or removal that lands after this point does not
+/// change the destination of the payment already authorized; it governs the
+/// next payment. Every destination that reaches the backend is therefore one
+/// the contact's identity signed at the moment it was authorized.
+async fn require_verified_keysend_destination(
+    state: &AppState,
+    peer_id: &NodeId,
+    destination: &str,
+) -> Result<(), ApiError> {
+    keysend_destination_reason(state, peer_id, destination)
+        .await
+        .map_err(|reason| ApiError::PeerNotReady { reason })
+}
+
+/// Read the contact's current binding and decide whether `destination` may
+/// be paid; the error is the fixed refusal reason.
+async fn keysend_destination_reason(
+    state: &AppState,
+    peer_id: &NodeId,
+    destination: &str,
+) -> Result<(), &'static str> {
+    let binding = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
+    keysend_destination_allowed(binding.as_ref(), destination)
+}
+
+/// [`keysend_destination_reason`] at the dispatch boundary: the binding is
+/// read without waiting, and [`BINDING_BUSY`] refuses when it cannot be.
+fn keysend_destination_reason_now(
+    state: &AppState,
+    peer_id: &NodeId,
+    destination: &str,
+) -> Result<(), &'static str> {
+    let binding = binding_now(state, peer_id)?;
+    keysend_destination_allowed(binding.as_ref(), destination)
+}
+
+/// Internal marker for a payment refused at the dispatch boundary because the
+/// contact's binding was being changed at that instant. It travels as a
+/// not-dispatched reason, so the bookkeeping is rolled back and nothing is
+/// paid. It is not a binding refusal: a keysend refused this way may still
+/// fall back to the invoice path, which reads the binding itself.
+const BINDING_BUSY: &str = "lightning_binding_busy";
+
+/// The contact's current binding, read without waiting. The dispatch future
+/// must not suspend before the wallet's first poll, so a binding that cannot
+/// be read at once refuses the payment with [`BINDING_BUSY`].
+fn binding_now(state: &AppState, peer_id: &NodeId) -> Result<Option<PeerLightningKey>, &'static str> {
+    state
+        .peer_ln_pubkeys
+        .try_lock()
+        .map(|map| map.get(peer_id).cloned())
+        .map_err(|_| BINDING_BUSY)
+}
+
+/// The decision behind [`require_verified_keysend_destination`]: only a
+/// verified binding equal to the destination lets a keysend proceed.
+fn keysend_destination_allowed(
+    binding: Option<&PeerLightningKey>,
+    destination: &str,
+) -> Result<(), &'static str> {
+    match binding {
+        Some(PeerLightningKey::Verified(key)) if key == destination => Ok(()),
+        Some(PeerLightningKey::Verified(_)) => Err(REASON_DESTINATION_MISMATCH),
+        Some(PeerLightningKey::Unsigned) => Err(REASON_CONTACT_MUST_UPDATE),
+        None => Err(REASON_NO_BINDING),
+    }
+}
+
+/// The fixed binding reason carried by a not-dispatched keysend that the
+/// authorization point refused, if that is what it was.
+fn binding_refusal_reason(reason: &str) -> Option<&'static str> {
+    [
+        REASON_DESTINATION_MISMATCH,
+        REASON_CONTACT_MUST_UPDATE,
+        REASON_NO_BINDING,
+    ]
+    .into_iter()
+    .find(|fixed| *fixed == reason)
+}
+
+#[cfg(test)]
+mod keysend_destination_tests {
+    use super::*;
+
+    fn key(prefix: &str) -> String {
+        format!("{prefix}{}", "ab".repeat(32))
+    }
+
+    fn reason(result: Result<(), &'static str>) -> Option<&'static str> {
+        result.err()
+    }
+
+    #[test]
+    fn binding_refusals_are_recognized_in_not_dispatched_reasons() {
+        for fixed in [
+            REASON_DESTINATION_MISMATCH,
+            REASON_CONTACT_MUST_UPDATE,
+            REASON_NO_BINDING,
+        ] {
+            assert_eq!(binding_refusal_reason(fixed), Some(fixed));
+        }
+        assert_eq!(binding_refusal_reason("no route"), None);
+        assert_eq!(binding_refusal_reason("disk_low"), None);
+    }
+
+    #[test]
+    fn a_busy_binding_is_not_a_binding_refusal() {
+        assert_eq!(binding_refusal_reason(BINDING_BUSY), None);
+    }
+
+    #[test]
+    fn verified_binding_matching_destination_is_allowed() {
+        let binding = PeerLightningKey::Verified(key("02"));
+        assert_eq!(
+            reason(keysend_destination_allowed(Some(&binding), &key("02"))),
+            None
+        );
+    }
+
+    #[test]
+    fn verified_binding_for_another_key_refuses_destination() {
+        let binding = PeerLightningKey::Verified(key("02"));
+        assert_eq!(
+            reason(keysend_destination_allowed(Some(&binding), &key("03"))),
+            Some(REASON_DESTINATION_MISMATCH)
+        );
+    }
+
+    #[test]
+    fn unsigned_binding_refuses_with_update_reason() {
+        let binding = PeerLightningKey::Unsigned;
+        assert_eq!(
+            reason(keysend_destination_allowed(Some(&binding), &key("02"))),
+            Some(REASON_CONTACT_MUST_UPDATE)
+        );
+    }
+
+    #[test]
+    fn missing_binding_refuses() {
+        assert_eq!(
+            reason(keysend_destination_allowed(None, &key("02"))),
+            Some(REASON_NO_BINDING)
+        );
+    }
+}
+
+/// An invoice from a contact must be payable to the Lightning key their
+/// identity signed, when one is on record. An unsigned advertisement refuses
+/// the payment; no entry leaves the invoice's own payee as the only check.
+async fn require_invoice_payee_bound(
+    state: &AppState,
+    peer_id: &NodeId,
+    invoice: &lightning_invoice::Bolt11Invoice,
+    mismatch: &'static str,
+) -> Result<(), ApiError> {
+    invoice_payee_reason(state, peer_id, invoice)
+        .await
+        .map_err(|reason| invoice_binding_error(reason, mismatch).unwrap_or(ApiError::Lightning(mismatch.into())))
+}
+
+/// Internal marker for a refused invoice whose payee is not the contact's
+/// verified key. It travels as a not-dispatched reason from the dispatch
+/// future and is mapped back to the caller's mismatch error; never shown.
+const INVOICE_PAYEE_MISMATCH: &str = "invoice_payee_mismatch";
+
+/// Read the contact's current binding and decide whether `invoice` may be
+/// paid. Called when the invoice is validated; the dispatch future decides
+/// again through [`invoice_payee_reason_now`], so a binding that turns
+/// `Unsigned` or moves to another key while the payment is being prepared
+/// still refuses it before the wallet sees it.
+async fn invoice_payee_reason(
+    state: &AppState,
+    peer_id: &NodeId,
+    invoice: &lightning_invoice::Bolt11Invoice,
+) -> Result<(), &'static str> {
+    let binding = state.peer_ln_pubkeys.lock().await.get(peer_id).cloned();
+    invoice_payee_allowed(binding.as_ref(), invoice)
+}
+
+/// [`invoice_payee_reason`] at the dispatch boundary: the binding is read
+/// without waiting, and [`BINDING_BUSY`] refuses when it cannot be.
+fn invoice_payee_reason_now(
+    state: &AppState,
+    peer_id: &NodeId,
+    invoice: &lightning_invoice::Bolt11Invoice,
+) -> Result<(), &'static str> {
+    let binding = binding_now(state, peer_id)?;
+    invoice_payee_allowed(binding.as_ref(), invoice)
+}
+
+/// The decision behind [`invoice_payee_reason`].
+fn invoice_payee_allowed(
+    binding: Option<&PeerLightningKey>,
+    invoice: &lightning_invoice::Bolt11Invoice,
+) -> Result<(), &'static str> {
+    match binding {
+        Some(PeerLightningKey::Verified(key)) if invoice_payee_is(invoice, key) => Ok(()),
+        Some(PeerLightningKey::Verified(_)) => Err(INVOICE_PAYEE_MISMATCH),
+        Some(PeerLightningKey::Unsigned) => Err(REASON_CONTACT_MUST_UPDATE),
+        None => Ok(()),
+    }
+}
+
+/// The caller-facing error for an invoice binding refusal, if `reason` is one.
+fn invoice_binding_error(reason: &str, mismatch: &'static str) -> Option<ApiError> {
+    match reason {
+        INVOICE_PAYEE_MISMATCH => Some(ApiError::Lightning(mismatch.into())),
+        REASON_CONTACT_MUST_UPDATE => Some(ApiError::PeerNotReady {
+            reason: REASON_CONTACT_MUST_UPDATE,
+        }),
+        _ => None,
+    }
+}
+
 /// Create a payment proof via the invoice-request/response round-trip.
 ///
 /// This is the original flow: send RequestInvoice to peer, wait for their
@@ -873,7 +1207,9 @@ async fn create_payment_proof_via_invoice(
     invoice_amount_msat: u64,
     peer_id: &NodeId,
     debit: &Debit,
+    kind: Option<u16>,
     promotion_deadline: Option<tokio::time::Instant>,
+    tip: &ObservedTip,
 ) -> Result<([u8; 32], [u8; 32], u64), ApiError> {
     // Generate a unique request ID for correlating request/response.
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -900,7 +1236,7 @@ async fn create_payment_proof_via_invoice(
     let frame = Frame::RequestInvoice {
         request_id: request_id.clone(),
         amount_msat: invoice_amount_msat,
-        purpose: debit.invoice_purpose(),
+        purpose: debit.invoice_purpose(kind),
     };
     let frame_bytes = frame
         .to_bytes()
@@ -988,13 +1324,13 @@ async fn create_payment_proof_via_invoice(
         return Err(ApiError::Lightning("recipient invoice provenance/hash/expiry mismatch".into()));
     }
 
-    if let Some(expected) = state.peer_ln_pubkeys.lock().await.get(peer_id) {
-        if !invoice_payee_is(&invoice, expected) {
-            return Err(ApiError::Lightning(
-                "invoice payee does not match recipient".into(),
-            ));
-        }
-    }
+    require_invoice_payee_bound(
+        state,
+        peer_id,
+        &invoice,
+        "invoice payee does not match recipient",
+    )
+    .await?;
 
     if promotion_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
         return Err(admission_refusal(peer_id));
@@ -1004,13 +1340,27 @@ async fn create_payment_proof_via_invoice(
     // settlement (it commonly returns Pending/InFlight before the preimage is
     // known; treating that as failure dropped settling messages).
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
-    let details = debit.dispatch_message(state, Some(invoice.payment_hash().to_string()), invoice_amount_msat, state
-        .lightning
-        .pay_invoice_with_fee_limit(&response.bolt11, debit.fee_limit(state, invoice_amount_msat)))
+    let fee_limit = debit.fee_limit(state, invoice_amount_msat);
+    // The binding is read again at the moment the wallet is handed the
+    // payment, as for keysend: a binding that changed during the journal and
+    // budget awaits refuses it as not dispatched, so nothing is paid. The
+    // read does not wait: the first poll of this future is the wallet's.
+    let dispatch = async {
+        if let Err(reason) = invoice_payee_reason_now(state, peer_id, &invoice) {
+            return Err(LightningError::PaymentNotDispatched(reason.to_owned()));
+        }
+        state.lightning.pay_invoice_with_fee_limit(&response.bolt11, fee_limit).await
+    };
+    let details = debit.dispatch_message(state, Some(invoice.payment_hash().to_string()), invoice_amount_msat, tip, dispatch)
         .await?
         .map_err(|e| match e {
             LightningError::NotReady => ApiError::NotReady,
-            LightningError::PaymentNotDispatched(reason) => ApiError::NotDispatched(reason),
+            LightningError::PaymentNotDispatched(reason) => {
+                match invoice_binding_error(&reason, "invoice payee does not match recipient") {
+                    Some(refused) => refused,
+                    None => ApiError::NotDispatched(reason),
+                }
+            }
             other => ApiError::PaymentUnresolved(format!("failed to pay recipient invoice: {other}")),
         })?;
 
@@ -1957,7 +2307,7 @@ async fn request_admission_invoice(
     if kind != konsensus_core::kind::KIND_CHAT {
         return Err(ApiError::BadRequest("first contact must be a chat message".into()));
     }
-    let current_block_height = state.chain.get_block_height().await.unwrap_or(0);
+    let current_block_height = crate::error::chain_tip(state).await?;
     let peer_announced = state
         .peer_prices
         .get_fresh_discounted_peer_price(
@@ -1971,7 +2321,7 @@ async fn request_admission_invoice(
         .pricing
         .get_price_msat(konsensus_core::kind::KIND_CHAT)
         .await
-        .map_err(|e| ApiError::Internal(format!("pricing error: {e}")))?;
+        .map_err(crate::error::pricing_error)?;
     let requested_msat = derive_admission_msat(peer_announced, own_price);
     let request_id = konsensus_core::admission_quote::request_id(
         peer_id, state.identity.node_id(), std::time::SystemTime::now()
@@ -2141,13 +2491,13 @@ async fn validate_admission_invoice(
             "admission invoice hash/expiry mismatch".into(),
         ));
     }
-    if let Some(expected) = state.peer_ln_pubkeys.lock().await.get(peer_id) {
-        if !invoice_payee_is(&invoice, expected) {
-            return Err(ApiError::Lightning(
-                "admission invoice payee does not match recipient".into(),
-            ));
-        }
-    }
+    require_invoice_payee_bound(
+        state,
+        peer_id,
+        &invoice,
+        "admission invoice payee does not match recipient",
+    )
+    .await?;
     let prefix = format!("konsensus:{request_id}:message=");
     let message_price = invoice
         .description()
@@ -2749,6 +3099,10 @@ async fn first_contact_admission_at(
         }
     }
 
+    // The payment chokepoint for admission: a usable chain tip for this send,
+    // read before anything is reserved, journaled or paid.
+    let tip = crate::error::observe_tip(state).await?;
+
     // 0c. ATOMIC capacity reservation (fail closed): we reached the paid path, so
     //     this peer has NO live guard. Reserve a slot in ONE locked operation so
     //     two concurrent NEW peers cannot both pass at MAX-1 and overrun the cap
@@ -2911,12 +3265,16 @@ async fn first_contact_admission_at(
     }
     // Last generation check, before the durable dispatch marker: a reconnect
     // while the journal was written backs out exactly like a wallet refusal.
-    if state.transport.connected_since(peer_id).await != quote_generation {
+    let tip_ready = tip.recheck(state).await;
+    if state.transport.connected_since(peer_id).await != quote_generation || tip_ready.is_err() {
         super::admission_journal::mark_undispatched(state, peer_id, &bolt11_payment_hash)?;
         if let Some(operation) = &charge.operation { operation.admission_not_dispatched().await?; }
         super::admission_journal::clear_failed(state, peer_id)?;
         lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
-        return Err(quote_generation_changed(peer_id));
+        if let Some(r) = readmit.as_ref().and_then(|r| r.reserved.as_ref()) {
+            r.released(&peer_id.to_hex());
+        }
+        return Err(tip_ready.err().unwrap_or_else(|| quote_generation_changed(peer_id)));
     }
     // No await separates this durable dispatch marker from the guarded wallet
     // call below. Cancellation while admission_started awaited leaves false.
@@ -2940,7 +3298,7 @@ async fn first_contact_admission_at(
         counter.fetch_add(admission_fee_ceiling, std::sync::atomic::Ordering::Relaxed);
     }
     let updates = SettlementUpdates::subscribe(state.lightning.as_ref());
-    let dispatched = match debit.dispatch(state.lightning.pay_invoice_with_fee_limit(&response.bolt11, admission_fee_ceiling)).await {
+    let dispatched = match debit.dispatch(pay_admission_invoice(state, peer_id, &response.bolt11, admission_fee_ceiling, &tip)).await {
         Ok(result) => result,
         Err(error @ ApiError::BudgetExceeded(_)) => {
             super::admission_journal::mark_undispatched(state, peer_id, &bolt11_payment_hash)?;
@@ -2968,7 +3326,10 @@ async fn first_contact_admission_at(
             super::admission_journal::clear_failed(state, peer_id)?;
             lock_admission_ledger().clear_tracked(peer_id, &bolt11_payment_hash);
             charge.reserved_msat = 0;
-            return Err(ApiError::NotDispatched(reason));
+            return Err(match invoice_binding_error(&reason, "admission invoice payee does not match recipient") {
+                Some(refused) => refused,
+                None => ApiError::NotDispatched(reason),
+            });
         }
         Err(error) => return Err(ApiError::PaymentUnresolved(format!(
             "admission dispatch outcome unknown for {bolt11_payment_hash}; retry will reconcile the same invoice: {error}"
@@ -3024,6 +3385,7 @@ async fn first_contact_admission_at(
 /// These values are identical for all members of a single room compose, so we
 /// bundle them once instead of threading each through the per-member helper.
 struct RoomFanoutCtx<'a> {
+    tip: Option<&'a ObservedTip>,
     debit: &'a Debit,
     readmission: &'a Readmission,
     sender: NodeId,
@@ -3103,7 +3465,7 @@ async fn compose_room_member(
     // Preserve refused vs unresolved payment state for every member.
     let mut admission = FirstContactCharge::default();
     let (payment_hash, preimage_bytes, amount_msat) =
-        match create_metered_payment_proof(state, price_msat, &member, ctx.debit, ctx.readmission, Some(ctx.kind), &mut admission).await.map_err(|error| admission.error(error)) {
+        match create_metered_payment_proof(state, price_msat, &member, ctx.debit, ctx.readmission, Some(ctx.kind), &mut admission, ctx.tip).await.map_err(|error| admission.error(error)) {
             Ok(proof) => proof,
             Err(e) => {
                 tracing::warn!(
@@ -3149,7 +3511,7 @@ async fn compose_room_member(
 
     // Cache plaintext (encrypted at rest) for API retrieval.
     if let Some(ref cipher) = state.plaintext_cipher {
-        match cipher.encrypt(ctx.plaintext.as_bytes()) {
+        match cipher.encrypt(&envelope.id.to_hex(), ctx.plaintext.as_bytes()) {
             Ok(encrypted) => {
                 if let Err(e) = state
                     .storage
@@ -3341,17 +3703,12 @@ pub(super) async fn compose_message_with_policy(
             None => admin_room_members(&state, &req).await?,
         };
 
-        let current_block_height = if !state.lightning.money_ready().await { 0 } else { match state.chain.get_block_height().await {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to get block height for room compose, using fallback 0");
-                0
-            }
-        }};
+        // Observe only when a member needs a positive price or a new session.
+        let mut tip = None;
 
         let mut prices = Vec::new();
         for member in members.iter().filter(|m| *m != state.identity.node_id()) {
-            prices.push((*member, quoted_price(&state, member, req.kind, current_block_height).await?));
+            prices.push((*member, quoted_price(&state, member, req.kind, &mut tip).await?));
         }
         if prices.is_empty() && !skipped.is_empty() {
             return Ok(Json(ComposeResponse {
@@ -3397,6 +3754,7 @@ pub(super) async fn compose_message_with_policy(
             },
         );
         let ctx = RoomFanoutCtx {
+            tip: tip.as_ref(),
             debit: &debit,
             readmission: &readmission,
             sender,
@@ -3542,12 +3900,27 @@ pub(super) async fn compose_peer(
         reconcile_admission_budget(&state, &peer_id, None).await?;
         let mut admission = FirstContactCharge { operation: Some(operation.clone()), ..Default::default() };
         let recipient = Recipient::Node(peer_id);
+        // An answer or a decline to a call this node is ringing for, sent to a
+        // caller that accepts it free (`[calls] call_reply_free_v1` on both
+        // nodes): no quote, no invoice, no grant debit, no reservation and no
+        // payment. It is bound to that call and to the open session below.
+        let free_reply = state.session_manager.has_session(&peer_id).await
+            && crate::calls::free_reply_allowed(&state, &peer_id, req.kind, &req.plaintext, &references).await?;
+        let references = if free_reply {
+            let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            vec![konsensus_core::payloads::call::free_reply_reference(&signal.call_id)]
+        } else { references };
 
-        let height = if state.lightning.money_ready().await { state.chain.get_block_height().await.unwrap_or(0) } else { 0 };
-        let mut price_msat = if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
-            crate::handlers::browse::page_price(&state, peer_id, &req.plaintext, req.max_routing_fee_msat).await?
+        let mut tip = if state.lightning.money_ready().await && !state.session_manager.has_session(&peer_id).await {
+            Some(crate::error::observe_tip(&state).await?)
+        } else { None };
+        let mut price_msat = if free_reply {
+            0
+        } else if req.kind == konsensus_core::kind::KIND_PAGE_REQUEST {
+            crate::handlers::browse::page_price(&state, peer_id, &req.plaintext, req.max_routing_fee_msat, &mut tip).await?
         } else {
-            quoted_price(&state, &peer_id, req.kind, height).await?
+            quoted_price(&state, &peer_id, req.kind, &mut tip).await?
         };
         let mut cap = req.max_total_msat;
         if let Some(per) = &req.max_recipient_msat {
@@ -3679,7 +4052,7 @@ pub(super) async fn compose_peer(
                     // Quote closure as an ordinary hangup: the callee's
                     // payable signal price plus its approved routing ceiling.
                     let (closing_price, closing_fee) = if auth.is_metered() {
-                        let price = quoted_price(&state, &peer_id, konsensus_core::kind::KIND_CALL_HANGUP, height).await?;
+                        let price = quoted_price(&state, &peer_id, konsensus_core::kind::KIND_CALL_HANGUP, &mut tip).await?;
                         let fee_cap = if caller_fee_cap == Some(0)
                             || super::caps::direct_channel(&state, &peer_id, &[price]).await { Some(0) }
                             else { caller_fee_cap };
@@ -3728,11 +4101,22 @@ pub(super) async fn compose_peer(
             super::caps::check_payment(&state, price_msat, req.max_routing_fee_msat, cap)?;
         } else if cap.is_none() {
             auth.refuse_unpriced("first contact requires an aggregate cap")?;
+            // The owner's key too: a payment to a peer without an open session
+            // (first contact or re-admission) is bounded by a total the caller
+            // states. A cap of 0 is a cap ("pay nothing new") and passes here.
+            return Err(ApiError::PriceCapExceeded(
+                "a payment to a peer without an open session needs max_total_msat (0 pays \
+                 nothing new) — nothing was requested or paid"
+                    .into(),
+            )
+            .with_reason("total_cap_required"));
         }
 
         // Reject budget limits before advancing the ratchet or requesting an invoice.
         let peer_key = peer_id.to_hex();
-        let debit = if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+        let debit = if free_reply {
+            Ok(crate::metered::Debit::unmetered())
+        } else if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
             let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
                 .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             auth.debit_call_block(&state, &signal, &peer_key, price_msat,
@@ -3832,12 +4216,22 @@ pub(super) async fn compose_peer(
                 }
                 reconcile_admission_budget(&state, &peer_id, debit.reservation().as_ref()).await?;
                 if let Some(target_price) = admission.message_price {
+                    // A kept quote is the target's price, but this payment
+                    // still needs a usable tip (none was read if the wallet
+                    // was not ready when the send began).
+                    if target_price > 0 && tip.is_none() {
+                        tip = Some(crate::error::observe_tip(&state).await?);
+                    }
                     price_msat = target_price;
                 } else {
                     // A resumed admission may belong to another kind. Never
-                    // substitute this node's own price for the target's quote.
+                    // substitute this node's own price for the target's quote,
+                    // and never check that quote against a missing tip.
+                    if tip.is_none() {
+                        tip = Some(crate::error::observe_tip(&state).await?);
+                    }
                     price_msat = state.peer_prices.get_fresh_discounted_peer_price(
-                        &peer_id, req.kind, height, MAX_PRICE_AGE,
+                        &peer_id, req.kind, tip.as_ref().expect("observed tip").height(), MAX_PRICE_AGE,
                     ).await.map(super::caps::payable).ok_or_else(|| ApiError::Lightning(
                         "prior admission is paid, but the target quote for this kind is unknown".into()
                     ))?;
@@ -3856,8 +4250,9 @@ pub(super) async fn compose_peer(
                             "first-contact admission payment for {peer_id} settled and a signed \
                              proof is held, but the E2EE session did not establish within {}s \
                              (the proof envelope may still need re-delivery) — retry the message \
-                             shortly; the retry is guarded by admission idempotence and will NOT \
-                             pay admission again",
+                             shortly; on this connection the retry is guarded by admission \
+                             idempotence and will NOT pay admission again (after a reconnect a new \
+                             admission is paid only within the request's max_total_msat)",
                             ADMISSION_SESSION_TIMEOUT.as_secs()
                         )));
                     }
@@ -3920,19 +4315,73 @@ pub(super) async fn compose_peer(
             forbidden: !policy.allow_readmission,
             ..Readmission::for_cap(readmission_cap)
         };
-        let (payment_hash, preimage_bytes, amount_msat) =
-            create_metered_payment_proof(&state, price_msat, &peer_id, &debit, &readmission, Some(req.kind), &mut admission).await?;
+        let (payment_hash, preimage_bytes, amount_msat) = if free_reply {
+            // Judged free: it stays free or is not sent. Recheck the call
+            // right before it goes out; a closed ring window refuses it.
+            let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            let decline = req.kind == konsensus_core::kind::KIND_CALL_HANGUP;
+            crate::calls::free_reply_still_eligible(&state, &peer_id, &signal.call_id, decline).await?;
+            // Not a payment: a fresh preimage only makes the envelope's replay
+            // keys unique. The caller's gate binds the reply to its ringing
+            // offer instead of to a settlement.
+            let preimage: [u8; 32] = rand::random();
+            (sha2::Sha256::digest(preimage).into(), preimage, 0)
+        } else {
+            create_metered_payment_proof(&state, price_msat, &peer_id, &debit, &readmission, Some(req.kind), &mut admission, tip.as_ref()).await?
+        };
         admission.message_settled = amount_msat;
         let proof =
             konsensus_core::PaymentProof::new(payment_hash, preimage_bytes, amount_msat);
 
-        if crate::calls::is_call_kind(req.kind) {
-            // Paid: publish the call transition before the envelope goes out.
-            let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
-            crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await
-                .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
-        }
-        let envelope = operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?;
+        let envelope = if free_reply {
+            // Free: save the signed reply first, then publish the call
+            // transition with this reply's receipt, then queue the reply. A
+            // stop or failed write before the transition leaves the call
+            // ringing and the reply unsent; after it, recovery queues the
+            // saved reply. A call that moved on without it never gets it.
+            let call_id = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?.call_id;
+            let envelope = operation.sealed_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat), &call_id).await?;
+            match operation.free_reply_transition(auth.user.pairing.as_ref()).await? {
+                super::operations::FreeReplyGate::Queue(call_id) => operation.publish_sealed(&envelope, &call_id).await?,
+                super::operations::FreeReplyGate::Withdrawn => {
+                    return Err(ApiError::NotDispatched(
+                        "the call is no longer ringing; the reply was not sent and nothing was paid".into(),
+                    ).with_reason("call_reply_expired"));
+                }
+                super::operations::FreeReplyGate::NotApplied => {
+                    // Unsent only once the saved reply is taken back. Otherwise
+                    // it is still saved and recovery sends it after moving the
+                    // call, so the outcome is unresolved, as for a paid send.
+                    if let Err(error) = operation.unseal().await {
+                        tracing::warn!(%error, "free call reply kept saved; recovery sends it");
+                        return Err(ApiError::PaymentUnresolved(
+                            "the call could not be updated and the saved reply could not be withdrawn; \
+                             it may still be sent, nothing was paid — read the operation before acting again".into()
+                        ).with_reason("call_reply_unresolved"));
+                    }
+                    return Err(ApiError::NotDispatched(
+                        "the call could not be updated; the reply was not sent and nothing was paid".into()
+                    ).with_reason("call_reply_unavailable"));
+                }
+                super::operations::FreeReplyGate::Unresolved { why, .. } => {
+                    return Err(ApiError::PaymentUnresolved(format!(
+                        "the call could not be confirmed ({why}); the saved reply is not sent now but may be later, \
+                         nothing was paid — read the operation before acting again"
+                    )).with_reason("call_reply_unresolved"));
+                }
+            }
+            envelope
+        } else {
+            if crate::calls::is_call_kind(req.kind) {
+                // Paid: publish the call transition before the envelope goes out.
+                let request_hash = super::operations::request_digest(&peer_id, &req).unwrap_or_default();
+                crate::calls::commit_outgoing_for(&state, &auth.user, &peer_id, &req.plaintext, &operation.id, &request_hash).await
+                    .map_err(|e| ApiError::PaymentProofUnavailable { amount_msat, reason: format!("paid call transition failed: {e}") })?;
+            }
+            operation.settled_envelope(proof, debit.fee_limit(&state, amount_msat).saturating_add(admission.fee_ceiling_msat)).await?
+        };
 
         // A paid web request's outstanding-reply row was committed by
         // `settled_envelope` in the same transaction as the envelope, and every
@@ -3940,7 +4389,7 @@ pub(super) async fn compose_peer(
 
         // Cache plaintext (encrypted at rest) for API retrieval
         if let Some(ref cipher) = state.plaintext_cipher {
-            match cipher.encrypt(req.plaintext.as_bytes()) {
+            match cipher.encrypt(&envelope.id.to_hex(), req.plaintext.as_bytes()) {
                 Ok(encrypted) => {
                     if let Err(e) = state
                         .storage

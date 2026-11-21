@@ -34,6 +34,34 @@ pub fn price_with_floor_msat(discounted: u64, min_admission_cost_msat: u64) -> u
     discounted.max(min_admission_cost_msat).max(1_000)
 }
 
+/// The payable price of one paid call minute (kind 404): the callee's raw
+/// minute tariff with the admission floors, and never a trust discount.
+/// The callee mints and answers with this; the caller quotes with it, so the
+/// two sides cannot disagree on a minute invoice amount.
+pub fn call_minute_price_msat(tariff_msat: u64, min_admission_cost_msat: u64) -> u64 {
+    price_with_floor_msat(tariff_msat, min_admission_cost_msat)
+}
+
+/// Invoice-request purpose naming the service (message kind) being paid for,
+/// so the recipient prices it locally rather than trusting the requested
+/// amount against its highest price. Older recipients treat it as a generic
+/// message invoice.
+pub const SERVICE_INVOICE_PREFIX: &str = "konsensus:service:";
+
+/// The purpose a sender puts on an invoice request for a message of `kind`.
+pub fn service_invoice_purpose(kind: u16) -> String {
+    format!("{SERVICE_INVOICE_PREFIX}{kind}")
+}
+
+/// The kind a service invoice request names. `None` for any other purpose,
+/// including a malformed service purpose.
+pub fn parse_service_invoice_purpose(purpose: &str) -> Option<u16> {
+    let kind = purpose.strip_prefix(SERVICE_INVOICE_PREFIX)?;
+    (!kind.is_empty() && kind.bytes().all(|b| b.is_ascii_digit()) && kind.len() <= 5)
+        .then(|| kind.parse().ok())
+        .flatten()
+}
+
 /// Why the gate rejected a message.
 ///
 /// Every variant is a hard rejection — the message MUST NOT be accepted.
@@ -216,6 +244,16 @@ pub trait NonceStore: Send + Sync {
         _request: crate::web_reply::OutstandingWebRequest,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
+    }
+
+    /// Whether this free-reply-shaped envelope answers or declines a ringing
+    /// call offer THIS node paid for, to this sender, under the reference it
+    /// carries. Default: never (the reply then meets the price floor).
+    async fn is_free_call_reply(
+        &self,
+        _envelope: &UkmEnvelope,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(false)
     }
 
     /// Atomically take the outstanding web request for this payment hash, if any.
@@ -558,6 +596,26 @@ impl PaymentGate {
             debug!("web service reply: no outstanding request — applying price floor");
         }
 
+        // ── Step 4.6: Free call replies ─────────────────────────────────
+        // An answer or a declined hangup to a ringing offer THIS node paid
+        // for, from the callee it rang: amount 0 and one reference naming
+        // the call. Only the store can bind it (and only when the operator
+        // turned free replies on); otherwise it meets the price floor below,
+        // so an unbound zero-amount reply stays rejected. The decrypted
+        // payload is checked against the same call before it is admitted.
+        if crate::payloads::call::is_free_reply_shape(envelope) {
+            if let Some(store) = receipts {
+                if store
+                    .is_free_call_reply(envelope)
+                    .await
+                    .map_err(|e| GateRejection::NonceCheckFailed(e.to_string()))?
+                {
+                    debug!("free call reply: bound to our ringing offer, skipping price/settlement");
+                    return Ok(false);
+                }
+            }
+        }
+
         // ── Step 5: Price verification ─────────────────────────────────
         // Determine the required price for this message kind and verify
         // the payment amount meets or exceeds it. Plasticity pricing
@@ -715,6 +773,7 @@ impl PaymentGate {
     /// Verify the payment amount meets the required price.
     ///
     /// Applies plasticity trust discount: `required = base * (1 - discount)`.
+    /// Call minutes keep their undiscounted invoice tariff.
     /// Discount is clamped to \[0.0, 0.5\]; every paid admission requires
     /// at least 1,000 msat after discount (Principle 2, DESIGN-REASONING T18).
     ///
@@ -746,7 +805,10 @@ impl PaymentGate {
         // Apply plasticity trust discount (v2.1): reliable peers pay less.
         // Clamp discount to [0.0, 0.5]; apply the admission floor below.
         // Fail-safe: NaN or infinite discount → no discount (full price).
-        let clamped_discount = if trust_discount.is_finite() {
+        let clamped_discount = if envelope.kind == crate::kind::KIND_CALL_BLOCK {
+            // A paid minute uses the same undiscounted tariff as its invoice.
+            0.0
+        } else if trust_discount.is_finite() {
             trust_discount.clamp(0.0, 0.5)
         } else {
             0.0
@@ -839,7 +901,7 @@ impl PaymentGate {
         }
 
         let details = lightning
-            .get_payment_status(&payment_hash)
+            .gate_payment_status(&payment_hash)
             .await
             .map_err(|e| GateRejection::LightningUnavailable(e.to_string()))?;
 
@@ -984,6 +1046,8 @@ mod tests {
         seen_payment_hashes: Mutex<HashSet<[u8; 32]>>,
         outstanding_web:
             Mutex<std::collections::HashMap<[u8; 32], crate::web_reply::OutstandingWebRequest>>,
+        /// The (callee, reference) of a ringing offer this node made.
+        ringing_offer: Mutex<Option<(NodeId, crate::MessageId)>>,
     }
 
     impl MockNonceStore {
@@ -993,6 +1057,7 @@ mod tests {
                 seen: Mutex::new(HashSet::new()),
                 seen_payment_hashes: Mutex::new(HashSet::new()),
                 outstanding_web: Mutex::new(std::collections::HashMap::new()),
+                ringing_offer: Mutex::new(None),
             }
         }
     }
@@ -1069,6 +1134,19 @@ mod tests {
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(self.outstanding_web.lock().unwrap().remove(payment_hash))
+        }
+
+        async fn is_free_call_reply(
+            &self,
+            envelope: &UkmEnvelope,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self
+                .ringing_offer
+                .lock()
+                .unwrap()
+                .is_some_and(|(callee, reference)| {
+                    envelope.sender == callee && envelope.references == [reference]
+                }))
         }
     }
 
@@ -3377,6 +3455,15 @@ mod tests {
     /// The cost floor is applied AFTER the plasticity trust discount, so even a
     /// maximally-trusted peer (50% discount) cannot pay below cost. base=10,000,
     /// discount=0.5 → discounted=5,000; floor=8,000 → required=8,000.
+    #[test]
+    fn service_invoice_purpose_round_trips_and_rejects_malformed() {
+        assert_eq!(parse_service_invoice_purpose(&service_invoice_purpose(1)), Some(1));
+        assert_eq!(parse_service_invoice_purpose(&service_invoice_purpose(u16::MAX)), Some(u16::MAX));
+        for bad in ["konsensus message", "konsensus:service:", "konsensus:service:-1", "konsensus:service:70000", "konsensus:service:1x", "konsensus:service:+1", "konsensus:service:000001"] {
+            assert_eq!(parse_service_invoice_purpose(bad), None, "{bad}");
+        }
+    }
+
     #[tokio::test]
     async fn cost_floor_cannot_be_undercut_by_trust_discount() {
         let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
@@ -3489,5 +3576,181 @@ mod tests {
         assert!(
             matches!(result, Err(GateRejection::PaymentSettlementMismatch(s)) if s.contains("funding"))
         );
+    }
+
+    /// A backend gated on chain sync: every ordinary read refuses, and only the
+    /// gate's own read reaches the local payment record, if there is one.
+    struct NotReadyBackend {
+        record: Option<PaymentDetails>,
+        funding: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl LightningProvider for NotReadyBackend {
+        async fn is_funding_payment(&self, _hash: &str) -> Result<bool, LightningError> {
+            Ok(self.funding)
+        }
+        async fn gate_payment_status(&self, _hash: &str) -> Result<PaymentDetails, LightningError> {
+            self.record.clone().ok_or(LightningError::NotReady)
+        }
+        async fn get_payment_status(&self, _hash: &str) -> Result<PaymentDetails, LightningError> {
+            Err(LightningError::NotReady)
+        }
+        async fn create_invoice(&self, _: u64, _: &str, _: u32) -> Result<Invoice, LightningError> {
+            Err(LightningError::NotReady)
+        }
+        async fn pay_invoice(&self, _: &str) -> Result<PaymentDetails, LightningError> {
+            Err(LightningError::NotReady)
+        }
+        async fn get_balance_msat(&self) -> Result<u64, LightningError> {
+            Err(LightningError::NotReady)
+        }
+        async fn is_available(&self) -> bool {
+            false
+        }
+    }
+
+    fn stored(status: PaymentStatus, direction: PaymentDirection) -> PaymentDetails {
+        let proof = make_proof(10_000);
+        PaymentDetails {
+            payment_hash: hex::encode(proof.payment_hash),
+            preimage: (status == PaymentStatus::Settled).then(|| hex::encode(proof.preimage)),
+            amount_msat: 10_000,
+            status,
+            direction,
+            timestamp: 0,
+            memo: None,
+            fee_msat: None,
+        }
+    }
+
+    async fn gate_with(backend: NotReadyBackend) -> Result<(), GateRejection> {
+        let identity = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let envelope = make_signed_envelope(&identity, 10_000);
+        let gate = PaymentGate::with_config(GateConfig {
+            verify_lightning_settlement: true,
+            ..Default::default()
+        });
+        gate.verify(
+            &envelope,
+            &MockNonceStore::new(),
+            &MockPricing { price_msat: 1_000 },
+            None,
+            Some(&backend),
+            0.0,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn not_ready_backend_with_a_settled_inbound_payment_is_admitted() {
+        let record = stored(PaymentStatus::Settled, PaymentDirection::Incoming);
+        let result = gate_with(NotReadyBackend { record: Some(record), funding: false }).await;
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn not_ready_backend_refuses_every_other_record() {
+        for status in [
+            PaymentStatus::Pending,
+            PaymentStatus::InFlight,
+            PaymentStatus::Failed,
+            PaymentStatus::Expired,
+        ] {
+            let record = stored(status, PaymentDirection::Incoming);
+            let result = gate_with(NotReadyBackend { record: Some(record), funding: false }).await;
+            assert!(matches!(result, Err(GateRejection::PaymentNotSettled(_))), "{status:?}: {result:?}");
+        }
+        // An unknown hash has no record to confirm.
+        let result = gate_with(NotReadyBackend { record: None, funding: false }).await;
+        assert!(matches!(result, Err(GateRejection::LightningUnavailable(_))), "{result:?}");
+        // The same hash settled the other way is not a payment to this node.
+        let record = stored(PaymentStatus::Settled, PaymentDirection::Outgoing);
+        let result = gate_with(NotReadyBackend { record: Some(record), funding: false }).await;
+        assert!(matches!(result, Err(GateRejection::PaymentSettlementMismatch(_))), "{result:?}");
+        // Settled funding never admits.
+        let record = stored(PaymentStatus::Settled, PaymentDirection::Incoming);
+        let result = gate_with(NotReadyBackend { record: Some(record), funding: true }).await;
+        assert!(matches!(result, Err(GateRejection::PaymentSettlementMismatch(_))), "{result:?}");
+    }
+
+    #[test]
+    fn call_minute_price_is_the_floored_tariff_without_a_discount() {
+        // A tariff above the floor stays whole, even where a trust discount
+        // (50_000 at 0.5 is 25_000) would have been lifted only to the floor.
+        assert_eq!(call_minute_price_msat(50_000, 30_000), 50_000);
+        assert_eq!(price_with_floor_msat(25_000, 30_000), 30_000);
+        assert_eq!(call_minute_price_msat(23_000, 30_000), 30_000);
+        assert_eq!(call_minute_price_msat(500, 0), 1_000);
+        assert_eq!(call_minute_price_msat(u64::MAX, 30_000), u64::MAX);
+    }
+
+    fn call_reply(identity: &NodeIdentity, kind: u16, amount_msat: u64, references: Vec<crate::MessageId>) -> UkmEnvelope {
+        let mut envelope = UkmEnvelopeBuilder::new(
+            kind,
+            *identity.node_id(),
+            Recipient::Node(NodeId::from_bytes([2u8; 32])),
+            b"sealed reply".to_vec(),
+            make_proof(amount_msat),
+        )
+        .references(references)
+        .timestamp(now_ms())
+        .build();
+        envelope.signature = crate::types::Signature::from_ed25519(&identity.sign(&envelope.signable_bytes()));
+        envelope
+    }
+
+    #[tokio::test]
+    async fn free_call_reply_bound_to_our_ringing_offer_needs_no_payment_and_is_single_use() {
+        use crate::kind::{KIND_CALL_ANSWER, KIND_CALL_HANGUP};
+        let callee = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let reference = crate::payloads::call::free_reply_reference("0123456789abcdef0123456789abcdef");
+        for kind in [KIND_CALL_ANSWER, KIND_CALL_HANGUP] {
+            let store = MockNonceStore::new();
+            *store.ringing_offer.lock().unwrap() = Some((*callee.node_id(), reference));
+            let reply = call_reply(&callee, kind, 0, vec![reference]);
+            let gate = PaymentGate::new();
+            let pricing = MockPricing { price_msat: 5_000 };
+            gate.verify(&reply, &store, &pricing, None, None, 0.0, None)
+                .await
+                .unwrap_or_else(|e| panic!("kind {kind}: a bound free reply was refused: {e:?}"));
+            // Its replay keys are consumed: the same reply cannot come twice.
+            assert!(matches!(
+                gate.verify(&reply, &store, &pricing, None, None, 0.0, None).await,
+                Err(GateRejection::ReplayDetected)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unbound_zero_amount_call_reply_still_meets_the_price_floor() {
+        use crate::kind::{KIND_CALL_ANSWER, KIND_CALL_HANGUP, KIND_ICE_CANDIDATE};
+        let callee = NodeIdentity::from_mnemonic(TEST_MNEMONIC, "").unwrap();
+        let other = NodeIdentity::from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong", "").unwrap();
+        let reference = crate::payloads::call::free_reply_reference("0123456789abcdef0123456789abcdef");
+        let elsewhere = crate::payloads::call::free_reply_reference("fedcba9876543210fedcba9876543210");
+        let gate = PaymentGate::new();
+        let pricing = MockPricing { price_msat: 5_000 };
+        let cases = [
+            (&callee, KIND_CALL_ANSWER, vec![reference], None),
+            (&other, KIND_CALL_ANSWER, vec![reference], Some(reference)),
+            (&callee, KIND_CALL_ANSWER, vec![elsewhere], Some(reference)),
+            (&callee, KIND_CALL_ANSWER, vec![reference, reference], Some(reference)),
+            (&callee, KIND_CALL_ANSWER, vec![], Some(reference)),
+            (&callee, KIND_ICE_CANDIDATE, vec![reference], Some(reference)),
+            (&callee, KIND_CHAT, vec![reference], Some(reference)),
+            (&callee, KIND_CALL_HANGUP, vec![reference], None),
+        ];
+        for (sender, kind, references, ringing) in cases {
+            let store = MockNonceStore::new();
+            *store.ringing_offer.lock().unwrap() = ringing.map(|r| (*callee.node_id(), r));
+            let reply = call_reply(sender, kind, 0, references.clone());
+            let result = gate.verify(&reply, &store, &pricing, None, None, 0.0, None).await;
+            assert!(
+                matches!(result, Err(GateRejection::InsufficientPayment { paid_msat: 0, .. })),
+                "kind {kind} refs {references:?}: {result:?}"
+            );
+        }
     }
 }

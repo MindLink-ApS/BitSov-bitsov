@@ -10,7 +10,9 @@ Paid admission follows the [2026-07-01 keystone](v2/F1-CAPPED-FIRST-CONTACT.md)
 (the target re-prices and the requester pays its invoice), and **mainnet is not
 supported for the public beta**: this guide never uses it and nothing here
 funds a mainnet wallet. Signet coins have no value. There is no final signed
-release yet (only pre-release candidates); this guide builds from source. Every
+release yet, only signed pre-release binaries for signet testing; this guide
+builds from source, or installs a pre-release binary
+([step 1b](#1b-or-install-a-signed-pre-release-binary)). Every
 step below was run in the session that produced this guide, except the two
 marked **untested in CI**, and some ran under different conditions (a debug
 build on another compiler, mock Lightning instead of a live signet node); the
@@ -54,6 +56,102 @@ guide assumes it is on your `PATH`:
 export PATH="$PWD/target/release:$PATH"
 ```
 
+## 1b. Or install a signed pre-release binary
+
+Signed pre-release binaries are on the
+[releases page](https://github.com/MindLink-ApS/BitSov-bitsov/releases), for
+signet testing only. These steps are for macOS and Linux. Each binary is named
+for its platform, `bitsov-<os>-<arch>`: `bitsov-darwin-aarch64` (Apple silicon),
+`bitsov-darwin-x86_64` (Intel Mac), `bitsov-linux-aarch64` or
+`bitsov-linux-x86_64`. This guide and the node's own messages call it
+`konsensus`.
+
+Into an empty directory, download your platform's binary, `SHA256SUMS` and
+`SHA256SUMS.asc` from the release, and the release key from the repository at
+the same tag:
+
+```sh
+TAG=v0.3.0-rc24   # the release you downloaded
+curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/RELEASE_KEY.asc"
+```
+
+**Check the signature.** A throwaway GnuPG home keeps your own keyring
+untouched, and `--no-auto-key-retrieve` stops gpg from fetching any key from
+the network; only the downloaded `RELEASE_KEY.asc` is used:
+
+```sh
+(
+  export GNUPGHOME="$(mktemp -d)"
+  gpg --batch --quiet --import RELEASE_KEY.asc
+  gpg --batch --no-auto-key-retrieve --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null > gpg-status.txt
+  gpg_exit=$?
+  rm -rf "$GNUPGHOME"
+  if [ "$gpg_exit" -eq 0 ] &&
+     ! grep -qE '^\[GNUPG:\] (BADSIG|ERRSIG|EXPSIG|EXPKEYSIG|REVKEYSIG) ' gpg-status.txt &&
+     [ "$(awk '$2 == "VALIDSIG" { print $12 }' gpg-status.txt)" = B299274C200301714DC6F51A7C2D6F8AC842EF6E ]
+  then echo "signature OK"
+  else echo "SIGNATURE CHECK FAILED: do not use these files"; exit 1
+  fi
+)
+```
+
+It prints `signature OK` and exits 0 only if gpg exits 0, no bad-signature
+status appears, and the primary-key fingerprint in the `VALIDSIG` line is
+exactly `B299274C200301714DC6F51A7C2D6F8AC842EF6E`, the release key (also in
+[`SECURITY.md`](../SECURITY.md)). Any non-zero status means stop: do not use
+the files. The parentheses keep the `exit` from closing your shell. "Good
+signature" alone is not enough: that fingerprint field is what ties the
+signature to the release key.
+
+If you download every asset of the release instead, a source checkout's
+`bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` makes the same
+check plus every checksum, and prints a sealed copy to install from. It refuses
+a directory that holds only one platform's binary.
+
+**Check the file.** `SHA256SUMS` lists every platform's files, so tell the
+check to skip the ones you didn't download:
+
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing   # macOS
+sha256sum -c --ignore-missing SHA256SUMS       # Linux
+```
+
+Look for `OK` after your binary's name. Without `--ignore-missing` the command
+fails on the files that aren't there, even when yours is fine.
+
+**Install it as `konsensus`.** The download isn't executable, and on macOS a
+browser marks it as downloaded. The macOS binary is not notarized, so
+Gatekeeper refuses to open a marked copy; after the checks above pass, remove
+the mark (`curl` and `gh` downloads have none):
+
+```sh
+mv bitsov-darwin-aarch64 konsensus   # your platform's file; or: ln -s bitsov-darwin-aarch64 konsensus
+chmod +x konsensus
+xattr -d com.apple.quarantine konsensus 2>/dev/null   # macOS only
+./konsensus --version                # konsensus 0.3.0-rc24
+export PATH="$PWD:$PATH"
+```
+
+Step 4 needs the owner-token helper. It is not a release asset, so neither
+`SHA256SUMS` nor its signature covers it. Fetch it from the same tag into this
+directory:
+
+```sh
+curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/docs/ops/owner-token.sh"
+shasum -a 256 owner-token.sh   # Linux: sha256sum owner-token.sh
+```
+
+For `v0.3.0-rc24` the hash is
+`a23f002e754f91416c5580a3ff6b82ef8447cea7cc6a125e505fef3a5ff95764`, the file at
+that tag (`docs/ops/owner-token.sh` in the tag's tree on GitHub). That value
+comes from the same site as the file, so it catches a damaged or mismatched
+download, not a changed repository. For a check tied to the release key,
+verify the tag in a source checkout (`git verify-tag`, with the fingerprint
+above) and compare the file there with `cmp`. Read the script before you
+source it.
+
+Keep this directory; step 4 comes back to it. Then continue at step 2.
+
 ## 2. Initialize a node on signet
 
 `init` creates a data directory, a 24-word recovery phrase, and
@@ -75,11 +173,49 @@ encrypt it at rest instead, add `--encrypt` and type a password when asked
 (then `start` prompts for it, or read [password input](operations/password-input.md)
 for launchers).
 
-`init` writes a **mainnet** Lightning network and mainnet chain URLs into a fresh
-config today. Switch them to signet before the first start. Open
-`~/bitsov-signet/konsensus.toml` and change these keys in place, leaving
-everything else as written (do not paste a second `[lightning]` or `[chain]`
-table; TOML rejects duplicates):
+`init` writes signet unless told otherwise (`--network signet` is the
+default): `[lightning] network = "signet"` and the signet Esplora URLs in both
+`[lightning]` and `[chain]`. Its last line of output names the network:
+
+```text
+Network:    signet
+```
+
+The fresh config names these signet servers:
+
+```toml
+[lightning]
+backend = "ldk"
+network = "signet"
+esplora_url = "https://mempool.space/signet/api"
+esplora_url_fallback = "https://blockstream.info/signet/api"
+
+[chain]
+backend = "esplora"
+api_url = "https://mempool.space/signet"
+esplora_url_fallback = "https://blockstream.info/signet"
+```
+
+They are the signet endpoints of two public Esplora operators; any
+Esplora-compatible signet server works. Your own Bitcoin Core or an Electrum
+server are different backends, configured as described in
+[chain source](CHAIN-SOURCE.md) instead of these URLs. A public Esplora can
+link the addresses your wallet watches to your IP; that is the trade-off of
+not running your own chain source.
+
+One key is still yours to add. Open `~/bitsov-signet/konsensus.toml` and add
+`hub_only_channels = false` to the existing `[lightning]` table (do not paste a
+second `[lightning]` table; TOML rejects duplicates):
+
+```toml
+[lightning]
+hub_only_channels = false
+```
+
+**Older configs.** A config written by an `init` or `restore` from before the
+`--network` flag says `network = "bitcoin"` and names mainnet URLs, and `start`
+refuses it with `mainnet_not_approved`. Either run `init` again into a new
+directory, or change these keys in place, leaving everything else as written:
 
 ```toml
 [lightning]
@@ -95,14 +231,13 @@ api_url = "https://mempool.space/signet"
 esplora_url_fallback = "https://blockstream.info/signet"
 ```
 
-The URLs are the signet endpoints of the same two public Esplora operators
-`init` already wrote; any Esplora-compatible signet server works. Your own
-Bitcoin Core or an Electrum server are different backends, configured as
-described in [chain source](CHAIN-SOURCE.md) instead of these URLs. A public
-Esplora can link the addresses your wallet watches to your IP; that is the
-trade-off of not running your own chain source.
+`start` also refuses (`chain_network_mismatch`) a config that names one of these
+public Esplora servers for another network than `[lightning] network`, for
+example a signet `[lightning]` left with a mainnet `[chain]` URL, so a
+half-finished edit does not start. Other servers are checked when the node
+first asks them which chain they serve.
 
-`hub_only_channels = false` is new in this file. By default an embedded LDK
+`hub_only_channels = false` is the one manual edit. By default an embedded LDK
 node opens channels only to a configured hub or LSP, because nothing watches a
 home node's channels while it is offline yet, and a fresh config has no hub.
 Step 7 opens a channel straight to your contact, which needs this opt-out. It
@@ -151,6 +286,15 @@ In the second terminal, enter the checkout and put the binary on `PATH` again
 ```sh
 cd BitSov-bitsov
 export PATH="$PWD/target/release:$PATH"
+```
+
+With a release binary from step 1b, enter that directory instead, and source
+the helper from there in place of the `docs/ops/owner-token.sh` line below:
+
+```sh
+cd <the step 1b directory>
+export PATH="$PWD:$PATH"
+KONSENSUS_CONFIG=~/bitsov-signet/konsensus.toml source ./owner-token.sh
 ```
 
 The HTTP API is loopback only and every owner route needs a bearer token. The
@@ -337,7 +481,7 @@ signet-specific steps are marked.
 | Step | Ran | Notes |
 | --- | --- | --- |
 | 1. Build | partly | A debug build (`cargo build -p konsensus-node`, not `--release`) on stable 1.97.0, before `rust-toolchain.toml` (1.99.1) landed on main; neither pinned toolchain was installed in the session |
-| 2. `init --tier full`, config edit | yes | Fresh config confirmed to contain `network = "bitcoin"` and mainnet URLs; after the edit the node starts, logs `network=signet`, and reports `money_ready: false` because the Esplora servers were unreachable from the session |
+| 2. `init --tier full`, config edit | yes | Run before the `--network` flag: the fresh config then contained `network = "bitcoin"` and mainnet URLs; after the edit the node started, logged `network=signet`, and reported `money_ready: false` because the Esplora servers were unreachable from the session. The signet default of `init` and `restore` is covered by the node's CLI tests |
 | 3. `start --owner-control` | yes | Signet config above, and two mock nodes on loopback ports |
 | 4. Owner token, `status` | yes | `docs/ops/owner-token.sh` on both nodes; the `api` helper checked for GET and POST, and `ps` showed no process carrying the token |
 | 5. Faucet, `funding-address`, one confirmation | **untested in CI** | Needs a reachable signet Esplora and a faucet; the route and its `network` field were read from source, and on a mock node it answers 400 as expected |

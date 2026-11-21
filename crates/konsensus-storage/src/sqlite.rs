@@ -53,6 +53,49 @@ pub fn sqlite_file_path(connection: &str) -> Option<std::path::PathBuf> {
 }
 
 impl SqliteStorage {
+    async fn load_message_record(
+        &self,
+        id: &MessageId,
+        include_held: bool,
+    ) -> Result<Option<UkmEnvelope>, StorageError> {
+        let id_hex = id.to_hex();
+
+        let row = sqlx::query_as::<_, (
+            String,  // id
+            i64,     // kind
+            String,  // sender
+            String,  // recipient_type
+            String,  // recipient_id
+            i64,     // timestamp_ms
+            Vec<u8>, // ciphertext
+            String,  // payment_hash
+            String,  // preimage
+            i64,     // amount_msat
+            String,  // signature
+            String,  // nonce
+            String,  // references_json
+        )>(
+            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
+             FROM messages WHERE id = ? AND (? OR id NOT IN (SELECT message_id FROM call_admission_hold))",
+        )
+        .bind(&id_hex)
+        .bind(include_held)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let envelope = row_to_envelope(
+                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
+                    &r.12,
+                )?;
+                Ok(Some(envelope))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Open (or create) a SQLite database at the given path.
     ///
     /// When `KONSENSUS_SQLITE_MIGRATIONS_DIR` is set, migrations are loaded from that
@@ -195,9 +238,20 @@ const EMBEDDED_MIGRATIONS: &[(i64, &str, &str)] = &[
     (30, "channel open operations", include_str!("../migrations/030_channel_open_operations.sql")),
     (31, "starter requests", include_str!("../migrations/031_starter_requests.sql")),
     (32, "starter queries", include_str!("../migrations/032_starter_queries.sql")),
+    (
+        33,
+        "calendar and schema parity",
+        include_str!("../migrations/033_calendar_and_schema_parity.sql"),
+    ),
+    // 034 stays unused. Main reserved it for the call-invite work and shipped 035–037 around that gap.
     (35, "call blocks", include_str!("../migrations/035_call_blocks.sql")),
     (36, "call unpaid notice", include_str!("../migrations/036_call_unpaid_notice.sql")),
     (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
+    (38, "envelope deferrals", include_str!("../migrations/038_envelope_deferrals.sql")),
+    (39, "envelope deferral expiry", include_str!("../migrations/039_envelope_deferral_expiry.sql")),
+    (40, "call media detach intents", include_str!("../migrations/040_call_media_detach_intents.sql")),
+    (41, "call offer binding", include_str!("../migrations/041_call_offer_binding.sql")),
+    (42, "call free reply receipts", include_str!("../migrations/042_call_free_reply_receipts.sql")),
 ];
 
 /// Migration version numbers compiled into this binary, in ascending order.
@@ -622,8 +676,264 @@ const OPERATOR_HOSTING_PAYMENTS_SELECT: &str =
 const PEERS_SELECT: &str =
     "SELECT node_id, address, last_seen, display_name, metadata_json FROM peers ORDER BY node_id";
 
+impl SqliteStorage {
+    async fn commit_outbox_envelope_inner(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope, previous: Option<&MessageId>, plaintext_enc: Option<&[u8]>) -> Result<bool, StorageError> {
+        if op.state != "paid" || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str()) || envelope.recipient != Recipient::Node(NodeId::from_hex(&op.recipient).map_err(|e| StorageError::Conversion(e.to_string()))?) {
+            return Err(StorageError::Conversion("invalid paid operation binding".into()));
+        }
+        let mut tx = self.pool.begin().await?;
+
+        if let Some(previous) = previous {
+            let current: Option<crate::OutboxOperation> = sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = ?")
+                .bind(&op.operation_id).fetch_optional(&mut *tx).await?;
+            let Some(current) = current else { tx.rollback().await?; return Ok(false); };
+            if !crate::outbox::validate_handover_replacement(&current, op, previous, envelope)? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+            let refs: Vec<String> = envelope.references.iter().map(|id| id.to_hex()).collect();
+            let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages m JOIN pending_deliveries p ON p.message_id = m.id WHERE m.id = ? AND m.sender = ? AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = ? AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ? AND p.recipient_id = ? AND p.dispatched = 1 AND p.state != 'failed_paid' AND p.rejection_reason = ?")
+                .bind(previous.to_hex()).bind(envelope.sender.to_hex()).bind(i64::from(envelope.kind))
+                .bind(rtype).bind(&rid).bind(hex::encode(envelope.payment_proof.payment_hash))
+                .bind(hex::encode(envelope.payment_proof.preimage)).bind(op.settled_msat)
+                .bind(hex::encode(envelope.nonce.as_bytes()))
+                .bind(serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?)
+                .bind(&op.recipient).bind(&current.last_error).fetch_one(&mut *tx).await?;
+            if matches != 1 {
+                return Err(StorageError::Conversion("deferred envelope binding changed".into()));
+            }
+            // Remove the old dispatch authority before publishing a new ID. A
+            // concurrent old ACK either wins the operation CAS or has no row.
+            sqlx::query("DELETE FROM pending_deliveries WHERE message_id = ? AND recipient_id = ?")
+                .bind(previous.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        }
+        let changed = sqlx::query("UPDATE outbox_operations SET state = ?, payment_hash = ?, admission_payment_hash = ?, message_id = ?, settled_msat = ?, readmission_msat = ?, updated_at = ?, last_sent_at = ?, attempts = ?, last_error = ?, recovery = ?, accounting_pending = ?, recovery_compacted = ?, version = version + 1 WHERE operation_id = ? AND version = ?")
+            .bind(&op.state)
+            .bind(&op.payment_hash)
+            .bind(&op.admission_payment_hash)
+            .bind(&op.message_id)
+            .bind(op.settled_msat)
+            .bind(op.readmission_msat)
+            .bind(op.updated_at)
+            .bind(op.last_sent_at)
+            .bind(op.attempts)
+            .bind(&op.last_error)
+            .bind(&op.recovery)
+            .bind(op.accounting_pending)
+            .bind(op.recovery_compacted)
+            .bind(&op.operation_id).bind(op.version)
+            .execute(&mut *tx).await?.rows_affected() == 1;
+        if !changed { tx.rollback().await?; return Ok(false); }
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ts = i64::try_from(envelope.timestamp)
+            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ciphertext = &envelope.ciphertext;
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let sig = hex::encode(envelope.signature.as_bytes());
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, plaintext_enc) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(&sender)
+        .bind(rtype)
+        .bind(&rid)
+        .bind(ts)
+        .bind(ciphertext)
+        .bind(&ph)
+        .bind(&pi)
+        .bind(amt)
+        .bind(&sig)
+        .bind(&nonce)
+        .bind(&refs_json)
+        .bind(plaintext_enc)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
+            .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        if let Some(previous) = previous {
+            sqlx::query("DELETE FROM messages WHERE id = ? AND sender = ?")
+                .bind(previous.to_hex()).bind(&sender).execute(&mut *tx).await?;
+        }
+        // A paid web request binds its reply in the same transaction as its
+        // envelope: no crash window between "paid and queued" and "reply bindable".
+        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
+            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
+                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
+                .execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+}
+
+impl SqliteStorage {
+    /// `require_hold`: a held kind (call signal, candidate room chat,
+    /// calendar) is accepted fresh only while its admission hold exists,
+    /// checked under the writer lock this transaction holds from its first
+    /// INSERT. Only `readable` acceptance may require the hold.
+    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool, require_hold: bool) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+        use crate::PaidAcceptance::*;
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ts = i64::try_from(envelope.timestamp)
+            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ciphertext = &envelope.ciphertext;
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let sig = hex::encode(envelope.signature.as_bytes());
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let mut tx = self.pool.begin().await?;
+        let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
+            .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
+        let deferred: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = ? AND sender = ? AND payment_hash = ? AND expires_at_ms > ?)")
+            .bind(&id).bind(&sender).bind(&ph).bind(crate::traits::deferral_now_ms()).fetch_one(&mut *tx).await?;
+        if deferred {
+            tx.rollback().await?;
+            return Err(StorageError::Conversion("envelope deferred for session recovery".into()));
+        }
+        let healing = receipt.rows_affected() == 0;
+        if healing {
+            // Serialize legacy healers on the receipt binding (SQLite already
+            // holds the writer lock from the INSERT above).
+            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = ?")
+                .bind(&ph).fetch_one(&mut *tx).await?;
+            if binding.0 != id || binding.1 != sender {
+                tx.rollback().await?;
+                return Ok(Some(PaymentReused));
+            }
+            // The same envelope, refused and withdrawn by the application: its
+            // sender is told so again, never that its proof belongs to another.
+            if binding.2 == -1 {
+                tx.rollback().await?;
+                return Ok(Some(Withdrawn));
+            }
+            // Receipt metadata is independent of retained message content and
+            // excludes only the timestamp/signature wrapper refreshed on retry.
+            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = 1 AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if durable == 1 {
+                tx.rollback().await?;
+                return Ok(Some(AlreadyAccepted));
+            }
+            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.accepted IN (0, 1) AND r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if matched == 1 {
+                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ?")
+                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+                tx.commit().await?;
+                return Ok(Some(AlreadyAccepted));
+            }
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
+                .bind(&id).fetch_one(&mut *tx).await?;
+            if exists != 0 || binding.2 != 0 {
+                tx.rollback().await?;
+                return Ok(Some(PaymentReused));
+            }
+            // Full gate validation precedes this transaction. The receipt
+            // binds this paid identity; repair only its missing message row.
+        }
+        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES (?, ?) ON CONFLICT DO NOTHING")
+            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = ?")
+                .bind(&nonce).fetch_one(&mut *tx).await?;
+            if !healing || owner != sender {
+                tx.rollback().await?;
+                return Ok(Some(NonceReused));
+            }
+        }
+        if !readable {
+            // Classify the existing receipt/nonce using the same transaction as
+            // acceptance, but leave fresh and resumable legacy proofs untouched.
+            // This also rolls back speculative receipt and nonce inserts.
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        // A held kind is accepted fresh only under its admission hold: the hold
+        // sweep may have withdrawn an expired or inherited hold between the hold
+        // and this acceptance, and an unheld acceptance would never be admitted
+        // yet be replay-acknowledged. Checked here, under the writer lock this
+        // transaction already holds.
+        if require_hold {
+            let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_admission_hold WHERE message_id = ?")
+                .bind(&id).fetch_one(&mut *tx).await?;
+            if held != 1 {
+                tx.rollback().await?;
+                return Err(StorageError::NotFound(format!("admission hold for {id}")));
+            }
+        }
+        sqlx::query(
+            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(&sender)
+        .bind(rtype)
+        .bind(&rid)
+        .bind(ts)
+        .bind(ciphertext)
+        .bind(&ph)
+        .bind(&pi)
+        .bind(amt)
+        .bind(&sig)
+        .bind(&nonce)
+        .bind(&refs_json)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ?")
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM envelope_deferrals WHERE payment_hash = ?")
+            .bind(&ph).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Some(Accepted))
+    }
+
+}
+
 #[async_trait]
 impl Storage for SqliteStorage {
+    async fn record_upgrade_rows(&self, table: crate::record_upgrade::RecordTable, after: Option<&str>, limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
+        crate::record_upgrade::sqlite::rows(&self.pool, table, after, limit).await
+    }
+    async fn record_upgrade_row(&self, table: crate::record_upgrade::RecordTable, id: &str) -> Result<Option<crate::record_upgrade::RecordRow>, StorageError> {
+        crate::record_upgrade::sqlite::row(&self.pool, table, id).await
+    }
+    async fn record_upgrade_replace(&self, table: crate::record_upgrade::RecordTable, old: &crate::record_upgrade::RecordRow, new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
+        crate::record_upgrade::sqlite::replace(&self.pool, table, old, new).await
+    }
+
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         crate::starter_request::sqlite::get(&self.pool, id).await
     }
@@ -780,76 +1090,11 @@ impl Storage for SqliteStorage {
     // ── Messages ───────────────────────────────────────────────────────
 
     async fn commit_outbox_envelope(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
-        if op.state != "paid" || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str()) || envelope.recipient != Recipient::Node(NodeId::from_hex(&op.recipient).map_err(|e| StorageError::Conversion(e.to_string()))?) {
-            return Err(StorageError::Conversion("invalid paid operation binding".into()));
-        }
-        let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE outbox_operations SET state = ?, payment_hash = ?, admission_payment_hash = ?, message_id = ?, settled_msat = ?, readmission_msat = ?, updated_at = ?, last_sent_at = ?, attempts = ?, last_error = ?, recovery = ?, accounting_pending = ?, recovery_compacted = ?, version = version + 1 WHERE operation_id = ? AND version = ?")
-            .bind(&op.state)
-            .bind(&op.payment_hash)
-            .bind(&op.admission_payment_hash)
-            .bind(&op.message_id)
-            .bind(op.settled_msat)
-            .bind(op.readmission_msat)
-            .bind(op.updated_at)
-            .bind(op.last_sent_at)
-            .bind(op.attempts)
-            .bind(&op.last_error)
-            .bind(&op.recovery)
-            .bind(op.accounting_pending)
-            .bind(op.recovery_compacted)
-            .bind(&op.operation_id).bind(op.version)
-            .execute(&mut *tx).await?.rows_affected() == 1;
-        if !changed { tx.rollback().await?; return Ok(false); }
-        let id = envelope.id.to_hex();
-        let kind = i64::from(envelope.kind);
-        let sender = envelope.sender.to_hex();
-        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ts = i64::try_from(envelope.timestamp)
-            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
-        let ciphertext = &envelope.ciphertext;
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
-        let sig = hex::encode(envelope.signature.as_bytes());
-        let nonce = hex::encode(envelope.nonce.as_bytes());
-        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
-        let refs_json =
-            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.commit_outbox_envelope_inner(op, envelope, None, None).await
+    }
 
-        sqlx::query(
-            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(kind)
-        .bind(&sender)
-        .bind(rtype)
-        .bind(&rid)
-        .bind(ts)
-        .bind(ciphertext)
-        .bind(&ph)
-        .bind(&pi)
-        .bind(amt)
-        .bind(&sig)
-        .bind(&nonce)
-        .bind(&refs_json)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
-            .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
-        // A paid web request binds its reply in the same transaction as its
-        // envelope: no crash window between "paid and queued" and "reply bindable".
-        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
-            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
-                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
-                .execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        Ok(true)
+    async fn replace_outbox_envelope(&self, op: &crate::OutboxOperation, previous: &MessageId, envelope: &UkmEnvelope, plaintext_enc: Option<&[u8]>) -> Result<bool, StorageError> {
+        self.commit_outbox_envelope_inner(op, envelope, Some(previous), plaintext_enc).await
     }
 
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
@@ -944,6 +1189,51 @@ impl Storage for SqliteStorage {
         Ok(durable == 1)
     }
 
+    async fn call_invite_outcome(&self, envelope: &UkmEnvelope) -> Result<Option<crate::CallInviteOutcome>, StorageError> {
+        if envelope.kind != konsensus_core::kind::KIND_CALL_INVITE { return Ok(None); }
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let value: Option<i32> = sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE (accepted <> 1 OR message_id NOT IN (SELECT message_id FROM call_admission_hold)) AND payment_hash = ? AND message_id = ? AND sender = ? AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
+            .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+            .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .fetch_optional(&self.pool).await?;
+        Ok(value.and_then(crate::CallInviteOutcome::from_stored))
+    }
+
+    async fn call_invite_set_outcome(&self, id: &MessageId, peer: &NodeId, outcome: crate::CallInviteOutcome) -> Result<(), StorageError> {
+        sqlx::query("UPDATE payment_receipts SET accepted = ? WHERE message_id = ? AND sender = ? AND kind = 400 AND accepted IN (1, -2)")
+            .bind(outcome.stored()).bind(id.to_hex()).bind(peer.to_hex()).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn call_invite_recover(&self, max: u32) -> Result<Vec<(MessageId, NodeId)>, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        // Holds make a partial/failed startup cleanup invisible to readers.
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT message_id, sender, 0 FROM payment_receipts WHERE kind = 400 AND accepted = -2 ORDER BY message_id LIMIT ? ON CONFLICT DO NOTHING")
+            .bind(i64::from(max)).execute(&mut *tx).await?;
+        let done: Vec<(String, String)> = sqlx::query_as("UPDATE payment_receipts SET accepted = -3 WHERE kind = 400 AND accepted = -2 AND message_id IN (SELECT message_id FROM call_admission_hold) RETURNING message_id, sender")
+            .fetch_all(&mut *tx).await?;
+        sqlx::query("DELETE FROM messages WHERE id IN (SELECT r.message_id FROM payment_receipts r JOIN call_admission_hold h ON h.message_id = r.message_id WHERE r.kind = 400 AND r.accepted = -3)")
+            .execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM call_admission_hold WHERE message_id IN (SELECT r.message_id FROM payment_receipts r JOIN call_admission_hold h ON h.message_id = r.message_id WHERE r.kind = 400 AND r.accepted = -3)")
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        done.iter()
+            .map(|(id, sender)| Ok((MessageId::from_hex(id).map_err(|e| StorageError::Conversion(e.to_string()))?, NodeId::from_hex(sender).map_err(|e| StorageError::Conversion(e.to_string()))?)))
+            .collect()
+    }
+
     async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         let id = envelope.id.to_hex();
         let kind = i64::from(envelope.kind);
@@ -963,7 +1253,7 @@ impl Storage for SqliteStorage {
             .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
             .fetch_one(&self.pool).await?;
         if durable == 1 { return Ok(true); }
-        let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.message_id NOT IN (SELECT message_id FROM call_admission_hold) AND r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
+        let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.accepted IN (0, 1) AND r.message_id NOT IN (SELECT message_id FROM call_admission_hold) AND r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
             .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
             .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
             .fetch_one(&self.pool).await?;
@@ -983,108 +1273,76 @@ impl Storage for SqliteStorage {
         Ok(true)
     }
 
-    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        use crate::PaidAcceptance::*;
+    async fn defer_unreadable_envelope(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        use crate::traits::{deferral_now_ms, DEFERRAL_CLEANUP_BATCH, ENVELOPE_DEFERRAL_TTL_MS, MAX_DEFERRALS_PER_PROOF, MAX_DEFERRALS_PER_SENDER};
         let id = envelope.id.to_hex();
-        let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
-        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ts = i64::try_from(envelope.timestamp)
-            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
-        let ciphertext = &envelope.ciphertext;
         let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
-        let sig = hex::encode(envelope.signature.as_bytes());
-        let nonce = hex::encode(envelope.nonce.as_bytes());
-        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
-        let refs_json =
-            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
-
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let amount = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
+        let now = deferral_now_ms();
+        let expires = now.saturating_add(ENVELOPE_DEFERRAL_TTL_MS).min(
+            i64::try_from(envelope.timestamp).unwrap_or(i64::MAX).saturating_add(ENVELOPE_DEFERRAL_TTL_MS));
+        if expires <= now { return Ok(false); }
         let mut tx = self.pool.begin().await?;
-        let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
-            .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
-        let healing = receipt.rows_affected() == 0;
-        if healing {
-            // Serialize legacy healers on the receipt binding (SQLite already
-            // holds the writer lock from the INSERT above).
-            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = ?")
-                .bind(&ph).fetch_one(&mut *tx).await?;
-            if binding.0 != id || binding.1 != sender {
-                tx.rollback().await?;
-                return Ok(PaymentReused);
-            }
-            // The same envelope, refused and withdrawn by the application: its
-            // sender is told so again, never that its proof belongs to another.
-            if binding.2 == -1 {
-                tx.rollback().await?;
-                return Ok(Withdrawn);
-            }
-            // Receipt metadata is independent of retained message content and
-            // excludes only the timestamp/signature wrapper refreshed on retry.
-            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = 1 AND kind = ? AND recipient_type = ? AND recipient_id = ? AND preimage = ? AND amount_msat = ? AND nonce = ? AND references_json = ?")
-                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
-                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
-                .fetch_one(&mut *tx).await?;
-            if durable == 1 {
-                tx.rollback().await?;
-                return Ok(AlreadyAccepted);
-            }
-            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = ? AND r.message_id = ? AND r.sender = ? AND m.sender = r.sender AND m.kind = ? AND m.recipient_type = ? AND m.recipient_id = ? AND m.payment_hash = r.payment_hash AND m.preimage = ? AND m.amount_msat = ? AND m.nonce = ? AND m.references_json = ?")
-                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
-                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
-                .fetch_one(&mut *tx).await?;
-            if matched == 1 {
-                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ?")
-                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
-                tx.commit().await?;
-                return Ok(AlreadyAccepted);
-            }
-            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ?")
-                .bind(&id).fetch_one(&mut *tx).await?;
-            if exists != 0 || binding.2 != 0 {
-                tx.rollback().await?;
-                return Ok(PaymentReused);
-            }
-            // Full gate validation precedes this transaction. The receipt
-            // binds this paid identity; repair only its missing message row.
-        }
-        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES (?, ?) ON CONFLICT DO NOTHING")
-            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
-        if inserted.rows_affected() == 0 {
-            let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = ?")
-                .bind(&nonce).fetch_one(&mut *tx).await?;
-            if !healing || owner != sender {
-                tx.rollback().await?;
-                return Ok(NonceReused);
-            }
-        }
-        sqlx::query(
-            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(kind)
-        .bind(&sender)
-        .bind(rtype)
-        .bind(&rid)
-        .bind(ts)
-        .bind(ciphertext)
-        .bind(&ph)
-        .bind(&pi)
-        .bind(amt)
-        .bind(&sig)
-        .bind(&nonce)
-        .bind(&refs_json)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = ?, recipient_type = ?, recipient_id = ?, preimage = ?, amount_msat = ?, nonce = ?, references_json = ? WHERE payment_hash = ?")
-            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM envelope_deferrals WHERE message_id IN (SELECT message_id FROM envelope_deferrals WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms, message_id LIMIT ?2)")
+            .bind(now).bind(i64::from(DEFERRAL_CLEANUP_BATCH)).execute(&mut *tx).await?;
+        // Exact retries keep their original deadline and signed terms.
+        sqlx::query("INSERT INTO envelope_deferrals (message_id, sender, payment_hash, recipient_type, recipient_id, amount_msat, expires_at_ms)
+                SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                WHERE NOT EXISTS (SELECT 1 FROM payment_receipts WHERE payment_hash = ?3)
+                  AND (SELECT COUNT(*) FROM envelope_deferrals WHERE payment_hash = ?3 AND expires_at_ms > ?8) < ?9
+                  AND (SELECT COUNT(*) FROM envelope_deferrals WHERE sender = ?2 AND expires_at_ms > ?8) < ?10
+                ON CONFLICT(message_id) DO NOTHING")
+            .bind(&id).bind(&sender).bind(&ph).bind(rtype).bind(&rid).bind(amount)
+            .bind(expires).bind(now)
+            .bind(MAX_DEFERRALS_PER_PROOF).bind(MAX_DEFERRALS_PER_SENDER)
+            .execute(&mut *tx).await?;
+        let deferred: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = ?1 AND sender = ?2 AND payment_hash = ?3 AND recipient_type = ?4 AND recipient_id = ?5 AND amount_msat = ?6 AND expires_at_ms > ?7)")
+            .bind(&id).bind(&sender).bind(&ph).bind(rtype).bind(&rid).bind(amount).bind(now)
+            .fetch_one(&mut *tx).await?;
         tx.commit().await?;
-        Ok(Accepted)
+        Ok(deferred)
+    }
+
+    async fn is_envelope_deferred(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let amount = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = ?1 AND sender = ?2 AND payment_hash = ?3 AND recipient_type = ?4 AND recipient_id = ?5 AND amount_msat = ?6 AND expires_at_ms > ?7)")
+            .bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
+            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(rtype).bind(&rid).bind(amount)
+            .bind(crate::traits::deferral_now_ms())
+            .fetch_one(&self.pool).await.map_err(Into::into)
+    }
+
+    async fn session_repair_expires_at(&self, own: &NodeId, peer: &NodeId) -> Result<Option<i64>, StorageError> {
+        let now = crate::traits::deferral_now_ms();
+        sqlx::query_scalar("SELECT MAX(expires_at_ms) FROM (SELECT d.expires_at_ms FROM envelope_deferrals d WHERE d.sender = ?2 AND d.recipient_type = 'node' AND d.recipient_id = ?1 AND d.amount_msat > 0 AND d.expires_at_ms > ?3 AND NOT EXISTS (SELECT 1 FROM payment_receipts r WHERE r.payment_hash = d.payment_hash) UNION ALL SELECT ?4 WHERE EXISTS (SELECT 1 FROM outbox_operations o JOIN pending_deliveries p ON p.message_id = o.message_id AND p.recipient_id = o.recipient JOIN messages m ON m.id = o.message_id WHERE o.recipient = ?2 AND o.state IN ('paid', 'sent', 'rejected_retryable') AND substr(o.last_error, 1, 17) = 'session_handover:' AND p.state IN ('pending', 'stalled') AND p.dispatched = 1 AND p.rejection_reason = o.last_error AND m.sender = ?1 AND m.recipient_type = 'node' AND m.recipient_id = ?2 AND m.kind = o.kind AND m.amount_msat > 0 AND o.settled_msat = m.amount_msat AND o.payment_hash = m.payment_hash) ) repair")
+            .bind(own.to_hex()).bind(peer.to_hex()).bind(now)
+            .bind(now.saturating_add(crate::ENVELOPE_DEFERRAL_TTL_MS))
+            .fetch_one(&self.pool).await.map_err(Into::into)
+    }
+
+    async fn cleanup_expired_deferrals(&self, now_ms: i64, max: u32) -> Result<u64, StorageError> {
+        Ok(sqlx::query("DELETE FROM envelope_deferrals WHERE message_id IN (SELECT message_id FROM envelope_deferrals WHERE expires_at_ms <= ?1 ORDER BY expires_at_ms, message_id LIMIT ?2)")
+            .bind(now_ms).bind(i64::from(max.min(crate::DEFERRAL_CLEANUP_BATCH)))
+            .execute(&self.pool).await?.rows_affected())
+    }
+
+    async fn paid_envelope_status(&self, envelope: &UkmEnvelope) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+        self.accept_paid_envelope_inner(envelope, false, false).await
+    }
+
+    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.accept_paid_envelope_inner(envelope, true, false).await?
+            .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
+    }
+
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.accept_paid_envelope_inner(envelope, true, true).await?
+            .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
     }
 
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
@@ -1111,6 +1369,12 @@ impl Storage for SqliteStorage {
 
     async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
         Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = ? AND p.recipient_id = ? AND p.dispatched = 1 AND p.state != 'failed_paid' AND m.sender = ?)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).fetch_one(&self.pool).await?)
+    }
+
+    async fn pending_was_undecryptable(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = ? AND p.recipient_id = ? AND m.sender = ? AND p.dispatched = 1 AND p.state != 'failed_paid' AND substr(p.rejection_reason, 1, 14) = 'undecryptable:')")
+            .bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+            .fetch_one(&self.pool).await.map_err(Into::into)
     }
 
     async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {
@@ -1149,41 +1413,11 @@ impl Storage for SqliteStorage {
     }
 
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
-        let id_hex = id.to_hex();
+        self.load_message_record(id, false).await
+    }
 
-        let row = sqlx::query_as::<_, (
-            String,  // id
-            i64,     // kind
-            String,  // sender
-            String,  // recipient_type
-            String,  // recipient_id
-            i64,     // timestamp_ms
-            Vec<u8>, // ciphertext
-            String,  // payment_hash
-            String,  // preimage
-            i64,     // amount_msat
-            String,  // signature
-            String,  // nonce
-            String,  // references_json
-        )>(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-             FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND id = ?",
-        )
-        .bind(&id_hex)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(r) => {
-                let envelope = row_to_envelope(
-                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
-                )?;
-                Ok(Some(envelope))
-            }
-            None => Ok(None),
-        }
+    async fn record_upgrade_envelope(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
+        self.load_message_record(id, true).await
     }
 
     async fn get_messages_for_recipient(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {
@@ -1640,23 +1874,82 @@ impl Storage for SqliteStorage {
         Ok(result.rows_affected())
     }
 
+    async fn call_media_publish(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<u64, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let id: i64 = sqlx::query_scalar("INSERT INTO call_media_detach_intents(peer, call_id, event, only_unpaid, may_hangup_live) VALUES (?, ?, 'attached', 0, 1) RETURNING id")
+            .bind(peer.to_hex()).bind(call_id).fetch_one(&mut *tx).await?;
+        sqlx::query("INSERT INTO call_media_heads(peer, call_id, generation, latest_event, completed) VALUES (?, ?, ?, ?, 0) ON CONFLICT(peer, call_id) DO UPDATE SET generation = excluded.generation, latest_event = excluded.latest_event, completed = 0")
+            .bind(peer.to_hex()).bind(call_id).bind(id).bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        u64::try_from(id).map_err(|_| StorageError::Conversion("invalid attachment generation".into()))
+    }
+
+    async fn call_media_generation(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<u64>, StorageError> {
+        let id: Option<i64> = sqlx::query_scalar("SELECT generation FROM call_media_heads WHERE peer = ? AND call_id = ?")
+            .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
+        id.map(|id| u64::try_from(id).map_err(|_| StorageError::Conversion("invalid attachment generation".into()))).transpose()
+    }
+
+    async fn call_media_has_pending(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<bool, StorageError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_media_heads WHERE peer = ? AND call_id = ? AND completed = 0")
+            .bind(peer.to_hex()).bind(call_id).fetch_one(&self.pool).await?;
+        Ok(count == 1)
+    }
+
+    async fn call_media_record_detach(&self, intent: &crate::call_media::PendingMediaDetach, completed: bool) -> Result<(), StorageError> {
+        let generation = i64::try_from(intent.generation).map_err(|_| StorageError::Conversion("attachment generation overflow".into()))?;
+        let mut tx = self.pool.begin().await?;
+        // Lock the current projection before appending; completed or superseded
+        // generations can never be reopened by a delayed callback.
+        let previous: Option<i64> = sqlx::query_scalar("UPDATE call_media_heads SET latest_event = latest_event WHERE peer = ? AND call_id = ? AND generation = ? AND completed = 0 RETURNING latest_event")
+            .bind(intent.peer.to_hex()).bind(&intent.call_id).bind(generation).fetch_optional(&mut *tx).await?;
+        let previous = previous.ok_or_else(|| StorageError::Conversion("media attachment no longer pending".into()))?;
+        let policy: (String, i32, i32) = sqlx::query_as("SELECT event, only_unpaid, may_hangup_live FROM call_media_detach_intents WHERE id = ?")
+            .bind(previous).fetch_one(&mut *tx).await?;
+        if !completed && policy == ("detach".into(), i32::from(intent.only_unpaid), i32::from(intent.may_hangup_live)) {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let id: i64 = sqlx::query_scalar("INSERT INTO call_media_detach_intents(peer, call_id, generation, event, only_unpaid, may_hangup_live) VALUES (?, ?, ?, ?, ?, ?) RETURNING id")
+            .bind(intent.peer.to_hex()).bind(&intent.call_id).bind(generation)
+            .bind(if completed { "complete" } else { "detach" }).bind(i32::from(intent.only_unpaid)).bind(i32::from(intent.may_hangup_live))
+            .fetch_one(&mut *tx).await?;
+        sqlx::query("UPDATE call_media_heads SET latest_event = ?, completed = ? WHERE peer = ? AND call_id = ? AND generation = ?")
+            .bind(id).bind(i32::from(completed)).bind(intent.peer.to_hex()).bind(&intent.call_id).bind(generation).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn call_media_pending(&self, after: u64, max: u32) -> Result<Vec<crate::call_media::PendingMediaDetach>, StorageError> {
+        let mut after = i64::try_from(after).map_err(|_| StorageError::Conversion("attachment generation overflow".into()))?;
+        loop {
+            let rows: Vec<crate::call_media::IntentRow> = sqlx::query_as("SELECT h.generation, h.peer, h.call_id, e.only_unpaid, e.may_hangup_live, CASE WHEN e.event = 'attached' THEN 0 ELSE 1 END FROM call_media_heads h JOIN call_media_detach_intents e ON e.id = h.latest_event WHERE h.completed = 0 AND h.generation > ? ORDER BY h.generation LIMIT ?")
+                .bind(after).bind(i64::from(max)).fetch_all(&self.pool).await?;
+            let Some(last) = rows.last() else { return Ok(Vec::new()) };
+            after = last.0;
+            let decoded = crate::call_media::decode_intents(rows);
+            if !decoded.is_empty() { return Ok(decoded); }
+            // Advance through undecodable pages while retaining their pending heads.
+        }
+    }
+
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
-        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE peer = ? AND call_id = ?")
+        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE peer = ? AND call_id = ?")
             .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
         row.map(call_entry_from_row).transpose()
     }
 
     async fn call_open_by_peer(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
-        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
-            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state \
+        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state \
              WHERE peer = ? AND (pending_operation_id IS NOT NULL OR (phase <> 'ended' AND (CASE WHEN phase = 'live' THEN deadline_ms >= ? ELSE deadline_ms > ? END))) \
              ORDER BY CASE WHEN pending_operation_id IS NOT NULL THEN 0 ELSE 1 END, call_id LIMIT ?")
             .bind(peer.to_hex()).bind(now).bind(now)
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS_PER_PEER as i64)
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
-            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
+            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
         }).collect()
     }
 
@@ -1675,6 +1968,65 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    async fn call_invite_deliver(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let (phase, _, accepted) = call_invite_locked(&mut tx, id, peer, call_id).await?;
+        // The awaiting row, not the receipt alone, proves no delivery yet: a
+        // paid acceptance whose Pending mark was never written also reads 1.
+        if phase.as_deref() == Some("awaiting_device") && matches!(accepted, Some(1 | -2)) {
+            sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE message_id = ? AND sender = ? AND kind = 400")
+                .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+            call_upsert(peer, call_id, entry)?.execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
+        if call_invite_delivered(phase.as_deref(), accepted) {
+            return Ok(false);
+        }
+        Err(StorageError::Conversion("call invite receipt not pending".into()))
+    }
+
+    async fn call_offer_bind(&self, peer: &konsensus_core::NodeId, call_id: &str, offer: &MessageId) -> Result<(), StorageError> {
+        let bound = sqlx::query("UPDATE call_state SET offer_id = ? WHERE peer = ? AND call_id = ? AND side = 'caller'")
+            .bind(offer.to_hex()).bind(peer.to_hex()).bind(call_id).execute(&self.pool).await?;
+        if bound.rows_affected() != 1 {
+            return Err(StorageError::Conversion("no caller call row to bind its offer to".into()));
+        }
+        Ok(())
+    }
+
+    async fn call_offer(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<MessageId>, StorageError> {
+        let offer: Option<Option<String>> = sqlx::query_scalar("SELECT offer_id FROM call_state WHERE peer = ? AND call_id = ?")
+            .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
+        offer.flatten().map(|hex| MessageId::from_hex(&hex).map_err(|e| StorageError::Conversion(e.to_string()))).transpose()
+    }
+
+    async fn call_invite_expire(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, deadline_ms: u64) -> Result<crate::CallInviteExpiry, StorageError> {
+        let deadline = i64::try_from(deadline_ms).map_err(|_| StorageError::Conversion("call deadline overflow".into()))?;
+        let tombstone = deadline.saturating_add(i64::try_from(konsensus_core::payloads::call::TOMBSTONE_MS).unwrap_or(i64::MAX));
+        let mut tx = self.pool.begin().await?;
+        let (phase, row_deadline, accepted) = call_invite_locked(&mut tx, id, peer, call_id).await?;
+        if call_invite_delivered(phase.as_deref(), accepted) {
+            return Ok(crate::CallInviteExpiry::Delivered);
+        }
+        let awaiting = phase.as_deref() == Some("awaiting_device") && row_deadline == Some(deadline);
+        if !awaiting && !matches!(accepted, Some(-2 | -3)) {
+            return Ok(crate::CallInviteExpiry::Gone);
+        }
+        sqlx::query("UPDATE payment_receipts SET accepted = -3 WHERE message_id = ? AND sender = ? AND kind = 400 AND accepted IN (1, -2, -3)")
+            .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+        // Held before it is withdrawn: a failed withdrawal stays protected
+        // and the held-message sweep retries it.
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT id, sender, 0 FROM messages WHERE id = ? AND sender = ? ON CONFLICT DO NOTHING")
+            .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+        if awaiting {
+            sqlx::query("UPDATE call_state SET phase = 'ended', deadline_ms = ?, replay_until_ms = ? WHERE peer = ? AND call_id = ?")
+                .bind(tombstone).bind(tombstone).bind(peer.to_hex()).bind(call_id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(crate::CallInviteExpiry::Expired)
+    }
+
     async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
         sqlx::query("DELETE FROM call_state WHERE peer = ? AND call_id = ?")
             .bind(peer.to_hex()).bind(call_id).execute(&self.pool).await?;
@@ -1691,7 +2043,7 @@ impl Storage for SqliteStorage {
                 COALESCE(SUM(CASE WHEN open = 0 AND peer = ? THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN open = 0 THEN 1 ELSE 0 END), 0) \
              FROM (SELECT peer, CASE WHEN pending_operation_id IS NOT NULL OR (phase <> 'ended' AND (CASE WHEN phase = 'live' THEN deadline_ms >= ? ELSE deadline_ms > ? END)) THEN 1 ELSE 0 END AS open \
-                   FROM call_state WHERE replay_until_ms > ? OR pending_operation_id IS NOT NULL) AS rows")
+                   FROM call_state WHERE replay_until_ms > ? OR pending_operation_id IS NOT NULL OR free_reply_receipts IS NOT NULL OR EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0)) AS rows")
             .bind(peer.to_hex()).bind(peer.to_hex()).bind(now).bind(now).bind(now).fetch_one(&self.pool).await?;
         let n = |v: i64| u64::try_from(v).unwrap_or(0);
         Ok(konsensus_core::payloads::call::CallCounts { open_peer: n(open_peer), open_total: n(open_total), burned_peer: n(burned_peer), burned_total: n(burned_total) })
@@ -1701,8 +2053,8 @@ impl Storage for SqliteStorage {
         let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call time overflow".into()));
         let done = sqlx::query(
             "DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state \
-             WHERE (? IS NULL OR peer = ?) AND pending_operation_id IS NULL AND (phase = 'ended' OR deadline_ms <= ?) \
-             AND replay_until_ms <= ? ORDER BY replay_until_ms LIMIT ?)")
+             WHERE (? IS NULL OR peer = ?) AND pending_operation_id IS NULL AND free_reply_receipts IS NULL AND (phase = 'ended' OR deadline_ms <= ?) \
+             AND replay_until_ms <= ? AND NOT EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0) ORDER BY replay_until_ms LIMIT ?)")
             .bind(peer.map(|p| p.to_hex())).bind(peer.map(|p| p.to_hex()))
             .bind(ms(now_ms)?).bind(ms(replay_until_at_most)?).bind(ms(max)?)
             .execute(&self.pool).await?;
@@ -1710,23 +2062,29 @@ impl Storage for SqliteStorage {
     }
 
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE pending_operation_id IS NOT NULL")
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE pending_operation_id IS NOT NULL")
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
         }).collect()
     }
 
     async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE phase = 'live' ORDER BY deadline_ms LIMIT ?")
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE phase = 'live' ORDER BY deadline_ms LIMIT ?")
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS as i64).fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
         }).collect()
+    }
+
+    async fn call_block_invoice_count(&self, peer: &NodeId, call_id: &str, seq: u32) -> Result<u32, StorageError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_block_invoices WHERE peer = ? AND call_id = ? AND seq = ?")
+            .bind(peer.to_hex()).bind(call_id).bind(i64::from(seq)).fetch_one(&self.pool).await?;
+        u32::try_from(count).map_err(|_| StorageError::Conversion("call block invoice count overflow".into()))
     }
 
     async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
@@ -1750,6 +2108,45 @@ impl Storage for SqliteStorage {
         Ok(count == 1)
     }
 
+    async fn call_awaiting(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE side = 'callee' AND phase = 'awaiting_device' ORDER BY peer, call_id LIMIT ?")
+            .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS as i64).fetch_all(&self.pool).await?;
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
+            let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
+        }).collect()
+    }
+
+    async fn call_with_free_reply_receipts(&self, after: Option<(&[u8], &[u8])>, max: u32) -> Result<crate::FreeReplyReceiptPage, StorageError> {
+        // Untyped rows keyed by their raw bytes, in byte order: every stored
+        // row has a usable key, and a column holding a value of the wrong type
+        // fails only its own row, never the page. Query errors stay errors.
+        let rows = sqlx::query(
+            "SELECT CAST(peer AS BLOB), CAST(call_id AS BLOB), side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND (? IS NULL OR CAST(peer AS BLOB) > ? OR (CAST(peer AS BLOB) = ? AND CAST(call_id AS BLOB) > ?)) ORDER BY CAST(peer AS BLOB), CAST(call_id AS BLOB) LIMIT ?")
+            .bind(after.map(|(p, _)| p)).bind(after.map(|(p, _)| p)).bind(after.map(|(p, _)| p)).bind(after.map(|(_, c)| c))
+            .bind(i64::from(max)).fetch_all(&self.pool).await?;
+        let mut page = crate::FreeReplyReceiptPage { rows: Vec::with_capacity(rows.len()), scanned: rows.len(), last_key: None };
+        let mut unkeyed = 0usize;
+        for row in &rows {
+            use sqlx::Row;
+            let peer_key: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(0).ok().flatten().unwrap_or_default();
+            let call_key: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(1).ok().flatten().unwrap_or_default();
+            match (String::from_utf8(peer_key.clone()), String::from_utf8(call_key.clone())) {
+                (Ok(peer), Ok(id)) => {
+                    let entry = free_reply_receipt_entry(row, &peer);
+                    page.rows.push((peer, id, entry));
+                }
+                _ => unkeyed += 1,
+            }
+            page.last_key = Some((peer_key, call_key));
+        }
+        if unkeyed > 0 {
+            tracing::warn!(rows = unkeyed, "call rows holding free-reply receipts have unreadable keys; left untouched");
+        }
+        Ok(page)
+    }
+
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
         // Reclaim legacy caller reservations once no interval can be resumed.
@@ -1760,7 +2157,7 @@ impl Storage for SqliteStorage {
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         sqlx::query("DELETE FROM call_block_invoices WHERE payment_hash IN (SELECT payment_hash FROM call_block_invoices WHERE retain_until_ms < ? ORDER BY retain_until_ms LIMIT ?)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
-        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= ? AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) ORDER BY replay_until_ms LIMIT ?)")
+        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= ? AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) AND free_reply_receipts IS NULL AND NOT EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0) ORDER BY replay_until_ms LIMIT ?)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         Ok(done.rows_affected())
     }
@@ -1770,12 +2167,19 @@ impl Storage for SqliteStorage {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM messages WHERE id = ? AND sender = ?")
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
-        sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = ? AND message_id = ?")
+        sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) OR kind = 400 THEN -3 ELSE -1 END WHERE payment_hash = ? AND message_id = ?")
             .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
             .bind(&id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn is_application_rejected(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = ? AND message_id = ? AND sender = ? AND accepted = -1")
+            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
+            .fetch_one(&self.pool).await?;
+        Ok(n > 0)
     }
 
     async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
@@ -1784,6 +2188,12 @@ impl Storage for SqliteStorage {
         let done = sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = ?) ON CONFLICT DO NOTHING")
             .bind(&id).bind(envelope.sender.to_hex()).bind(now).bind(&id).execute(&self.pool).await?;
         Ok(done.rows_affected() == 1)
+    }
+
+    async fn call_admission_rehold(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT id, sender, 0 FROM messages WHERE id = ? AND sender = ? ON CONFLICT DO NOTHING")
+            .bind(envelope.id.to_hex()).bind(envelope.sender.to_hex()).execute(&self.pool).await?;
+        Ok(())
     }
 
     async fn call_admission_release(&self, id: &MessageId) -> Result<(), StorageError> {
@@ -1801,7 +2211,7 @@ impl Storage for SqliteStorage {
     async fn call_admission_withdraw(&self, held_before_ms: u64) -> Result<u64, StorageError> {
         let before = i64::try_from(held_before_ms).unwrap_or(i64::MAX);
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE (message_id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
+        sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) OR kind = 400 THEN -3 ELSE -1 END WHERE (message_id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
             .bind(before).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM messages WHERE (id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < ?)")
             .bind(before).execute(&mut *tx).await?;
@@ -3257,6 +3667,91 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    async fn commit_calendar_admission(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        admission: &crate::CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        let id = envelope.id.to_hex();
+        let mut tx = self.pool.begin().await?;
+        // The hold must still be there: a missing hold means the sweep withdrew
+        // the envelope (or it was never held), and nothing may be written for it.
+        let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_admission_hold WHERE message_id = ?")
+            .bind(&id).fetch_one(&mut *tx).await?;
+        if held != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = ? AND sender = ?")
+            .bind(&id).bind(envelope.sender.to_hex()).fetch_one(&mut *tx).await?;
+        if stored != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("accepted envelope {id}")));
+        }
+        match admission {
+            crate::CalendarAdmission::Event(record) => {
+                sqlx::query(
+                    "INSERT INTO calendar_events
+                       (id, message_id, organizer, title, description, start_ms, end_ms, tz,
+                        location, attendees_json, recurrence_json, color, parent_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     ON CONFLICT(id) DO UPDATE SET
+                       message_id      = excluded.message_id,
+                       title           = excluded.title,
+                       description     = excluded.description,
+                       start_ms        = excluded.start_ms,
+                       end_ms          = excluded.end_ms,
+                       tz              = excluded.tz,
+                       location        = excluded.location,
+                       attendees_json  = excluded.attendees_json,
+                       recurrence_json = excluded.recurrence_json,
+                       color           = excluded.color,
+                       parent_id       = excluded.parent_id",
+                )
+                .bind(&record.id)
+                .bind(&record.message_id)
+                .bind(&record.organizer)
+                .bind(&record.title)
+                .bind(&record.description)
+                .bind(record.start_ms as i64)
+                .bind(record.end_ms as i64)
+                .bind(&record.tz)
+                .bind(&record.location)
+                .bind(&record.attendees_json)
+                .bind(&record.recurrence_json)
+                .bind(&record.color)
+                .bind(&record.parent_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            crate::CalendarAdmission::Rsvp(record) => {
+                sqlx::query(
+                    "INSERT INTO calendar_rsvps (id, event_id, responder, response, comment)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(event_id, responder) DO UPDATE SET
+                       response = excluded.response,
+                       comment  = excluded.comment",
+                )
+                .bind(&record.id)
+                .bind(&record.event_id)
+                .bind(&record.responder)
+                .bind(&record.response)
+                .bind(&record.comment)
+                .execute(&mut *tx)
+                .await?;
+            }
+            crate::CalendarAdmission::Opaque => {}
+        }
+        let released = sqlx::query("DELETE FROM call_admission_hold WHERE message_id = ?")
+            .bind(&id).execute(&mut *tx).await?;
+        if released.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn store_reaction(&self, record: &ReactionRecord) -> Result<(), StorageError> {
         sqlx::query(
             "INSERT OR IGNORE INTO message_reactions (message_id, sender, emoji)
@@ -3536,6 +4031,14 @@ impl konsensus_core::gate::NonceStore for SqliteStorage {
 mod tests;
 
 #[cfg(test)]
+#[path = "tests/schema_parity.rs"]
+mod schema_parity_tests;
+
+#[cfg(test)]
+#[path = "tests/migration_matrix.rs"]
+mod migration_matrix_tests;
+
+#[cfg(test)]
 mod dbh2_guard {
     /// DBH2: the sibling authority-listing queries that DBH1 missed
     /// (`list_sessions`, `get_pending_peers`, `get_room_members`) must never
@@ -3692,8 +4195,8 @@ fn outstanding_from_row(
 /// Insert or replace one call row, on the pool or inside a transaction.
 fn call_upsert<'q>(peer: &konsensus_core::NodeId, call_id: &'q str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>, StorageError> {
     let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
-    Ok(sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used")
+    Ok(sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used, free_reply_receipts = excluded.free_reply_receipts")
         .bind(peer.to_hex()).bind(call_id)
         .bind(entry.side.as_str()).bind(entry.phase.as_str())
         .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
@@ -3703,14 +4206,30 @@ fn call_upsert<'q>(peer: &konsensus_core::NodeId, call_id: &'q str, entry: &kons
         .bind(entry.paid_until_ms.map(ms).transpose()?)
         .bind(i64::from(entry.next_block_seq))
         .bind(entry.end_reason.map(|reason| reason.as_str()))
-        .bind(i64::from(entry.unpaid_notice_used)))
+        .bind(i64::from(entry.unpaid_notice_used))
+        .bind(if entry.free_reply_receipts.is_empty() { None } else {
+            Some(serde_json::to_string(&entry.free_reply_receipts).map_err(|e| StorageError::Conversion(format!("call state: free reply receipts: {e}")))?)
+        }))
 }
 
 /// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash)` of `call_state`.
-type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64);
+type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>);
+
+/// The entry of one listed receipt row, decoded column by column; `None`
+/// when any column (or the peer) cannot be decoded.
+fn free_reply_receipt_entry(row: &sqlx::sqlite::SqliteRow, peer: &str) -> Option<(konsensus_core::NodeId, konsensus_core::payloads::call::CallEntry)> {
+    use sqlx::Row;
+    let node = konsensus_core::NodeId::from_hex(peer).ok()?;
+    let columns: CallRow = (
+        row.try_get(2).ok()?, row.try_get(3).ok()?, row.try_get(4).ok()?, row.try_get(5).ok()?,
+        row.try_get(6).ok()?, row.try_get(7).ok()?, row.try_get(8).ok()?, row.try_get(9).ok()?,
+        row.try_get(10).ok()?, row.try_get(11).ok()?, row.try_get(12).ok()?,
+    );
+    call_entry_from_row(columns).ok().map(|entry| (node, entry))
+}
 
 /// A stored call row. A corrupt row is an error, never a call.
-fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
+fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
     use konsensus_core::payloads::call::{CallEntry, Pending, Phase, Side};
     let bad = |what: &str| StorageError::Conversion(format!("call state: bad {what}"));
     let pending = match (op, kind) {
@@ -3727,5 +4246,26 @@ fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason
         end_reason: reason.map(|v| konsensus_core::payloads::call::HangupReason::parse(&v).ok_or_else(|| bad("end reason"))).transpose()?,
         unpaid_notice_used: match notice { 0 => false, 1 => true, _ => return Err(bad("unpaid notice")) },
         pending,
+        // NULL on rows written before receipts existed.
+        free_reply_receipts: receipts.map(|v| serde_json::from_str(&v).map_err(|_| bad("free reply receipts"))).transpose()?.unwrap_or_default(),
     })
+}
+
+/// Lock an invite's call row first, so delivery and expiry of the same wait
+/// serialize, then read the row phase/deadline and the receipt state.
+async fn call_invite_locked(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(Option<String>, Option<i64>, Option<i32>), StorageError> {
+    sqlx::query("UPDATE call_state SET phase = phase WHERE peer = ? AND call_id = ?")
+        .bind(peer.to_hex()).bind(call_id).execute(&mut **tx).await?;
+    let row: Option<(String, i64)> = sqlx::query_as("SELECT phase, deadline_ms FROM call_state WHERE peer = ? AND call_id = ?")
+        .bind(peer.to_hex()).bind(call_id).fetch_optional(&mut **tx).await?;
+    let accepted: Option<i32> = sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = ? AND sender = ? AND kind = 400")
+        .bind(id.to_hex()).bind(peer.to_hex()).fetch_optional(&mut **tx).await?;
+    let (phase, deadline) = row.unzip();
+    Ok((phase, deadline, accepted))
+}
+
+/// Committed device delivery: the receipt reads delivered and the row moved
+/// on to ringing or live. Never the receipt alone.
+fn call_invite_delivered(phase: Option<&str>, accepted: Option<i32>) -> bool {
+    accepted == Some(1) && matches!(phase, Some("ringing" | "live"))
 }

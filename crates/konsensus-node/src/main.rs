@@ -4,6 +4,9 @@
 
 mod admission_quotes;
 mod call_media;
+mod chain_tip;
+#[path = "cli/chain_tip.rs"]
+mod chain_tip_cmd;
 mod claim_code;
 mod cli;
 mod config;
@@ -15,6 +18,7 @@ mod endpoints;
 mod guarded_lightning;
 mod housekeeping;
 mod invoice_refusals;
+mod lightning_health;
 #[cfg(test)]
 #[path = "tests/fixtures/flaky_session_store.rs"]
 mod flaky_session_store;
@@ -34,6 +38,7 @@ mod onboarding;
 mod owner_cmd;
 mod password;
 mod peer_exchange;
+mod peer_invoices;
 mod pending_handler;
 mod profile_handler;
 #[path = "cli/recover.rs"]
@@ -139,9 +144,10 @@ async fn main() -> Result<()> {
             tier,
             encrypt,
             password_fd,
+            network,
         } => {
             let password = password_fd.map(password::read_password_fd).transpose()?;
-            cmd_init(&dir, non_interactive, tier.as_deref(), encrypt, password)?;
+            cmd_init(&dir, non_interactive, tier.as_deref(), encrypt, password, &network)?;
         }
         Command::Start {
             config,
@@ -161,10 +167,10 @@ async fn main() -> Result<()> {
             let local_owner_device = local_owner_device || home;
             let password_source = if remote_unlock || home {
                 PasswordSource::RemoteUnlock
-            } else if password_fd.is_some() {
-                PasswordSource::Descriptor
-            } else if password_file.is_some() {
-                PasswordSource::File
+            } else if let Some(fd) = password_fd {
+                PasswordSource::Descriptor(InputAccess::of(password::descriptor_is_owner_only(fd)))
+            } else if let Some(path) = &password_file {
+                PasswordSource::File(InputAccess::of(seed_cmd::password_file_is_owner_only(path)))
             } else if password.is_some() {
                 PasswordSource::Flag
             } else {
@@ -191,6 +197,7 @@ async fn main() -> Result<()> {
         } => {
             seed_cmd::cmd_seed_encrypt(&config)?;
         }
+        Command::ChainTip(args) => chain_tip_cmd::run(args)?,
         Command::Device { command } => {
             owner_cmd::cmd_device(command).await?;
         }
@@ -271,11 +278,15 @@ async fn main() -> Result<()> {
             qr,
             ttl,
             legacy,
+            allow,
+            per_call,
+            days,
         } => {
             if second_device {
                 owner_cmd::check_second_device_ticket(&config).await?;
             }
-            ticket_cmd::cmd_pair_ticket(&config, qr, ttl, legacy, second_device)?;
+            let allowance = allow.map(|daily| ticket_cmd::AllowanceArgs { daily_sats: daily, per_call_sats: per_call, days });
+            ticket_cmd::cmd_pair_ticket_with_allowance(&config, qr, ttl, legacy, second_device, allowance)?;
         }
         Command::Peer { command } => match command {
             PeerCommand::Add {
@@ -301,8 +312,9 @@ async fn main() -> Result<()> {
             mnemonic,
             tier,
             encrypt,
+            network,
         } => {
-            cmd_restore(&dir, mnemonic.as_deref(), tier.as_deref(), encrypt)?;
+            cmd_restore(&dir, mnemonic.as_deref(), tier.as_deref(), encrypt, &network)?;
         }
         Command::NodeId {
             mnemonic,
@@ -460,7 +472,10 @@ fn cmd_init(
     tier_arg: Option<&str>,
     encrypt: Option<Option<String>>,
     password: Option<Zeroizing<String>>,
+    network: &str,
 ) -> Result<()> {
+    // Before any prompt or file: an unknown network writes nothing.
+    ensure_init_network(network)?;
     let password = mnemonic_encryption_password(encrypt, password, non_interactive)?;
     use crate::config::NodeTier;
 
@@ -523,8 +538,9 @@ fn cmd_init(
     .with_context(|| format!("failed to write mnemonic to {}", mnemonic_path.display()))?;
     drop(password); // Last use: do not retain the password during config I/O.
 
-    // Generate tier-specific config
-    let config = NodeConfig::default_for_tier(tier, final_mnemonic_path.clone(), dir);
+    // Generate tier-specific config on the chosen network
+    let config =
+        NodeConfig::default_for_tier_on_network(tier, network, final_mnemonic_path.clone(), dir)?;
     config
         .save(&config_path)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
@@ -578,13 +594,41 @@ fn cmd_init(
         }
     }
     print_network_notice(&config);
+    println!();
+    println!("{}", network_line(&config));
 
     Ok(())
 }
 
+/// `--network` for `init` and `restore`: one of [`config::INIT_NETWORKS`].
+fn ensure_init_network(network: &str) -> Result<()> {
+    anyhow::ensure!(
+        config::INIT_NETWORKS.contains(&network),
+        "unknown network '{network}'. Valid options: {}",
+        config::INIT_NETWORKS.join(", ")
+    );
+    Ok(())
+}
+
+/// The last line `init` and `restore` print: the network the written config
+/// pays on. Mock backends are regtest whatever `--network` says.
+fn network_line(config: &NodeConfig) -> String {
+    let network = match &config.lightning {
+        LightningConfig::Mock { .. } | LightningConfig::SharedMock { .. } => {
+            "regtest (mock Lightning and chain; --network applies to the full tier)".to_string()
+        }
+        lightning => match lightning.chain_source_network() {
+            Some(network) => konsensus_chain::network::network_name(network).to_string(),
+            None => "not set by this Lightning backend".to_string(),
+        },
+    };
+    format!("Network:    {network}")
+}
+
 /// Lines naming the Bitcoin network a freshly written config pays on, when that
-/// is mainnet. `init` and `restore` write `network = "bitcoin"` today, while this
-/// beta supports signet only, so the owner is told before the first start.
+/// is mainnet. `init` and `restore` write it only with `--network bitcoin`,
+/// while this beta supports signet only, so the owner is told before the first
+/// start that `start` will refuse it.
 fn network_notice(config: &NodeConfig) -> Vec<String> {
     if config.lightning.bitcoin_network().as_deref() != Some("bitcoin") {
         return Vec::new();
@@ -593,7 +637,11 @@ fn network_notice(config: &NodeConfig) -> Vec<String> {
         "NOTE: This config uses the Bitcoin mainnet ([lightning] network = \"bitcoin\").".into(),
         "      Mainnet is not supported in this beta. Before the first start, switch".into(),
         "      [lightning] network and the [lightning] and [chain] server URLs to signet:".into(),
-        "      see docs/QUICKSTART-SIGNET.md, step 2.".into(),
+        "      see docs/QUICKSTART-SIGNET.md, step 2. Until then `konsensus start`".into(),
+        format!(
+            "      refuses this config ({}) unless [node] allow_mainnet = true.",
+            config::MAINNET_NOT_APPROVED
+        ),
     ]
 }
 
@@ -614,8 +662,12 @@ fn cmd_restore(
     mnemonic_arg: Option<&str>,
     tier_arg: Option<&str>,
     encrypt: Option<Option<String>>,
+    network: &str,
 ) -> Result<()> {
     use crate::config::NodeTier;
+
+    // Before any prompt or file: an unknown network writes nothing.
+    ensure_init_network(network)?;
 
     let password = mnemonic_encryption_password(encrypt, None, false)?;
 
@@ -710,8 +762,9 @@ fn cmd_restore(
     )
     .with_context(|| format!("failed to write mnemonic to {}", mnemonic_path.display()))?;
 
-    // Generate tier-specific config
-    let config = NodeConfig::default_for_tier(tier, final_mnemonic_path.clone(), dir);
+    // Generate tier-specific config on the chosen network
+    let config =
+        NodeConfig::default_for_tier_on_network(tier, network, final_mnemonic_path.clone(), dir)?;
     config
         .save(&config_path)
         .with_context(|| format!("failed to write config to {}", config_path.display()))?;
@@ -741,6 +794,7 @@ fn cmd_restore(
     }
     print_network_notice(&config);
     println!();
+    println!("{}", network_line(&config));
 
     Ok(())
 }
@@ -938,8 +992,8 @@ fn cmd_node_id(
 /// The three inputs are mutually exclusive at the CLI. Absent all three,
 /// returns `None` so the caller can prompt. The password is never logged.
 /// `--password-file` uses [`seed_cmd::read_password_file`] (chmod 600, regular
-/// file). `--password-fd` uses [`password::read_password_fd`] (one read to EOF,
-/// trailing CR/LF stripped, 4096-byte maximum).
+/// file, 4096-byte maximum). `--password-fd` uses [`password::read_password_fd`]
+/// (one read to EOF, trailing CR/LF stripped, 4096-byte maximum).
 fn supplied_seed_password(
     password: Option<Zeroizing<String>>,
     password_file: Option<&Path>,
@@ -1056,15 +1110,33 @@ fn sign_auth_challenge(
 }
 
 /// Provenance is authority: descriptor input is trusted only with the explicit
-/// local owner device flag. It never enables console authority.
+/// local owner device flag, or the owner's `[pairing]
+/// unattended_device_approvals` setting. It never enables console authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PasswordSource {
     Typed,
-    Descriptor,
+    Descriptor(InputAccess),
     RemoteUnlock,
     Flag,
-    File,
+    File(InputAccess),
     None,
+}
+
+/// What start could verify about who else can read an unattended password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputAccess {
+    OwnerOnly,
+    NotOwnerOnly,
+}
+
+impl InputAccess {
+    fn of(owner_only: bool) -> Self {
+        if owner_only {
+            Self::OwnerOnly
+        } else {
+            Self::NotOwnerOnly
+        }
+    }
 }
 
 /// Lockable starts are always hub-only, regardless of the configured opt-out.
@@ -1091,9 +1163,13 @@ fn is_home_profile(source: PasswordSource, local_owner_device: bool) -> bool {
     source == PasswordSource::RemoteUnlock || local_owner_device
 }
 
-/// Authority selected for this invocation, never loaded from configuration.
+/// Authority selected for this invocation. Console and local-owner authority are
+/// never loaded from configuration. Device approvals are selected by the password
+/// source, which `[pairing] unattended_device_approvals` can only widen for a
+/// verifier: it holds no signing key and opens no console.
 struct StartAuthority {
     device_authority: std::result::Result<OwnerDeviceAuthority, &'static str>,
+    password_source: PasswordSource,
     owner_control: bool,
     local_owner_device: bool,
     lock_status_socket: bool,
@@ -1113,12 +1189,79 @@ impl std::fmt::Debug for OwnerDeviceAuthority {
     }
 }
 
+/// Stated at startup and in the docs whenever the owner's setting is in effect.
+const UNATTENDED_DEVICE_APPROVALS_TRADE: &str =
+    "whoever gets this disk and the password can approve as the owner, and so can any \
+     program running as this OS user. Keep the password file owner-only and out of backups, \
+     and do not use this setting on a machine someone else runs for you.";
+
+/// Why `[pairing] unattended_device_approvals` does not apply to this start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnattendedRefusal {
+    SettingOff,
+    HostedCustody,
+    PasswordOnCommandLine,
+    PasswordNotOwnerOnly,
+    NotAnUnattendedSource,
+}
+
+impl UnattendedRefusal {
+    fn explain(self) -> &'static str {
+        match self {
+            Self::SettingOff => "the setting is off",
+            Self::HostedCustody => {
+                "this machine is run for someone else (tier = \"cloud\" or [identity] hosted): the \
+                 person running it must not hold a decryptable owner key for another person"
+            }
+            Self::PasswordOnCommandLine => {
+                "--password puts the password on the command line, where other OS users can read \
+                 it; use --password-file or --password-fd"
+            }
+            Self::PasswordNotOwnerOnly => {
+                "other OS users can read the password's file, or this platform cannot check that; \
+                 it must be a regular file owned by this user with no group or other permissions \
+                 (chmod 600)"
+            }
+            Self::NotAnUnattendedSource => "the password does not come from a file or descriptor",
+        }
+    }
+}
+
+/// The owner's setting applies only to their own box, and only to a password no
+/// other OS user can read.
+fn unattended_password_allowed(
+    config: &NodeConfig,
+    source: PasswordSource,
+) -> std::result::Result<(), UnattendedRefusal> {
+    if !config.pairing.unattended_device_approvals {
+        return Err(UnattendedRefusal::SettingOff);
+    }
+    if is_hosted_custody(config) {
+        return Err(UnattendedRefusal::HostedCustody);
+    }
+    match source {
+        PasswordSource::File(InputAccess::OwnerOnly)
+        | PasswordSource::Descriptor(InputAccess::OwnerOnly) => Ok(()),
+        PasswordSource::File(InputAccess::NotOwnerOnly)
+        | PasswordSource::Descriptor(InputAccess::NotOwnerOnly) => {
+            Err(UnattendedRefusal::PasswordNotOwnerOnly)
+        }
+        PasswordSource::Flag => Err(UnattendedRefusal::PasswordOnCommandLine),
+        PasswordSource::Typed | PasswordSource::RemoteUnlock | PasswordSource::None => {
+            Err(UnattendedRefusal::NotAnUnattendedSource)
+        }
+    }
+}
+
 /// The owner authority, or why device approvals stay off.
 ///
-/// Only an encrypted recovery phrase, with no plaintext copy beside it, whose
-/// password was typed, supplied by descriptor, or remotely unlocked with explicit
-/// local owner authority, yields a key. The local launcher must protect the password:
-/// seed plus password derives the key (see `mnemonic_crypto::owner_secret`).
+/// Only an encrypted recovery phrase, with no plaintext copy beside it, yields a
+/// key, and only if its password was typed, supplied by descriptor or remotely
+/// unlocked with explicit local owner authority, or came from an owner-only file
+/// or descriptor with the owner's `[pairing] unattended_device_approvals` setting.
+/// Whoever holds the password protects the key: seed plus password derives it (see
+/// `mnemonic_crypto::owner_secret`). All refusals keep the stable reason codes
+/// apps already handle; the startup log says which rule applied.
 fn owner_approval_key(
     config: &NodeConfig,
     password: Option<&str>,
@@ -1135,8 +1278,11 @@ fn owner_approval_key(
     if source != PasswordSource::Typed
         && !(matches!(
             source,
-            PasswordSource::Descriptor | PasswordSource::RemoteUnlock
+            PasswordSource::Descriptor(_) | PasswordSource::RemoteUnlock
         ) && local_owner_device)
+        // The setting loads a verifier only. It never reaches a start that would
+        // retain the signing key.
+        && (local_owner_device || unattended_password_allowed(config, source).is_err())
     {
         return Err(SEED_PASSWORD_NOT_TYPED);
     }
@@ -1156,6 +1302,44 @@ fn owner_approval_key(
         .map_err(|_| OWNER_KEY_UNAVAILABLE)
 }
 
+/// The machine this node runs on is declared as operated for the owner.
+fn is_hosted_custody(config: &NodeConfig) -> bool {
+    config.identity.hosted || matches!(config.tier, NodeTier::Cloud)
+}
+
+/// Which rule turned device approvals on, for the startup log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceApprovalsMode {
+    TypedPassword,
+    LocalOwner,
+    OwnerSetting,
+}
+
+fn device_approvals_mode(source: PasswordSource, local_owner_device: bool) -> DeviceApprovalsMode {
+    if local_owner_device {
+        DeviceApprovalsMode::LocalOwner
+    } else if source == PasswordSource::Typed {
+        DeviceApprovalsMode::TypedPassword
+    } else {
+        DeviceApprovalsMode::OwnerSetting
+    }
+}
+
+/// Why the owner's setting did not turn approvals on.
+fn unattended_setting_note(
+    config: &NodeConfig,
+    source: PasswordSource,
+    reason: &str,
+) -> &'static str {
+    if reason == konsensus_api::pairing::device::SEED_NOT_ENCRYPTED {
+        return "the recovery phrase is not encrypted, or a plaintext copy is beside it";
+    }
+    match unattended_password_allowed(config, source) {
+        Err(refusal) => refusal.explain(),
+        Ok(()) => "no owner key could be derived with this password",
+    }
+}
+
 /// Where this node's seed lives, for the owner's badge
 /// (`docs/protocol/REMOTE-SIGNER.md` §2). A hosted node holding its seed is
 /// `hosted_custody` even when the seed is encrypted: it decrypts into the
@@ -1164,7 +1348,7 @@ fn owner_approval_key(
 fn custody_mode(config: &NodeConfig) -> konsensus_api::custody::CustodyMode {
     use konsensus_api::custody::CustodyMode;
     let path = &config.identity.mnemonic_file;
-    if config.identity.hosted || matches!(config.tier, NodeTier::Cloud) {
+    if is_hosted_custody(config) {
         CustodyMode::HostedCustody
     } else if mnemonic_crypto::is_encrypted_path(path) && !path.with_extension("txt").exists() {
         CustodyMode::EncryptedSeed
@@ -1238,7 +1422,7 @@ async fn cmd_start(
             });
             if local_owner_device
                 && !remote
-                && (password_source != PasswordSource::Descriptor || local.is_none())
+                && (!matches!(password_source, PasswordSource::Descriptor(_)) || local.is_none())
             {
                 anyhow::bail!("--local-owner-device requires --password-fd");
             }
@@ -1256,6 +1440,11 @@ async fn cmd_start(
         // `prepare_start` has already turned this into an error.
         konsensus_api::bootstrap::StartupMode::Refuse(_) => unreachable!(),
     }
+
+    // Before any lease, page, unlock wait, chain source or Lightning state:
+    // an unapproved mainnet (`mainnet_not_approved`) or a known server URL on
+    // another network (`chain_network_mismatch`) refuses the start.
+    config.validate_bitcoin_network()?;
 
     // Fail before waiting for unlock; construction checks again under its lifetime lease.
     {
@@ -1400,6 +1589,7 @@ async fn cmd_start(
         data_dir,
         StartAuthority {
             device_authority,
+            password_source,
             owner_control,
             local_owner_device,
             lock_status_socket: password_source == PasswordSource::RemoteUnlock,
@@ -1431,53 +1621,26 @@ async fn start_node_services<'a>(
 )> {
     let StartAuthority {
         device_authority,
+        password_source,
         owner_control,
         local_owner_device,
         lock_status_socket,
     } = authority;
     // ── Lightning health check ─────────────────────────────────────
-    // Verify Lightning connectivity at startup so users get a clear
-    // error message if their wallet is misconfigured.
-    let lightning_backend = config.lightning.backend_name();
-    match node.lightning().get_balance_msat().await {
-        Ok(balance_msat) => {
-            info!(
-                backend = lightning_backend,
-                balance_msat, "lightning health check passed"
-            );
-        }
-        Err(e) => {
-            if config.lightning.is_mock() {
-                // Mock should never fail, but log just in case
-                warn!(error = %e, "mock lightning health check failed (unexpected)");
-            } else {
-                // Real backend failure — give a helpful error message per tier
-                let fix_hint = match config.tier {
-                    crate::config::NodeTier::Cloud => {
-                        "Cloud tier: check your hosted node URL and ensure the service is running."
-                    }
-                    crate::config::NodeTier::Light => {
-                        "Light tier: check your LDK or LND settings in konsensus.toml.\n  \
-                         If using hosted Lightning, ensure your configured provider is reachable.\n  \
-                         You can switch to mock Lightning for testing: set [lightning] backend = \"mock\"."
-                    }
-                    crate::config::NodeTier::Full => {
-                        "Full tier: LDK embedded Lightning is enabled by default. Your node IS its own Lightning node.\n  \
-                         Keys are derived from your mnemonic. Fund the on-chain wallet to open channels.\n  \
-                         To use your own LND instead, set [lightning] backend = \"lnd\" and configure its REST credentials."
-                    }
-                };
-                warn!(
-                    backend = lightning_backend,
-                    error = %e,
-                    "lightning health check FAILED — payments will not work"
-                );
-                warn!("Fix: {}", fix_hint);
-                // Don't abort — the node can still operate for non-payment tasks,
-                // but the payment gate will reject all messages.
-            }
-        }
-    }
+    // A wallet still syncing is normal on every start and is said at INFO;
+    // an unreachable chain service, a failure, or a sync still running after
+    // the sync window is a WARN. See `lightning_health`.
+    lightning_health::check_and_watch(
+        node.lightning(),
+        lightning_health::Context {
+            backend: config.lightning.backend_name(),
+            chain_source: config.chain.backend_name(),
+            tier: config.tier,
+            is_mock: config.lightning.is_mock(),
+        },
+        node.shutdown_rx(),
+    )
+    .await;
 
     // Replay invite-derived whitelist entries before the listener accepts
     // inbound traffic. `transport.add_to_whitelist` is dynamic in-memory
@@ -1541,7 +1704,7 @@ async fn start_node_services<'a>(
     let session_manager = Arc::new(konsensus_crypto::SessionManager::with_store(
         Arc::clone(node.identity()),
         session_store,
-    ));
+    ).with_record_policy(node.record_policy()));
 
     // Restore E2EE sessions from previous run
     let restored = session_manager.restore_sessions().await;
@@ -1587,7 +1750,8 @@ async fn start_node_services<'a>(
     // downgraded. `owner_control` decides whether elevation can EVER be
     // written on this node: with the flag off there is no control socket, and
     // console grant-writing calls refuse. Local device envelopes have their
-    // own explicit flag; neither authority can be enabled through config.
+    // own explicit flag; neither authority can be enabled through config. The
+    // config can only let an unattended password load the owner's verifier.
     let identity_fingerprint =
         konsensus_api::pairing::identity_fingerprint(&node.node_id().to_hex());
     let pairing_service = Arc::new({
@@ -1602,6 +1766,8 @@ async fn start_node_services<'a>(
         .with_hosted_by(config.node.hosted_by.clone())
         .with_second_device_enrollment(config.pairing.second_device_enrollment)
         .with_second_device_claim_v1(config.pairing.second_device_claim_v1)
+        .with_standing_allowance(config.pairing.standing_allowance_v1)
+        .with_call_continuity(config.calls.call_continuity_v1)
         .with_enrollment_audit(Arc::clone(&audit_log));
         let service = if local_owner_device {
             service.with_local_owner_device()
@@ -1610,7 +1776,32 @@ async fn start_node_services<'a>(
         };
         match device_authority {
             Ok(key) => {
-                info!("device approvals (Touch ID) enabled: owner key from the encrypted seed");
+                match device_approvals_mode(password_source, local_owner_device) {
+                    DeviceApprovalsMode::OwnerSetting => {
+                        use std::io::Write;
+                        let notice = format!(
+                            "device approvals (Touch ID) enabled by [pairing] \
+                             unattended_device_approvals, with the password from a file or \
+                             descriptor: {UNATTENDED_DEVICE_APPROVALS_TRADE}"
+                        );
+                        // Keep this disclosure visible even when logging is disabled.
+                        let _ = writeln!(
+                            std::io::stdout().lock(),
+                            "WARNING: mode=\"owner_setting\" {notice}"
+                        );
+                        warn!(mode = "owner_setting", "{notice}");
+                    }
+                    DeviceApprovalsMode::LocalOwner => info!(
+                        mode = "local_owner",
+                        "device approvals (Touch ID) enabled: owner key from the encrypted \
+                         seed, with explicit local owner authority"
+                    ),
+                    DeviceApprovalsMode::TypedPassword => info!(
+                        mode = "typed_password",
+                        "device approvals (Touch ID) enabled: owner key from the encrypted \
+                         seed, with the password typed at start"
+                    ),
+                }
                 if let Some(signer) = key.signing_key {
                     service.with_owner_signing_key(signer)
                 } else {
@@ -1623,6 +1814,13 @@ async fn start_node_services<'a>(
                     "device approvals (Touch ID) are OFF: {}",
                     konsensus_api::pairing::device::device_approvals_off_message(reason)
                 );
+                if config.pairing.unattended_device_approvals {
+                    warn!(
+                        reason,
+                        "[pairing] unattended_device_approvals is set but does not apply: {}",
+                        unattended_setting_note(config, password_source, reason)
+                    );
+                }
                 service.with_device_authority_disabled(reason)
             }
         }
@@ -1683,6 +1881,12 @@ async fn start_node_services<'a>(
         _ => None,
     };
 
+    // Resolve media left by the previous process before accepting call work.
+    // Startup refuses to continue if the durable recovery state is unreadable.
+    konsensus_api::calls::replay_media_detaches(
+        node.storage().as_ref(), chrono::Utc::now().timestamp_millis() as u64, true,
+    ).await.context("call media startup recovery failed")?;
+
     // M6 N2: node-routed call media, admitted by N1's settled-block
     // coverage and paid-until grace check.
     let call_media = call_media::CallMediaRouter::with_limits(
@@ -1691,6 +1895,9 @@ async fn start_node_services<'a>(
         config.calls.media_limits(),
     );
     let call_media_handle = call_media.spawn(node.shutdown_rx());
+
+    let device_refusals = konsensus_api::calls::recover_devices(node.storage().as_ref()).await
+        .context("incoming call device recovery failed")?;
 
     let api_state = Arc::new(konsensus_api::AppState {
         starter: config.starter_settings(),
@@ -1707,7 +1914,7 @@ async fn start_node_services<'a>(
         session_manager,
         jwt_secret,
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         cors_enabled: config.api.cors_enabled,
         operator_probes_enabled: config
             .api
@@ -1716,6 +1923,7 @@ async fn start_node_services<'a>(
         sensitive_identity_routes_enabled: config.tier.is_self_hosted(),
         has_identity_passphrase: !config.identity.passphrase.is_empty(),
         ws_broadcast: ws_tx.clone(),
+        call_devices: Default::default(),
         ws_delivery_broadcast: ws_delivery_tx.clone(),
         rate_limiter,
         mnemonic_reveal_limiter: Arc::new(
@@ -1735,8 +1943,9 @@ async fn start_node_services<'a>(
         },
         peer_prices: Arc::clone(&peer_prices),
         routing: Arc::clone(node.routing()),
-        plaintext_cipher: Some(Arc::new(konsensus_crypto::PlaintextCacheCipher::new(
+        plaintext_cipher: Some(Arc::new(konsensus_crypto::PlaintextCacheCipher::with_policy(
             node.identity().aes_key(),
+            node.record_policy(),
         ))),
         send_timestamps: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         peer_ln_pubkeys: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1759,6 +1968,7 @@ async fn start_node_services<'a>(
         // Validated at config load; an over-ceiling policy never starts.
         sponsor: config.sponsor.policy().map_err(|e| anyhow::anyhow!(e))?,
         max_call_minutes: config.calls.max_call_minutes,
+        call_reply_free: config.calls.call_reply_free_v1,
         stun_port: stun_socket
             .as_ref()
             .and_then(|s| s.local_addr().ok())
@@ -1779,6 +1989,12 @@ async fn start_node_services<'a>(
                 .join("ldk")
         }),
     });
+    // Callers whose invite the restart ended hear "not reachable" once they
+    // are connected, instead of ringing out their answer window.
+    api_state.call_devices.queue_notices(
+        device_refusals,
+        konsensus_api::calls::now_ms() + konsensus_api::calls::devices::RESTART_REFUSAL_TTL_MS,
+    );
 
     // Public remote access is Noise only. Decrypted bytes go to an ephemeral
     // loopback router that deliberately omits `/api/v1/auth/local`.
@@ -1958,9 +2174,12 @@ async fn start_node_services<'a>(
         front_door: api_state.front_door.clone(),
         routing: Arc::clone(node.routing()),
         identity: Arc::clone(node.identity()),
-        plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::new(
+        plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::with_policy(
             node.identity().aes_key(),
+            node.record_policy(),
         )),
+        call_devices: api_state.call_devices.clone(),
+        call_reply_free: config.calls.call_reply_free_v1,
         ws_tx,
         audit_log: Arc::clone(&audit_log),
         // M1a: wire the configured admission mode into the receive-path gate carrier.
@@ -2074,6 +2293,8 @@ async fn start_node_services<'a>(
     // A failure to bind is fatal rather than a silent downgrade: an owner who
     // asked for the channel must not end up running without it and discover
     // later that nothing can be approved.
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut control_handle: Option<tokio::task::JoinHandle<()>> = None;
     if owner_control || lock_status_socket {
         #[cfg(unix)]
         {
@@ -2109,7 +2330,7 @@ async fn start_node_services<'a>(
                 konsensus_api::control::ControlServer::bind_status_only(&data_dir, status)
                     .context("failed to bind owner status socket")?
             };
-            tokio::spawn(server.serve(node.shutdown_rx()));
+            control_handle = Some(tokio::spawn(server.serve(node.shutdown_rx())));
         }
         #[cfg(not(unix))]
         if owner_control {
@@ -2139,6 +2360,7 @@ async fn start_node_services<'a>(
     let send_timestamps_for_cleanup = Arc::clone(&api_state.send_timestamps);
     let peer_ln_pubkeys_for_cleanup = Arc::clone(&api_state.peer_ln_pubkeys);
     let invoice_requests_for_cleanup = Arc::clone(&api_state.invoice_requests);
+    let call_devices_for_cleanup = Arc::clone(&api_state.call_devices);
 
     let api_handle = tokio::spawn(async move {
         if let Err(e) = konsensus_api::serve(api_addr, api_state, shutdown_rx_api).await {
@@ -2148,6 +2370,13 @@ async fn start_node_services<'a>(
     });
 
     // ── Housekeeping tasks ──────────────────────────────────────────────
+
+    let call_cleanup_handle = tokio::spawn(housekeeping::run_call_cleanup(
+        Arc::clone(node.storage()),
+        call_devices_for_cleanup,
+        Arc::clone(node.transport()),
+        node.shutdown_rx(),
+    ));
 
     let nonce_cleanup_handle = tokio::spawn(housekeeping::run_nonce_cleanup(
         Arc::clone(node.storage()),
@@ -2291,6 +2520,9 @@ async fn start_node_services<'a>(
         if let Err(e) = offline_safety_handle.await {
             warn!(error = %e, "offline safety task panicked");
         }
+        if let Err(e) = call_cleanup_handle.await {
+            warn!(error = %e, "call cleanup task failed");
+        }
         if let Err(e) = nonce_cleanup_handle.await {
             warn!(error = %e, "nonce cleanup task panicked");
         }
@@ -2343,6 +2575,11 @@ async fn start_node_services<'a>(
         if let Some(h) = remote_access_handle {
             if let Err(e) = h.await {
                 warn!(error = %e, "remote access task panicked");
+            }
+        }
+        if let Some(h) = control_handle {
+            if let Err(e) = h.await {
+                warn!(error = %e, "owner control socket task panicked");
             }
         }
         if let Some(h) = remote_internal_handle {
@@ -2502,9 +2739,13 @@ async fn replay_accepted_invite_whitelist(
 
     for record in &records {
         let inviter = NodeId::from_bytes(record.inviter_pubkey);
-        let peer = match storage.get_peer(&inviter).await? {
-            Some(peer) => peer,
-            None => {
+        let peer = match storage.get_peer(&inviter).await {
+            Ok(Some(peer)) => peer,
+            // The active invitation supplies this admission decision. Leave
+            // unreadable peer metadata for the background format upgrade.
+            Err(konsensus_storage::StorageError::Encryption(_)) => konsensus_storage::Peer::new(inviter),
+            Err(error) => return Err(error.into()),
+            Ok(None) => {
                 let peer = konsensus_storage::Peer::new(inviter);
                 storage
                     .upsert_peer(&peer)
@@ -2590,6 +2831,22 @@ mod whitelist_replay_tests {
         async fn add_to_whitelist(&self, peer: &NodeId) {
             self.whitelist.lock().await.insert(*peer);
         }
+    }
+
+    #[tokio::test]
+    async fn whitelist_replay_defers_unreadable_peer_metadata() {
+        let raw = SqliteStorage::in_memory().await.unwrap();
+        let inviter = NodeId::from_bytes([2; 32]);
+        raw.upsert_peer(&konsensus_storage::Peer::new(inviter)).await.unwrap();
+        raw.add_accepted_invite(&AcceptedInviteRecord {
+            nonce: [9; 16], inviter_pubkey: [2; 32], expiry_unix: 200, accepted_at: 10,
+        }).await.unwrap();
+        let storage = konsensus_storage::EncryptedStorage::new(raw, &[7; 32]);
+        let transport = RecordingTransport::default();
+        let registry = tokio::sync::RwLock::new(konsensus_message::PeerRegistry::new());
+        assert_eq!(replay_accepted_invite_whitelist(&storage, &transport, &registry, 100).await.unwrap(), 1);
+        assert!(transport.whitelist.lock().await.contains(&inviter));
+        assert!(storage.get_peer(&inviter).await.is_err());
     }
 
     #[tokio::test]
@@ -2816,7 +3073,12 @@ mod tests;
 #[cfg(test)]
 mod owner_key_startup_tests {
     use super::*;
-    use konsensus_api::pairing::device::{SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED};
+    use konsensus_api::pairing::device::{
+        OWNER_KEY_UNAVAILABLE, SEED_NOT_ENCRYPTED, SEED_PASSWORD_NOT_TYPED,
+    };
+
+    const DESCRIPTOR: PasswordSource = PasswordSource::Descriptor(InputAccess::OwnerOnly);
+    const FILE: PasswordSource = PasswordSource::File(InputAccess::OwnerOnly);
 
     #[test]
     fn home_channels_are_hub_only_and_only_non_lockable_starts_can_opt_out() {
@@ -2825,10 +3087,10 @@ mod owner_key_startup_tests {
             toml::from_str("backend = 'ldk'\nhub_only_channels = false").unwrap();
         for source in [
             PasswordSource::Typed,
-            PasswordSource::Descriptor,
+            DESCRIPTOR,
             PasswordSource::RemoteUnlock,
             PasswordSource::Flag,
-            PasswordSource::File,
+            FILE,
             PasswordSource::None,
         ] {
             assert_eq!(
@@ -2856,10 +3118,10 @@ mod owner_key_startup_tests {
     fn home_profile_all_password_sources() {
         for (source, without_local_owner) in [
             (PasswordSource::Typed, false),
-            (PasswordSource::Descriptor, false),
+            (DESCRIPTOR, false),
             (PasswordSource::RemoteUnlock, true),
             (PasswordSource::Flag, false),
-            (PasswordSource::File, false),
+            (FILE, false),
             (PasswordSource::None, false),
         ] {
             assert_eq!(
@@ -2909,13 +3171,7 @@ mod owner_key_startup_tests {
         std::fs::remove_file(dir.path().join("mnemonic.txt")).unwrap();
         // Encrypted, password from a flag or file: off.
         assert_eq!(
-            owner_approval_key(
-                &enc,
-                Some("correct horse"),
-                PasswordSource::Descriptor,
-                false
-            )
-            .unwrap_err(),
+            owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, false).unwrap_err(),
             SEED_PASSWORD_NOT_TYPED
         );
         // Encrypted and typed: on, and it is exactly the key the owner CLI signs with.
@@ -2930,19 +3186,303 @@ mod owner_key_startup_tests {
         assert!(owner_approval_key(&enc, Some("wrong"), PasswordSource::Typed, false).is_err());
     }
 
+    fn unattended(password: Option<&str>) -> (tempfile::TempDir, NodeConfig) {
+        let (dir, mut config) = config(password);
+        config.pairing.unattended_device_approvals = true;
+        (dir, config)
+    }
+
+    /// What `start --password-file` records for a real file of this mode.
+    #[cfg(unix)]
+    fn file_source(dir: &Path, mode: u32) -> PasswordSource {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("pw");
+        std::fs::write(&path, "correct horse").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        PasswordSource::File(InputAccess::of(seed_cmd::password_file_is_owner_only(
+            &path,
+        )))
+    }
+
+    #[test]
+    fn unattended_device_approvals_default_off_with_a_file_password() {
+        assert!(!crate::config::PairingConfig::default().unattended_device_approvals);
+        let parsed: crate::config::PairingConfig = toml::from_str("").unwrap();
+        assert!(!parsed.unattended_device_approvals);
+        let (_dir, enc) = config(Some("correct horse"));
+        assert!(!enc.pairing.unattended_device_approvals);
+        assert!(
+            !toml::to_string(&enc)
+                .unwrap()
+                .contains("unattended_device_approvals"),
+            "off is absence, so a saved config still loads on an older binary"
+        );
+        for source in [FILE, DESCRIPTOR] {
+            assert_eq!(
+                owner_approval_key(&enc, Some("correct horse"), source, false).unwrap_err(),
+                SEED_PASSWORD_NOT_TYPED,
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            unattended_password_allowed(&enc, FILE).unwrap_err(),
+            UnattendedRefusal::SettingOff
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_device_approvals_load_the_owner_verifier_from_an_owner_only_file() {
+        let (dir, enc) = unattended(Some("correct horse"));
+        for mode in [0o600, 0o400] {
+            let source = file_source(dir.path(), mode);
+            assert_eq!(source, FILE, "{mode:o}");
+            let key = owner_approval_key(&enc, Some("correct horse"), source, false).unwrap();
+            // Exactly the key the owner CLI signs with, so existing device records
+            // stay valid, and only its public half is kept.
+            let secret = mnemonic_crypto::owner_secret("correct horse", &node_id()).unwrap();
+            let cli_key = konsensus_core::OwnerApprovalKey::from_mnemonic(PHRASE, "", &secret)
+                .unwrap()
+                .verifying_key();
+            assert_eq!(key.verifying_key, cli_key);
+            assert!(key.signing_key.is_none());
+            assert_eq!(
+                device_approvals_mode(source, false),
+                DeviceApprovalsMode::OwnerSetting
+            );
+        }
+        // A descriptor is the same choice, and also retains no signer.
+        let key = owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, false).unwrap();
+        assert!(key.signing_key.is_none());
+    }
+
+    #[test]
+    fn unattended_device_approvals_never_retain_the_signing_key() {
+        // The CLI already refuses --local-owner-device with --password-file; the
+        // setting must not open that door if the CLI ever changes.
+        let (_dir, enc) = unattended(Some("correct horse"));
+        assert_eq!(
+            owner_approval_key(&enc, Some("correct horse"), FILE, true).unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+    }
+
+    #[test]
+    fn unattended_device_approvals_stay_refused_for_a_plaintext_seed() {
+        let (_dir, plain) = unattended(None);
+        for source in [FILE, DESCRIPTOR, PasswordSource::Typed] {
+            assert_eq!(
+                owner_approval_key(&plain, Some("correct horse"), source, false).unwrap_err(),
+                SEED_NOT_ENCRYPTED,
+                "{source:?}"
+            );
+        }
+        // An encrypted seed with a plaintext copy beside it counts as plaintext.
+        let (dir, enc) = unattended(Some("correct horse"));
+        std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
+        assert_eq!(
+            owner_approval_key(&enc, Some("correct horse"), FILE, false).unwrap_err(),
+            SEED_NOT_ENCRYPTED
+        );
+        assert!(unattended_setting_note(&enc, FILE, SEED_NOT_ENCRYPTED).contains("not encrypted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_device_approvals_refuse_a_file_other_users_can_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, enc) = unattended(Some("correct horse"));
+        for mode in [0o640, 0o604, 0o644, 0o660, 0o606, 0o666] {
+            let source = file_source(dir.path(), mode);
+            assert_eq!(
+                source,
+                PasswordSource::File(InputAccess::NotOwnerOnly),
+                "{mode:o}"
+            );
+            assert_eq!(
+                owner_approval_key(&enc, Some("correct horse"), source, false).unwrap_err(),
+                SEED_PASSWORD_NOT_TYPED,
+                "{mode:o}"
+            );
+            assert_eq!(
+                unattended_password_allowed(&enc, source).unwrap_err(),
+                UnattendedRefusal::PasswordNotOwnerOnly
+            );
+            assert!(seed_cmd::read_password_file(&dir.path().join("pw")).is_err());
+        }
+        // A symlink and a missing file are not verified as owner-only either.
+        let target = dir.path().join("pw");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("pw-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!seed_cmd::password_file_is_owner_only(&link));
+        assert!(!seed_cmd::password_file_is_owner_only(
+            &dir.path().join("missing")
+        ));
+        // A descriptor over such a file is refused the same way.
+        let source = PasswordSource::Descriptor(InputAccess::NotOwnerOnly);
+        assert_eq!(
+            owner_approval_key(&enc, Some("correct horse"), source, false).unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_device_approvals_refuse_a_fifo_other_users_can_read() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let (dir, enc) = unattended(Some("correct horse"));
+        let path = dir.path().join("pw-fifo");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: c_path is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        writer.write_all(b"correct horse\n").unwrap();
+        drop(writer);
+
+        let source = PasswordSource::Descriptor(InputAccess::of(
+            password::descriptor_is_owner_only(reader.as_raw_fd()),
+        ));
+        let password = password::read_password_fd(reader.as_raw_fd()).unwrap();
+        assert_eq!(
+            owner_approval_key(&enc, Some(password.as_str()), source, false).unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+        assert_eq!(
+            source,
+            PasswordSource::Descriptor(InputAccess::NotOwnerOnly)
+        );
+        assert_eq!(
+            unattended_password_allowed(&enc, source).unwrap_err(),
+            UnattendedRefusal::PasswordNotOwnerOnly
+        );
+    }
+
+    #[test]
+    fn unattended_device_approvals_refuse_a_password_on_the_command_line() {
+        let (_dir, enc) = unattended(Some("correct horse"));
+        assert_eq!(
+            owner_approval_key(&enc, Some("correct horse"), PasswordSource::Flag, false)
+                .unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+        assert_eq!(
+            unattended_password_allowed(&enc, PasswordSource::Flag).unwrap_err(),
+            UnattendedRefusal::PasswordOnCommandLine
+        );
+    }
+
+    #[test]
+    fn unattended_device_approvals_refuse_a_machine_run_for_someone_else() {
+        let (_d, mut hosted) = unattended(Some("correct horse"));
+        hosted.identity.hosted = true;
+        let (_d2, mut cloud) = unattended(Some("correct horse"));
+        cloud.tier = crate::config::NodeTier::Cloud;
+        for config in [&hosted, &cloud] {
+            for source in [FILE, DESCRIPTOR] {
+                assert_eq!(
+                    owner_approval_key(config, Some("correct horse"), source, false).unwrap_err(),
+                    SEED_PASSWORD_NOT_TYPED,
+                    "{source:?}"
+                );
+                assert_eq!(
+                    unattended_password_allowed(config, source).unwrap_err(),
+                    UnattendedRefusal::HostedCustody
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unattended_device_approvals_do_not_cover_remote_unlock_without_local_owner() {
+        let (_dir, enc) = unattended(Some("correct horse"));
+        assert_eq!(
+            owner_approval_key(
+                &enc,
+                Some("correct horse"),
+                PasswordSource::RemoteUnlock,
+                false
+            )
+            .unwrap_err(),
+            SEED_PASSWORD_NOT_TYPED
+        );
+    }
+
+    #[test]
+    fn unattended_device_approvals_wrong_password_yields_no_key() {
+        let (_dir, enc) = unattended(Some("correct horse"));
+        for source in [FILE, DESCRIPTOR] {
+            assert_eq!(
+                owner_approval_key(&enc, Some("wrong"), source, false).unwrap_err(),
+                OWNER_KEY_UNAVAILABLE,
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            owner_approval_key(&enc, None, FILE, false).unwrap_err(),
+            OWNER_KEY_UNAVAILABLE
+        );
+        assert!(unattended_setting_note(&enc, FILE, OWNER_KEY_UNAVAILABLE).contains("no owner key"));
+    }
+
+    #[test]
+    fn a_typed_password_behaves_the_same_with_the_setting_on_or_off() {
+        let (_d, off) = config(Some("correct horse"));
+        let (_d2, on) = unattended(Some("correct horse"));
+        let off_key =
+            owner_approval_key(&off, Some("correct horse"), PasswordSource::Typed, false).unwrap();
+        let on_key =
+            owner_approval_key(&on, Some("correct horse"), PasswordSource::Typed, false).unwrap();
+        assert_eq!(off_key.verifying_key, on_key.verifying_key);
+        assert!(off_key.signing_key.is_none() && on_key.signing_key.is_none());
+        assert_eq!(
+            device_approvals_mode(PasswordSource::Typed, false),
+            DeviceApprovalsMode::TypedPassword
+        );
+        for config in [&off, &on] {
+            assert!(
+                owner_approval_key(config, Some("wrong"), PasswordSource::Typed, false).is_err()
+            );
+        }
+        // A hosted machine's typed start is not this setting's concern: unchanged.
+        let (_d3, mut hosted) = unattended(Some("correct horse"));
+        hosted.identity.hosted = true;
+        assert!(
+            owner_approval_key(&hosted, Some("correct horse"), PasswordSource::Typed, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_startup_trade_is_stated_plainly() {
+        for words in [
+            "whoever gets this disk and the password can approve as the owner",
+            "any program running as this OS user",
+            "owner-only",
+            "out of backups",
+            "a machine someone else runs",
+        ] {
+            assert!(UNATTENDED_DEVICE_APPROVALS_TRADE.contains(words), "{words}");
+        }
+    }
+
     #[test]
     fn only_local_owner_start_retains_the_delegation_signer() {
         let (_dir, enc) = config(Some("correct horse"));
         let typed =
             owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false).unwrap();
         assert!(typed.signing_key.is_none());
-        let local = owner_approval_key(
-            &enc,
-            Some("correct horse"),
-            PasswordSource::Descriptor,
-            true,
-        )
-        .unwrap();
+        let local = owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, true).unwrap();
         let signer = local
             .signing_key
             .as_ref()
@@ -2979,58 +3519,32 @@ mod owner_key_startup_tests {
         let typed =
             owner_approval_key(&enc, Some("correct horse"), PasswordSource::Typed, false).unwrap();
         assert_eq!(
-            owner_approval_key(
-                &enc,
-                Some("correct horse"),
-                PasswordSource::Descriptor,
-                true
-            )
-            .unwrap()
-            .verifying_key,
+            owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, true)
+                .unwrap()
+                .verifying_key,
             typed.verifying_key
         );
-        for source in [
-            PasswordSource::Descriptor,
-            PasswordSource::Flag,
-            PasswordSource::File,
-            PasswordSource::None,
-        ] {
+        for source in [DESCRIPTOR, PasswordSource::Flag, FILE, PasswordSource::None] {
             assert_eq!(
                 owner_approval_key(&enc, Some("correct horse"), source, false).unwrap_err(),
                 SEED_PASSWORD_NOT_TYPED
             );
         }
-        for source in [
-            PasswordSource::Flag,
-            PasswordSource::File,
-            PasswordSource::None,
-        ] {
+        for source in [PasswordSource::Flag, FILE, PasswordSource::None] {
             assert_eq!(
                 owner_approval_key(&enc, Some("correct horse"), source, true).unwrap_err(),
                 SEED_PASSWORD_NOT_TYPED
             );
         }
-        assert!(owner_approval_key(&enc, Some("wrong"), PasswordSource::Descriptor, true).is_err());
+        assert!(owner_approval_key(&enc, Some("wrong"), DESCRIPTOR, true).is_err());
         std::fs::write(dir.path().join("mnemonic.txt"), PHRASE).unwrap();
         assert_eq!(
-            owner_approval_key(
-                &enc,
-                Some("correct horse"),
-                PasswordSource::Descriptor,
-                true
-            )
-            .unwrap_err(),
+            owner_approval_key(&enc, Some("correct horse"), DESCRIPTOR, true).unwrap_err(),
             SEED_NOT_ENCRYPTED
         );
         let (_dir, plain) = config(None);
         assert_eq!(
-            owner_approval_key(
-                &plain,
-                Some("correct horse"),
-                PasswordSource::Descriptor,
-                true
-            )
-            .unwrap_err(),
+            owner_approval_key(&plain, Some("correct horse"), DESCRIPTOR, true).unwrap_err(),
             SEED_NOT_ENCRYPTED
         );
     }
@@ -3130,6 +3644,10 @@ mod custody_mode_tests {
 mod regtest_e2e;
 
 #[cfg(test)]
+#[path = "tests/gate_while_not_ready.rs"]
+mod gate_while_not_ready_tests;
+
+#[cfg(test)]
 #[path = "tests/shutdown.rs"]
 mod shutdown_tests;
 
@@ -3166,5 +3684,268 @@ mod network_notice_tests {
             let (_dir, config) = fresh(tier);
             assert!(network_notice(&config).is_empty(), "{}", tier.description());
         }
+    }
+
+    #[test]
+    fn the_mainnet_notice_names_the_start_refusal() {
+        let (_dir, config) = fresh(NodeTier::Full);
+        let text = network_notice(&config).join("\n");
+        assert!(text.contains("mainnet_not_approved"), "{text}");
+        assert!(text.contains("[node] allow_mainnet = true"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod init_network_tests {
+    use super::*;
+    use crate::config::ChainConfig;
+
+    fn on(tier: NodeTier, network: &str) -> (tempfile::TempDir, NodeConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = NodeConfig::default_for_tier_on_network(
+            tier,
+            network,
+            dir.path().join("mnemonic.txt"),
+            dir.path(),
+        )
+        .unwrap();
+        (dir, config)
+    }
+
+    fn urls(config: &NodeConfig) -> (String, Option<String>, String, Option<String>) {
+        let LightningConfig::Ldk {
+            esplora_url,
+            esplora_url_fallback,
+            ..
+        } = &config.lightning
+        else {
+            panic!("full tier writes an LDK backend");
+        };
+        let ChainConfig::Esplora {
+            api_url,
+            esplora_url_fallback: chain_fallback,
+            ..
+        } = &config.chain
+        else {
+            panic!("full tier writes an Esplora chain");
+        };
+        (
+            esplora_url.clone(),
+            esplora_url_fallback.clone(),
+            api_url.clone(),
+            chain_fallback.clone(),
+        )
+    }
+
+    #[test]
+    fn the_default_init_network_is_signet() {
+        assert_eq!(config::DEFAULT_INIT_NETWORK, "signet");
+        let cli = Cli::parse_from(["konsensus", "init"]);
+        let Command::Init { network, .. } = cli.command else {
+            panic!("expected Init command");
+        };
+        assert_eq!(network, "signet");
+        let cli = Cli::parse_from(["konsensus", "restore"]);
+        let Command::Restore { network, .. } = cli.command else {
+            panic!("expected Restore command");
+        };
+        assert_eq!(network, "signet");
+        for bad in ["testnet", "mainnet", "SIGNET"] {
+            assert!(Cli::try_parse_from(["konsensus", "init", "--network", bad]).is_err());
+            assert!(Cli::try_parse_from(["konsensus", "restore", "--network", bad]).is_err());
+        }
+    }
+
+    #[test]
+    fn each_network_writes_matching_lightning_and_chain_urls() {
+        let (_d, signet) = on(NodeTier::Full, "signet");
+        assert_eq!(signet.lightning.bitcoin_network().as_deref(), Some("signet"));
+        assert_eq!(
+            urls(&signet),
+            (
+                "https://mempool.space/signet/api".into(),
+                Some("https://blockstream.info/signet/api".into()),
+                "https://mempool.space/signet".into(),
+                Some("https://blockstream.info/signet".into()),
+            )
+        );
+        let (_d, regtest) = on(NodeTier::Full, "regtest");
+        assert_eq!(regtest.lightning.bitcoin_network().as_deref(), Some("regtest"));
+        assert_eq!(
+            urls(&regtest),
+            (
+                "http://localhost:3002/api".into(),
+                None,
+                "http://localhost:3002".into(),
+                None,
+            )
+        );
+        // Mainnet keeps exactly the provider pair a plain default writes.
+        let (_d, bitcoin) = on(NodeTier::Full, "bitcoin");
+        let (_d2, plain) = {
+            let dir = tempfile::tempdir().unwrap();
+            let c = NodeConfig::default_for_tier(
+                NodeTier::Full,
+                dir.path().join("mnemonic.txt"),
+                dir.path(),
+            );
+            (dir, c)
+        };
+        assert_eq!(bitcoin.lightning.bitcoin_network().as_deref(), Some("bitcoin"));
+        assert_eq!(urls(&bitcoin), urls(&plain));
+        // Every fresh config passes the offline network check.
+        for config in [&signet, &regtest, &bitcoin] {
+            config.refuse_known_chain_url_on_another_network().unwrap();
+        }
+        assert!(NodeConfig::default_for_tier_on_network(
+            NodeTier::Full,
+            "testnet",
+            PathBuf::from("m"),
+            Path::new(".")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mock_tiers_are_unchanged_by_the_network() {
+        for tier in [NodeTier::Light, NodeTier::Cloud] {
+            let (_d, config) = on(tier, "bitcoin");
+            assert!(matches!(config.lightning, LightningConfig::Mock { .. }));
+            assert!(matches!(config.chain, ChainConfig::Mock));
+            config.validate_bitcoin_network().unwrap();
+            assert!(network_line(&config).starts_with("Network:    regtest (mock"));
+        }
+    }
+
+    #[test]
+    fn the_network_line_names_the_written_network() {
+        for (network, line) in [
+            ("signet", "Network:    signet"),
+            ("regtest", "Network:    regtest"),
+            ("bitcoin", "Network:    bitcoin (mainnet)"),
+        ] {
+            let (_d, config) = on(NodeTier::Full, network);
+            assert_eq!(network_line(&config), line);
+        }
+    }
+
+    #[test]
+    fn start_refuses_mainnet_unless_the_owner_opted_in() {
+        let (_d, mut config) = on(NodeTier::Full, "bitcoin");
+        let error = config.validate_bitcoin_network().unwrap_err().to_string();
+        assert!(error.starts_with("mainnet_not_approved: "), "{error}");
+        assert!(error.contains("allow_mainnet = true"), "{error}");
+        // The starter-hub opt-in is a different key and does not count.
+        config.starter_hub.allow_mainnet = true;
+        assert!(config.refuse_unapproved_mainnet().is_err());
+        config.starter_hub.allow_mainnet = false;
+        config.node.allow_mainnet = true;
+        config.validate_bitcoin_network().unwrap();
+        // A mainnet CLN backend is refused the same way.
+        let (_d, mut cln) = on(NodeTier::Full, "signet");
+        cln.lightning = toml::from_str(
+            "backend = \"cln\"\nrest_url = \"https://127.0.0.1:3010\"\n\
+             ca_cert_path = \"/tmp/ca.pem\"\nrune_file = \"/tmp/rune\"\nnetwork = \"bitcoin\"\n",
+        )
+        .unwrap();
+        cln.chain = ChainConfig::Mock;
+        let error = cln.validate_bitcoin_network().unwrap_err().to_string();
+        assert!(error.starts_with("mainnet_not_approved: "), "{error}");
+        // Signet and regtest need no opt-in.
+        for network in ["signet", "regtest"] {
+            let (_d, config) = on(NodeTier::Full, network);
+            config.validate_bitcoin_network().unwrap();
+        }
+    }
+
+    #[test]
+    fn the_mainnet_opt_in_is_read_from_node_and_never_written() {
+        let (_d, config) = on(NodeTier::Full, "bitcoin");
+        let mut table: toml::Table = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let node = table
+            .entry("node")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .unwrap();
+        assert!(!node.contains_key("allow_mainnet"), "{node:?}");
+        node.insert("allow_mainnet".into(), true.into());
+        let opted: NodeConfig = toml::from_str(&toml::to_string(&table).unwrap()).unwrap();
+        assert!(opted.node.allow_mainnet);
+        opted.validate_bitcoin_network().unwrap();
+    }
+
+    #[test]
+    fn a_lightning_and_chain_network_mismatch_is_refused() {
+        // Signet [lightning] with a mainnet [chain] left over from an old config.
+        let (_d, mut config) = on(NodeTier::Full, "signet");
+        if let ChainConfig::Esplora { api_url, .. } = &mut config.chain {
+            *api_url = "https://blockstream.info".into();
+        }
+        let error = config.validate_bitcoin_network().unwrap_err().to_string();
+        assert!(error.starts_with("chain_network_mismatch: "), "{error}");
+        assert!(error.contains("[chain] api_url"), "{error}");
+        assert!(error.contains("bitcoin (mainnet)"), "{error}");
+
+        // A mainnet fallback in [lightning], with or without `/api` and a slash.
+        let (_d, mut config) = on(NodeTier::Full, "signet");
+        if let LightningConfig::Ldk {
+            esplora_url_fallback,
+            ..
+        } = &mut config.lightning
+        {
+            *esplora_url_fallback = Some("https://mempool.space/api/".into());
+        }
+        let error = config.validate_bitcoin_network().unwrap_err().to_string();
+        assert!(error.contains("[lightning] esplora_url_fallback"), "{error}");
+
+        // Mainnet [lightning] (opted in) with signet [chain] URLs.
+        let (_d, mut config) = on(NodeTier::Full, "bitcoin");
+        config.node.allow_mainnet = true;
+        if let ChainConfig::Esplora {
+            esplora_url_fallback,
+            ..
+        } = &mut config.chain
+        {
+            *esplora_url_fallback = Some("https://blockstream.info/signet".into());
+        }
+        let error = config.validate_bitcoin_network().unwrap_err().to_string();
+        assert!(error.starts_with("chain_network_mismatch: "), "{error}");
+
+        // Regtest [lightning] with a signet server.
+        let (_d, mut config) = on(NodeTier::Full, "regtest");
+        if let LightningConfig::Ldk { esplora_url, .. } = &mut config.lightning {
+            *esplora_url = "https://mempool.space/signet/api".into();
+        }
+        assert!(config.validate_bitcoin_network().is_err());
+    }
+
+    #[test]
+    fn unknown_or_unused_urls_are_left_to_the_source_check() {
+        // A server this check does not know is not refused offline.
+        let (_d, mut config) = on(NodeTier::Full, "signet");
+        if let ChainConfig::Esplora { api_url, .. } = &mut config.chain {
+            *api_url = "https://esplora.example.invalid".into();
+        }
+        config.validate_bitcoin_network().unwrap();
+        // With Bitcoin Core as [chain], LDK reads Core, not its own URLs.
+        let (_d, mut config) = on(NodeTier::Full, "signet");
+        config.chain = toml::from_str(
+            "backend = \"bitcoind\"\nrpc_host = \"127.0.0.1\"\nrpc_port = 38332\n\
+             cookie_file = \"/tmp/.cookie\"\n",
+        )
+        .unwrap();
+        if let LightningConfig::Ldk { esplora_url, .. } = &mut config.lightning {
+            *esplora_url = "https://blockstream.info/api".into();
+        }
+        config.validate_bitcoin_network().unwrap();
+        // A backend that states no network is not checked.
+        let (_d, mut config) = on(NodeTier::Light, "signet");
+        config.chain = ChainConfig::Esplora {
+            api_url: "https://blockstream.info".into(),
+            esplora_url_fallback: None,
+            credentials_file: None,
+            accept_third_party_tip: false,
+        };
+        config.validate_bitcoin_network().unwrap();
     }
 }

@@ -2,9 +2,10 @@
 //!
 //! Mounted only on the owner-local API router, never on the remote tunnel
 //! router or any peer surface. The code reaches a caller only when the
-//! request comes from loopback, carries a live token, and that token is either
-//! a local console session or a pairing holding an enrolled owner device key.
-//! The code is never written to tracing or the audit log.
+//! request comes from loopback, presents an allowed local Host (and Origin,
+//! when one is sent), carries a live token, and that token is either a local
+//! console session or a pairing holding an enrolled owner device key. The
+//! code is never written to tracing or the audit log.
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
@@ -134,8 +135,10 @@ fn view(state: &AppState) -> ClaimCodeView {
 /// `GET /api/v1/owner/claim-code`.
 ///
 /// Refused for any tunnel-bridged request (the route is also absent from the
-/// remote router), any non-loopback source, and any pairing without an
-/// enrolled owner device. Rate limited per actor. Always `no-store`.
+/// remote router), any non-loopback source, any Host or Origin outside the
+/// local API allowlist, and any pairing without an enrolled owner device.
+/// The allowlist runs before this handler, so a rejected header does not
+/// spend the per-actor display budget. Always `no-store`.
 pub(crate) async fn show(
     auth: ScopedAuth<Read>,
     State(state): State<Arc<AppState>>,

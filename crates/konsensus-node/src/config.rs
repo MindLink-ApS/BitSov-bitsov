@@ -136,6 +136,11 @@ impl NodeTier {
 #[serde(deny_unknown_fields)]
 pub struct NodeDisplayConfig {
     pub hosted_by: Option<String>,
+    /// The owner's opt-in to run on Bitcoin mainnet, added to `[node]` by hand.
+    /// `start` refuses a mainnet `[lightning] network` without it. Defaults to
+    /// false, is never written by the node, and is omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_mainnet: bool,
 }
 
 const HOSTED_BY_MAX_CHARS: usize = 64;
@@ -210,14 +215,54 @@ impl Default for SetupPageConfig {
 pub struct PairingConfig {
     pub second_device_enrollment: bool,
     pub second_device_claim_v1: bool,
+    /// The owner's choice for an unattended box: device approvals (Touch ID)
+    /// stay available when the password of an encrypted seed comes from an
+    /// owner-only file or a descriptor rather than being typed. Whoever gets
+    /// the disk and that file can then approve as the owner. Off by default,
+    /// and refused for a plaintext seed or a machine run for someone else.
+    /// See `docs/operations/password-input.md`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unattended_device_approvals: bool,
+    /// Standing allowances. The owner may attach an allowance to a pairing
+    /// ticket (`konsensus pair-ticket --allow`): a daily cap counted over any
+    /// rolling 24 hours, a per-call cap and an end date. Inside it, the node
+    /// opens the paired app's spend windows by itself; anything outside it
+    /// still needs the owner. Only owner channels write an allowance, never
+    /// the app. Off by default; only the value `true` turns it on, and any
+    /// other value leaves it off.
+    #[serde(
+        deserialize_with = "deserialize_off_unless_true",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub standing_allowance_v1: bool,
 }
 impl Default for PairingConfig {
     fn default() -> Self {
         Self {
             second_device_enrollment: false,
             second_device_claim_v1: true,
+            unattended_device_approvals: false,
+            standing_allowance_v1: false,
         }
     }
+}
+
+/// A switch that fails closed: a literal `true` turns it on; `false` or any
+/// other value (a string, a number, a table) leaves it off.
+fn deserialize_off_unless_true<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Switch {
+        Set(bool),
+        Invalid(serde::de::IgnoredAny),
+    }
+    Ok(match Switch::deserialize(deserializer)? {
+        Switch::Set(on) => on,
+        Switch::Invalid(_) => {
+            tracing::warn!("pairing.standing_allowance_v1 is neither true nor false; it stays off");
+            false
+        }
+    })
 }
 
 /// Top-level node configuration, matching `konsensus.toml`.
@@ -237,7 +282,8 @@ pub struct NodeConfig {
     /// Opt-in local tower client core; transport and payments are W2b.
     #[serde(default)]
     pub tower: konsensus_lightning::tower::TowerConfig,
-    /// Display metadata only; independent of identity.hosted custody.
+    /// Display metadata and the owner's mainnet opt-in; independent of
+    /// identity.hosted custody.
     #[serde(default)]
     pub node: NodeDisplayConfig,
 
@@ -878,20 +924,37 @@ impl LightningConfig {
         }
     }
 
-    /// Bitcoin network this backend pays on, when it states one. Mock
-    /// backends are regtest; LND and LNbits do not say.
+    /// Bitcoin network this backend pays on, when it states one, as one of
+    /// `bitcoin`, `testnet`, `signet` or `regtest`. LDK and CLN accept the
+    /// `mainnet` and `testnet3` aliases in any letter case; other text states
+    /// no network. Mock backends are regtest; LND and LNbits do not say.
     pub fn bitcoin_network(&self) -> Option<String> {
         match self {
-            Self::Ldk { network, .. } => match network.to_ascii_lowercase().as_str() {
-                "bitcoin" | "mainnet" => Some("bitcoin".into()),
-                "testnet" | "testnet3" => Some("testnet".into()),
-                "signet" => Some("signet".into()),
-                "regtest" => Some("regtest".into()),
-                _ => None,
-            },
-            Self::Cln { network, .. } => Some(network.clone()),
+            Self::Ldk { network, .. } | Self::Cln { network, .. } => {
+                match network.to_ascii_lowercase().as_str() {
+                    "bitcoin" | "mainnet" => Some("bitcoin".into()),
+                    "testnet" | "testnet3" => Some("testnet".into()),
+                    "signet" => Some("signet".into()),
+                    "regtest" => Some("regtest".into()),
+                    _ => None,
+                }
+            }
             Self::Mock { .. } | Self::SharedMock { .. } => Some("regtest".into()),
             Self::Lnbits { .. } | Self::Lnd { .. } => None,
+        }
+    }
+
+    /// Network the chain source must be on: `[lightning] network` for the
+    /// backends that set one. Mock, LND and LNbits state none.
+    pub fn chain_source_network(&self) -> Option<bitcoin::Network> {
+        match self {
+            Self::Ldk { network, .. } | Self::Cln { network, .. } => {
+                konsensus_chain::network::parse_configured_network(network)
+            }
+            Self::Lnbits { .. }
+            | Self::Lnd { .. }
+            | Self::Mock { .. }
+            | Self::SharedMock { .. } => None,
         }
     }
 
@@ -907,10 +970,9 @@ impl LightningConfig {
                 ("advertised_address", advertised_address),
                 ("listening_address", listening_address),
             ] {
-                if address
-                    .as_ref()
-                    .is_some_and(|address| address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES)
-                {
+                if address.as_ref().is_some_and(|address| {
+                    address.len() > konsensus_message::wire::MAX_LN_ADDR_BYTES
+                }) {
                     anyhow::bail!(
                         "Lightning address lightning.{field} exceeds the wire limit of {} UTF-8 bytes",
                         konsensus_message::wire::MAX_LN_ADDR_BYTES
@@ -970,6 +1032,12 @@ pub enum ChainConfig {
         /// Owner-only OAuth client credentials for the primary Esplora source.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credentials_file: Option<PathBuf>,
+        /// The owner accepted a public explorer as this node's tip by adding
+        /// `accept_third_party_tip = true` to `[chain]` by hand. Only silences
+        /// the start-time warning; the source stays `third_party`. Defaults to
+        /// false, is never written by the node, and is omitted when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accept_third_party_tip: bool,
     },
     /// Mock provider — static block data, no network calls.
     /// For testnet, development, and offline operation.
@@ -991,6 +1059,7 @@ impl std::fmt::Debug for ChainConfig {
                 api_url,
                 esplora_url_fallback,
                 credentials_file,
+                accept_third_party_tip,
             } => f
                 .debug_struct("Esplora")
                 .field(
@@ -1004,6 +1073,7 @@ impl std::fmt::Debug for ChainConfig {
                         .map(konsensus_core::logging::redact_url_for_debug),
                 )
                 .field("credentials_file", credentials_file)
+                .field("accept_third_party_tip", accept_third_party_tip)
                 .finish(),
             Self::Mock => f.write_str("Mock"),
             Self::Bitcoind(config) => f.debug_tuple("Bitcoind").field(config).finish(),
@@ -1054,6 +1124,7 @@ impl Default for ChainConfig {
             api_url: FRESH_CHAIN_PRIMARY.to_string(),
             esplora_url_fallback: Some(FRESH_CHAIN_FALLBACK.to_string()),
             credentials_file: None,
+            accept_third_party_tip: false,
         }
     }
 }
@@ -1345,6 +1416,43 @@ pub struct CallsConfig {
     /// against one budget and the socket closes past it, as it always has.
     #[serde(default)]
     pub media_drop_bulk_over_share: bool,
+    /// Live-call continuity. When a paired app's spend grant expires or the
+    /// owner replaces it during a call, the call admitted under it keeps its
+    /// media socket and keeps paying its minutes from the hold reserved at
+    /// admission, up to that hold and its minute limit. Nothing new is
+    /// reserved and no new call is admitted on the ended grant. A revocation,
+    /// epoch bump, removed pairing or identity change still ends the call's
+    /// media within a second. Off by default; only the value `true` turns it
+    /// on, and any other value leaves it off.
+    #[serde(default, deserialize_with = "deserialize_fail_closed_switch", skip_serializing_if = "std::ops::Not::not")]
+    pub call_continuity_v1: bool,
+    /// Free call replies. This node answers a call, or declines it, at no
+    /// charge when the caller's node advertises the same switch, and accepts
+    /// such an answer or decline at no charge when it replies to this node's
+    /// own ringing offer. Nothing else becomes free; every other signal, and
+    /// every reply to a node without the switch, is paid as before. Off by
+    /// default; only the value `true` turns it on, and any other value leaves
+    /// it off.
+    #[serde(default, deserialize_with = "deserialize_fail_closed_switch", skip_serializing_if = "std::ops::Not::not")]
+    pub call_reply_free_v1: bool,
+}
+
+/// A switch that fails closed: a literal `true` turns it on; `false` or any
+/// other value (a string, a number, a table) leaves it off.
+fn deserialize_fail_closed_switch<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Switch {
+        Set(bool),
+        Invalid(serde::de::IgnoredAny),
+    }
+    Ok(match Switch::deserialize(deserializer)? {
+        Switch::Set(on) => on,
+        Switch::Invalid(_) => {
+            tracing::warn!("a [calls] switch is neither true nor false; it stays off");
+            false
+        }
+    })
 }
 
 fn default_media_max_frames_per_second() -> u32 { konsensus_api::call_media::DEFAULT_MAX_FRAMES_PER_SECOND }
@@ -1396,6 +1504,8 @@ impl Default for CallsConfig {
             media_max_frames_per_second: default_media_max_frames_per_second(),
             media_max_bytes_per_second: default_media_max_bytes_per_second(),
             media_drop_bulk_over_share: false,
+            call_continuity_v1: false,
+            call_reply_free_v1: false,
         }
     }
 }
@@ -1517,8 +1627,22 @@ impl Default for BackupConfig {
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     /// Address to listen on for API connections.
+    ///
+    /// Defaults to loopback `127.0.0.1:3141`. `0.0.0.0`, `::`, and any other
+    /// non-loopback address fail validation unless
+    /// [`Self::allow_non_loopback_bind`] is set.
     #[serde(default = "default_api_addr")]
     pub listen_addr: SocketAddr,
+
+    /// Opt in to binding the owner API outside loopback.
+    ///
+    /// Default `false`. Leave this unset so the owner API stays on `127.0.0.1`
+    /// or `::1`. Set `allow_non_loopback_bind = true` only to accept `0.0.0.0`,
+    /// `::`, or a LAN address in `listen_addr`. This does not relax remote
+    /// access: with `[remote_access]` enabled, `listen_addr` must still be
+    /// loopback.
+    #[serde(default)]
+    pub allow_non_loopback_bind: bool,
 
     /// JWT secret for API authentication. If not set, a random secret
     /// is generated at startup (tokens won't survive restarts).
@@ -1549,6 +1673,7 @@ impl std::fmt::Debug for ApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiConfig")
             .field("listen_addr", &self.listen_addr)
+            .field("allow_non_loopback_bind", &self.allow_non_loopback_bind)
             .field("jwt_secret", &"<redacted>")
             .field("rate_limit_rps", &self.rate_limit_rps)
             .field("cors_enabled", &self.cors_enabled)
@@ -1562,6 +1687,7 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             listen_addr: default_api_addr(),
+            allow_non_loopback_bind: false,
             jwt_secret: None,
             rate_limit_rps: default_rate_limit(),
             cors_enabled: true,
@@ -1764,11 +1890,16 @@ impl NodeConfig {
         Ok(())
     }
 
-    pub(crate) fn starter_settings(&self) -> konsensus_api::handlers::starter_channel::StarterSettings {
+    pub(crate) fn starter_settings(
+        &self,
+    ) -> konsensus_api::handlers::starter_channel::StarterSettings {
         let mut settings = konsensus_api::handlers::starter_channel::StarterSettings {
             config: self.starter.clone(),
             network: self.lightning.bitcoin_network().unwrap_or_default(),
-            hub_whitelisted: self.peers.iter().any(|p| p.node_id == self.starter.hub_node_id),
+            hub_whitelisted: self
+                .peers
+                .iter()
+                .any(|p| p.node_id == self.starter.hub_node_id),
             ..Default::default()
         };
         if let LightningConfig::Ldk { liquidity, .. } = &self.lightning {
@@ -1781,15 +1912,129 @@ impl NodeConfig {
         settings
     }
 
+    /// Start-time network policy: refuse an unapproved mainnet, then a known
+    /// server URL on another network. Reads no file and contacts no source.
+    pub(crate) fn validate_bitcoin_network(&self) -> anyhow::Result<()> {
+        self.refuse_unapproved_mainnet()?;
+        self.refuse_known_chain_url_on_another_network()
+    }
+
+    /// Mainnet is not supported in this beta: `start` refuses it unless the
+    /// owner added `[node] allow_mainnet = true`. Backends that state no
+    /// network (mock, LND, LNbits) are not refused here.
+    pub(crate) fn refuse_unapproved_mainnet(&self) -> anyhow::Result<()> {
+        if self.node.allow_mainnet
+            || self.lightning.chain_source_network() != Some(bitcoin::Network::Bitcoin)
+        {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{MAINNET_NOT_APPROVED}: [lightning] network is bitcoin (mainnet), which this beta \
+             does not support. Switch [lightning] network and the [lightning] and [chain] server \
+             URLs to signet (docs/QUICKSTART-SIGNET.md, step 2). To run on mainnet anyway, add \
+             allow_mainnet = true to the [node] section by hand"
+        );
+    }
+
+    /// Offline part of the chain source network check: a public server URL
+    /// known to serve one network, named in a config set to another, is
+    /// refused before any source is asked. Every other URL is left to the
+    /// check that asks the source itself. Same code as that check.
+    pub(crate) fn refuse_known_chain_url_on_another_network(&self) -> anyhow::Result<()> {
+        let Some(configured) = self.lightning.chain_source_network() else {
+            return Ok(());
+        };
+        let mut urls: Vec<(&str, &str)> = Vec::new();
+        if let ChainConfig::Esplora {
+            api_url,
+            esplora_url_fallback,
+            ..
+        } = &self.chain
+        {
+            urls.push(("[chain] api_url", api_url));
+            urls.extend(
+                esplora_url_fallback
+                    .as_deref()
+                    .map(|url| ("[chain] esplora_url_fallback", url)),
+            );
+        }
+        // LDK uses the [chain] source instead of its own URLs for these backends.
+        if !matches!(self.chain, ChainConfig::Bitcoind(_) | ChainConfig::Electrum(_)) {
+            if let LightningConfig::Ldk {
+                esplora_url,
+                esplora_url_fallback,
+                ..
+            } = &self.lightning
+            {
+                urls.push(("[lightning] esplora_url", esplora_url));
+                urls.extend(
+                    esplora_url_fallback
+                        .as_deref()
+                        .map(|url| ("[lightning] esplora_url_fallback", url)),
+                );
+            }
+        }
+        for (field, url) in urls {
+            let Some((known, served)) = known_public_esplora(url) else {
+                continue;
+            };
+            if served != configured {
+                anyhow::bail!(
+                    "{}: [lightning] network is {} but {field} is {known}, a {} server. \
+                     Set the [lightning] and [chain] server URLs for {}, or set [lightning] \
+                     network to match, then restart",
+                    konsensus_chain::network::NETWORK_MISMATCH_CODE,
+                    konsensus_chain::network::network_name(configured),
+                    konsensus_chain::network::network_name(served),
+                    konsensus_chain::network::network_name(configured),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_starter_hub(&self, lockable: bool) -> anyhow::Result<()> {
         let network = self.lightning.bitcoin_network();
         self.starter
-            .validate(network.as_deref(), matches!(self.lightning, LightningConfig::Ldk { .. }))
+            .validate(
+                network.as_deref(),
+                matches!(self.lightning, LightningConfig::Ldk { .. }),
+            )
             .map_err(anyhow::Error::msg)?;
-        self.starter_hub.validate(network.as_deref(), self.lightning.channel_capacity_limits().map(|l| l.max_channel_capacity_sats), lockable)
+        self.starter_hub.validate(
+            network.as_deref(),
+            self.lightning
+                .channel_capacity_limits()
+                .map(|l| l.max_channel_capacity_sats),
+            lockable,
+        )
+    }
+
+    /// Refuse `0.0.0.0`, `::`, and every other non-loopback owner API bind
+    /// unless `[api].allow_non_loopback_bind` is explicitly true.
+    fn reject_non_loopback_api_bind(&self) -> anyhow::Result<()> {
+        if self.api.listen_addr.ip().is_loopback() || self.api.allow_non_loopback_bind {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "[api].listen_addr ({}) must be loopback (127.0.0.1 or ::1). \
+             Binding 0.0.0.0, ::, or a LAN address exposes the owner API. \
+             To opt in, set allow_non_loopback_bind = true in the [api] section",
+            self.api.listen_addr
+        );
     }
 
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        // `[network].tier` is what peers see; it must not contradict `tier`.
+        let expected_tier = self.tier.to_sovereignty_tier();
+        if self.network.tier != expected_tier {
+            anyhow::bail!(
+                "[network].tier = \"{:?}\" disagrees with tier = \"{}\", which advertises \
+                 {expected_tier:?}; set [network].tier = \"{expected_tier:?}\"",
+                self.network.tier,
+                self.tier
+            );
+        }
         anyhow::ensure!((1..=240).contains(&self.calls.max_call_minutes), "calls.max_call_minutes must be between 1 and 240");
         self.lightning.validate_address_lengths()?;
         self.validate_starter_hub(false)?;
@@ -1866,6 +2111,12 @@ impl NodeConfig {
                  remote access closed"
             );
         }
+
+        // Owner HTTP stays on loopback unless the operator opts in. Remote
+        // access already refused a non-loopback API above, and that refusal
+        // stands even when the opt-in is set: plaintext HTTP must not be the
+        // remote listener.
+        self.reject_non_loopback_api_bind()?;
 
         // Check P2P and Lightning (LDK) ports don't collide.
         //
@@ -2133,6 +2384,41 @@ impl NodeConfig {
         Ok(())
     }
 
+    /// [`Self::default_for_tier`] on one Bitcoin network, as `init` and
+    /// `restore` write it: `[lightning] network` and the `[lightning]` and
+    /// `[chain]` Esplora URLs all name `network` (one of [`INIT_NETWORKS`]).
+    /// Mock tiers have no network or server to set and are unchanged.
+    pub fn default_for_tier_on_network(
+        tier: NodeTier,
+        network: &str,
+        mnemonic_file: PathBuf,
+        node_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        let endpoints = fresh_endpoints(network)?;
+        let mut config = Self::default_for_tier(tier, mnemonic_file, node_dir);
+        if let LightningConfig::Ldk {
+            network: ldk_network,
+            esplora_url,
+            esplora_url_fallback,
+            ..
+        } = &mut config.lightning
+        {
+            *ldk_network = network.to_string();
+            *esplora_url = endpoints.ldk.to_string();
+            *esplora_url_fallback = endpoints.ldk_fallback.map(str::to_string);
+        }
+        if let ChainConfig::Esplora {
+            api_url,
+            esplora_url_fallback,
+            ..
+        } = &mut config.chain
+        {
+            *api_url = endpoints.chain.to_string();
+            *esplora_url_fallback = endpoints.chain_fallback.map(str::to_string);
+        }
+        Ok(config)
+    }
+
     /// Generate a default configuration with absolute paths rooted in `node_dir`.
     ///
     /// Uses mock Lightning and chain backends so the node starts immediately
@@ -2339,6 +2625,74 @@ const FRESH_CHAIN_FALLBACK: &str = "https://mempool.space";
 const FRESH_LDK_PRIMARY: &str = "https://blockstream.info/api";
 /// LDK takes the full API URL, `/api` included.
 const FRESH_LDK_FALLBACK: &str = "https://mempool.space/api";
+
+/// Bitcoin networks `init` and `restore` write (`--network`).
+pub const INIT_NETWORKS: [&str; 3] = ["signet", "regtest", "bitcoin"];
+/// What `init` and `restore` write without `--network`.
+pub const DEFAULT_INIT_NETWORK: &str = "signet";
+
+/// Stable refusal code: `start` on mainnet without `[node] allow_mainnet`.
+pub const MAINNET_NOT_APPROVED: &str = "mainnet_not_approved";
+
+/// The Esplora servers a fresh config names for one network.
+struct FreshEndpoints {
+    /// Full API URL, `/api` included.
+    ldk: &'static str,
+    ldk_fallback: Option<&'static str>,
+    /// Base URL; the chain client appends `/api`.
+    chain: &'static str,
+    chain_fallback: Option<&'static str>,
+}
+
+fn fresh_endpoints(network: &str) -> anyhow::Result<FreshEndpoints> {
+    Ok(match network {
+        "bitcoin" => FreshEndpoints {
+            ldk: FRESH_LDK_PRIMARY,
+            ldk_fallback: Some(FRESH_LDK_FALLBACK),
+            chain: FRESH_CHAIN_PRIMARY,
+            chain_fallback: Some(FRESH_CHAIN_FALLBACK),
+        },
+        // The signet endpoints of the same two public operators.
+        "signet" => FreshEndpoints {
+            ldk: "https://mempool.space/signet/api",
+            ldk_fallback: Some("https://blockstream.info/signet/api"),
+            chain: "https://mempool.space/signet",
+            chain_fallback: Some("https://blockstream.info/signet"),
+        },
+        // No public regtest server exists. Local default: an Esplora on this
+        // machine at port 3002; point both URLs at your own regtest server.
+        // One local server, so no fallback.
+        "regtest" => FreshEndpoints {
+            ldk: "http://localhost:3002/api",
+            ldk_fallback: None,
+            chain: "http://localhost:3002",
+            chain_fallback: None,
+        },
+        other => anyhow::bail!(
+            "unknown network '{other}'. Valid options: {}",
+            INIT_NETWORKS.join(", ")
+        ),
+    })
+}
+
+/// Public Esplora servers, by base URL, and the network each one serves.
+const KNOWN_PUBLIC_ESPLORA: [(&str, bitcoin::Network); 6] = [
+    ("https://blockstream.info", bitcoin::Network::Bitcoin),
+    ("https://mempool.space", bitcoin::Network::Bitcoin),
+    ("https://blockstream.info/signet", bitcoin::Network::Signet),
+    ("https://mempool.space/signet", bitcoin::Network::Signet),
+    ("https://blockstream.info/testnet", bitcoin::Network::Testnet),
+    ("https://mempool.space/testnet", bitcoin::Network::Testnet),
+];
+
+/// The known server a URL names (with or without `/api`), and its network.
+fn known_public_esplora(url: &str) -> Option<(&'static str, bitcoin::Network)> {
+    let base = url.trim().trim_end_matches('/');
+    let base = base.strip_suffix("/api").unwrap_or(base).trim_end_matches('/');
+    KNOWN_PUBLIC_ESPLORA
+        .into_iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(base))
+}
 
 fn default_sqlite_path() -> String {
     "konsensus.db".into()

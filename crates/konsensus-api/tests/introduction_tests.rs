@@ -414,3 +414,41 @@ fn endpoint_view_names_the_reason_when_nothing_is_known() {
     let view = IntroductionSettings::default().endpoint_view();
     assert_eq!((view.endpoint, view.source, view.reason), (None, None, Some("no_dialable_endpoint")));
 }
+
+#[tokio::test]
+async fn no_card_is_signed_without_a_chain_tip() {
+    // With a tip, the card's price epoch is that tip's difficulty epoch.
+    let state = state_with(Arc::default(), settings(Some("node.example.org:9000")));
+    let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["card"]["price_epoch"], 850_000 / 2016);
+
+    // Without one, no card: never a signed epoch 0.
+    let chain = Arc::new(TipDownChain::down());
+    let state = Arc::new(AppState { chain: chain.clone(), ..(*state).clone() });
+    let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    assert_chain_not_ready(status.as_u16(), &body);
+    assert!(body.get("card").is_none(), "{body}");
+    assert_eq!(chain.reads(), 1);
+
+    // A tip reported as height 0 is no tip either.
+    let state = Arc::new(AppState { chain: Arc::new(TipDownChain::zero()), ..(*state).clone() });
+    let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    assert_chain_not_ready(status.as_u16(), &body);
+}
+
+#[tokio::test]
+async fn a_stale_tip_under_chain_aware_pricing_is_not_ready_not_an_error() {
+    // Mock headers are a year old: under the mainnet bound the tip is stale.
+    let chain = konsensus_chain::FreshTip::wrap(Arc::new(konsensus_chain::MockChainProvider::new()), Some("bitcoin"));
+    let pricing = Arc::new(konsensus_pricing::ChainAwarePricingEngine::new(Default::default(), chain.clone()));
+    let base = state_with(Arc::default(), settings(Some("node.example.org:9000")));
+    let state = Arc::new(AppState { chain, pricing, ..(*base).clone() });
+    let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    assert_chain_not_ready(status.as_u16(), &body);
+
+    // A tip, but a price that needs one the engine could not read: the same.
+    let state = Arc::new(AppState { chain: Arc::new(StubChain), pricing: Arc::new(ChainlessPricing), ..(*base).clone() });
+    let (status, body, _) = call(&state, "GET", "/api/v1/introduction", bearer(&state, vec![auth::Scope::Read]), None).await;
+    assert_chain_not_ready(status.as_u16(), &body);
+}

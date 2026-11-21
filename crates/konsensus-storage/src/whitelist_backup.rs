@@ -21,7 +21,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce as AesNonce,
 };
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::error::StorageError;
@@ -49,9 +49,8 @@ pub struct WhitelistBackup {
 impl WhitelistBackup {
     /// Collect the current whitelist state from storage.
     ///
-    /// Accepted invites are best-effort: a backend that does not implement the
-    /// table yields an empty list rather than failing the whole backup (the
-    /// `peers` rows are the load-bearing whitelist authority).
+    /// Both peer and accepted-invite reads must complete successfully before
+    /// a replacement backup can be produced.
     pub async fn collect(storage: &dyn Storage, now_unix: u64) -> Result<Self, StorageError> {
         let peers = storage.list_peers_with_diagnostics().await?;
         // A partial UI list is useful; a partial replacement backup is data loss.
@@ -62,8 +61,7 @@ impl WhitelistBackup {
         }
         let accepted_invites = storage
             .list_active_accepted_invites(now_unix)
-            .await
-            .unwrap_or_default();
+            .await?;
         Ok(Self {
             version: BACKUP_VERSION,
             peers: peers.items,
@@ -81,7 +79,7 @@ impl WhitelistBackup {
             .map_err(|e| StorageError::Serialization(format!("whitelist backup encode: {e}")))?;
         let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256 key is always 32 bytes");
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = AesNonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(nonce, plaintext.as_ref())

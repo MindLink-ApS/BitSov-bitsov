@@ -13,6 +13,8 @@
 //! Read-modify-write is serialised by one process-wide async lock; the
 //! backing store is one node's database.
 
+pub mod devices;
+
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -64,7 +66,7 @@ impl Drop for ClosingNotice {
     }
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -84,21 +86,38 @@ pub async fn call_media_admitted(store: Store<'_>, peer: &NodeId, call_id: &str,
     store.call_get(peer, call_id).await.ok().flatten().is_some_and(|entry| entry.media_admitted(now))
 }
 
+mod media_detach;
+pub use media_detach::{detach_callee_media, publish_media_attachment, replay_media_detaches, stop_media_attachment, MediaDetach, MediaDetachOutcome};
+
 /// End expired calls durably, retaining pending evidence and tombstones.
 /// Only callee entries are returned for a best-effort 403 Unpaid notification.
 pub async fn expire_calls(store: Store<'_>, now: u64) -> Result<Vec<(NodeId, String)>, konsensus_storage::StorageError> {
+    // Replay failures must not prevent ordinary unpaid expiry.
+    if let Err(error) = replay_media_detaches(store, now, false).await {
+        tracing::warn!(%error, "call media replay deferred");
+    }
     let _g = lock().lock().await;
     let mut expired = Vec::new();
     for (peer, call_id, entry) in store.call_live().await? {
         if now <= entry.deadline_ms { continue; }
         // at() may discard a very old row; keep a tombstone until the next
         // ordinary replay sweep so a notification never opens a fresh call.
-        let next = entry.clone().at(now).unwrap_or(rules::CallEntry {
+        let mut next = entry.clone().at(now).unwrap_or(rules::CallEntry {
             phase: rules::Phase::Ended,
             end_reason: Some(rules::HangupReason::Unpaid),
             deadline_ms: entry.deadline_ms.saturating_add(rules::TOMBSTONE_MS),
             ..entry
         });
+        if next.side == rules::Side::Callee {
+            match media_detach::media_attachment_stopped(store, &peer, &call_id).await {
+                Ok(true) => next.paid_until_ms = Some(0),
+                Ok(false) => {},
+                Err(error) => {
+                    tracing::warn!(%error, "call media expiry state unavailable; resume closed");
+                    next.paid_until_ms = Some(0);
+                }
+            }
+        }
         if let Err(error) = store.call_put(&peer, &call_id, &next).await {
             tracing::warn!(%error, "call expiry deferred");
             continue;
@@ -231,7 +250,7 @@ pub(crate) async fn owner_funded_call(state: &AppState, peer: &NodeId, call_id: 
                     None => {
                         let Some(cipher) = &state.plaintext_cipher else { return Ok(false) };
                         let Some(cached) = state.storage.get_message_plaintext(&envelope.id).await? else { return Ok(false) };
-                        let plaintext = cipher.decrypt(&cached).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
+                        let plaintext = cipher.decrypt(&envelope.id.to_hex(), &cached).map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
                         let signal = CallSignal::parse(kind, std::str::from_utf8(&plaintext)
                             .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?)
                             .map_err(|e| konsensus_storage::StorageError::Conversion(e.to_string()))?;
@@ -373,13 +392,27 @@ async fn awaiting_block_grant(state: &AppState, peer: &NodeId, call_id: &str, se
 
 pub(crate) async fn fail_outgoing(state: &AppState, peer: &NodeId, plaintext: &str) -> Result<(), konsensus_storage::StorageError> {
     let Ok(signal) = konsensus_core::wire_json::from_str::<CallSignal>(plaintext) else { return Ok(()) };
+    fail_call(state, peer, &signal.call_id, None).await
+}
+
+/// Idempotent terminal cleanup uses the durable call binding, even when its
+/// pending reservation has already been released by an earlier attempt.
+pub(crate) async fn fail_call(state: &AppState, peer: &NodeId, call_id: &str,
+    refused_request: Option<(&str, &str)>) -> Result<(), konsensus_storage::StorageError> {
     let _guard = lock().lock().await;
-    if let Some(mut entry) = state.storage.call_get(peer, &signal.call_id).await? {
-        if entry.phase != rules::Phase::Ended {
+    if let Some(mut entry) = state.storage.call_get(peer, call_id).await? {
+        let previous = entry.clone();
+        if entry.phase != rules::Phase::Ended
+            || (refused_request.is_some() && entry.end_reason == Some(rules::HangupReason::Unpaid)) {
             entry.phase = rules::Phase::Ended;
             entry.end_reason = Some(rules::HangupReason::Failed);
             entry.deadline_ms = now_ms().saturating_add(rules::TOMBSTONE_MS);
-            state.storage.call_put(peer, &signal.call_id, &entry).await?;
+        }
+        if refused_request.is_some_and(|(id, hash)| entry.pending.as_ref().is_some_and(|p| p.is(id, hash))) {
+            entry.pending = None;
+        }
+        if entry != previous {
+            state.storage.call_put(peer, call_id, &entry).await?;
         }
     }
     Ok(())
@@ -462,7 +495,11 @@ pub(crate) async fn offer_dispatch_guard(store: Store<'_>, peer: &NodeId, plaint
 }
 
 async fn current(store: Store<'_>, peer: &NodeId, call_id: &str, now: u64) -> Result<Option<CallEntry>, konsensus_storage::StorageError> {
-    Ok(store.call_get(peer, call_id).await?.and_then(|e| e.at(now)))
+    let aged = store.call_get(peer, call_id).await?.and_then(|e| e.at(now));
+    if aged.is_none() && store.call_media_has_pending(peer, call_id).await? {
+        return Err(konsensus_storage::StorageError::Conversion("call media recovery pending".into()));
+    }
+    Ok(aged)
 }
 
 async fn write(store: Store<'_>, peer: &NodeId, call_id: &str, entry: Option<&CallEntry>) -> Result<(), konsensus_storage::StorageError> {
@@ -529,6 +566,20 @@ impl IncomingBlock<'_> {
     }
 }
 
+/// Read invoice eligibility and media ownership under one lifecycle lock.
+/// Wallet operations run after this returns; callers repeat it before publishing.
+/// The result is the retention deadline for the invoice's call binding.
+pub async fn validate_call_block_invoice(store: Store<'_>, peer: &NodeId, call_id: &str, seq: u32) -> Result<u64, CallRefusal> {
+    let _guard = lock().lock().await;
+    let unavailable = |_| CallRefusal::Invalid("call state unavailable");
+    let entry = store.call_get(peer, call_id).await.map_err(unavailable)?.ok_or(CallRefusal::UnknownCall)?;
+    if media_detach::media_attachment_stopped(store, peer, call_id).await.map_err(unavailable)? {
+        return Err(CallRefusal::UnknownCall);
+    }
+    rules::validate_block_invoice(&entry, seq, now_ms())?;
+    Ok(entry.deadline_ms.saturating_add(rules::CALL_BLOCK_RESUME_MS))
+}
+
 /// Check a payment-validated block before consuming its nonce/payment proof.
 /// Retain the guard through acceptance and commit. An unserviceable settled
 /// block still consumes its proof and becomes an audited overpayment.
@@ -540,10 +591,120 @@ pub async fn prepare_incoming_block<'a>(store: Store<'a>, peer: &NodeId, plainte
     let seq = signal.seq.ok_or(CallRefusal::Invalid("missing seq"))?;
     let issued = store.has_call_block_invoice(peer, &signal.call_id, seq, payment_hash).await
         .map_err(|_| CallRefusal::Invalid("call invoice provenance unavailable"))?;
-    let next = if issued { rules::receive_block(entry, seq, now) } else {
+    let next = if !issued {
         Err(CallRefusal::Invalid("call block paid through a non-block invoice"))
-    };
+    } else if entry.as_ref().is_some_and(|e| e.side == rules::Side::Callee
+        && (e.phase == rules::Phase::Live || (e.phase == rules::Phase::Ended && e.end_reason == Some(rules::HangupReason::Unpaid)))) {
+        // A socket can stop while expiry's durable write is in flight. The
+        // final ownership snapshot orders this admission after that stop.
+        // A protected Live row keeps its paid interval but cannot renew it.
+        if media_detach::media_attachment_stopped(store, peer, &signal.call_id).await
+            .map_err(|_| CallRefusal::Invalid("call media state unavailable"))? {
+            Err(CallRefusal::UnknownCall)
+        } else {
+            rules::receive_block(entry, seq, now)
+        }
+    } else { rules::receive_block(entry, seq, now) };
     Ok(IncomingBlock { _guard: guard, store, peer: *peer, signal, next })
+}
+
+/// Receiving side of free call replies, at the payment gate: whether a
+/// free-reply-shaped envelope from `sender` names, by its reference, a call
+/// this node placed to `sender`, whose paid offer is bound and which is still
+/// ringing at `now`. Always false while `[calls] call_reply_free_v1` is off.
+pub async fn free_reply_bound(enabled: bool, store: Store<'_>, envelope: &konsensus_core::UkmEnvelope,
+    now: u64) -> Result<bool, konsensus_storage::StorageError> {
+    if !enabled || !rules::is_free_reply_shape(envelope) {
+        return Ok(false);
+    }
+    for (call_id, entry) in store.call_open_by_peer(&envelope.sender, now).await? {
+        let ringing = entry.at(now).is_some_and(|e| e.side == rules::Side::Caller && e.phase == rules::Phase::Ringing);
+        if ringing && [rules::free_reply_reference(&call_id)] == envelope.references.as_slice()
+            && store.call_offer(&envelope.sender, &call_id).await?.is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Receiving side, after decryption: a zero-amount answer or hangup was
+/// accepted only as a free reply, so its payload must be exactly that reply,
+/// to the call its reference names: an answer, or a hangup whose reason is
+/// `declined`, to this node's own ringing offer. Anything else is refused and
+/// withdrawn; it was never paid, so the refusal costs the sender nothing more.
+pub async fn check_free_reply(store: Store<'_>, envelope: &konsensus_core::UkmEnvelope,
+    plaintext: Option<&str>) -> Result<(), CallRefusal> {
+    if !rules::is_free_reply_shape(envelope) {
+        return Ok(());
+    }
+    let signal = CallSignal::parse(envelope.kind, plaintext.ok_or(CallRefusal::Invalid("undecryptable"))?)?;
+    if [rules::free_reply_reference(&signal.call_id)] != envelope.references.as_slice() {
+        return Err(CallRefusal::Invalid("a free reply names another call"));
+    }
+    if envelope.kind == konsensus_core::kind::KIND_CALL_HANGUP && signal.reason != Some(rules::HangupReason::Declined) {
+        return Err(CallRefusal::Invalid("only a declined hangup is a free reply"));
+    }
+    let entry = store.call_get(&envelope.sender, &signal.call_id).await
+        .map_err(|_| CallRefusal::Invalid("call state unavailable"))?
+        .and_then(|e| e.at(now_ms()));
+    match entry {
+        Some(e) if e.side == rules::Side::Caller && e.phase == rules::Phase::Ringing => Ok(()),
+        Some(_) => Err(CallRefusal::NotRinging),
+        None => Err(CallRefusal::UnknownCall),
+    }
+}
+
+/// Sending side: whether this answer or declined hangup goes out free. Only
+/// with the switch on, to a connected peer that advertised
+/// [`konsensus_core::payloads::call::FREE_REPLY_CAPABILITY`], for a call this
+/// node is ringing for as callee (a decline also while the call waits for a
+/// device), and with no other reference. The legacy paid path is used only
+/// for compatibility: switch off, a peer that does not advertise it, or a
+/// signal that is not an answer or decline. Once both nodes offer the free
+/// reply, a call that cannot be read or is no longer ringing refuses the
+/// reply unsent; it is never paid instead.
+pub(crate) async fn free_reply_allowed(state: &AppState, peer: &NodeId, kind: u16, plaintext: &str,
+    references: &[konsensus_core::MessageId]) -> Result<bool, ApiError> {
+    if !state.call_reply_free || !references.is_empty() {
+        return Ok(false);
+    }
+    let Ok(signal) = CallSignal::parse(kind, plaintext) else { return Ok(false) };
+    let answer = kind == konsensus_core::kind::KIND_CALL_ANSWER;
+    let decline = kind == konsensus_core::kind::KIND_CALL_HANGUP && signal.reason == Some(rules::HangupReason::Declined);
+    if !answer && !decline {
+        return Ok(false);
+    }
+    let wanted = format!("Custom({:?})", rules::FREE_REPLY_CAPABILITY);
+    if !state.transport.peer_info(peer).await.is_some_and(|info| info.capabilities.contains(&wanted)) {
+        return Ok(false);
+    }
+    // Both nodes offer the free reply: from here on it is free or not sent.
+    // Never fall back to paying it because the call could not be read, or
+    // because its ring window closed after the reply was reserved.
+    free_reply_still_eligible(state, peer, &signal.call_id, decline).await?;
+    Ok(true)
+}
+
+/// The call this free reply answers is still ours to answer: this node is
+/// its callee and it is ringing (a decline also while it waits for a
+/// device). Otherwise the reply is refused unsent, with nothing paid. Read
+/// when deciding and again right before the reply is dispatched.
+pub(crate) async fn free_reply_still_eligible(state: &AppState, peer: &NodeId, call_id: &str, decline: bool)
+    -> Result<(), ApiError> {
+    let entry = state.storage.call_get(peer, call_id).await
+        .map_err(|_| ApiError::NotDispatched(
+            "the call could not be read; the reply was not sent and nothing was paid".into(),
+        ).with_reason("call_reply_unavailable"))?
+        .and_then(|e| e.at(now_ms()));
+    let eligible = entry.is_some_and(|e| e.side == rules::Side::Callee
+        && (e.phase == rules::Phase::Ringing || (decline && e.phase == rules::Phase::AwaitingDevice)));
+    if !eligible {
+        return Err(ApiError::NotDispatched(
+            "the call is no longer ringing; the reply was not sent and nothing was paid".into(),
+        ).with_reason("call_reply_expired"));
+    }
+    Ok(())
 }
 
 /// Admit a signal this node (`own`) received from `peer` (after the payment
@@ -555,8 +716,30 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     signal.check_leg(peer, own)?;
     let _g = lock().lock().await;
     let now = now_ms();
+    admit_locked(store, peer, kind, &signal, now, now).await?;
+    Ok(signal)
+}
+
+async fn admit_locked(store: Store<'_>, peer: &NodeId, kind: u16, signal: &CallSignal, now: u64, arrived: u64) -> Result<(), CallRefusal> {
     let unavailable = |_| CallRefusal::Invalid("call state unavailable");
-    let entry = current(store, peer, &signal.call_id, now).await.map_err(unavailable)?;
+    let raw = store.call_get(peer, &signal.call_id).await.map_err(unavailable)?;
+    let entry = raw.clone().and_then(|e| e.at(now));
+    // As `current`: an aged-out call id whose media teardown is still pending
+    // cannot be reused until that teardown is resolved.
+    if entry.is_none() && store.call_media_has_pending(peer, &signal.call_id).await.map_err(unavailable)? {
+        return Err(CallRefusal::Invalid("call state unavailable"));
+    }
+    if kind == konsensus_core::kind::KIND_CALL_HANGUP {
+        // A device wait past its deadline can still be rung by a stream write
+        // armed before it, or by retained delivery evidence. A cancellation
+        // must end that wait durably first, even when the hangup itself is
+        // refused as late.
+        if let (Some(raw), Some(aged)) = (&raw, &entry) {
+            if raw.side == rules::Side::Callee && raw.phase == rules::Phase::AwaitingDevice && aged.phase == rules::Phase::Ended {
+                write(store, peer, &signal.call_id, Some(aged)).await.map_err(unavailable)?;
+            }
+        }
+    }
     // Only an offer opens a new call id; an unknown-id answer/ICE/hangup is
     // refused below and must never make room by evicting a burned id (review R2).
     if entry.is_none() && kind == konsensus_core::kind::KIND_CALL_INVITE {
@@ -565,16 +748,19 @@ pub async fn admit_incoming(store: Store<'_>, own: &NodeId, peer: &NodeId, kind:
     let next = if kind == konsensus_core::kind::KIND_CALL_BLOCK {
         return Err(CallRefusal::Invalid("call blocks require invoice-bound admission"));
     } else {
-        rules::receive(entry, kind, signal.reason, now)?
+        // The device wait runs from arrival, not from when admission got the lock.
+        let transition_time = if kind == konsensus_core::kind::KIND_CALL_INVITE { arrived } else { now };
+        rules::receive(entry, kind, signal.reason, transition_time)?
     };
     write(store, peer, &signal.call_id, Some(&next)).await.map_err(unavailable)?;
-    Ok(signal)
+    Ok(())
 }
 
 fn refused(e: CallRefusal, new_operation: bool) -> ApiError {
     let reason = match e {
         CallRefusal::Replayed => "call_id_used",
         CallRefusal::Full => "call_busy",
+        CallRefusal::NotReachable => "call_not_reachable",
         CallRefusal::InFlight => "call_signal_in_flight",
         CallRefusal::Invalid(_) | CallRefusal::NotCallKind => "call_signal_invalid",
         _ => "call_not_live",
@@ -790,6 +976,217 @@ pub async fn settle_operation(state: &AppState, op: &konsensus_storage::OutboxOp
     }
 }
 
+/// Where a saved free call reply stands after its checked call transition.
+/// Only [`FreeReply::Applied`] and [`FreeReply::AlreadyApplied`] let it be
+/// queued; nothing here ever pays for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreeReply {
+    /// Its transition and receipt were written now, in one call-row write.
+    Applied,
+    /// Its receipt was already on the call row: the transition happened.
+    AlreadyApplied,
+    /// Definitely not applied, and its call can no longer take it: no receipt,
+    /// and its reservation is gone, belongs to another request, or the call
+    /// left the phase the reply may move.
+    Invalid,
+    /// Not established either way; never queued.
+    Unknown(Unresolved),
+}
+
+/// Why a saved free reply is [`FreeReply::Unknown`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unresolved {
+    /// The transition definitely did not happen: its write failed and a
+    /// reread shows this reply's reservation still in place, with no receipt.
+    NotApplied,
+    /// The call row could not be read, or a failed write could not be reread.
+    Unreadable,
+    /// Saved before receipts existed, with no receipt and no reservation of
+    /// its own left: whether its transition happened was never recorded.
+    NoEvidence,
+    /// Contradictory evidence: an empty digest, several candidate calls, or a
+    /// receipt for this operation naming another request, peer or call.
+    Corrupt,
+}
+
+impl Unresolved {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Unresolved::NotApplied => "not_applied",
+            Unresolved::Unreadable => "call_unreadable",
+            Unresolved::NoEvidence => "no_transition_evidence",
+            Unresolved::Corrupt => "evidence_mismatch",
+        }
+    }
+}
+
+/// The call of a free reply saved before its call was recorded with it: only
+/// its own remaining reservation can name it. None left is no evidence
+/// either way; more than one is contradictory.
+pub(crate) async fn locate_saved_reply(store: Store<'_>, op: &konsensus_storage::OutboxOperation) -> Result<String, Unresolved> {
+    let peer = NodeId::from_hex(&op.recipient).map_err(|_| Unresolved::Corrupt)?;
+    let pending = store.call_pending().await.map_err(|_| Unresolved::Unreadable)?;
+    let mut mine = pending.into_iter().filter(|(p, _, e)| *p == peer
+        && e.pending.as_ref().is_some_and(|x| x.operation_id == op.operation_id));
+    match (mine.next(), mine.next()) {
+        (Some((_, id, _)), None) => Ok(id),
+        (None, _) => Err(Unresolved::NoEvidence),
+        _ => Err(Unresolved::Corrupt),
+    }
+}
+
+/// The checked call transition of a saved free reply on `call_id`, the call
+/// recorded with it, shared by the send path and recovery: under the call
+/// lock, reread the call and either find this operation's receipt (already
+/// applied), or apply the transition of its own exact reservation together
+/// with its receipt in one write. `media_owner` is checked and promoted for
+/// an answer exactly as for a paid one.
+pub(crate) async fn free_reply_transition(state: &AppState, op: &konsensus_storage::OutboxOperation, call_id: &str,
+    media_owner: Option<(&crate::pairing::PairingService, Option<&crate::auth::PairingBinding>)>) -> FreeReply {
+    let store = state.storage.as_ref();
+    let (Ok(peer), Ok(kind)) = (NodeId::from_hex(&op.recipient), u16::try_from(op.kind)) else {
+        return FreeReply::Unknown(Unresolved::Corrupt);
+    };
+    let _g = lock().lock().await;
+    let now = now_ms();
+    let receipt = rules::FreeReplyReceipt {
+        peer: peer.to_hex(), call_id: call_id.to_string(), kind, operation_id: op.operation_id.clone(),
+        request_hash: op.request_hash.clone(), phase: String::new(), applied_ms: 0,
+    };
+    let Ok(raw) = store.call_get(&peer, call_id).await else {
+        return FreeReply::Unknown(Unresolved::Unreadable);
+    };
+    let next = match rules::free_reply_transition(raw, &receipt, now) {
+        rules::FreeReplyCheck::Apply(next) => next,
+        rules::FreeReplyCheck::AlreadyApplied => return FreeReply::AlreadyApplied,
+        rules::FreeReplyCheck::Invalid => return FreeReply::Invalid,
+        rules::FreeReplyCheck::Corrupt => return FreeReply::Unknown(Unresolved::Corrupt),
+        rules::FreeReplyCheck::Full => return FreeReply::Unknown(Unresolved::NotApplied),
+    };
+    if kind == konsensus_core::kind::KIND_CALL_ANSWER {
+        if let Some((service, binding)) = media_owner {
+            // As for a paid answer: an admitted call is never visible with
+            // another client's binding. Without this proof nothing moves.
+            if service.commit_call_client(binding, &peer.to_hex(), call_id, &op.operation_id, &op.request_hash).is_err() {
+                return FreeReply::Unknown(Unresolved::NotApplied);
+            }
+        }
+    }
+    if let Err(error) = store.call_put(&peer, call_id, &next).await {
+        // A failed acknowledgement may still have committed: reread.
+        let outcome = match store.call_get(&peer, call_id).await {
+            Ok(Some(row)) if row.free_reply_receipts.iter().any(|r| r.binds(&receipt)) => FreeReply::AlreadyApplied,
+            Ok(Some(row)) if row.pending.as_ref().is_some_and(|p| p.operation_id == receipt.operation_id
+                && p.kind == kind && p.request_hash == receipt.request_hash) => FreeReply::Unknown(Unresolved::NotApplied),
+            _ => FreeReply::Unknown(Unresolved::Unreadable),
+        };
+        tracing::warn!(%error, outcome = ?outcome, "free call reply transition write failed");
+        return outcome;
+    }
+    if let Some((service, _)) = media_owner {
+        service.finish_call_client(&peer.to_hex(), call_id, &op.operation_id, &op.request_hash);
+    }
+    FreeReply::Applied
+}
+
+/// A saved free reply was queued: its operation can no longer be recovered
+/// as a saved reply, so its receipt is released and its call row may age out
+/// again. A failure leaves the receipt for [`prune_free_reply_receipts`].
+pub(crate) async fn release_free_reply_receipt(store: Store<'_>, peer: &NodeId, call_id: &str, operation_id: &str)
+    -> Result<(), konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(()) };
+    let before = entry.free_reply_receipts.len();
+    entry.free_reply_receipts.retain(|r| r.operation_id != operation_id);
+    if entry.free_reply_receipts.len() != before {
+        store.call_put(peer, call_id, &entry).await?;
+    }
+    Ok(())
+}
+
+/// Rows visited per receipt cleanup sweep.
+const RECEIPT_SWEEP_ROWS: u32 = 256;
+
+/// Where the next receipt cleanup sweep of each store resumes: the raw key
+/// of the last row the previous sweep covered. Entries are keyed by the
+/// store's address and hold a weak reference to it, which keeps that address
+/// from being reused by another store while the entry exists; entries of
+/// dropped stores are discarded.
+type ReceiptCursor = (std::sync::Weak<dyn Storage>, (Vec<u8>, Vec<u8>));
+fn receipt_sweep_cursor() -> &'static Mutex<HashMap<usize, ReceiptCursor>> {
+    static CURSOR: OnceLock<Mutex<HashMap<usize, ReceiptCursor>>> = OnceLock::new();
+    CURSOR.get_or_init(Default::default)
+}
+
+/// Release receipts whose saved reply can no longer be recovered (it was
+/// queued, withdrawn, or its operation is gone). A receipt whose operation
+/// may still be recovered is always kept; a read error keeps that row's, and
+/// a row that cannot be decoded is passed over untouched (it stays held).
+/// Each sweep covers at most [`RECEIPT_SWEEP_ROWS`] stored rows, resuming
+/// after the last row the previous sweep covered and starting over once a
+/// page comes back short (at once, if nothing is left after the cursor), so
+/// rows whose receipts must be kept never keep a later row from being reached.
+pub(crate) async fn prune_free_reply_receipts(state: &AppState) -> Result<usize, konsensus_storage::StorageError> {
+    let store = state.storage.as_ref();
+    let key = std::sync::Arc::as_ptr(&state.storage) as *const () as usize;
+    let after = {
+        let mut cursors = receipt_sweep_cursor().lock().unwrap_or_else(|e| e.into_inner());
+        cursors.retain(|_, (weak, _)| weak.strong_count() > 0);
+        cursors.get(&key).map(|(_, at)| at.clone())
+    };
+    let mut page = store.call_with_free_reply_receipts(after.as_ref().map(|(p, c)| (p.as_slice(), c.as_slice())), RECEIPT_SWEEP_ROWS).await?;
+    if after.is_some() && page.scanned == 0 {
+        // The previous page ended exactly at the last row: start over now.
+        page = store.call_with_free_reply_receipts(None, RECEIPT_SWEEP_ROWS).await?;
+    }
+    {
+        let mut cursors = receipt_sweep_cursor().lock().unwrap_or_else(|e| e.into_inner());
+        match page.last_key.take() {
+            Some(last) if page.scanned >= RECEIPT_SWEEP_ROWS as usize => {
+                cursors.insert(key, (std::sync::Arc::downgrade(&state.storage), last));
+            }
+            _ => { cursors.remove(&key); }
+        }
+    }
+    // A store that lists more rows than it says it covered is not trusted to
+    // count: never underflow on it.
+    let unkeyed = page.scanned.saturating_sub(page.rows.len());
+    let (mut released, mut undecodable, mut unread) = (0, 0usize, 0usize);
+    for (_, call_id, entry) in page.rows {
+        let Some((peer, _)) = entry else { undecodable += 1; continue };
+        match prune_row(store, &peer, &call_id).await {
+            Ok(n) => released += n,
+            Err(_) => unread += 1,
+        }
+    }
+    if undecodable + unread + unkeyed > 0 {
+        // One line per sweep, however many rows were passed over.
+        tracing::warn!(undecodable, unread, unkeyed, "free call reply receipt cleanup passed over rows it could not read; they keep their receipts");
+    }
+    Ok(released)
+}
+
+async fn prune_row(store: Store<'_>, peer: &NodeId, call_id: &str) -> Result<usize, konsensus_storage::StorageError> {
+    let _g = lock().lock().await;
+    let Some(mut entry) = store.call_get(peer, call_id).await? else { return Ok(0) };
+    let mut keep = Vec::with_capacity(entry.free_reply_receipts.len());
+    for receipt in &entry.free_reply_receipts {
+        let op = store.get_outbox_operation(&receipt.operation_id).await?;
+        if op.as_ref().is_some_and(crate::handlers::messages::operations::free_reply_recoverable) {
+            keep.push(receipt.clone());
+        }
+    }
+    let released = entry.free_reply_receipts.len() - keep.len();
+    // A row listed as holding receipts that decodes to none (a stored empty
+    // list, which writes never produce) is rewritten once as holding none, so
+    // later sweeps stop listing it and it can age out like any other row.
+    if released > 0 || entry.free_reply_receipts.is_empty() {
+        entry.free_reply_receipts = keep;
+        store.call_put(peer, call_id, &entry).await?;
+    }
+    Ok(released)
+}
+
 /// Release every reservation of a durably abandoned operation. The caller
 /// holds its operation lock and has already persisted the tombstone: a
 /// cancelled POST may have reserved a signal before inserting any operation
@@ -809,6 +1206,8 @@ pub(crate) async fn release_abandoned(store: Store<'_>, operation_id: &str) -> R
 /// operation journal. Ambiguous ones stay for a same-operation retry. Run
 /// before the receive loop and the outbox resend start.
 pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_storage::StorageError> {
+    // Normally a no-op: the node recovers devices first and queues these.
+    recover_devices(store).await?;
     let (mut committed, mut released) = (0, 0);
     for (peer, call_id, entry) in store.call_pending().await? {
         let Some(p) = entry.pending.clone() else { continue };
@@ -826,6 +1225,34 @@ pub async fn recover(store: Store<'_>) -> Result<(usize, usize), konsensus_stora
         }
     }
     Ok((committed, released))
+}
+
+/// Startup prerequisite before serving devices or receiving peer messages.
+/// A failure must prevent startup: volatile bindings cannot recover pending
+/// receipt outcomes by an ordinary same-operation retry. Returns a
+/// not-reachable refusal for each invite whose wait the restart ended, for
+/// [`devices::Devices::queue_notices`], so its caller stops ringing now.
+pub async fn recover_devices(store: Store<'_>) -> Result<Vec<(NodeId, konsensus_message::Frame)>, konsensus_storage::StorageError> {
+    let mut notices = Vec::new();
+    loop {
+        let withdrawn = store.call_invite_recover(10_000).await?;
+        if withdrawn.is_empty() { break; }
+        notices.extend(withdrawn.into_iter().map(|(id, caller)| {
+            (caller, konsensus_message::Frame::MessageReject { id, reason: devices::NOT_REACHABLE.into() })
+        }));
+    }
+    // Device bindings are intentionally volatile. On restart, fail closed
+    // rather than attach a historical envelope to an awaiting call id.
+    let _guard = lock().lock().await;
+    loop {
+        let rows = store.call_awaiting().await?;
+        if rows.is_empty() { break; }
+        for (peer, id, row) in rows {
+            let ended = CallEntry { phase: rules::Phase::Ended, deadline_ms: row.deadline_ms.saturating_add(rules::TOMBSTONE_MS), ..row };
+            store.call_put(&peer, &id, &ended).await?;
+        }
+    }
+    Ok(notices)
 }
 
 /// How long an incoming signal may stay held by a live handler before the
@@ -875,6 +1302,8 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
         )
         .with_reason("call_price_unknown")
     };
+    // No query is claimed or sent without a tip to check the answer against.
+    crate::error::chain_tip(state).await?;
     let now = Instant::now();
     // A query counts as asked only once it was sent (review N4): the slot is
     // claimed so concurrent callers share one frame, and given back if the
@@ -922,7 +1351,10 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
     .await
     .map_err(|_| unknown())?
     .map_err(|()| unknown())?;
-    let height = state.chain.get_block_height().await.unwrap_or(0);
+    let height = crate::error::chain_tip(state).await?;
+    // A minute quote is the callee's payable price: the cache applies the same
+    // floors the callee mints with, and no trust discount for kind 404. A full
+    // table may have replaced the floored answer with a raw tariff.
     state.peer_prices.get_fresh_discounted_peer_price(peer, kind, height, PRICE_ANSWER_MAX_AGE).await.ok_or_else(unknown)
 }
 
@@ -931,7 +1363,7 @@ pub async fn peer_call_kind_price(state: &AppState, peer: &NodeId, kind: u16) ->
 pub async fn block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher, peer: &NodeId, id: &konsensus_core::MessageId) -> Result<Option<u64>, konsensus_storage::StorageError> {
     let unavailable = || konsensus_storage::StorageError::Conversion("paid call grant metadata unavailable".into());
     let cached = store.get_message_plaintext(id).await?.ok_or_else(unavailable)?;
-    let plaintext = cipher.decrypt(&cached).map_err(|_| unavailable())?;
+    let plaintext = cipher.decrypt(&id.to_hex(), &cached).map_err(|_| unavailable())?;
     let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, std::str::from_utf8(&plaintext).map_err(|_| unavailable())?).map_err(|_| unavailable())?;
     let entry = store.call_get(peer, &signal.call_id).await?.ok_or_else(unavailable)?;
     if entry.side != rules::Side::Callee || entry.next_block_seq != signal.seq.ok_or_else(unavailable)?.saturating_add(1)
@@ -944,6 +1376,7 @@ pub async fn block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextC
 pub async fn receive_block_grant(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher, own: &NodeId, peer: &NodeId,
     id: &konsensus_core::MessageId, paid_until_ms: u64,
 ) -> Result<(), konsensus_storage::StorageError> {
+    if paid_until_ms == 0 { return Ok(()); }
     if !store.is_pending_dispatched(id, peer, own).await? { return Ok(()); }
     let Some(envelope) = store.get_message(id).await? else { return Ok(()) };
     if envelope.kind != konsensus_core::kind::KIND_CALL_BLOCK || envelope.sender != *own
@@ -998,12 +1431,50 @@ pub async fn receive_block_grant(store: Store<'_>, cipher: &konsensus_crypto::Pl
     store.call_put(peer, &call_id, &next).await
 }
 
+/// The callee answered our dispatched invite `id` with `call_not_reachable`:
+/// no paired device took it, so the call can never ring. End our still-ringing
+/// caller row, so the reservation sweep releases the call's unused hold now
+/// rather than at the ringing deadline. Returns whether a call was ended.
+pub async fn end_unreachable_invite(store: Store<'_>, own: &NodeId, peer: &NodeId,
+    id: &konsensus_core::MessageId,
+) -> Result<bool, konsensus_storage::StorageError> {
+    let Some(envelope) = store.get_message(id).await? else { return Ok(false) };
+    if envelope.kind != konsensus_core::kind::KIND_CALL_INVITE || envelope.sender != *own
+        || envelope.recipient != konsensus_core::Recipient::Node(*peer) { return Ok(false); }
+    // Our own offer is ratchet-encrypted to the peer; its call id comes from
+    // the binding recorded when it was drafted.
+    let Some(op) = store.get_outbox_operation_by_message(id).await? else { return Ok(false) };
+    let Some(call_id) = crate::handlers::messages::operations::call_offer_binding(&op)? else { return Ok(false) };
+    // Bind to this offer's generation, not the operation's age: every draft
+    // replaces the operation's message id, so only a refusal of its current
+    // offer finds it. A delayed retry or settlement keeps the generation; a
+    // refusal of an earlier draft can never end the call a newer one rings.
+    if op.message_id.as_deref() != Some(id.to_hex().as_str()) { return Ok(false); }
+    let _guard = lock().lock().await;
+    let now = now_ms();
+    let Some(entry) = current(store, peer, &call_id, now).await? else { return Ok(false) };
+    // A pending cancellation keeps its reservation mark (its own commit or
+    // release still resolves it) but cannot keep an unreachable call ringing.
+    if entry.side != rules::Side::Caller || entry.phase != rules::Phase::Ringing {
+        return Ok(false);
+    }
+    // The ringing lifecycle must be this offer's: a reused call id rebinds
+    // its row to the newer offer, so an older offer's refusal stops here.
+    if store.call_offer(peer, &call_id).await? != Some(*id) {
+        return Ok(false);
+    }
+    let ended = CallEntry { phase: rules::Phase::Ended, end_reason: Some(rules::HangupReason::Timeout),
+        deadline_ms: now.saturating_add(rules::TOMBSTONE_MS), ..entry };
+    write(store, peer, &call_id, Some(&ended)).await?;
+    Ok(true)
+}
+
 async fn cached_call_block_binding(store: Store<'_>, cipher: &konsensus_crypto::PlaintextCacheCipher,
     id: &konsensus_core::MessageId,
 ) -> Result<(String, u32), konsensus_storage::StorageError> {
     let unavailable = || konsensus_storage::StorageError::Conversion("legacy paid block binding unavailable".into());
     let cached = store.get_message_plaintext(id).await?.ok_or_else(unavailable)?;
-    let plaintext = cipher.decrypt(&cached).map_err(|_| unavailable())?;
+    let plaintext = cipher.decrypt(&id.to_hex(), &cached).map_err(|_| unavailable())?;
     let signal = CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK,
         std::str::from_utf8(&plaintext).map_err(|_| unavailable())?).map_err(|_| unavailable())?;
     Ok((signal.call_id, signal.seq.ok_or_else(unavailable)?))

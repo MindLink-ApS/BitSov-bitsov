@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, OnceLock, Weak},
     time::Duration,
 };
 
@@ -32,6 +32,12 @@ struct Recovery {
     /// Call/sequence binding survives missing plaintext caches and recovery.
     #[serde(default)]
     call_block: Option<(String, u32)>,
+    /// A terminal pre-payment refusal, retained for polling and duplicate POSTs.
+    #[serde(default)]
+    call_price_changed: bool,
+    /// Clear only after durable termination and hold release both succeeded.
+    #[serde(default)]
+    call_cleanup_done: bool,
     caller: Option<String>,
     #[serde(default)]
     execution_id: Option<String>,
@@ -40,6 +46,22 @@ struct Recovery {
     draft: Option<UkmEnvelope>,
     #[serde(default)]
     envelope_ready: bool,
+    /// The sealed envelope is a free call reply, saved before its call
+    /// transition: recovery sends it, a failure never resets it to unsent.
+    #[serde(default)]
+    free_reply: bool,
+    /// The call a sealed free reply answers, saved with it so recovery checks
+    /// that exact call. Absent on replies saved before it was recorded.
+    #[serde(default)]
+    free_reply_call: Option<String>,
+    /// The saved free reply's call moved on without it: withdrawn for good,
+    /// never queued. The operation is abandoned; the envelope is kept.
+    #[serde(default)]
+    free_reply_withdrawn: bool,
+    /// Whether the saved free reply's transition happened cannot be
+    /// established: kept, never queued, reported unresolved.
+    #[serde(default)]
+    free_reply_unresolved: bool,
     dispatched: bool,
     expected_msat: u64,
     settlement: Option<PaymentDetails>,
@@ -93,7 +115,9 @@ fn encode(op: &mut OutboxOperation, data: &Recovery) -> Result<(), ApiError> {
     op.accounting_pending = data.reservation.is_some()
         || data.admission_reservation.is_some()
         || data.admission_pending
-        || !data.budget_resolutions.is_empty();
+        || !data.budget_resolutions.is_empty()
+        || (op.kind == i64::from(konsensus_core::kind::KIND_CALL_BLOCK)
+            && data.call_price_changed && !data.call_cleanup_done);
     op.recovery = serde_json::to_vec(data).map_err(storage)?;
     Ok(())
 }
@@ -166,6 +190,40 @@ pub(crate) struct Operation {
     pub(crate) id: String,
     execution_id: String,
 }
+// Cancellation before the first wallet poll proves non-dispatch. Complete
+// that rollback under the operation lock, fenced to the same execution.
+struct DispatchRollback {
+    operation: Operation,
+    polled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for DispatchRollback {
+    fn drop(&mut self) {
+        if !self.armed || self.polled.load(Ordering::Acquire) {
+            return;
+        }
+        let operation = self.operation.clone();
+        tokio::spawn(async move {
+            let result: Result<(), ApiError> = async {
+                let _guard = lock(&operation.state, &operation.id).await?;
+                let mut op = operation.load().await?;
+                let mut data = recovery(&op)?;
+                if !data.dispatched {
+                    return Ok(());
+                }
+                data.dispatched = false;
+                op.payment_hash = None;
+                encode(&mut op, &data)?;
+                save(&operation.state, &mut op).await
+            }.await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "unsubmitted payment rollback failed");
+            }
+        });
+    }
+}
+
 impl Operation {
     pub(crate) fn reservation_link(&self, readmission: bool) -> crate::spend_budget::OperationReservationLink {
         crate::spend_budget::OperationReservationLink {
@@ -192,7 +250,7 @@ impl Operation {
         if op.state == "acked" {
             return Ok(true);
         }
-        resend(&self.state, &op).await
+        resend(&self.state, &op, None).await
     }
     pub(crate) async fn attach_debit(&self, debit: &Debit) -> Result<(), ApiError> {
         let mut op = self.load().await?;
@@ -285,6 +343,13 @@ impl Operation {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
         if op.kind == i64::from(konsensus_core::kind::KIND_CALL_INVITE) {
+            if let Some((call_id, _)) = call_binding.as_ref() {
+                // Bind the call row to this exact offer before the operation names
+                // it, so only a refusal of the current offer can end the call. A
+                // failed bind leaves the draft unrecorded.
+                let peer = NodeId::from_hex(&op.recipient).map_err(storage)?;
+                self.state.storage.call_offer_bind(&peer, call_id, &draft.id).await.map_err(storage)?;
+            }
             data.call_offer = call_binding.map(|(id, _)| id);
         } else { data.call_block = call_binding; }
         op.message_id = Some(draft.id.to_hex());
@@ -311,6 +376,7 @@ impl Operation {
         debit: &Debit,
         hash: Option<String>,
         amount: u64,
+        tip: &crate::error::ObservedTip,
         future: F,
     ) -> Result<Result<PaymentDetails, LightningError>, ApiError>
     where
@@ -330,7 +396,15 @@ impl Operation {
         op.state = "paying".into();
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await?;
-        let mut result = debit.dispatch_message_payment(&self.state, future).await;
+        let mut rollback = DispatchRollback {
+            operation: self.clone(), polled: Arc::new(AtomicBool::new(false)), armed: true,
+        };
+        let polled = rollback.polled.clone();
+        let wallet = async move {
+            polled.store(true, Ordering::Release);
+            future.await
+        };
+        let mut result = debit.dispatch_message_payment(&self.state, tip, wallet).await;
         match &mut result {
             Ok(Ok(details)) => {
                 if details.payment_hash.is_empty() {
@@ -343,7 +417,7 @@ impl Operation {
                 })?;
             }
             Ok(Err(LightningError::NotReady | LightningError::PaymentNotDispatched(_)))
-            | Err(ApiError::BudgetExceeded(_)) => {
+            | Err(ApiError::BudgetExceeded(_) | ApiError::ChainNotReady) => {
                 let mut op = self.load().await?;
                 let mut data = recovery(&op)?;
                 data.dispatched = false;
@@ -353,6 +427,7 @@ impl Operation {
             }
             _ => {} // durable dispatch intent remains unresolved
         }
+        rollback.armed = false;
         result
     }
     pub(crate) async fn release_call_debit(&self, debit: &Debit, recipient: &str) {
@@ -393,8 +468,57 @@ impl Operation {
         proof: PaymentProof,
         fee_ceiling_msat: u64,
     ) -> Result<UkmEnvelope, ApiError> {
+        let (mut op, env) = self.seal(proof, fee_ceiling_msat, None).await?;
+        materialize(&self.state, &mut op, &env).await?;
+        Ok(env)
+    }
+    /// A free call reply's evidence: its signed envelope is saved before the
+    /// call transition, but not yet queued, so a stop or a failed write at
+    /// any point leaves either an unsent reply on a still-ringing call, or a
+    /// recorded one that recovery queues ([`reconcile`]) after the transition.
+    pub(crate) async fn sealed_envelope(&self, proof: PaymentProof, fee_ceiling_msat: u64, call_id: &str) -> Result<UkmEnvelope, ApiError> {
+        self.seal(proof, fee_ceiling_msat, Some(call_id)).await.map(|(_, env)| env)
+    }
+    /// The checked call transition of this operation's sealed free reply
+    /// (see [`free_reply_gate`]); the caller holds the operation lock.
+    pub(crate) async fn free_reply_transition(&self, binding: Option<&crate::auth::PairingBinding>) -> Result<FreeReplyGate, ApiError> {
+        let mut op = self.load().await?;
+        free_reply_gate(&self.state, &mut op, binding).await
+    }
+    /// Queue a sealed free reply, once its call transition on `call_id` is
+    /// published, then release that transition's receipt.
+    pub(crate) async fn publish_sealed(&self, env: &UkmEnvelope, call_id: &str) -> Result<(), ApiError> {
+        let mut op = self.load().await?;
+        materialize(&self.state, &mut op, env).await?;
+        release_reply_receipt(&self.state, &op, call_id).await;
+        Ok(())
+    }
+    /// The call transition of a sealed free reply did not happen: take its
+    /// evidence back, so the operation is plainly unsent and can be retried.
+    /// If this write fails too, the reply stays sealed and recovery sends it.
+    pub(crate) async fn unseal(&self) -> Result<(), ApiError> {
         let mut op = self.load().await?;
         let mut data = recovery(&op)?;
+        if !data.free_reply || data.dispatched || data.expected_msat > 0 {
+            return Err(storage("only a sealed free reply can be unsealed"));
+        }
+        data.envelope_ready = false;
+        data.free_reply = false;
+        data.free_reply_call = None;
+        op.payment_hash = None;
+        op.settled_msat = 0;
+        encode(&mut op, &data)?;
+        save(&self.state, &mut op).await
+    }
+    /// `free_reply`: the call a free reply answers; `None` for a paid send.
+    async fn seal(&self, proof: PaymentProof, fee_ceiling_msat: u64, free_reply: Option<&str>) -> Result<(OutboxOperation, UkmEnvelope), ApiError> {
+        let mut op = self.load().await?;
+        let mut data = recovery(&op)?;
+        if free_reply.is_some() && (data.dispatched || data.expected_msat > 0 || proof.amount_msat > 0) {
+            return Err(storage("a free reply carries no payment"));
+        }
+        data.free_reply = free_reply.is_some();
+        data.free_reply_call = free_reply.map(str::to_string);
         data.fee_ceiling_msat = fee_ceiling_msat;
         let mut env = data
             .draft
@@ -422,8 +546,7 @@ impl Operation {
         op.settled_msat = i64::try_from(env.payment_proof.amount_msat).map_err(storage)?;
         encode(&mut op, &data)?;
         save(&self.state, &mut op).await?;
-        materialize(&self.state, &mut op, &env).await?;
-        Ok(env)
+        Ok((op, env))
     }
 }
 
@@ -469,7 +592,7 @@ fn response(backend: &str, op: &OutboxOperation, delivered: bool) -> Result<Comp
         state: op.state.clone(),
         accepted: op.state == "acked",
         payment_hash: op.payment_hash.clone(),
-        retry_allowed: matches!(
+        retry_allowed: !data.call_price_changed && matches!(
             op.state.as_str(),
             "prepared" | "released" | "paid" | "sent" | "rejected_retryable"
         ),
@@ -483,15 +606,16 @@ fn response(backend: &str, op: &OutboxOperation, delivered: bool) -> Result<Comp
     })
 }
 fn contextual(error: ApiError, op: &OutboxOperation) -> ApiError {
+    let retry_allowed = !call_price_changed(&error) && matches!(
+        op.state.as_str(),
+        "prepared" | "released" | "paid" | "sent" | "rejected_retryable"
+    );
     ApiError::Operation {
         source: Box::new(error),
         operation_id: op.operation_id.clone(),
         state: op.state.clone(),
         payment_hash: op.payment_hash.clone(),
-        retry_allowed: matches!(
-            op.state.as_str(),
-            "prepared" | "released" | "paid" | "sent" | "rejected_retryable"
-        ),
+        retry_allowed,
     }
 }
 
@@ -545,15 +669,41 @@ pub(super) async fn compose_call(
     // signal is refused before any reservation. A retry of an operation that
     // already paid is answered from the journal, without reserving.
     let request_hash = request_digest(&peer, &req)?;
-    let journal = state.storage.get_outbox_operation(&id).await.map_err(storage)?;
+    let mut journal = state.storage.get_outbox_operation(&id).await.map_err(storage)?;
     if let Some(op) = journal.as_ref().filter(|op| op.state == "abandoned") {
         return Err(contextual(ApiError::OperationConflict("operation_abandoned"), op));
     }
     if let Some(op) = journal.as_ref().filter(|op| op.request_hash != request_hash) {
         return Err(mismatch(op));
     }
+    // A paired client acts only on a call it holds: a block for a call held
+    // under another client's grant is refused before anything is reserved or
+    // recorded for this operation.
+    if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+        if let (Some(binding), Some(service), Ok(signal)) = (auth.user.pairing.as_ref(), state.pairing.as_ref(),
+            konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)) {
+            if service.call_spend_status(&peer.to_hex(), &signal.call_id).is_some()
+                && !service.owns_call_spend(binding, &peer.to_hex(), &signal.call_id) {
+                return Err(ApiError::Forbidden("call belongs to another caller".into()));
+            }
+        }
+    }
+    if let Some(op) = journal.as_mut().filter(|op| recovery(op).is_ok_and(|data| data.call_price_changed)) {
+        if caller(&auth).is_some() && caller(&auth) != recovery(op)?.caller {
+            return Err(ApiError::Forbidden("operation belongs to another caller".into()));
+        }
+        if let Err(error) = finish_refused_call(&state, op).await {
+            tracing::warn!(%error, "call refusal cleanup deferred");
+        }
+        return Err(contextual(ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::CallPriceChanged), op));
+    }
+    // A sealed free reply still in `paying` (stopped after its evidence was
+    // saved) is completed by the reconcile below, not reserved again: its
+    // call may already have moved on.
     let paid = journal.as_ref().is_some_and(|op| {
         konsensus_core::payloads::call::settlement(Some(&op.state)) == konsensus_core::payloads::call::Settlement::Paid
+            || (matches!(op.state.as_str(), "paying" | "payment_unknown")
+                && recovery(op).is_ok_and(|data| data.free_reply && data.envelope_ready))
     });
     let plaintext = req.plaintext.clone();
     let spend_client = auth.user.pairing.clone();
@@ -577,14 +727,22 @@ pub(super) async fn compose_call(
         id.clone(),
         policy,
     ).await;
+    if let Ok(Some(mut op)) = state.storage.get_outbox_operation(&id).await {
+        if let Err(error) = finish_refused_call(&state, &mut op).await {
+            tracing::warn!(%error, "call refusal cleanup deferred");
+        }
+    }
     crate::calls::resolve_outgoing(&state, &peer, &plaintext, &id, &request_hash).await;
     if ends_on_failure && call_payment_failed(&state, &id, result.as_ref().err()).await {
-        if let (Some(client), Some(service), Ok(signal)) = (spend_client, state.pairing.as_ref(),
+        let owner_price_change = spend_client.is_none() && result.as_ref().err().is_some_and(call_price_changed);
+        let owns_call_spend = match (spend_client.as_ref(), state.pairing.as_ref(),
             konsensus_core::wire_json::from_str::<konsensus_core::payloads::call::CallSignal>(&plaintext)) {
-            if service.owns_call_spend(&client, &peer.to_hex(), &signal.call_id) {
-                if let Err(error) = crate::calls::fail_outgoing(&state, &peer, &plaintext).await {
-                    tracing::warn!(%error, "call failure cleanup deferred");
-                }
+            (Some(client), Some(service), Ok(signal)) => service.owns_call_spend(client, &peer.to_hex(), &signal.call_id),
+            _ => false,
+        };
+        if owner_price_change || owns_call_spend {
+            if let Err(error) = crate::calls::fail_outgoing(&state, &peer, &plaintext).await {
+                tracing::warn!(%error, "call failure cleanup deferred");
             }
         }
     }
@@ -594,8 +752,9 @@ pub(super) async fn compose_call(
     result
 }
 
-// Validation and invoice refusals leave a live call retryable. Only terminal
-// payment evidence (or a price above the held ceiling) ends it here; ambiguous
+// Validation and other invoice refusals leave a live call retryable. Only terminal
+// payment evidence, a price change, or a direct-channel/payment-limit refusal
+// ends it here; ambiguous
 // outcomes retain their journal and are bounded by ordinary call expiry.
 async fn call_payment_failed(state: &AppState, id: &str, error: Option<&ApiError>) -> bool {
     fn price_changed(error: &ApiError) -> bool {
@@ -612,6 +771,15 @@ async fn call_payment_failed(state: &AppState, id: &str, error: Option<&ApiError
     if price_changed(error) { return true; }
     let Ok(Some(op)) = state.storage.get_outbox_operation(id).await else { return false };
     definite_call_payment_failure(&op)
+}
+
+fn call_price_changed(error: &ApiError) -> bool {
+    match error {
+        ApiError::Operation { source, .. } | ApiError::RoutingFee { source, .. }
+            | ApiError::Reasoned { source, .. } => call_price_changed(source),
+        ApiError::BudgetExceeded(crate::spend_budget::BudgetRefusal::CallPriceChanged) => true,
+        _ => false,
+    }
 }
 
 pub(crate) fn definite_call_payment_failure(op: &OutboxOperation) -> bool {
@@ -696,7 +864,7 @@ async fn compose_locked(
         match op.state.as_str() {
             "acked" => return Ok(Json(response(&state.lightning_backend, &op, true)?)),
             "paid" | "sent" | "rejected_retryable" => {
-                let delivered = resend(&state, &op).await?;
+                let delivered = resend(&state, &op, Some(req.plaintext.as_bytes())).await?;
                 return wait_response(&state, &id, req.wait_ack_ms, delivered).await;
             }
             "prepared" | "released" => {}
@@ -721,6 +889,11 @@ async fn compose_locked(
     // links and fee evidence now belong to that execution, not the old receipt.
     op.recovery_compacted = false;
     let mut data = recovery(&op)?;
+    if req.kind == konsensus_core::kind::KIND_CALL_BLOCK {
+        let signal = konsensus_core::payloads::call::CallSignal::parse(req.kind, &req.plaintext)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        data.call_block = signal.seq.map(|seq| (signal.call_id, seq));
+    }
     data.compacted_fee_paid_msat = None;
     data.dispatched = false;
     data.settlement = None;
@@ -731,6 +904,7 @@ async fn compose_locked(
     data.budget_admission_msat = 0;
     data.admission_fee_msat = Some(0);
     data.envelope_ready = false;
+    data.free_reply = false;
     data.draft = None;
     op.payment_hash = None;
     encode(&mut op, &data)?;
@@ -747,16 +921,22 @@ async fn compose_locked(
         Ok(result) => wait_response(&state, &id, wait, result.0.delivered).await,
         Err(error) => {
             op = operation.load().await?;
-            if op.state == "paying" {
-                let data = recovery(&op)?;
-                op.state = if proven_unpaid(&state, &op, &data).await {
-                    "released"
-                } else if !data.dispatched && !data.admission_pending {
-                    "prepared"
-                } else {
-                    "payment_unknown"
+            if op.state == "paying" || call_price_changed(&error) {
+                let mut data = recovery(&op)?;
+                if op.state == "paying" {
+                    op.state = if proven_unpaid(&state, &op, &data).await {
+                        "released"
+                    } else if !data.dispatched && !data.admission_pending && !(data.free_reply && data.envelope_ready) {
+                        // A sealed free call reply is recorded evidence:
+                        // recovery sends it, never a reset to unsent.
+                        "prepared"
+                    } else {
+                        "payment_unknown"
+                    }
+                    .into();
                 }
-                .into();
+                data.call_price_changed |= call_price_changed(&error);
+                encode(&mut op, &data)?;
                 op.last_error = Some(error.to_string());
                 save(&state, &mut op).await?;
             }
@@ -793,8 +973,35 @@ pub(crate) async fn restore_outstanding_web_request(
         .map_err(storage)
 }
 
-async fn resend(state: &AppState, op: &OutboxOperation) -> Result<bool, ApiError> {
-    let id = MessageId::from_hex(
+fn handover_deferred(op: &OutboxOperation) -> bool {
+    matches!(op.state.as_str(), "paid" | "sent" | "rejected_retryable")
+        && op.last_error.as_deref().is_some_and(|reason| reason.starts_with("session_handover:"))
+}
+
+async fn reencrypt_paid_envelope(
+    sessions: &konsensus_crypto::SessionManager,
+    identity: &konsensus_core::NodeIdentity,
+    env: &UkmEnvelope,
+    plaintext: &[u8],
+) -> Result<UkmEnvelope, ApiError> {
+    let konsensus_core::Recipient::Node(peer) = env.recipient else {
+        return Err(storage("deferred envelope is not a direct message"));
+    };
+    let message = sessions.encrypt(&peer, plaintext).await.map_err(|error| {
+        ApiError::Conflict(format!("the existing payment is retained while the E2EE session recovers; retry this operation: {error}"))
+            .with_reason("session_handover")
+    })?;
+    let mut replacement = env.clone();
+    replacement.ciphertext = konsensus_crypto::ratchet_message_to_bytes(&message);
+    replacement.id = MessageId::compute(&replacement.ciphertext, &replacement.nonce);
+    replacement.timestamp = chrono::Utc::now().timestamp_millis() as u64;
+    replacement.signature = konsensus_core::Signature::from_ed25519(&identity.sign(&replacement.signable_bytes()));
+    Ok(replacement)
+}
+
+async fn resend(state: &AppState, op: &OutboxOperation, retry_plaintext: Option<&[u8]>) -> Result<bool, ApiError> {
+    let mut op = op.clone();
+    let mut id = MessageId::from_hex(
         op.message_id
             .as_deref()
             .ok_or_else(|| storage("missing message id"))?,
@@ -818,6 +1025,41 @@ async fn resend(state: &AppState, op: &OutboxOperation) -> Result<bool, ApiError
         save(state, &mut terminal).await?;
         state.storage.delete_message(&id).await.map_err(storage)?;
         return Ok(false);
+    }
+    // Only the recipient's explicit pre-acceptance deferral permits a new
+    // ciphertext under the same proof. Legacy refusals keep their original ID.
+    if handover_deferred(&op) {
+        let cached = match (&state.plaintext_cipher, state.storage.get_message_plaintext(&id).await.map_err(storage)?) {
+            (Some(cipher), Some(cached)) => Some(cipher.decrypt(&id.to_hex(), &cached).map_err(storage)?),
+            _ => None,
+        };
+        let plaintext = match cached {
+            Some(bytes) => Some(bytes),
+            // Explicit compose retries already matched the original request digest.
+            // The direct compose path encrypts these exact bytes for every kind.
+            None => retry_plaintext.map(<[u8]>::to_vec),
+        };
+        let Some(plaintext) = plaintext else { return Ok(false); };
+        let replacement = reencrypt_paid_envelope(&state.session_manager, &state.identity, &env, &plaintext)
+            .await.map_err(|error| contextual(error, &op))?;
+        let cached = state.plaintext_cipher.as_ref()
+            .map(|cipher| cipher.encrypt(&replacement.id.to_hex(), &plaintext))
+            .transpose().map_err(storage)?;
+        let mut data = recovery(&op)?;
+        data.draft = Some(replacement.clone());
+        data.envelope_ready = true;
+        op.message_id = Some(replacement.id.to_hex());
+        op.state = "paid".into();
+        op.last_error = None;
+        op.last_sent_at = None;
+        op.updated_at = chrono::Utc::now().timestamp_millis();
+        encode(&mut op, &data)?;
+        if !state.storage.replace_outbox_envelope(&op, &id, &replacement, cached.as_deref()).await.map_err(storage)? {
+            return Err(contextual(ApiError::Conflict("operation changed during session recovery; retry this operation".into()), &op));
+        }
+        op.version += 1;
+        id = replacement.id;
+        env = replacement;
     }
     if env
         .refresh_for_resend(
@@ -1001,6 +1243,123 @@ pub(super) async fn record_undispatched_admission(
     drain_resolutions(state, &mut op).await
 }
 
+/// What a sealed free reply may do after its checked call transition.
+pub(crate) enum FreeReplyGate {
+    /// Its transition happened (now or before): queue it, on this call.
+    Queue(String),
+    /// Its call moved on without it: durably withdrawn, never sent.
+    Withdrawn,
+    /// Its transition definitely did not happen and its own reservation
+    /// still stands (a failed call write): not queued, retryable.
+    NotApplied,
+    /// Not established either way: not queued. `held` once it is kept
+    /// unresolved for good, with its evidence.
+    Unresolved { why: &'static str, held: bool },
+}
+
+/// The one gate between a sealed free reply and the outbox, for the send path
+/// and recovery alike; the caller holds the operation lock. Only a transition
+/// this operation applied, now or provably before, lets the reply be queued.
+/// A definite invalid reply is withdrawn for good (the operation is abandoned,
+/// releasing only its own reservation) before it is called unsent; a reply
+/// saved before receipts existed with no evidence either way is held
+/// unresolved, never inferred as sent or unsent.
+async fn free_reply_gate(state: &AppState, op: &mut OutboxOperation, binding: Option<&crate::auth::PairingBinding>)
+    -> Result<FreeReplyGate, ApiError> {
+    use crate::calls::{FreeReply, Unresolved};
+    let mut data = recovery(op)?;
+    if data.free_reply_unresolved {
+        return Ok(FreeReplyGate::Unresolved { why: "held", held: true });
+    }
+    let outcome = match data.free_reply_call.clone() {
+        Some(call_id) => Ok(call_id),
+        // Saved before its call was recorded with it: record the call its own
+        // reservation names first, so the transition below is never left
+        // without a way back to its receipt.
+        None => match crate::calls::locate_saved_reply(state.storage.as_ref(), op).await {
+            Ok(call_id) => {
+                let mut located = op.clone();
+                data.free_reply_call = Some(call_id.clone());
+                encode(&mut located, &data)?;
+                match save(state, &mut located).await {
+                    Ok(()) => { *op = located; Ok(call_id) }
+                    Err(_) => Err(Unresolved::Unreadable),
+                }
+            }
+            Err(why) => Err(why),
+        },
+    };
+    let outcome = match outcome {
+        Ok(call_id) => {
+            let owner = state.pairing.as_deref().map(|service| (service, binding));
+            let outcome = crate::calls::free_reply_transition(state, op, &call_id, owner).await;
+            (outcome, call_id)
+        }
+        Err(why) => (FreeReply::Unknown(why), String::new()),
+    };
+    match outcome {
+        (FreeReply::Applied | FreeReply::AlreadyApplied, call_id) => Ok(FreeReplyGate::Queue(call_id)),
+        (FreeReply::Invalid, _) => {
+            let mut withdrawn = op.clone();
+            let mut next = data;
+            next.envelope_ready = false;
+            next.free_reply_withdrawn = true;
+            withdrawn.state = "abandoned".into();
+            withdrawn.last_error = Some("free call reply withdrawn: its call moved on without it".into());
+            encode(&mut withdrawn, &next)?;
+            if let Err(error) = save(state, &mut withdrawn).await {
+                tracing::warn!(operation_id = %op.operation_id, %error, "free call reply withdrawal deferred");
+                return Ok(FreeReplyGate::Unresolved { why: "withdrawal_failed", held: false });
+            }
+            *op = withdrawn;
+            if let Err(error) = crate::calls::release_abandoned(state.storage.as_ref(), &op.operation_id).await {
+                tracing::warn!(operation_id = %op.operation_id, %error, "withdrawn free call reply: reservation release deferred");
+            }
+            Ok(FreeReplyGate::Withdrawn)
+        }
+        (FreeReply::Unknown(Unresolved::NotApplied), _) => Ok(FreeReplyGate::NotApplied),
+        (FreeReply::Unknown(why @ (Unresolved::NoEvidence | Unresolved::Corrupt)), _) => {
+            // Permanent: keep the evidence, report it once, never queue it.
+            let mut held = op.clone();
+            let mut next = data;
+            next.free_reply_unresolved = true;
+            held.state = "payment_unknown".into();
+            held.last_error = Some(format!("free call reply unresolved: {}", why.as_str()));
+            encode(&mut held, &next)?;
+            match save(state, &mut held).await {
+                Ok(()) => {
+                    *op = held;
+                    tracing::warn!(operation_id = %op.operation_id, reason = why.as_str(), "saved free call reply held unresolved; it is not sent");
+                    Ok(FreeReplyGate::Unresolved { why: why.as_str(), held: true })
+                }
+                Err(error) => {
+                    tracing::warn!(operation_id = %op.operation_id, %error, "free call reply hold deferred");
+                    Ok(FreeReplyGate::Unresolved { why: why.as_str(), held: false })
+                }
+            }
+        }
+        (FreeReply::Unknown(why), _) => Ok(FreeReplyGate::Unresolved { why: why.as_str(), held: false }),
+    }
+}
+
+/// Best effort after a free reply was queued; a later sweep prunes it.
+async fn release_reply_receipt(state: &AppState, op: &OutboxOperation, call_id: &str) {
+    let Ok(peer) = NodeId::from_hex(&op.recipient) else { return };
+    if let Err(error) = crate::calls::release_free_reply_receipt(state.storage.as_ref(), &peer, call_id, &op.operation_id).await {
+        tracing::debug!(%error, "free call reply receipt kept; a later sweep releases it");
+    }
+}
+
+/// Whether this operation may still be recovered as a sealed, unqueued free
+/// reply, so its call transition receipt must be kept. Unreadable: kept.
+pub(crate) fn free_reply_recoverable(op: &OutboxOperation) -> bool {
+    match recovery(op) {
+        Err(_) => true,
+        Ok(data) => data.free_reply && data.envelope_ready
+            && !matches!(op.state.as_str(), "paid" | "sent" | "acked" | "abandoned" | "rejected_retryable" | "failed_paid"),
+    }
+}
+
 async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
     recover_budget(state, op).await?;
     let mut data = recovery(op)?;
@@ -1112,7 +1471,21 @@ async fn reconcile(state: &AppState, op: &mut OutboxOperation) -> Result<(), Api
             save(state, op).await?;
             return Ok(());
         };
+        let mut queued_reply = None;
+        if data.free_reply {
+            // A saved free reply: its checked call transition comes before
+            // the reply becomes visible to the outbox, as on the send path.
+            match free_reply_gate(state, op, None).await? {
+                FreeReplyGate::Queue(call_id) => queued_reply = Some(call_id),
+                FreeReplyGate::Withdrawn | FreeReplyGate::Unresolved { held: true, .. } => return Ok(()),
+                FreeReplyGate::NotApplied => return Err(storage("free call reply transition not applied; retried later")),
+                FreeReplyGate::Unresolved { why, .. } => return Err(storage(format!("free call reply unresolved: {why}"))),
+            }
+        }
         materialize(state, op, env).await?;
+        if let Some(call_id) = queued_reply {
+            release_reply_receipt(state, op, &call_id).await;
+        }
         recover_budget(state, op).await?;
         return Ok(());
     }
@@ -1341,7 +1714,7 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
             // A call signal's reservation follows its operation here too, and
             // before any resend (review N1).
             crate::calls::settle_operation(state, &op, true).await;
-            if op.state == "paid" {
+            if op.state == "paid" || handover_deferred(&op) {
                 recover_paid(state, &mut op).await?;
             }
             Ok(())
@@ -1352,6 +1725,9 @@ pub async fn reconcile_operations(state: &Arc<AppState>) -> Result<(), ApiError>
         }
     }
     prune_paces(state, &ids);
+    if let Err(error) = crate::calls::prune_free_reply_receipts(state).await {
+        tracing::warn!(%error, "free call reply receipt cleanup deferred");
+    }
     compact_terminal_operations(state, &links).await
 }
 
@@ -1554,6 +1930,8 @@ async fn compact_terminal_operations(
             }
             let compacted_fee_paid_msat = reported_fee_paid_msat(&state.lightning_backend, &op, &data);
             let receipt = Recovery {
+                call_price_changed: data.call_price_changed,
+                call_cleanup_done: data.call_cleanup_done,
                 ldk_fee_evidence: data.ldk_fee_evidence,
                 compacted_fee_paid_msat,
                 caller: data.caller,
@@ -1583,7 +1961,26 @@ fn settlement_matches(op: &OutboxOperation, data: &Recovery, details: &PaymentDe
         && details.amount_msat == data.expected_msat
 }
 
+/// The refusal receipt is also a durable cleanup intent. `accounting_pending`
+/// keeps it in recovery and out of compaction until every side effect succeeds.
+async fn finish_refused_call(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    let mut data = recovery(op)?;
+    if op.kind != i64::from(konsensus_core::kind::KIND_CALL_BLOCK)
+        || !data.call_price_changed || data.call_cleanup_done { return Ok(()); }
+    let call_id = data.call_block.as_ref().map(|(id, _)| id)
+        .ok_or_else(|| storage("refused call binding unavailable"))?;
+    let peer = NodeId::from_hex(&op.recipient).map_err(storage)?;
+    crate::calls::fail_call(state, &peer, call_id, Some((&op.operation_id, &op.request_hash)))
+        .await.map_err(storage)?;
+    crate::calls::reconcile_call_spend(state, chrono::Utc::now().timestamp_millis() as u64)
+        .await.map_err(storage)?;
+    data.call_cleanup_done = true;
+    encode(op, &data)?;
+    save(state, op).await
+}
+
 async fn recover_budget(state: &AppState, op: &mut OutboxOperation) -> Result<(), ApiError> {
+    finish_refused_call(state, op).await?;
     if !op.accounting_pending { return Ok(()); }
     let mut data = recovery(op)?;
     let before = op.recovery.clone();
@@ -1709,7 +2106,7 @@ async fn recover_paid(state: &AppState, op: &mut OutboxOperation) -> Result<(), 
             return Ok(());
         }
     }
-    let result = resend(state, op).await;
+    let result = resend(state, op, None).await;
     let mut paces = paces();
     if matches!(result, Ok(true)) {
         paces.remove(&key);
@@ -1856,5 +2253,67 @@ mod actual_fee_tests {
         let compacted = Recovery { ldk_fee_evidence: true, compacted_fee_paid_msat: fee, fee_ceiling_msat: 5000, ..Default::default() };
         assert_eq!(wire("ldk", op.clone(), compacted)["fee_paid_msat"], 400);
         assert!(wire("ldk", op, Recovery::default()).get("fee_paid_msat").is_none());
+    }
+}
+
+#[cfg(test)]
+mod handover_retry_tests {
+    use super::*;
+    use konsensus_core::{NodeIdentity, Recipient, UkmEnvelopeBuilder};
+    use konsensus_crypto::{ratchet_message_from_bytes, ratchet_message_to_bytes, SessionManager};
+
+    #[test]
+    fn only_live_preacceptance_handover_deferrals_allow_reencryption() {
+        let mut op = OutboxOperation::prepared("operation".into(), "peer".into(), 0, "request".into());
+        for (state, reason, allowed) in [
+            ("rejected_retryable", "session_handover: unavailable", true),
+            ("paid", "session_handover: unavailable", true),
+            ("sent", "session_handover: unavailable", true),
+            ("rejected_retryable", "undecryptable: unavailable", false),
+            ("rejected_retryable", "session_pending: unavailable", false),
+            ("acked", "session_handover: unavailable", false),
+            ("failed_paid", "session_handover: unavailable", false),
+        ] {
+            op.state = state.into();
+            op.last_error = Some(reason.into());
+            assert_eq!(handover_deferred(&op), allowed, "{state}: {reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn handover_retry_reencrypts_with_the_same_paid_proof() {
+        let (_, a_identity) = NodeIdentity::generate().unwrap();
+        let (_, b_identity) = NodeIdentity::generate().unwrap();
+        let a_identity = Arc::new(a_identity);
+        let b_identity = Arc::new(b_identity);
+        let (aid, bid) = (*a_identity.node_id(), *b_identity.node_id());
+        let a = SessionManager::new(a_identity);
+        let b = SessionManager::new(Arc::clone(&b_identity));
+        let init = a.initiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
+        b.accept_session(&aid, &init).await.unwrap();
+        a.confirm_session(&bid).await;
+        let init = a.encrypt(&bid, b"ready").await.unwrap();
+        b.decrypt(&aid, &init).await.unwrap();
+        let old = b.encrypt(&aid, b"first user message").await.unwrap();
+        let mut env = UkmEnvelopeBuilder::new(1, bid, Recipient::Node(aid), ratchet_message_to_bytes(&old),
+            PaymentProof::new(Sha256::digest([4; 32]).into(), [4; 32], 10)).build();
+        env.signature = konsensus_core::Signature::from_ed25519(&b_identity.sign(&env.signable_bytes()));
+        a.remove_session(&bid).await;
+        let init = a.reinitiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
+        b.reaccept_session(&aid, &init).await.unwrap();
+        a.confirm_session(&bid).await;
+        let init = a.encrypt(&bid, b"recovered").await.unwrap();
+        b.decrypt(&aid, &init).await.unwrap();
+        assert!(a.preview_decrypt(&bid, &old).await.is_err());
+
+        let retry = reencrypt_paid_envelope(&b, &b_identity, &env, b"first user message").await.unwrap();
+        assert_eq!(a.decrypt(&bid, &ratchet_message_from_bytes(&retry.ciphertext).unwrap()).await.unwrap(), b"first user message");
+        assert_ne!(retry.id, env.id);
+        assert_eq!(retry.payment_proof.payment_hash, env.payment_proof.payment_hash);
+        assert_eq!(retry.payment_proof.preimage, env.payment_proof.preimage);
+        assert_eq!(retry.payment_proof.amount_msat, 10);
+        assert_eq!(retry.nonce, env.nonce);
+        retry.validate().unwrap();
+        b_identity.verify(&retry.signable_bytes(), &retry.signature.to_ed25519()).unwrap();
     }
 }

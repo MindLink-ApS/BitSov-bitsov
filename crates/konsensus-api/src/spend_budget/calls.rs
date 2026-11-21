@@ -313,6 +313,146 @@ impl GrantBudget {
         true
     }
 
+    /// Whether any call this grant funds is still open or still paying.
+    pub(crate) fn has_open_call(&self) -> bool {
+        self.call_reservations.values().any(|call| !call.closed || !call.draws.is_empty())
+    }
+
+    /// Take out every ordinary payment whose outcome is still unknown (not
+    /// a call hold or one of its blocks), with its operation link, and
+    /// release its amount here. Give them to the successor with
+    /// [`Self::accept_open_payments`]: they are already sent, so they move
+    /// whatever the successor has left, keep their failure slots there and
+    /// settle there once.
+    pub(crate) fn take_open_payments(&mut self) -> Vec<OpenPayment> {
+        let ids: Vec<String> = self
+            .pending
+            .keys()
+            .filter(|id| !self.call_reservations.contains_key(*id) && !self.holds_draw(id))
+            .cloned()
+            .collect();
+        ids.into_iter()
+            .map(|id| {
+                let recipients = self.pending.remove(&id).expect("listed payment");
+                for (recipient, amount) in &recipients {
+                    self.resolve(recipient, *amount, 0);
+                }
+                let link = self.operation_links.remove(&id);
+                OpenPayment { id, recipients, link }
+            })
+            .collect()
+    }
+
+    /// Take over payments from [`Self::take_open_payments`]. Their amounts
+    /// count here even past the budget, which only leaves less for new ones.
+    pub(crate) fn accept_open_payments(&mut self, payments: Vec<OpenPayment>) {
+        for payment in payments {
+            if self.pending.contains_key(&payment.id) {
+                continue;
+            }
+            for (recipient, amount) in &payment.recipients {
+                self.used_msat = self.used_msat.saturating_add(*amount);
+                let used = self.used_by_recipient.entry(recipient.clone()).or_insert(0);
+                *used = used.saturating_add(*amount);
+            }
+            if let Some(link) = payment.link {
+                self.operation_links.insert(payment.id.clone(), link);
+            }
+            self.pending.insert(payment.id, payment.recipients);
+        }
+    }
+
+    /// What call `id` still holds here, msat: its unpaid remainder and its
+    /// blocks in flight, which is what a carry to the next window moves.
+    pub(crate) fn call_outstanding(&self, id: &str) -> u64 {
+        let Some(call) = self.call_reservations.get(id) else {
+            return 0;
+        };
+        std::iter::once(id.to_string())
+            .chain(call.draws.keys().cloned())
+            .filter_map(|key| self.pending.get(&key))
+            .flat_map(|recipients| recipients.values())
+            .fold(0u64, |sum, amount| sum.saturating_add(*amount))
+    }
+
+    /// Whether reservation `id` is a block drawn from one of this grant's calls.
+    pub(crate) fn holds_draw(&self, id: &str) -> bool {
+        self.call_reservations.values().any(|call| call.draws.contains_key(id))
+    }
+
+    /// Whether any call this grant funds still has a block whose outcome is
+    /// not settled.
+    pub(crate) fn has_unsettled_draw(&self) -> bool {
+        self.call_reservations.values().any(|call| !call.draws.is_empty())
+    }
+
+    /// Whether `successor` could fund what a carried hold still has
+    /// (`outstanding`) under every restriction a new reservation meets: not
+    /// paused, payee allowed, the hold's per-block ceiling and closing signal
+    /// within its per-payment limits (and a live envelope on a relation
+    /// grant), and room in its recipient budget and its total.
+    fn fits_carried_hold(&self, terms: &CallSpendTerms, outstanding: u64, now: i64) -> bool {
+        let peer = &terms.peer;
+        let recipient_room = self.per_recipient_msat.get(peer).is_none_or(|cap| {
+            cap.saturating_sub(self.used_by_recipient.get(peer).copied().unwrap_or(0)) >= outstanding
+        });
+        !self.is_paused()
+            && self.payee_allowlist.as_ref().is_none_or(|payees| payees.contains(peer))
+            && self.check_call_hold(terms).is_ok()
+            && self.check_call_closing(terms).is_ok()
+            && self.envelopes_live(std::iter::once(peer), now)
+            && recipient_room
+            && self.remaining_msat() >= outstanding
+    }
+
+    /// Move every call still open or still paying to `successor`, once, with
+    /// what its hold has left and its blocks in flight, when the successor
+    /// can fund it ([`Self::fits_carried_hold`]). The successor is charged
+    /// exactly that remainder, which the call's own settlement and release
+    /// then resolve; minutes already paid stay with this grant, and no
+    /// breaker count is made again. A call that does not fit is closed here
+    /// instead: its unpaid remainder is released at once and any block in
+    /// flight settles on this grant. Returns each moved call's `peer:call_id`.
+    pub(crate) fn move_open_calls_to(&mut self, successor: &mut GrantBudget, now: i64) -> Vec<String> {
+        let ids: Vec<String> = self
+            .call_reservations
+            .iter()
+            .filter(|(id, call)| (!call.closed || !call.draws.is_empty()) && !successor.call_reservations.contains_key(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut moved = Vec::with_capacity(ids.len());
+        for id in ids {
+            let call = &self.call_reservations[&id];
+            let keys: Vec<String> = std::iter::once(id.clone()).chain(call.draws.keys().cloned()).collect();
+            let outstanding = keys.iter().filter_map(|key| self.pending.get(key))
+                .flat_map(|recipients| recipients.values())
+                .fold(0u64, |sum, amount| sum.saturating_add(*amount));
+            if call.closed || !successor.fits_carried_hold(&call.terms, outstanding, now) {
+                self.close_call(&id);
+                continue;
+            }
+            let call = self.call_reservations.remove(&id).expect("listed call");
+            let peer = call.terms.peer.clone();
+            for key in keys {
+                if let Some(recipients) = self.pending.remove(&key) {
+                    successor.pending.insert(key.clone(), recipients);
+                }
+                if let Some(link) = self.operation_links.remove(&key) {
+                    successor.operation_links.insert(key, link);
+                }
+            }
+            successor.used_msat = successor.used_msat.saturating_add(outstanding);
+            if outstanding > 0 {
+                let used = successor.used_by_recipient.entry(peer.clone()).or_insert(0);
+                *used = used.saturating_add(outstanding);
+            }
+            self.resolve(&peer, outstanding, 0);
+            moved.push(format!("{peer}:{}", call.terms.call_id));
+            successor.call_reservations.insert(id, call);
+        }
+        moved
+    }
+
     pub(crate) fn close_call(&mut self, id: &str) {
         let Some(call) = self.call_reservations.get_mut(id) else {
             return;
@@ -345,5 +485,24 @@ impl GrantBudget {
             }
             self.prune_call_tombstones(chrono::Utc::now().timestamp());
         }
+    }
+}
+
+/// An ordinary payment in flight, moving between windows.
+pub(crate) struct OpenPayment {
+    id: String,
+    recipients: BTreeMap<String, u64>,
+    link: Option<OperationReservationLink>,
+}
+
+impl OpenPayment {
+    /// Its reservation id.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// What it reserved, msat.
+    pub(crate) fn amount_msat(&self) -> u64 {
+        self.recipients.values().fold(0u64, |sum, amount| sum.saturating_add(*amount))
     }
 }

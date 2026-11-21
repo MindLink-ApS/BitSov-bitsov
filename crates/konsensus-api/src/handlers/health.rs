@@ -10,18 +10,24 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::scoped::{Read, ScopedAuth};
 use crate::freshness::DataFreshness;
 use crate::state::AppState;
 
+/// Workspace release version, shared by every crate and the `konsensus` binary.
+pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Full node status response (owner-only, behind [`ScopedAuth<Read>`]).
 #[derive(Serialize)]
 pub struct HealthResponse {
+    /// Opt-in, read-only discovery. This view never grants authority.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compound_readiness: Option<crate::compound_readiness::Discovery>,
     /// Configured Bitcoin network; null when the backend configuration has none.
     pub network: Option<String>,
     /// Sanitized restore journal diagnostics, owner-only and read-only.
@@ -68,6 +74,10 @@ pub struct HealthResponse {
     pub uptime_secs: u64,
     /// Protocol version.
     pub version: u16,
+    /// Release version of the running binary, as `konsensus --version` prints it
+    /// (e.g. `0.3.0-rc22`). Owner-only: the public `/health` leaves it out so an
+    /// unauthenticated caller can't pick nodes by release.
+    pub node_version: &'static str,
     /// Lightning backend name (e.g. "lnbits", "mock", "void").
     pub lightning_backend: String,
     /// Lightning node public key (hex, compressed secp256k1). Used for channel opening.
@@ -86,6 +96,9 @@ pub struct HealthResponse {
     /// server for calls, never switch to it by itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stun_port: Option<u16>,
+    /// `[calls] max_call_minutes`: the paid-duration cap a new outgoing call
+    /// reserves against, so an app can compute the hold before ringing. Read-only.
+    pub max_call_minutes: u16,
     /// `stun:host:port` for ICE: this node's own STUN responder when it has a
     /// dialable peer host, else the owner's `[network] stun_server` when set and
     /// valid; omitted when neither applies.
@@ -292,17 +305,49 @@ pub(crate) async fn health(
     )
 }
 
+#[derive(Default, Deserialize)]
+struct StatusQuery {
+    #[serde(default)]
+    compound_readiness: bool,
+    generation: Option<String>,
+    request_id: Option<String>,
+}
+
 /// `GET /api/v1/status` — owner-only full node status (behind [`ScopedAuth<Read>`]).
 ///
 /// Includes identity, connected peer IDs, wallet balance, and LN pubkey — the
 /// fields redacted from the public `/health` endpoint.
 async fn status(
     auth: ScopedAuth<Read>,
+    Query(query): Query<StatusQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<HealthResponse>, axum::http::StatusCode> {
     if auth.node_id != state.identity.node_id().to_hex() {
         return Err(axum::http::StatusCode::FORBIDDEN);
     }
+    let correlation = if query.compound_readiness {
+        match (
+            query.generation.and_then(|value| value.parse::<u64>().ok()),
+            query.request_id,
+        ) {
+            (Some(generation), Some(request_id))
+                if crate::compound_readiness::valid_request_id(&request_id) =>
+            {
+                Some(crate::compound_readiness::ConnectionBinding {
+                    generation,
+                    request_id,
+                    client_context: auth
+                        .pairing
+                        .as_ref()
+                        .map(|p| p.client_id.clone())
+                        .unwrap_or_else(|| "local-owner".into()),
+                })
+            }
+            _ => return Err(axum::http::StatusCode::BAD_REQUEST),
+        }
+    } else {
+        None
+    };
     let recovery = if let Some(dir) = state.recovery_dir.clone() {
         Some(
             tokio::task::spawn_blocking(move || konsensus_lightning::recover::status(&dir))
@@ -360,7 +405,27 @@ async fn status(
         state.stun_port,
         state.configured_stun_server.as_deref(),
     );
+    let compound_readiness = correlation.map(|connection| {
+        crate::compound_readiness::runtime_discovery(crate::compound_readiness::RuntimeInputs {
+            node_id: state.identity.node_id().to_hex(),
+            network: state.introduction.network.clone(),
+            connection,
+            role: if auth.pairing.is_some() {
+                crate::compound_readiness::Role::Reader
+            } else {
+                crate::compound_readiness::Role::Owner
+            },
+            enrollment_epoch: auth.pairing.as_ref().map_or(0, |p| p.epoch),
+            device_approvals: state
+                .pairing
+                .as_ref()
+                .map(|p| p.device_authority_off().is_none()),
+            chain_ready: block_height.is_some(),
+            payment_ready: readiness.money_ready && ln_payment_capable,
+        })
+    });
     Ok(Json(HealthResponse {
+        compound_readiness,
         network: state.introduction.network.clone(),
         recovery,
         channel_safety: state.lightning.channel_safety(),
@@ -393,6 +458,7 @@ async fn status(
                 crate::membrane::CAPABILITY,
                 crate::spend_budget::CAPABILITY,
                 crate::spend_budget::RELATION_ENVELOPE_ID_CAPABILITY,
+                crate::pairing::device::RELATION_INTENT_V2_CAPABILITY,
                 crate::spend_budget::FIRST_CONTACT_CAPABILITY,
                 super::introduction::CAPABILITY,
                 super::front_door::CAPABILITY,
@@ -407,12 +473,21 @@ async fn status(
             if state.starter.config.enabled {
                 capabilities.push("starter_channel_request_v1");
             }
+            if state.call_reply_free {
+                capabilities.push(konsensus_core::payloads::call::FREE_REPLY_CAPABILITY);
+            }
             if state
                 .pairing
                 .as_ref()
                 .is_some_and(|p| p.second_device_enrollment_enabled())
             {
                 capabilities.push(crate::pairing::second_device::CAPABILITY);
+            }
+            if state.pairing.as_ref().is_some_and(|p| p.standing_allowance_enabled()) {
+                capabilities.push(crate::pairing::allowance::STANDING_ALLOWANCE_CAPABILITY);
+            }
+            if state.pairing.as_ref().is_some_and(|p| p.call_continuity_enabled()) {
+                capabilities.push(crate::pairing::CALL_CONTINUITY_CAPABILITY);
             }
             capabilities
         },
@@ -427,6 +502,7 @@ async fn status(
         lightning_balance_msat: ln_balance,
         uptime_secs: uptime,
         version: 2,
+        node_version: NODE_VERSION,
         lightning_backend: state.lightning_backend.clone(),
         lightning_node_pubkey: state.lightning.get_node_pubkey().await,
         chain_backend: state.chain_backend.clone(),
@@ -434,6 +510,7 @@ async fn status(
         chain_sync,
         block_height,
         stun_port: state.stun_port,
+        max_call_minutes: state.max_call_minutes,
         stun_url,
         stun_source,
         peer_endpoint: peer.endpoint,

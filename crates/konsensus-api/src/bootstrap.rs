@@ -787,6 +787,10 @@ pub struct BootstrapState {
     before_marker: Option<BeforeMarkerHookOwned>,
     local: Option<LocalOwnerHooks>,
     remote: Option<RemoteOwner>,
+    /// Configured Bitcoin network name, when the lightning backend states one.
+    /// Published in `bootstrap/state` so a client can refuse to set up a home
+    /// node on the wrong network before any identity exists.
+    network: Option<String>,
     pending: Mutex<Option<PendingIdentity>>,
     sas_failures: std::sync::atomic::AtomicU8,
     sas_started_at: tokio::time::Instant,
@@ -795,9 +799,9 @@ pub struct BootstrapState {
 impl BootstrapState {
     /// Build bootstrap state for `layout`, generating the ephemeral secret.
     pub fn new(layout: DataDirLayout, pairing: Arc<PairingService>) -> Self {
-        use rand::RngCore;
+        use rand::Rng;
         let mut secret = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut secret);
+        rand::rng().fill_bytes(&mut secret);
         Self {
             layout,
             pairing,
@@ -809,6 +813,7 @@ impl BootstrapState {
             before_marker: None,
             local: None,
             remote: None,
+            network: None,
             pending: Mutex::new(None),
             sas_failures: std::sync::atomic::AtomicU8::new(0),
             sas_started_at: tokio::time::Instant::now(),
@@ -846,6 +851,18 @@ impl BootstrapState {
     pub fn with_remote_owner(mut self, remote: RemoteOwner) -> Self {
         self.remote = Some(remote);
         self.local = None;
+        self
+    }
+
+    /// Publish the configured Bitcoin network in `bootstrap/state`. Only one
+    /// of the four canonical names (`bitcoin`, `testnet`, `signet`, `regtest`)
+    /// is ever published; anything else, or `None`, omits the field, which a
+    /// client must treat as "network unknown". The whitelist keeps arbitrary
+    /// configuration text off the unauthenticated surface.
+    pub fn with_network(mut self, network: Option<String>) -> Self {
+        self.network = network.filter(|n| {
+            matches!(n.as_str(), "bitcoin" | "testnet" | "signet" | "regtest")
+        });
         self
     }
 
@@ -1224,6 +1241,8 @@ impl FromRequestParts<Arc<BootstrapState>> for BootstrapAuth {
 
 /// Unauthenticated `GET /api/v1/bootstrap/state` response.
 /// Refusal diagnostics and repair guidance belong in the CLI/stderr output.
+/// Besides the ceremony availability flags, the only node metadata here is the
+/// configured network name: no node id, balances, addresses or endpoints.
 #[derive(Debug, Serialize)]
 pub struct BootstrapStateResponse {
     /// `"bootstrap"`, `"initialized"`, or `"refused"` (operator repair required).
@@ -1234,6 +1253,11 @@ pub struct BootstrapStateResponse {
     pub can_create: bool,
     /// Explicit local ceremony availability, with no secret material.
     pub local_owner: LocalOwnerState,
+    /// Configured Bitcoin network: `"bitcoin"`, `"testnet"`, `"signet"` or
+    /// `"regtest"`. Absent when the node does not state one. A client that
+    /// requires a particular network must refuse setup when this is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
 }
 
 /// Public local ceremony status.
@@ -1284,6 +1308,7 @@ async fn bootstrap_state(
             pending: pending.is_some(),
             tunnel_password: remote,
         },
+        network: state.network.clone(),
     }))
 }
 
@@ -1646,11 +1671,13 @@ fn begin_pending(
     }
     // All inputs and the exclusive pending slot are committed before this RNG call.
     let (sas, box_nonce) = if let Some((device_key, device_name, binding)) = sas_input {
-        use rand::RngCore;
+        use rand::TryRng;
         let claim = crate::sas::load(&state.layout.data_dir)
             .map_err(|_| ceremony_error(StatusCode::CONFLICT, "claim_code_unavailable"))?;
         let mut nonce = [0; 16];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut nonce)
+            .expect("OS randomness unavailable");
         let digest = crate::sas::digest(&binding, &device_key, &nonce, &claim.commitment());
         (
             Some(PendingSas {
@@ -1675,7 +1702,7 @@ fn begin_pending(
     let node_id = identity.node_id().to_hex();
     let ceremony_id = uuid::Uuid::new_v4().simple().to_string();
     let mut indices: Vec<usize> = (0..mnemonic.split_whitespace().count()).collect();
-    indices.shuffle(&mut rand::thread_rng());
+    indices.shuffle(&mut rand::rng());
     let backup_check = [indices[0], indices[1], indices[2]];
     *slot = Some(PendingIdentity {
         ceremony_id: ceremony_id.clone(),
@@ -1787,9 +1814,6 @@ async fn cancel_pending(
         if ceremony_id != "current" && ceremony_id != pending.ceremony_id {
             return Err(ceremony_error(StatusCode::GONE, "ceremony_lost"));
         }
-    }
-    if slot.as_ref().is_some_and(|p| p.sas.is_some()) {
-        state.sas_failures.fetch_add(1, Ordering::SeqCst);
     }
     *slot = None;
     Ok(StatusCode::NO_CONTENT)

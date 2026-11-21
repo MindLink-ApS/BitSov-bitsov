@@ -47,10 +47,17 @@ pub use send::{SendMessageRequest, SendMessageResponse};
 // Observed here, around the handlers, so the send paths stay untouched.
 
 async fn compose_observed(
-    auth: MeteredSpend,
+    auth: crate::metered::ComposeSpend,
     State(state): State<Arc<AppState>>,
     Json(req): Json<ComposeRequest>,
-) -> Result<Json<ComposeResponse>, ApiError> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    // Only this route accepts the minute-block-only authority; every other
+    // request without `spend` gets the extractor's refusal unchanged.
+    let auth = match auth.for_request(&state, &req) {
+        Ok(auth) => auth,
+        Err(refusal) => return *refusal,
+    };
     let (recipient, kind, cap) = (
         crate::membrane::parse_recipient(&req.recipient, req.is_room),
         req.kind,
@@ -63,7 +70,7 @@ async fn compose_observed(
             .membrane()
             .outbound_refused(e, recipient.as_ref(), Some(kind), cap);
     }
-    out
+    out.into_response()
 }
 
 async fn compose_with_policy_observed(

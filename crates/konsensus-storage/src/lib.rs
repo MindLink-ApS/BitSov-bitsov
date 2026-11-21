@@ -3,22 +3,44 @@
 #![forbid(unsafe_code)]
 
 pub mod calendar;
+pub mod call_media;
 pub mod contacts;
 pub mod encrypted;
+pub mod record_upgrade;
 pub mod error;
 pub mod fiat_snapshots;
 pub mod models;
 pub mod postgres;
 pub mod reactions;
 pub mod recovery;
+#[cfg(test)]
+mod schema_catalog;
 pub mod sqlite;
 pub mod traits;
 pub mod whitelist_backup;
 
-pub use calendar::{CalendarEventRecord, RsvpRecord};
+pub use calendar::{CalendarAdmission, CalendarEventRecord, RsvpRecord};
 pub use contacts::{ContactRepo, ContactRow, PostgresContactRepo, SqliteContactRepo};
 pub use encrypted::EncryptedStorage;
 pub use error::StorageError;
+
+/// One call row holding free-reply receipts, from
+/// [`traits::Storage::call_with_free_reply_receipts`]: its key (peer as hex,
+/// call id) and its entry, or `None` when the row cannot be decoded.
+pub type FreeReplyReceiptRow = (String, String, Option<(konsensus_core::NodeId, konsensus_core::payloads::call::CallEntry)>);
+
+/// One page of [`traits::Storage::call_with_free_reply_receipts`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FreeReplyReceiptPage {
+    /// The rows whose key is readable text, in key order.
+    pub rows: Vec<FreeReplyReceiptRow>,
+    /// How many stored rows the page covered, including rows whose key is
+    /// not readable text (they are left out of `rows` and left untouched).
+    pub scanned: usize,
+    /// The raw key bytes `(peer, call_id)` of the last row covered: the
+    /// cursor for the next page.
+    pub last_key: Option<(Vec<u8>, Vec<u8>)>,
+}
 pub use fiat_snapshots::FiatRateSnapshot;
 pub use invites::{
     AcceptedInviteRecord, InviteIssuedRecord, InviteSchemaCapabilities, InviteState,
@@ -31,7 +53,7 @@ pub use recovery::{
     RecoveryTrustee, SqliteRecoveryStore,
 };
 pub use sqlite::SqliteStorage;
-pub use traits::{PaidAcceptance, Storage};
+pub use traits::{CallInviteExpiry, CallInviteOutcome, PaidAcceptance, Storage, MAX_DEFERRALS_PER_PROOF, MAX_DEFERRALS_PER_SENDER, ENVELOPE_DEFERRAL_TTL_MS, DEFERRAL_CLEANUP_BATCH};
 pub use whitelist_backup::WhitelistBackup;
 
 pub mod invites {

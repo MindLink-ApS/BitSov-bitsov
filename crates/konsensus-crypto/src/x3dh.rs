@@ -94,7 +94,7 @@ pub struct SignedPreKey {
 impl SignedPreKey {
     /// Generate a new signed pre-key pair.
     pub fn generate() -> Self {
-        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
         let public = PublicKey::from(&secret);
         Self { secret, public }
     }
@@ -126,7 +126,7 @@ pub struct OneTimePreKey {
 impl OneTimePreKey {
     /// Generate a new one-time pre-key with the given ID.
     pub fn generate(id: u32) -> Self {
-        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
         let public = PublicKey::from(&secret);
         Self { id, secret, public }
     }
@@ -240,7 +240,7 @@ pub fn initiate(
     // Step 2: Generate ephemeral key pair
     // Using StaticSecret rather than EphemeralSecret because we need multiple DH
     // operations. The key is still ephemeral — generated fresh for each initiation.
-    let ephemeral_secret = StaticSecret::random_from_rng(rand::thread_rng());
+    let ephemeral_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral_secret);
 
     // Step 3: Compute DH values

@@ -202,7 +202,8 @@ async fn compose_fails_without_e2ee_session() {
             serde_json::json!({
                 "recipient": peer_id.to_hex(),
                 "kind": 1,
-                "plaintext": "hello"
+                "plaintext": "hello",
+                "max_total_msat": 0
             })
             .to_string(),
         ))
@@ -1683,6 +1684,7 @@ async fn reveal_mnemonic_returns_plaintext_with_reauth() {
     // Re-auth (HARD-9): fetch a fresh challenge and sign it with the node key.
     let chal_req = Request::builder()
         .uri("/api/v1/auth/challenge")
+        .header("host", "localhost:3141")
         .body(Body::empty())
         .unwrap();
     let chal_resp = app.clone().oneshot(chal_req).await.unwrap();
@@ -1902,13 +1904,14 @@ async fn compose_happy_path_keysend() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1931,6 +1934,7 @@ async fn compose_happy_path_keysend() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1939,11 +1943,10 @@ async fn compose_happy_path_keysend() {
     });
 
     // Step 3: Register peer's Lightning pubkey (enables keysend path).
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, "02aaaa".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified("02aaaa".repeat(5)),
+    );
 
     // Step 4: Compose a message via the HTTP endpoint.
     let auth = auth_header(&state);
@@ -2059,13 +2062,14 @@ async fn compose_happy_path_invoice_flow() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -2089,6 +2093,7 @@ async fn compose_happy_path_invoice_flow() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2187,13 +2192,14 @@ async fn compose_rejects_invoice_amount_mismatch() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -2216,6 +2222,7 @@ async fn compose_rejects_invoice_amount_mismatch() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2378,13 +2385,14 @@ async fn compose_keysend_fallback_to_invoice() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -2407,6 +2415,7 @@ async fn compose_keysend_fallback_to_invoice() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2420,11 +2429,10 @@ async fn compose_keysend_fallback_to_invoice() {
         .unwrap()
         .recover_payee_pub_key()
         .to_string();
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, invoice_payee);
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified(invoice_payee),
+    );
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2516,13 +2524,14 @@ async fn compose_queues_when_transport_send_fails() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -2545,6 +2554,7 @@ async fn compose_queues_when_transport_send_fails() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2553,11 +2563,10 @@ async fn compose_queues_when_transport_send_fails() {
     });
 
     // Register LN pubkey for keysend path (simpler than invoice flow).
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, "02cccc".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified("02cccc".repeat(5)),
+    );
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2632,13 +2641,14 @@ async fn compose_room_delivers_to_all_connected_members() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -2661,6 +2671,7 @@ async fn compose_room_delivers_to_all_connected_members() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2669,11 +2680,10 @@ async fn compose_room_delivers_to_all_connected_members() {
     });
 
     // Register LN pubkey for keysend (avoids invoice flow complexity).
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, "02dddd".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified("02dddd".repeat(5)),
+    );
 
     // Create a room with our node + the peer as members.
     let auth = auth_header(&state);
@@ -2779,13 +2789,14 @@ async fn compose_broadcasts_to_websocket() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: ws_tx,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -2808,6 +2819,7 @@ async fn compose_broadcasts_to_websocket() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2815,11 +2827,10 @@ async fn compose_broadcasts_to_websocket() {
         gossip_validator: None,
     });
 
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, "02eeee".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified("02eeee".repeat(5)),
+    );
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2887,13 +2898,14 @@ async fn compose_records_send_timestamp_for_stdp() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -2916,6 +2928,7 @@ async fn compose_records_send_timestamp_for_stdp() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2923,11 +2936,10 @@ async fn compose_records_send_timestamp_for_stdp() {
         gossip_validator: None,
     });
 
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer_id, "02ffff".repeat(5));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified("02ffff".repeat(5)),
+    );
 
     let auth = auth_header(&state);
     let app = build_router(Arc::clone(&state));
@@ -2994,13 +3006,14 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -3023,6 +3036,7 @@ async fn compose_room_all_members_fail_returns_explicit_refusals() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -3164,13 +3178,14 @@ async fn compose_room_rejects_oversized_member_count() {
         session_manager: Arc::clone(&session_manager),
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(1000)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -3193,6 +3208,7 @@ async fn compose_room_rejects_oversized_member_count() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,

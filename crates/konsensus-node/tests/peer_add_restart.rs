@@ -57,7 +57,7 @@ impl Node {
             String::from_utf8_lossy(&out.stderr)
         );
         let config = dir.path().join("konsensus.toml");
-        let mut cfg: toml::Value = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+        let mut cfg: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
         let api = address();
         let peer = address();
         cfg["api"]["listen_addr"] = api.to_string().into();
@@ -212,7 +212,7 @@ async fn owner_added_peer_survives_restart_and_config_still_wins() {
     let a = Node::new();
     let b = Node::new();
     // B accepts A in advance; A starts with no configured contacts.
-    let mut cfg: toml::Value = std::fs::read_to_string(&b.config).unwrap().parse().unwrap();
+    let mut cfg: toml::Table = std::fs::read_to_string(&b.config).unwrap().parse().unwrap();
     cfg["peers"] = toml::Value::try_from(vec![json!({"node_id": a.identity.node_id().to_hex(), "addr": a.peer.to_string(), "auto_connect": false})]).unwrap();
     std::fs::write(&b.config, toml::to_string(&cfg).unwrap()).unwrap();
     let unchanged = std::fs::read(&a.config).unwrap();
@@ -275,7 +275,7 @@ async fn owner_added_peer_survives_restart_and_config_still_wins() {
     // Stop B too: an inbound reconnect cannot rewrite A's configured address.
     b.stop(pb).await;
     let wrong_addr = address();
-    let mut cfg: toml::Value = std::fs::read_to_string(&a.config).unwrap().parse().unwrap();
+    let mut cfg: toml::Table = std::fs::read_to_string(&a.config).unwrap().parse().unwrap();
     cfg["peers"] = toml::Value::try_from(vec![json!({"node_id": b.identity.node_id().to_hex(), "addr": wrong_addr.to_string(), "label": "Config contact"})]).unwrap();
     std::fs::write(&a.config, toml::to_string(&cfg).unwrap()).unwrap();
     let mut pa = a.start(true);

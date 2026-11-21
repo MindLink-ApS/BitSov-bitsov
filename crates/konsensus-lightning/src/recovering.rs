@@ -73,7 +73,10 @@ impl RecoveringLightning {
             Err(LightningError::ChainSourceUnavailable { .. }) => None,
             Err(e) => return Err(e),
         };
-        let offline_safety = backend.as_ref().and_then(|p| p.offline_safety()).unwrap_or_default();
+        let offline_safety = backend
+            .as_ref()
+            .and_then(|p| p.offline_safety())
+            .unwrap_or_default();
         let state = Arc::new(RwLock::new(State {
             backend,
             readiness: LightningReadiness {
@@ -183,6 +186,17 @@ impl RecoveringLightning {
         }
         state.backend.clone().ok_or(LightningError::NotReady)
     }
+
+    /// The backend for the gate's local store reads, plus whether money work is
+    /// allowed. Sync state does not close these; stopping or no backend does.
+    fn store_reader(&self) -> Result<(Arc<dyn LightningProvider>, bool), LightningError> {
+        let state = self.state.read().unwrap();
+        if *self.stop.borrow() {
+            return Err(LightningError::NotReady);
+        }
+        let backend = state.backend.clone().ok_or(LightningError::NotReady)?;
+        Ok((backend, state.readiness.money_ready))
+    }
 }
 
 impl Drop for RecoveringLightning {
@@ -204,7 +218,12 @@ impl LightningProvider for RecoveringLightning {
     }
 
     fn tower_status(&self) -> konsensus_core::tower::TowerStatus {
-        self.state.read().unwrap().backend.as_ref().map(|p| p.tower_status())
+        self.state
+            .read()
+            .unwrap()
+            .backend
+            .as_ref()
+            .map(|p| p.tower_status())
             .unwrap_or_else(|| konsensus_core::tower::TowerStatus {
                 error: Some("Lightning backend unavailable; tower coverage unknown".into()),
                 ..Default::default()
@@ -216,12 +235,22 @@ impl LightningProvider for RecoveringLightning {
     }
 
     fn offline_chain_state(&self) -> Option<konsensus_core::offline_safety::OfflineChainState> {
-        self.state.read().unwrap().backend.as_ref().and_then(|p| p.offline_chain_state())
+        self.state
+            .read()
+            .unwrap()
+            .backend
+            .as_ref()
+            .and_then(|p| p.offline_chain_state())
     }
 
     fn chain_sync_status(&self) -> Option<konsensus_core::traits::lightning::ChainSyncStatus> {
         // Diagnostics must bypass backend(), which deliberately gates money work.
-        self.state.read().unwrap().backend.as_ref().and_then(|p| p.chain_sync_status())
+        self.state
+            .read()
+            .unwrap()
+            .backend
+            .as_ref()
+            .and_then(|p| p.chain_sync_status())
     }
 
     async fn readiness(&self) -> LightningReadiness {
@@ -229,6 +258,12 @@ impl LightningProvider for RecoveringLightning {
     }
     async fn money_ready(&self) -> bool {
         !*self.stop.borrow() && self.state.read().unwrap().readiness.money_ready
+    }
+    async fn receive_invoice_capable(&self) -> bool {
+        match self.backend() {
+            Ok(p) => p.receive_invoice_capable().await,
+            Err(_) => false,
+        }
     }
     async fn is_available(&self) -> bool {
         self.money_ready().await
@@ -304,9 +339,18 @@ impl LightningProvider for RecoveringLightning {
         let p = self.backend()?;
         p.accept_liquidity(owner, id).await
     }
+    /// Only the payment gate calls this. It reads the local store, so a known
+    /// record answers while not ready. An unknown hash stays `NotReady` there.
     async fn is_funding_payment(&self, hash: &str) -> Result<bool, LightningError> {
-        let p = self.backend()?;
-        p.is_funding_payment(hash).await
+        let (p, ready) = self.store_reader()?;
+        // With no cutoff the gate's read can confirm nothing; do not ask.
+        if !ready && p.gate_settlement_cutoff().is_none() {
+            return Err(LightningError::NotReady);
+        }
+        match p.is_funding_payment(hash).await {
+            Err(LightningError::PaymentNotFound(_)) if !ready => Err(LightningError::NotReady),
+            result => result,
+        }
     }
     async fn liquidity_receipt(
         &self,
@@ -324,6 +368,23 @@ impl LightningProvider for RecoveringLightning {
         let p = self.backend()?;
         p.create_invoice(amount_msat, description, expiry_secs)
             .await
+    }
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        let p = self.backend()?;
+        p.forget_pending_invoice(payment_hash).await
+    }
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        let p = self.backend()?;
+        p.purge_expired_pending_invoices(now_unix).await
+    }
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        // Listing recorded expiries does not spend. Do it even while the
+        // backend is still synchronizing, so a restart still counts them.
+        let backend = self.state.read().unwrap().backend.clone();
+        match backend {
+            Some(backend) => backend.pending_invoice_expiries().await,
+            None => Err(LightningError::NotReady),
+        }
     }
     async fn create_stateless_invoice(
         &self,
@@ -364,6 +425,36 @@ impl LightningProvider for RecoveringLightning {
     ) -> Result<PaymentDetails, LightningError> {
         let p = self.backend()?;
         p.get_payment_status(payment_hash).await
+    }
+    async fn gate_payment_status(
+        &self,
+        payment_hash: &str,
+    ) -> Result<PaymentDetails, LightningError> {
+        let (p, ready) = self.store_reader()?;
+        if ready {
+            return p.gate_payment_status(payment_hash).await;
+        }
+        // While not ready this can only confirm an inbound settlement recorded
+        // while the chain view was recent. With no such time on record there is
+        // nothing to confirm, so the backend is not asked at all.
+        let Some(cutoff) = p.gate_settlement_cutoff() else {
+            return Err(LightningError::NotReady);
+        };
+        match p.gate_payment_status(payment_hash).await {
+            Ok(details)
+                if details.status == PaymentStatus::Settled
+                    && details.direction == PaymentDirection::Incoming
+                    && details.timestamp <= cutoff =>
+            {
+                Ok(details)
+            }
+            // Any other answer keeps the refusal it has always had.
+            Ok(_) | Err(LightningError::PaymentNotFound(_) | LightningError::NotReady) => {
+                Err(LightningError::NotReady)
+            }
+            // A failing backend is a failure, not a sync lapse.
+            Err(e) => Err(e),
+        }
     }
     async fn verify_payment(&self, payment_hash: &str) -> Result<PaymentDetails, LightningError> {
         let p = self.backend()?;
@@ -471,10 +562,22 @@ impl LightningProvider for RecoveringLightning {
         .await
     }
     async fn open_channel_with_status(
-        &self, peer_pubkey: &str, peer_addr: &str, amount_sats: u64,
-        announce: bool, fee_rate_sat_per_vb: Option<f32>,
+        &self,
+        peer_pubkey: &str,
+        peer_addr: &str,
+        amount_sats: u64,
+        announce: bool,
+        fee_rate_sat_per_vb: Option<f32>,
     ) -> Result<konsensus_core::traits::lightning::ChannelOpenResult, LightningError> {
-        self.backend()?.open_channel_with_status(peer_pubkey, peer_addr, amount_sats, announce, fee_rate_sat_per_vb).await
+        self.backend()?
+            .open_channel_with_status(
+                peer_pubkey,
+                peer_addr,
+                amount_sats,
+                announce,
+                fee_rate_sat_per_vb,
+            )
+            .await
     }
 
     async fn funding_fee_quote(
@@ -517,7 +620,12 @@ impl LightningProvider for RecoveringLightning {
 
     async fn release_local_spend(&self, txid: &str) -> Result<(), LightningError> {
         // Owner recovery remains available even when money readiness is false.
-        let backend = self.state.read().unwrap().backend.clone()
+        let backend = self
+            .state
+            .read()
+            .unwrap()
+            .backend
+            .clone()
             .ok_or_else(|| LightningError::Backend("wallet backend unavailable".into()))?;
         backend.release_local_spend(txid).await
     }
