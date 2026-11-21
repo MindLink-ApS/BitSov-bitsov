@@ -612,7 +612,7 @@ async fn get_price(
         .pricing
         .get_price_msat(kind)
         .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        .map_err(|e| crate::error::pricing_error_or(e, |e| ApiError::BadRequest(e.to_string())))?;
 
     Ok(Json(PriceResponse {
         kind,

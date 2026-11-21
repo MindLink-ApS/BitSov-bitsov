@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
-use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, oneshot, RwLock};
 
 use konsensus_core::gate::PaymentGate;
 use konsensus_core::identity::NodeIdentity;
+pub use konsensus_core::lightning_binding::PeerLightningKey;
 use konsensus_core::traits::chain::ChainProvider;
 use konsensus_core::traits::lightning::LightningProvider;
 use konsensus_core::traits::pricing::PricingEngine;
@@ -98,15 +99,16 @@ pub struct AppState {
     /// JWT signing secret.
     pub jwt_secret: String,
 
+    /// Volatile, quota-limited uploads; never persisted before send.
+    pub file_staging: Arc<std::sync::Mutex<crate::file_staging::FileStaging>>,
+
     /// Single-use authentication challenges.
     ///
     /// `/api/v1/auth/token` must not verify a replayable static string. The
     /// challenge endpoint writes short-lived challenge strings here and token
-    /// issuance consumes them exactly once.
-    /// Volatile, quota-limited uploads; never persisted before send.
-    pub file_staging: Arc<std::sync::Mutex<crate::file_staging::FileStaging>>,
-
-    pub auth_challenges: Arc<Mutex<HashMap<String, Instant>>>,
+    /// issuance consumes them exactly once. Each source has a rate limit and a
+    /// cap; at the cap that source's oldest challenge is replaced.
+    pub auth_challenges: Arc<crate::auth_challenge::AuthChallenges>,
 
     /// Client pairing and owner-approved elevation (#76).
     ///
@@ -141,6 +143,9 @@ pub struct AppState {
     /// Broadcast channel for real-time WebSocket notifications.
     /// Messages include decrypted plaintext when E2EE session is available.
     pub ws_broadcast: broadcast::Sender<Arc<WsMessage>>,
+
+    /// Callee invite waits, shared by receive, paired fetch and stream delivery.
+    pub call_devices: Arc<crate::calls::devices::Devices>,
 
     /// Broadcast channel for delivery status updates (ack/reject).
     ///
@@ -218,13 +223,17 @@ pub struct AppState {
     /// Hebbian learning with latency bonus.
     pub send_timestamps: Arc<tokio::sync::Mutex<HashMap<MessageId, Instant>>>,
 
-    /// Lightning pubkeys of connected peers (for keysend payments).
+    /// Lightning keys of connected peers (for keysend payments).
     ///
     /// Populated when a peer sends a `Frame::LightningInfo` after the
-    /// federation handshake. Used by `create_payment_proof()` to attempt
-    /// keysend before falling back to the invoice-request round-trip.
-    /// Key: peer NodeId, Value: compressed Lightning pubkey (hex, 66 chars).
-    pub peer_ln_pubkeys: Arc<tokio::sync::Mutex<HashMap<NodeId, String>>>,
+    /// federation handshake. Only a key whose identity-key signature verified
+    /// is stored as [`PeerLightningKey::Verified`]; a key advertised without
+    /// one (an older peer) is recorded as [`PeerLightningKey::Unsigned`] so
+    /// `create_payment_proof()` refuses to pay that contact with a fixed
+    /// reason instead of paying an unbound destination. Keysend only ever
+    /// targets a verified key; a peer with no entry is paid via the
+    /// invoice-request round-trip.
+    pub peer_ln_pubkeys: Arc<tokio::sync::Mutex<HashMap<NodeId, PeerLightningKey>>>,
 
     /// Lightning backend name (e.g. "lnbits", "mock", "void").
     ///
@@ -274,6 +283,11 @@ pub struct AppState {
 
     /// Owner-configured cap for outgoing calls (1..=240, default 60).
     pub max_call_minutes: u16,
+
+    /// `[calls] call_reply_free_v1`, off by default. When on, this node sends
+    /// an answer or a declined hangup at no charge to a peer that advertises
+    /// it, and accepts those replies at no charge to its own ringing offers.
+    pub call_reply_free: bool,
 
     /// Validated `[network] stun_server` as `host:port` (no `stun:` prefix),
     /// used for `/status` `stun_url` when the node's own responder has no

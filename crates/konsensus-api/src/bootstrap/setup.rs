@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rand::RngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
@@ -96,7 +96,10 @@ pub trait SetupTickets: Send + Sync {
     /// Replace the one-use ticket. The caller bounds TTL to the boot window.
     fn mint(&self, ttl: Duration) -> Result<String, SetupTicketError>;
     /// Invalidate the ticket and revoke the pre-commit bootstrap pairing atomically.
-    fn cancel(&self) -> Result<(), SetupTicketError>;
+    ///
+    /// `Ok(true)` means a live ticket or a paired client was cleared. `Ok(false)`
+    /// means there was nothing in progress to cancel.
+    fn cancel(&self) -> Result<bool, SetupTicketError>;
 }
 struct Session {
     cookie: String,
@@ -257,7 +260,9 @@ async fn read_body(request: Request, next: Next) -> Response {
 }
 fn random() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS randomness unavailable");
     hex::encode(bytes)
 }
 fn escape(text: &str) -> String {
@@ -426,13 +431,14 @@ async fn cancel(State(page): State<Arc<SetupPage>>) -> Result<StatusCode, Status
     let b = page.open()?;
     let _transition = b.transition.lock().unwrap();
     page.open()?;
+    // Cancellation leaves the comparison-attempt budget unchanged. The
+    // per-source POST bucket bounds retries and refills without a restart.
     page.tickets
         .as_ref()
         .ok_or(StatusCode::CONFLICT)?
         .cancel()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     *b.pending.lock().unwrap() = None;
-    b.sas_failures.fetch_add(1, Ordering::SeqCst);
     Ok(StatusCode::NO_CONTENT)
 }
 /// No CORS middleware and no API routes, owner grants, registration or signing routes.

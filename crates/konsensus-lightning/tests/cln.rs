@@ -191,6 +191,7 @@ async fn connects_with_header_only_and_reports_preview_status() {
     assert_eq!(provider.get_node_pubkey().await.as_deref(), Some(PUBKEY));
     assert!(!provider.is_payment_capable().await);
     assert!(!provider.money_ready().await);
+    assert!(provider.receive_invoice_capable().await);
     assert!(!provider.readiness().await.money_ready);
     for request in server.requests.lock().unwrap().iter() {
         let (head, body) = request.split_once("\r\n\r\n").unwrap();
@@ -547,6 +548,59 @@ async fn creates_invoice_with_unique_labels_and_backend_expiry() {
         json!({"bolt11":bolt11(), "payment_hash":hash(),"expires_at":1}),
     );
     assert!(provider.create_invoice(1234, "memo", 60).await.is_err());
+}
+
+#[tokio::test]
+async fn cln_peer_invoice_hooks_inventory_and_delinvoice() {
+    let (server, _dir, provider) = read_provider().await;
+    server.route(
+        "invoice",
+        json!({"bolt11":bolt11(), "payment_hash":hash().to_uppercase(), "expires_at":1700000060}),
+    );
+    let invoice = provider.create_invoice(1234, "memo", 60).await.unwrap();
+    let label = server.calls().last().unwrap().1["label"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.route(
+        "listinvoices?start=0",
+        json!({"invoices":[{
+            "label": label,
+            "payment_hash": hash().to_uppercase(),
+            "status":"unpaid",
+            "expires_at":1700000060,
+            "created_index":1,
+        }]}),
+    );
+    server.route("listinvoices?start=2", json!({"invoices":[]}));
+    assert_eq!(
+        provider.pending_invoice_expiries().await.unwrap(),
+        vec![(hash(), 1700000060)]
+    );
+    server.route(
+        "listinvoices",
+        json!({"invoices":[{
+            "label": label,
+            "payment_hash": hash().to_uppercase(),
+            "status":"unpaid",
+            "expires_at":1700000060,
+            "created_index":1,
+        }]}),
+    );
+    server.route(
+        "delinvoice",
+        json!({
+            "label": label,
+            "payment_hash": hash().to_uppercase(),
+            "status":"unpaid",
+            "expires_at":1700000060,
+            "created_index":1,
+        }),
+    );
+    assert!(provider
+        .forget_pending_invoice(&invoice.payment_hash)
+        .await
+        .unwrap());
 }
 
 #[tokio::test]

@@ -333,7 +333,10 @@ async fn direct_channel_readmission_quotes_no_routing_fee_and_pays_under_the_mes
     p.contact.price.store(1_000, Ordering::SeqCst);
     p.fx.state.peer_prices.update_kind_price(p.contact.peer, 0, 1_000, 850_000).await;
     let key = contact_ln(&p).await;
-    p.fx.state.peer_ln_pubkeys.lock().await.insert(p.contact.peer, key.clone());
+    p.fx.state.peer_ln_pubkeys.lock().await.insert(
+        p.contact.peer,
+        konsensus_api::state::PeerLightningKey::Verified(key.clone()),
+    );
     *p.wallet.direct_to.lock().unwrap() = Some(key);
     let quote = readmission_quote(&p).await;
     assert_eq!((quote["admission_msat"].as_u64(), quote["message_msat"].as_u64()), (Some(1_000), Some(1_000)));
@@ -351,7 +354,10 @@ async fn readmission_without_a_direct_channel_keeps_the_routing_ceiling() {
     p.contact.price.store(1_000, Ordering::SeqCst);
     p.fx.state.peer_prices.update_kind_price(p.contact.peer, 0, 1_000, 850_000).await;
     let key = contact_ln(&p).await;
-    p.fx.state.peer_ln_pubkeys.lock().await.insert(p.contact.peer, key);
+    p.fx.state.peer_ln_pubkeys.lock().await.insert(
+        p.contact.peer,
+        konsensus_api::state::PeerLightningKey::Verified(key),
+    );
     // A channel exists, but to another node.
     *p.wallet.direct_to.lock().unwrap() = Some(OTHER_LN.into());
     let quote = readmission_quote(&p).await;
@@ -368,7 +374,10 @@ async fn direct_readmission_needs_the_channel_to_carry_admission_and_message() {
     p.contact.price.store(1_000, Ordering::SeqCst);
     p.fx.state.peer_prices.update_kind_price(p.contact.peer, 0, 1_000, 850_000).await;
     let key = contact_ln(&p).await;
-    p.fx.state.peer_ln_pubkeys.lock().await.insert(p.contact.peer, key.clone());
+    p.fx.state.peer_ln_pubkeys.lock().await.insert(
+        p.contact.peer,
+        konsensus_api::state::PeerLightningKey::Verified(key.clone()),
+    );
     *p.wallet.direct_to.lock().unwrap() = Some(key);
     // The channel carries the 1 sat message alone, not admission before it.
     p.wallet.direct_capacity.store(1_500, Ordering::SeqCst);

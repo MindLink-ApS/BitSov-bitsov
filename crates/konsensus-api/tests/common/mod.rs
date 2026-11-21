@@ -62,10 +62,27 @@ pub struct MemStorage {
     pub peer_upsert_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub peer_delete_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub call_block_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub outbox_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub call_offer_dispatch_gate: Mutex<Option<Arc<PeerWriteGate>>>,
     pub fail_call_get_for: Mutex<Option<String>>,
     pub fail_call_put_for: Mutex<Option<String>>,
+    /// The next write of this call lands, but reports a failure (a lost acknowledgement).
+    pub lose_call_put_ack_for: Mutex<Option<String>>,
+    /// Runs once, before the next read of an outbox operation.
+    pub outbox_read_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub call_get_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Parks the next read of this call, after reading it, until the gate is released.
+    pub call_get_gate: Mutex<Option<(String, Arc<PeerWriteGate>)>>,
+    /// Runs once, right after the next listing of pending call reservations.
+    pub call_pending_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once, on the next page of rows holding free-reply receipts before it is returned.
+    #[allow(clippy::type_complexity)]
+    pub receipt_page_hook: Mutex<Option<Box<dyn FnOnce(&mut konsensus_storage::FreeReplyReceiptPage) + Send>>>,
+    /// Runs before every outbox operation write; an error fails that write.
+    #[allow(clippy::type_complexity)]
+    pub outbox_write_hook: Mutex<Option<Box<dyn FnMut(&konsensus_storage::OutboxOperation) -> Result<(), StorageError> + Send>>>,
     calls: Mutex<HashMap<(NodeId, String), konsensus_core::payloads::call::CallEntry>>,
+    call_offers: Mutex<HashMap<(NodeId, String), MessageId>>,
     outbox: Mutex<HashMap<String, konsensus_storage::OutboxOperation>>,
     /// The channel-open / send-onchain / direct-payment operation ledger.
     operations: Mutex<HashMap<String, konsensus_storage::ChannelOpenOperation>>,
@@ -86,15 +103,44 @@ pub struct MemStorage {
 }
 
 impl MemStorage {
+    /// Move a stored call's deadline, as the clock passing it would.
+    #[allow(dead_code)]
+    pub fn set_call_deadline(&self, peer: &NodeId, call_id: &str, deadline_ms: u64) {
+        if let Some(entry) = self.calls.lock().unwrap().get_mut(&(*peer, call_id.to_string())) {
+            entry.deadline_ms = deadline_ms;
+        }
+    }
+
+    /// Replace a stored call row directly, as another task's committed write would.
+    #[allow(dead_code)]
+    pub fn set_call(&self, peer: &NodeId, call_id: &str, entry: konsensus_core::payloads::call::CallEntry) {
+        self.calls.lock().unwrap().insert((*peer, call_id.to_string()), entry);
+    }
+
+    /// A stored call's phase, read without the async storage path (from a hook).
+    #[allow(dead_code)]
+    pub fn call_phase(&self, peer: &NodeId, call_id: &str) -> Option<konsensus_core::payloads::call::Phase> {
+        self.calls.lock().unwrap().get(&(*peer, call_id.to_string())).map(|e| e.phase)
+    }
+
     pub fn new() -> Self {
         Self {
             peer_upsert_gate: Mutex::new(None),
             peer_delete_gate: Mutex::new(None),
             call_block_dispatch_gate: Mutex::new(None),
+            outbox_dispatch_gate: Mutex::new(None),
             call_offer_dispatch_gate: Mutex::new(None),
             fail_call_get_for: Mutex::new(None),
             fail_call_put_for: Mutex::new(None),
+            lose_call_put_ack_for: Mutex::new(None),
+            outbox_read_hook: Mutex::new(None),
+            call_get_hook: Mutex::new(None),
+            call_get_gate: Mutex::new(None),
+            call_pending_hook: Mutex::new(None),
+            receipt_page_hook: Mutex::new(None),
+            outbox_write_hook: Mutex::new(None),
             calls: Mutex::new(HashMap::new()),
+            call_offers: Mutex::new(HashMap::new()),
             outbox: Mutex::new(HashMap::new()),
             operations: Mutex::new(HashMap::new()),
             calendar: Mutex::new(HashMap::new()),
@@ -132,36 +178,105 @@ impl MemStorage {
 
 #[async_trait]
 impl Storage for MemStorage {
-    async fn call_get(&self, peer: &NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
-        if self.fail_call_get_for.lock().unwrap().as_deref() == Some(call_id) {
-            return Err(StorageError::Serialization("injected call read failure".into()));
+    async fn call_get(
+        &self,
+        peer: &NodeId,
+        call_id: &str,
+    ) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
+        let hook = self.call_get_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
         }
-        Ok(self.calls.lock().unwrap().get(&(*peer, call_id.to_owned())).cloned())
+        if self.fail_call_get_for.lock().unwrap().as_deref() == Some(call_id) {
+            return Err(StorageError::Serialization(
+                "injected call read failure".into(),
+            ));
+        }
+        let read = self
+            .calls
+            .lock()
+            .unwrap()
+            .get(&(*peer, call_id.to_owned()))
+            .cloned();
+        let gate = {
+            let mut gate = self.call_get_gate.lock().unwrap();
+            if gate.as_ref().is_some_and(|(id, _)| id == call_id) { gate.take() } else { None }
+        };
+        if let Some((_, gate)) = gate {
+            // Parked after the read: the caller gets the row as it was then.
+            gate.run().await?;
+        }
+        Ok(read)
     }
 
-    async fn call_put(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<(), StorageError> {
+    async fn call_put(
+        &self,
+        peer: &NodeId,
+        call_id: &str,
+        entry: &konsensus_core::payloads::call::CallEntry,
+    ) -> Result<(), StorageError> {
         if self.fail_call_put_for.lock().unwrap().as_deref() == Some(call_id) {
-            return Err(StorageError::Serialization("injected call write failure".into()));
+            return Err(StorageError::Serialization(
+                "injected call write failure".into(),
+            ));
         }
-        self.calls.lock().unwrap().insert((*peer, call_id.to_owned()), entry.clone());
+        self.calls
+            .lock()
+            .unwrap()
+            .insert((*peer, call_id.to_owned()), entry.clone());
+        let lost = {
+            let mut lose = self.lose_call_put_ack_for.lock().unwrap();
+            if lose.as_deref() == Some(call_id) { lose.take() } else { None }
+        };
+        if lost.is_some() {
+            return Err(StorageError::Serialization("injected lost call write acknowledgement".into()));
+        }
         Ok(())
     }
 
     /// No admission holds in memory: the grant alone, with the same fault hook.
-    async fn call_commit_admitted(&self, peer: &NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry, _id: &MessageId) -> Result<(), StorageError> {
+    async fn call_commit_admitted(
+        &self,
+        peer: &NodeId,
+        call_id: &str,
+        entry: &konsensus_core::payloads::call::CallEntry,
+        _id: &MessageId,
+    ) -> Result<(), StorageError> {
         self.call_put(peer, call_id, entry).await
     }
 
-    async fn call_delete(&self, peer: &NodeId, call_id: &str) -> Result<(), StorageError> {
-        self.calls.lock().unwrap().remove(&(*peer, call_id.to_owned()));
+    async fn call_offer_bind(&self, peer: &NodeId, call_id: &str, offer: &MessageId) -> Result<(), StorageError> {
+        let key = (*peer, call_id.to_owned());
+        if !self.calls.lock().unwrap().get(&key).is_some_and(|e| e.side == konsensus_core::payloads::call::Side::Caller) {
+            return Err(StorageError::Conversion("no caller call row to bind its offer to".into()));
+        }
+        self.call_offers.lock().unwrap().insert(key, *offer);
         Ok(())
     }
 
-    async fn call_counts(&self, peer: &NodeId, now: u64) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
+    async fn call_offer(&self, peer: &NodeId, call_id: &str) -> Result<Option<MessageId>, StorageError> {
+        Ok(self.call_offers.lock().unwrap().get(&(*peer, call_id.to_owned())).copied())
+    }
+
+    async fn call_delete(&self, peer: &NodeId, call_id: &str) -> Result<(), StorageError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .remove(&(*peer, call_id.to_owned()));
+        Ok(())
+    }
+
+    async fn call_counts(
+        &self,
+        peer: &NodeId,
+        now: u64,
+    ) -> Result<konsensus_core::payloads::call::CallCounts, StorageError> {
         use konsensus_core::payloads::call::{CallCounts, Phase};
         let mut counts = CallCounts::default();
         for ((p, _), entry) in self.calls.lock().unwrap().iter() {
-            let Some(entry) = entry.clone().at(now) else { continue };
+            let Some(entry) = entry.clone().at(now) else {
+                continue;
+            };
             if entry.pending.is_some() || entry.phase != Phase::Ended {
                 counts.open_total += 1;
                 counts.open_peer += u64::from(p == peer);
@@ -173,14 +288,67 @@ impl Storage for MemStorage {
         Ok(counts)
     }
 
-    async fn call_live(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.phase != konsensus_core::payloads::call::Phase::Ended)
-            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    async fn call_live(
+        &self,
+    ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
+    {
+        Ok(self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.phase != konsensus_core::payloads::call::Phase::Ended)
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
+            .collect())
     }
 
-    async fn call_pending(&self) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        Ok(self.calls.lock().unwrap().iter().filter(|(_, e)| e.pending.is_some())
-            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone())).collect())
+    async fn call_pending(
+        &self,
+    ) -> Result<Vec<(NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError>
+    {
+        let pending = self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| e.pending.is_some())
+            .map(|((peer, id), entry)| (*peer, id.clone(), entry.clone()))
+            .collect();
+        let hook = self.call_pending_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        Ok(pending)
+    }
+
+    async fn call_with_free_reply_receipts(
+        &self,
+        after: Option<(&[u8], &[u8])>,
+        max: u32,
+    ) -> Result<konsensus_storage::FreeReplyReceiptPage, StorageError>
+    {
+        // Rows are held decoded in memory, so every listed row has its entry.
+        // An empty receipt list here is the SQL backends' NULL column: their
+        // writes store no receipts as NULL, never as an empty list, so this
+        // filter and their `IS NOT NULL` list the same rows.
+        let mut rows: Vec<konsensus_storage::FreeReplyReceiptRow> = self
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((peer, id), e)| !e.free_reply_receipts.is_empty()
+                && after.is_none_or(|(p, c)| (peer.to_hex().as_bytes(), id.as_bytes()) > (p, c)))
+            .map(|((peer, id), entry)| (peer.to_hex(), id.clone(), Some((*peer, entry.clone()))))
+            .collect();
+        rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        rows.truncate(max as usize);
+        let last_key = rows.last().map(|(p, c, _)| (p.clone().into_bytes(), c.clone().into_bytes()));
+        let mut page = konsensus_storage::FreeReplyReceiptPage { scanned: rows.len(), last_key, rows };
+        let hook = self.receipt_page_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(&mut page);
+        }
+        Ok(page)
     }
 
     async fn insert_channel_open_operation(
@@ -267,6 +435,18 @@ impl Storage for MemStorage {
         &self,
         op: &konsensus_storage::OutboxOperation,
     ) -> Result<bool, StorageError> {
+        // Taken out while it runs: a hook that panics (a node stopping) leaves
+        // no poisoned lock behind.
+        let hook = self.outbox_write_hook.lock().unwrap().take();
+        if let Some(mut hook) = hook {
+            let result = hook(op);
+            *self.outbox_write_hook.lock().unwrap() = Some(hook);
+            result?;
+        }
+        let dispatching = op.state == "paying" && serde_json::from_slice::<serde_json::Value>(&op.recovery)
+            .is_ok_and(|data| data["dispatched"] == true);
+        let gate = if dispatching { self.outbox_dispatch_gate.lock().unwrap().take() } else { None };
+        if let Some(gate) = gate { gate.run().await?; }
         let dispatched = op.kind == 404 && serde_json::from_slice::<serde_json::Value>(&op.recovery)
             .is_ok_and(|data| data["dispatched"] == true);
         let gate = if dispatched { self.call_block_dispatch_gate.lock().unwrap().take() } else { None };
@@ -291,6 +471,10 @@ impl Storage for MemStorage {
         &self,
         id: &str,
     ) -> Result<Option<konsensus_storage::OutboxOperation>, StorageError> {
+        let hook = self.outbox_read_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         Ok(self.outbox.lock().unwrap().get(id).cloned())
     }
     async fn list_recoverable_operations(
@@ -1116,6 +1300,125 @@ impl ChainProvider for StubChain {
     }
 }
 
+/// A chain source at height 850 000 that answers `ok_reads` tip reads and
+/// then fails every one. Counts all tip reads. Other reads work as
+/// [`StubChain`]'s.
+pub struct TipDownChain {
+    pub read_gate: Mutex<Option<Arc<PeerWriteGate>>>,
+    pub ok_reads: std::sync::atomic::AtomicUsize,
+    pub reads: std::sync::atomic::AtomicUsize,
+    /// When down, answer height 0 instead of an error.
+    pub zero: bool,
+}
+
+impl TipDownChain {
+    /// Down from the first read.
+    pub fn down() -> Self {
+        Self::after(0)
+    }
+    /// Up for `ok_reads` tip reads, then down.
+    pub fn after(ok_reads: usize) -> Self {
+        Self {
+            read_gate: Mutex::new(None),
+            ok_reads: std::sync::atomic::AtomicUsize::new(ok_reads),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            zero: false,
+        }
+    }
+    /// Answers height 0 from the first read: an unknown tip, not a height.
+    pub fn zero() -> Self {
+        Self {
+            zero: true,
+            ..Self::down()
+        }
+    }
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ChainProvider for TipDownChain {
+    fn trust_level(&self) -> TrustLevel {
+        TrustLevel::FullValidation
+    }
+    async fn get_block_height(&self) -> Result<u64, ChainError> {
+        use std::sync::atomic::Ordering;
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        let gate = self.read_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.run().await.map_err(|e| ChainError::Connection(e.to_string()))?;
+        }
+        // Tests read the tip from one task at a time.
+        let left = self.ok_reads.load(Ordering::SeqCst);
+        let up = left > 0;
+        if up {
+            self.ok_reads.store(left - 1, Ordering::SeqCst);
+        }
+        if up {
+            Ok(850_000)
+        } else if self.zero {
+            Ok(0)
+        } else {
+            Err(ChainError::Connection("chain source unreachable".into()))
+        }
+    }
+    async fn get_block_header(&self, height: u64) -> Result<BlockHeader, ChainError> {
+        StubChain.get_block_header(height).await
+    }
+    async fn estimate_fee(&self, target_blocks: u32) -> Result<FeeEstimate, ChainError> {
+        StubChain.estimate_fee(target_blocks).await
+    }
+    async fn is_tx_confirmed(
+        &self,
+        txid: &str,
+        min_confirmations: u32,
+    ) -> Result<bool, ChainError> {
+        StubChain.is_tx_confirmed(txid, min_confirmations).await
+    }
+    async fn is_synced(&self) -> bool {
+        true
+    }
+}
+
+/// A `not_ready` refusal because the local chain tip could not be read.
+pub fn assert_chain_not_ready(status: u16, body: &serde_json::Value) {
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["code"], "not_ready", "{body}");
+    assert_eq!(body["reason"], "chain_unavailable", "{body}");
+    assert_eq!(body["retry_allowed"], true, "{body}");
+    // About the chain source, not the wallet.
+    assert!(
+        body["error"].as_str().unwrap().contains("chain source"),
+        "{body}"
+    );
+    assert!(body.get("money_ready").is_none(), "{body}");
+}
+
+/// A pricing engine that always answers like a chain-aware engine without a
+/// usable tip.
+pub struct ChainlessPricing;
+
+#[async_trait]
+impl PricingEngine for ChainlessPricing {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    async fn get_price_msat(&self, _kind: u16) -> Result<u64, PricingError> {
+        Err(PricingError::ChainUnavailable(
+            "chain tip unavailable".into(),
+        ))
+    }
+    async fn get_category_price_msat(
+        &self,
+        _category: konsensus_core::kind::KindCategory,
+    ) -> Result<u64, PricingError> {
+        Err(PricingError::ChainUnavailable(
+            "chain tip unavailable".into(),
+        ))
+    }
+}
+
 // ─── Stub: Pricing Engine ───────────────────────────────────────────
 
 pub struct StubPricing;
@@ -1223,13 +1526,14 @@ pub fn test_state() -> Arc<AppState> {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1252,6 +1556,7 @@ pub fn test_state() -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1292,13 +1597,14 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1321,6 +1627,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1349,13 +1656,14 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1378,6 +1686,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1416,13 +1725,14 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1445,6 +1755,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1473,13 +1784,14 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1502,6 +1814,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1758,13 +2071,14 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1787,6 +2101,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1852,7 +2167,7 @@ pub async fn store_test_message_with_plaintext(
     state.storage.store_message(&envelope).await.unwrap();
 
     let encrypted = test_plaintext_cipher()
-        .encrypt(plaintext.as_bytes())
+        .encrypt(&msg_id, plaintext.as_bytes())
         .unwrap();
     state
         .storage
@@ -2021,13 +2336,14 @@ pub fn test_state_with_lightning_and_storage(
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -2050,6 +2366,7 @@ pub fn test_state_with_lightning_and_storage(
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2068,7 +2385,8 @@ pub struct FlakySessionStore {
 
 impl FlakySessionStore {
     pub fn fail_all(&self, fail: bool) {
-        self.fail_all.store(fail, std::sync::atomic::Ordering::SeqCst);
+        self.fail_all
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
     pub fn fail_peer(&self, peer: Option<NodeId>) {
         *self.fail_peer.lock().unwrap() = peer;
@@ -2077,17 +2395,29 @@ impl FlakySessionStore {
 
 #[async_trait]
 impl konsensus_crypto::SessionStore for FlakySessionStore {
-    async fn save_session(&self, peer: &NodeId, state: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) || *self.fail_peer.lock().unwrap() == Some(*peer) {
+    async fn save_session(
+        &self,
+        peer: &NodeId,
+        state: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self.fail_all.load(std::sync::atomic::Ordering::SeqCst)
+            || *self.fail_peer.lock().unwrap() == Some(*peer)
+        {
             return Err("test: disk full".into());
         }
         self.data.lock().unwrap().insert(*peer, state.to_vec());
         Ok(())
     }
-    async fn load_session(&self, peer: &NodeId) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    async fn load_session(
+        &self,
+        peer: &NodeId,
+    ) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(self.data.lock().unwrap().get(peer).cloned())
     }
-    async fn delete_session(&self, peer: &NodeId) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn delete_session(
+        &self,
+        peer: &NodeId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.data.lock().unwrap().remove(peer);
         Ok(())
     }

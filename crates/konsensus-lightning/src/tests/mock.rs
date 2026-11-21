@@ -624,6 +624,56 @@ async fn routing_fee_limit_refuses_before_debit_and_settles_actual_fee() {
 }
 
 #[tokio::test]
+async fn purge_expired_pending_invoices_removes_unpaid_and_keeps_settled() {
+    let provider = MockLightningProvider::new();
+    let unpaid = provider.create_invoice(1_000, "unpaid", 120).await.unwrap();
+    let settled = provider
+        .create_invoice(1_000, "settled", 120)
+        .await
+        .unwrap();
+    provider.pay_invoice(&settled.bolt11).await.unwrap();
+
+    assert_eq!(
+        provider
+            .purge_expired_pending_invoices(unpaid.created_at.saturating_add(30))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        provider
+            .get_payment_status(&unpaid.payment_hash)
+            .await
+            .unwrap()
+            .status,
+        PaymentStatus::Pending
+    );
+
+    assert_eq!(
+        provider
+            .purge_expired_pending_invoices(
+                settled
+                    .created_at
+                    .max(unpaid.created_at)
+                    .saturating_add(120),
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        provider.get_payment_status(&unpaid.payment_hash).await,
+        Err(LightningError::PaymentNotFound(_))
+    ));
+    let kept = provider
+        .get_payment_status(&settled.payment_hash)
+        .await
+        .unwrap();
+    assert_eq!(kept.status, PaymentStatus::Settled);
+    assert_eq!(kept.direction, PaymentDirection::Incoming);
+}
+
+#[tokio::test]
 async fn unsupported_channel_push_is_never_dispatched() {
     let provider = MockLightningProvider::new();
     for push in [0, 10_000_000] {

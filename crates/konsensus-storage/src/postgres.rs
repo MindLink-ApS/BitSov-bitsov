@@ -27,6 +27,38 @@ pub struct PostgresStorage {
 }
 
 impl PostgresStorage {
+    async fn load_message_record(
+        &self,
+        id: &MessageId,
+        include_held: bool,
+    ) -> Result<Option<UkmEnvelope>, StorageError> {
+        let id_hex = id.to_hex();
+
+        let row = sqlx::query_as::<_, (
+            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
+            String, String,
+        )>(
+            "SELECT id, kind::BIGINT, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
+             FROM messages WHERE id = $1 AND ($2 OR id NOT IN (SELECT message_id FROM call_admission_hold))",
+        )
+        .bind(&id_hex)
+        .bind(include_held)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let envelope = row_to_envelope(
+                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
+                    &r.12,
+                )?;
+                Ok(Some(envelope))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Connect to a PostgreSQL database and run migrations.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
         let pool = PgPoolOptions::new()
@@ -117,16 +149,26 @@ impl PostgresStorage {
         unknown
     }
 
+    /// Postgres 007–009 were registered only on an unreleased head, then withdrawn.
+    /// Version 033 repairs that catalog. A database that already recorded 007–009
+    /// must still start; those numbers are not a schema from a newer binary.
+    const WITHDRAWN_PG_VERSIONS: [i32; 3] = [7, 8, 9];
+
     fn refuse_future_schema(applied: &[i32]) -> Result<(), StorageError> {
-        let known: Vec<i32> = Self::pg_migrations()
+        let mut known: Vec<i32> = Self::pg_migrations()
             .iter()
             .map(|(version, _, _)| *version)
             .collect();
+        known.extend(Self::WITHDRAWN_PG_VERSIONS);
         let versions = Self::unknown_applied_migrations(applied, &known);
         if versions.is_empty() {
             return Ok(());
         }
-        let max_known = known.iter().copied().max().unwrap_or(0);
+        let max_known = Self::pg_migrations()
+            .iter()
+            .map(|(version, _, _)| *version)
+            .max()
+            .unwrap_or(0);
         Err(StorageError::FutureSchema {
             versions,
             max_known,
@@ -479,9 +521,20 @@ impl PostgresStorage {
     (30, "channel open operations", include_str!("../migrations/postgres/030_channel_open_operations.sql")),
     (31, "starter requests", include_str!("../migrations/postgres/031_starter_requests.sql")),
     (32, "starter queries", include_str!("../migrations/postgres/032_starter_queries.sql")),
+            (
+                33,
+                "calendar and schema parity",
+                include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql"),
+            ),
+    // 034 stays unused. Main reserved it for the call-invite work and shipped 035–037 around that gap.
     (35, "call blocks", include_str!("../migrations/035_call_blocks.sql")),
     (36, "call unpaid notice", include_str!("../migrations/036_call_unpaid_notice.sql")),
     (37, "call block invoices", include_str!("../migrations/037_call_block_invoices.sql")),
+    (38, "envelope deferrals", include_str!("../migrations/038_envelope_deferrals.sql")),
+    (39, "envelope deferral expiry", include_str!("../migrations/039_envelope_deferral_expiry.sql")),
+    (40, "call media detach intents", include_str!("../migrations/postgres/040_call_media_detach_intents.sql")),
+    (41, "call offer binding", include_str!("../migrations/041_call_offer_binding.sql")),
+    (42, "call free reply receipts", include_str!("../migrations/042_call_free_reply_receipts.sql")),
         ]
     }
 
@@ -689,8 +742,7 @@ const ROOM_MEMBERS_SELECT: &str =
 // classification (AUTHORITY / correctness-complete / WHERE-scoped read-surface):
 // none of these queries may grow a bare `LIMIT`, which would re-create the
 // DBH1/DBH2 silent fail-open. The `hard4_guard` test below asserts no `LIMIT`
-// regresses in. Postgres has no `list_fiat_rate_snapshots` impl (it falls back
-// to the trait default), so that constant lives only in `sqlite.rs`.
+// regresses in. `list_fiat_rate_snapshots` is range-scoped the same way as SQLite.
 
 /// `get_pending_for_peer` — AUTHORITY. Per-peer outbound delivery queue; the
 /// pending-delivery flusher must see the complete queue. WHERE-scoped to one
@@ -744,6 +796,15 @@ const CALENDAR_EXCEPTIONS_IN_RANGE_SELECT: &str =
      WHERE parent_id IS NOT NULL AND start_ms < $2 AND end_ms > $1
      ORDER BY start_ms ASC";
 
+/// `list_fiat_rate_snapshots` — READ-SURFACE, range-scoped. Bounded by the
+/// caller's `[from_date, to_date]` window. Must return every row inside the
+/// window — no bare `LIMIT`.
+const FIAT_RATE_SNAPSHOTS_SELECT: &str =
+    "SELECT date, currency, rate, source, created_at
+     FROM fiat_rate_snapshots
+     WHERE date >= $1 AND date <= $2
+     ORDER BY date DESC, currency ASC";
+
 /// `list_operator_hosting_contracts` — AUTHORITY (money-path). The daily payment
 /// task iterates every contract; a cap silently skips paying tenants. If a
 /// memory bound is ever needed it MUST be streaming/chunked, never a bare
@@ -760,17 +821,297 @@ const OPERATOR_HOSTING_PAYMENTS_SELECT: &str =
      FROM operator_hosting_payments
      WHERE contract_id = $1
      ORDER BY paid_at DESC";
+/// Read a `TIMESTAMPTZ` column into an RFC 3339 string field (`Peer::last_seen`,
+/// `Room::created_at`): UTC with microseconds, the full precision Postgres
+/// stores. NULL stays NULL. Writes to these columns cast the bound text with
+/// `::timestamptz`.
+macro_rules! utc_rfc3339 {
+    ($column:literal) => {
+        concat!(
+            "to_char(",
+            $column,
+            " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')"
+        )
+    };
+}
+
 /// Peer-listing query for the Postgres backend. Returns ALL peers — deliberately
 /// **no `LIMIT`** (DBH1), mirroring the SQLite backend. The `peers` table is the
 /// durable gate-whitelist authority (boot-loaded via `merge_persisted_peers`) and
 /// the RV-RESTORE backup source; a cap here is a Principle-2 fail-open at scale.
 /// CI has no Postgres service, so this path is guarded by code symmetry with
 /// SQLite plus the `dbh1_guard` string-assertion test below — not a live query.
-const PEERS_SELECT: &str =
-    "SELECT node_id, address, last_seen, display_name, metadata_json FROM peers ORDER BY node_id";
+const PEERS_SELECT: &str = concat!(
+    "SELECT node_id, address, ",
+    utc_rfc3339!("last_seen"),
+    ", display_name, metadata_json FROM peers ORDER BY node_id"
+);
+
+impl PostgresStorage {
+    async fn commit_outbox_envelope_inner(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope, previous: Option<&MessageId>, plaintext_enc: Option<&[u8]>) -> Result<bool, StorageError> {
+        if op.state != "paid" || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str()) || envelope.recipient != Recipient::Node(NodeId::from_hex(&op.recipient).map_err(|e| StorageError::Conversion(e.to_string()))?) {
+            return Err(StorageError::Conversion("invalid paid operation binding".into()));
+        }
+        let mut tx = self.pool.begin().await?;
+
+        if let Some(previous) = previous {
+            let current: Option<crate::OutboxOperation> = sqlx::query_as("SELECT operation_id, recipient, kind, request_hash, state, payment_hash, admission_payment_hash, message_id, settled_msat, readmission_msat, created_at, updated_at, last_sent_at, attempts, last_error, version, recovery, accounting_pending, recovery_compacted FROM outbox_operations WHERE operation_id = $1")
+                .bind(&op.operation_id).fetch_optional(&mut *tx).await?;
+            let Some(current) = current else { tx.rollback().await?; return Ok(false); };
+            if !crate::outbox::validate_handover_replacement(&current, op, previous, envelope)? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+            let refs: Vec<String> = envelope.references.iter().map(|id| id.to_hex()).collect();
+            let matches: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages m JOIN pending_deliveries p ON p.message_id = m.id WHERE m.id = $1 AND m.sender = $2 AND m.kind = $3 AND m.recipient_type = $4 AND m.recipient_id = $5 AND m.payment_hash = $6 AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10 AND p.recipient_id = $11 AND p.dispatched = 1 AND p.state != 'failed_paid' AND p.rejection_reason = $12")
+                .bind(previous.to_hex()).bind(envelope.sender.to_hex()).bind(i64::from(envelope.kind))
+                .bind(rtype).bind(&rid).bind(hex::encode(envelope.payment_proof.payment_hash))
+                .bind(hex::encode(envelope.payment_proof.preimage)).bind(op.settled_msat)
+                .bind(hex::encode(envelope.nonce.as_bytes()))
+                .bind(serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?)
+                .bind(&op.recipient).bind(&current.last_error).fetch_one(&mut *tx).await?;
+            if matches != 1 {
+                return Err(StorageError::Conversion("deferred envelope binding changed".into()));
+            }
+            // Remove the old dispatch authority before publishing a new ID. A
+            // concurrent old ACK either wins the operation CAS or has no row.
+            sqlx::query("DELETE FROM pending_deliveries WHERE message_id = $1 AND recipient_id = $2")
+                .bind(previous.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        }
+        let changed = sqlx::query("UPDATE outbox_operations SET state = $1, payment_hash = $2, admission_payment_hash = $3, message_id = $4, settled_msat = $5, readmission_msat = $6, updated_at = $7, last_sent_at = $8, attempts = $9, last_error = $10, recovery = $11, accounting_pending = $12, recovery_compacted = $13, version = version + 1 WHERE operation_id = $14 AND version = $15")
+            .bind(&op.state)
+            .bind(&op.payment_hash)
+            .bind(&op.admission_payment_hash)
+            .bind(&op.message_id)
+            .bind(op.settled_msat)
+            .bind(op.readmission_msat)
+            .bind(op.updated_at)
+            .bind(op.last_sent_at)
+            .bind(op.attempts)
+            .bind(&op.last_error)
+            .bind(&op.recovery)
+            .bind(op.accounting_pending)
+            .bind(op.recovery_compacted)
+            .bind(&op.operation_id).bind(op.version)
+            .execute(&mut *tx).await?.rows_affected() == 1;
+        if !changed { tx.rollback().await?; return Ok(false); }
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ts = i64::try_from(envelope.timestamp)
+            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ciphertext = &envelope.ciphertext;
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let sig = hex::encode(envelope.signature.as_bytes());
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        sqlx::query(
+            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json, plaintext_enc) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(&sender)
+        .bind(rtype)
+        .bind(&rid)
+        .bind(ts)
+        .bind(ciphertext)
+        .bind(&ph)
+        .bind(&pi)
+        .bind(amt)
+        .bind(&sig)
+        .bind(&nonce)
+        .bind(&refs_json)
+        .bind(plaintext_enc)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
+        if let Some(previous) = previous {
+            sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
+                .bind(previous.to_hex()).bind(&sender).execute(&mut *tx).await?;
+        }
+        // A paid web request binds its reply in the same transaction as its
+        // envelope: no crash window between "paid and queued" and "reply bindable".
+        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
+            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
+                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
+                .execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+}
+
+impl PostgresStorage {
+    /// `require_hold`: a held kind (call signal, candidate room chat,
+    /// calendar) is accepted fresh only while its admission hold exists. The
+    /// hold row is locked first, before the paid-identity advisory lock, the
+    /// same hold-first order as the hold sweep, the withdrawal and the
+    /// calendar admission. Only `readable` acceptance may require the hold.
+    async fn accept_paid_envelope_inner(&self, envelope: &UkmEnvelope, readable: bool, require_hold: bool) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+        use crate::PaidAcceptance::*;
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ts = i64::try_from(envelope.timestamp)
+            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
+        let ciphertext = &envelope.ciphertext;
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let sig = hex::encode(envelope.signature.as_bytes());
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let mut tx = self.pool.begin().await?;
+        // Hold-first lock order, shared with the sweep, the withdrawal and the
+        // calendar admission; none of them takes the advisory lock below.
+        let hold_locked = if require_hold {
+            sqlx::query_as::<_, (String,)>("SELECT message_id FROM call_admission_hold WHERE message_id = $1 FOR UPDATE")
+                .bind(&id).fetch_optional(&mut *tx).await?.is_some()
+        } else {
+            false
+        };
+        // Acceptance and deferral serialize on the same paid identity.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&ph).execute(&mut *tx).await?;
+        let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+            .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
+        let deferred: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = $1 AND sender = $2 AND payment_hash = $3 AND expires_at_ms > $4)")
+            .bind(&id).bind(&sender).bind(&ph).bind(crate::traits::deferral_now_ms()).fetch_one(&mut *tx).await?;
+        if deferred {
+            tx.rollback().await?;
+            return Err(StorageError::Conversion("envelope deferred for session recovery".into()));
+        }
+        let healing = receipt.rows_affected() == 0;
+        if healing {
+            // Serialize legacy healers on the receipt binding (SQLite already
+            // holds the writer lock from the INSERT above).
+            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = $1 FOR UPDATE")
+                .bind(&ph).fetch_one(&mut *tx).await?;
+            if binding.0 != id || binding.1 != sender {
+                tx.rollback().await?;
+                return Ok(Some(PaymentReused));
+            }
+            // The same envelope, refused and withdrawn by the application: its
+            // sender is told so again, never that its proof belongs to another.
+            if binding.2 == -1 {
+                tx.rollback().await?;
+                return Ok(Some(Withdrawn));
+            }
+            // Receipt metadata is independent of retained message content and
+            // excludes only the timestamp/signature wrapper refreshed on retry.
+            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = 1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if durable == 1 {
+                tx.rollback().await?;
+                return Ok(Some(AlreadyAccepted));
+            }
+            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.accepted IN (0, 1) AND r.payment_hash = $1 AND r.message_id = $2 AND r.sender = $3 AND m.sender = r.sender AND m.kind = $4 AND m.recipient_type = $5 AND m.recipient_id = $6 AND m.payment_hash = r.payment_hash AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10")
+                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+                .fetch_one(&mut *tx).await?;
+            if matched == 1 {
+                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
+                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+                tx.commit().await?;
+                return Ok(Some(AlreadyAccepted));
+            }
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = $1")
+                .bind(&id).fetch_one(&mut *tx).await?;
+            if exists != 0 || binding.2 != 0 {
+                tx.rollback().await?;
+                return Ok(Some(PaymentReused));
+            }
+            // Full gate validation precedes this transaction. The receipt
+            // binds this paid identity; repair only its missing message row.
+        }
+        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = $1")
+                .bind(&nonce).fetch_one(&mut *tx).await?;
+            if !healing || owner != sender {
+                tx.rollback().await?;
+                return Ok(Some(NonceReused));
+            }
+        }
+        if !readable {
+            // Classify the existing receipt/nonce using the same transaction as
+            // acceptance, but leave fresh and resumable legacy proofs untouched.
+            // This also rolls back speculative receipt and nonce inserts.
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        // A held kind is accepted fresh only under its admission hold: the hold
+        // sweep may have withdrawn an expired or inherited hold between the hold
+        // and this acceptance, and an unheld acceptance would never be admitted
+        // yet be replay-acknowledged. The hold row was locked first, above.
+        if require_hold && !hold_locked {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
+        sqlx::query(
+            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
+             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(&sender)
+        .bind(rtype)
+        .bind(&rid)
+        .bind(ts)
+        .bind(ciphertext)
+        .bind(&ph)
+        .bind(&pi)
+        .bind(amt)
+        .bind(&sig)
+        .bind(&nonce)
+        .bind(&refs_json)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
+            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM envelope_deferrals WHERE payment_hash = $1")
+            .bind(&ph).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Some(Accepted))
+    }
+
+}
 
 #[async_trait]
 impl Storage for PostgresStorage {
+    async fn record_upgrade_rows(&self, table: crate::record_upgrade::RecordTable, after: Option<&str>, limit: u32) -> Result<Vec<crate::record_upgrade::RecordRow>, StorageError> {
+        crate::record_upgrade::postgres::rows(&self.pool, table, after, limit).await
+    }
+    async fn record_upgrade_row(&self, table: crate::record_upgrade::RecordTable, id: &str) -> Result<Option<crate::record_upgrade::RecordRow>, StorageError> {
+        crate::record_upgrade::postgres::row(&self.pool, table, id).await
+    }
+    async fn record_upgrade_replace(&self, table: crate::record_upgrade::RecordTable, old: &crate::record_upgrade::RecordRow, new: &crate::record_upgrade::RecordRow) -> Result<bool, StorageError> {
+        crate::record_upgrade::postgres::replace(&self.pool, table, old, new).await
+    }
+
     async fn starter_request_get(&self, id: &str) -> Result<Option<crate::starter_request::StarterRequest>, StorageError> {
         crate::starter_request::postgres::get(&self.pool, id).await
     }
@@ -923,76 +1264,11 @@ impl Storage for PostgresStorage {
 
 
     async fn commit_outbox_envelope(&self, op: &crate::OutboxOperation, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
-        if op.state != "paid" || op.message_id.as_deref() != Some(envelope.id.to_hex().as_str()) || envelope.recipient != Recipient::Node(NodeId::from_hex(&op.recipient).map_err(|e| StorageError::Conversion(e.to_string()))?) {
-            return Err(StorageError::Conversion("invalid paid operation binding".into()));
-        }
-        let mut tx = self.pool.begin().await?;
-        let changed = sqlx::query("UPDATE outbox_operations SET state = $1, payment_hash = $2, admission_payment_hash = $3, message_id = $4, settled_msat = $5, readmission_msat = $6, updated_at = $7, last_sent_at = $8, attempts = $9, last_error = $10, recovery = $11, accounting_pending = $12, recovery_compacted = $13, version = version + 1 WHERE operation_id = $14 AND version = $15")
-            .bind(&op.state)
-            .bind(&op.payment_hash)
-            .bind(&op.admission_payment_hash)
-            .bind(&op.message_id)
-            .bind(op.settled_msat)
-            .bind(op.readmission_msat)
-            .bind(op.updated_at)
-            .bind(op.last_sent_at)
-            .bind(op.attempts)
-            .bind(&op.last_error)
-            .bind(&op.recovery)
-            .bind(op.accounting_pending)
-            .bind(op.recovery_compacted)
-            .bind(&op.operation_id).bind(op.version)
-            .execute(&mut *tx).await?.rows_affected() == 1;
-        if !changed { tx.rollback().await?; return Ok(false); }
-        let id = envelope.id.to_hex();
-        let kind = i64::from(envelope.kind);
-        let sender = envelope.sender.to_hex();
-        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ts = i64::try_from(envelope.timestamp)
-            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
-        let ciphertext = &envelope.ciphertext;
-        let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
-        let sig = hex::encode(envelope.signature.as_bytes());
-        let nonce = hex::encode(envelope.nonce.as_bytes());
-        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
-        let refs_json =
-            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        self.commit_outbox_envelope_inner(op, envelope, None, None).await
+    }
 
-        sqlx::query(
-            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
-        )
-        .bind(&id)
-        .bind(kind)
-        .bind(&sender)
-        .bind(rtype)
-        .bind(&rid)
-        .bind(ts)
-        .bind(ciphertext)
-        .bind(&ph)
-        .bind(&pi)
-        .bind(amt)
-        .bind(&sig)
-        .bind(&nonce)
-        .bind(&refs_json)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("INSERT INTO pending_deliveries (message_id, recipient_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-            .bind(envelope.id.to_hex()).bind(&op.recipient).execute(&mut *tx).await?;
-        // A paid web request binds its reply in the same transaction as its
-        // envelope: no crash window between "paid and queued" and "reply bindable".
-        if let Some(row) = crate::outstanding_web_request_row(envelope)? {
-            sqlx::query("INSERT INTO outstanding_web_requests (payment_hash, request_id, peer, expected_reply_kind, expires_at_ms) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(payment_hash) DO UPDATE SET request_id = excluded.request_id, peer = excluded.peer, expected_reply_kind = excluded.expected_reply_kind, expires_at_ms = excluded.expires_at_ms")
-                .bind(row.payment_hash).bind(row.request_id).bind(row.peer).bind(row.expected_reply_kind).bind(row.expires_at_ms)
-                .execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        Ok(true)
+    async fn replace_outbox_envelope(&self, op: &crate::OutboxOperation, previous: &MessageId, envelope: &UkmEnvelope, plaintext_enc: Option<&[u8]>) -> Result<bool, StorageError> {
+        self.commit_outbox_envelope_inner(op, envelope, Some(previous), plaintext_enc).await
     }
 
     async fn store_message(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
@@ -1087,6 +1363,51 @@ impl Storage for PostgresStorage {
         Ok(durable == 1)
     }
 
+    async fn call_invite_outcome(&self, envelope: &UkmEnvelope) -> Result<Option<crate::CallInviteOutcome>, StorageError> {
+        if envelope.kind != konsensus_core::kind::KIND_CALL_INVITE { return Ok(None); }
+        let id = envelope.id.to_hex();
+        let kind = i64::from(envelope.kind);
+        let sender = envelope.sender.to_hex();
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let ph = hex::encode(envelope.payment_proof.payment_hash);
+        let pi = hex::encode(envelope.payment_proof.preimage);
+        let amt = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
+        let nonce = hex::encode(envelope.nonce.as_bytes());
+        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
+        let refs_json =
+            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let value: Option<i32> = sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE (accepted <> 1 OR message_id NOT IN (SELECT message_id FROM call_admission_hold)) AND payment_hash = $1 AND message_id = $2 AND sender = $3 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
+            .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
+            .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
+            .fetch_optional(&self.pool).await?;
+        Ok(value.and_then(crate::CallInviteOutcome::from_stored))
+    }
+
+    async fn call_invite_set_outcome(&self, id: &MessageId, peer: &NodeId, outcome: crate::CallInviteOutcome) -> Result<(), StorageError> {
+        sqlx::query("UPDATE payment_receipts SET accepted = $1 WHERE message_id = $2 AND sender = $3 AND kind = 400 AND accepted IN (1, -2)")
+            .bind(outcome.stored()).bind(id.to_hex()).bind(peer.to_hex()).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn call_invite_recover(&self, max: u32) -> Result<Vec<(MessageId, NodeId)>, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        // Holds make a partial/failed startup cleanup invisible to readers.
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT message_id, sender, 0 FROM payment_receipts WHERE kind = 400 AND accepted = -2 ORDER BY message_id LIMIT $1 ON CONFLICT DO NOTHING")
+            .bind(i64::from(max)).execute(&mut *tx).await?;
+        let done: Vec<(String, String)> = sqlx::query_as("UPDATE payment_receipts SET accepted = -3 WHERE kind = 400 AND accepted = -2 AND message_id IN (SELECT message_id FROM call_admission_hold) RETURNING message_id, sender")
+            .fetch_all(&mut *tx).await?;
+        sqlx::query("DELETE FROM messages WHERE id IN (SELECT r.message_id FROM payment_receipts r JOIN call_admission_hold h ON h.message_id = r.message_id WHERE r.kind = 400 AND r.accepted = -3)")
+            .execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM call_admission_hold WHERE message_id IN (SELECT r.message_id FROM payment_receipts r JOIN call_admission_hold h ON h.message_id = r.message_id WHERE r.kind = 400 AND r.accepted = -3)")
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        done.iter()
+            .map(|(id, sender)| Ok((MessageId::from_hex(id).map_err(|e| StorageError::Conversion(e.to_string()))?, NodeId::from_hex(sender).map_err(|e| StorageError::Conversion(e.to_string()))?)))
+            .collect()
+    }
+
     async fn is_paid_envelope_accepted(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
         let id = envelope.id.to_hex();
         let kind = i64::from(envelope.kind);
@@ -1106,7 +1427,7 @@ impl Storage for PostgresStorage {
             .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
             .fetch_one(&self.pool).await?;
         if durable == 1 { return Ok(true); }
-        let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.message_id NOT IN (SELECT message_id FROM call_admission_hold) AND r.payment_hash = $1 AND r.message_id = $2 AND r.sender = $3 AND m.sender = r.sender AND m.kind = $4 AND m.recipient_type = $5 AND m.recipient_id = $6 AND m.payment_hash = r.payment_hash AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10")
+        let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.accepted IN (0, 1) AND r.message_id NOT IN (SELECT message_id FROM call_admission_hold) AND r.payment_hash = $1 AND r.message_id = $2 AND r.sender = $3 AND m.sender = r.sender AND m.kind = $4 AND m.recipient_type = $5 AND m.recipient_id = $6 AND m.payment_hash = r.payment_hash AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10")
             .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
             .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
             .fetch_one(&self.pool).await?;
@@ -1126,108 +1447,82 @@ impl Storage for PostgresStorage {
         Ok(true)
     }
 
-    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
-        use crate::PaidAcceptance::*;
+    async fn defer_unreadable_envelope(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        use crate::traits::{deferral_now_ms, DEFERRAL_CLEANUP_BATCH, ENVELOPE_DEFERRAL_TTL_MS, MAX_DEFERRALS_PER_PROOF, MAX_DEFERRALS_PER_SENDER};
         let id = envelope.id.to_hex();
-        let kind = i64::from(envelope.kind);
         let sender = envelope.sender.to_hex();
-        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
-        let ts = i64::try_from(envelope.timestamp)
-            .map_err(|_| StorageError::Conversion(format!("timestamp overflows i64: {}", envelope.timestamp)))?;
-        let ciphertext = &envelope.ciphertext;
         let ph = hex::encode(envelope.payment_proof.payment_hash);
-        let pi = hex::encode(envelope.payment_proof.preimage);
-        let amt = i64::try_from(envelope.payment_proof.amount_msat)
-            .map_err(|_| StorageError::Conversion(format!("amount_msat overflows i64: {}", envelope.payment_proof.amount_msat)))?;
-        let sig = hex::encode(envelope.signature.as_bytes());
-        let nonce = hex::encode(envelope.nonce.as_bytes());
-        let refs: Vec<String> = envelope.references.iter().map(|r| r.to_hex()).collect();
-        let refs_json =
-            serde_json::to_string(&refs).map_err(|e| StorageError::Serialization(e.to_string()))?;
-
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let amount = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
+        let now = deferral_now_ms();
+        let expires = now.saturating_add(ENVELOPE_DEFERRAL_TTL_MS).min(
+            i64::try_from(envelope.timestamp).unwrap_or(i64::MAX).saturating_add(ENVELOPE_DEFERRAL_TTL_MS));
+        if expires <= now { return Ok(false); }
         let mut tx = self.pool.begin().await?;
-        let receipt = sqlx::query("INSERT INTO payment_receipts (payment_hash, message_id, sender) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-            .bind(&ph).bind(&id).bind(&sender).execute(&mut *tx).await?;
-        let healing = receipt.rows_affected() == 0;
-        if healing {
-            // Serialize legacy healers on the receipt binding (SQLite already
-            // holds the writer lock from the INSERT above).
-            let binding: (String, String, i32) = sqlx::query_as("SELECT message_id, sender, accepted FROM payment_receipts WHERE payment_hash = $1 FOR UPDATE")
-                .bind(&ph).fetch_one(&mut *tx).await?;
-            if binding.0 != id || binding.1 != sender {
-                tx.rollback().await?;
-                return Ok(PaymentReused);
-            }
-            // The same envelope, refused and withdrawn by the application: its
-            // sender is told so again, never that its proof belongs to another.
-            if binding.2 == -1 {
-                tx.rollback().await?;
-                return Ok(Withdrawn);
-            }
-            // Receipt metadata is independent of retained message content and
-            // excludes only the timestamp/signature wrapper refreshed on retry.
-            let durable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = 1 AND kind = $4 AND recipient_type = $5 AND recipient_id = $6 AND preimage = $7 AND amount_msat = $8 AND nonce = $9 AND references_json = $10")
-                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
-                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
-                .fetch_one(&mut *tx).await?;
-            if durable == 1 {
-                tx.rollback().await?;
-                return Ok(AlreadyAccepted);
-            }
-            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts r JOIN messages m ON m.id = r.message_id WHERE r.payment_hash = $1 AND r.message_id = $2 AND r.sender = $3 AND m.sender = r.sender AND m.kind = $4 AND m.recipient_type = $5 AND m.recipient_id = $6 AND m.payment_hash = r.payment_hash AND m.preimage = $7 AND m.amount_msat = $8 AND m.nonce = $9 AND m.references_json = $10")
-                .bind(&ph).bind(&id).bind(&sender).bind(kind).bind(rtype).bind(&rid)
-                .bind(&pi).bind(amt).bind(&nonce).bind(&refs_json)
-                .fetch_one(&mut *tx).await?;
-            if matched == 1 {
-                sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
-                    .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
-                tx.commit().await?;
-                return Ok(AlreadyAccepted);
-            }
-            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = $1")
-                .bind(&id).fetch_one(&mut *tx).await?;
-            if exists != 0 || binding.2 != 0 {
-                tx.rollback().await?;
-                return Ok(PaymentReused);
-            }
-            // Full gate validation precedes this transaction. The receipt
-            // binds this paid identity; repair only its missing message row.
-        }
-        let inserted = sqlx::query("INSERT INTO nonces (nonce_hex, sender) VALUES ($1, $2) ON CONFLICT DO NOTHING")
-            .bind(&nonce).bind(&sender).execute(&mut *tx).await?;
-        if inserted.rows_affected() == 0 {
-            let owner: String = sqlx::query_scalar("SELECT sender FROM nonces WHERE nonce_hex = $1")
-                .bind(&nonce).fetch_one(&mut *tx).await?;
-            if !healing || owner != sender {
-                tx.rollback().await?;
-                return Ok(NonceReused);
-            }
-        }
-        sqlx::query(
-            "INSERT INTO messages (id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
-        )
-        .bind(&id)
-        .bind(kind)
-        .bind(&sender)
-        .bind(rtype)
-        .bind(&rid)
-        .bind(ts)
-        .bind(ciphertext)
-        .bind(&ph)
-        .bind(&pi)
-        .bind(amt)
-        .bind(&sig)
-        .bind(&nonce)
-        .bind(&refs_json)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("UPDATE payment_receipts SET accepted = 1, kind = $1, recipient_type = $2, recipient_id = $3, preimage = $4, amount_msat = $5, nonce = $6, references_json = $7 WHERE payment_hash = $8")
-            .bind(kind).bind(rtype).bind(&rid).bind(&pi).bind(amt).bind(&nonce).bind(&refs_json).bind(&ph).execute(&mut *tx).await?;
+        // Serialize proof acceptance and both deferral limits, including
+        // concurrent distinct proofs submitted by the same sender.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&ph).execute(&mut *tx).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))")
+            .bind(&sender).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM envelope_deferrals WHERE message_id IN (SELECT message_id FROM envelope_deferrals WHERE expires_at_ms <= $1 ORDER BY expires_at_ms, message_id LIMIT $2)")
+            .bind(now).bind(i64::from(DEFERRAL_CLEANUP_BATCH)).execute(&mut *tx).await?;
+        // Exact retries keep their original deadline and signed terms.
+        sqlx::query("INSERT INTO envelope_deferrals (message_id, sender, payment_hash, recipient_type, recipient_id, amount_msat, expires_at_ms)
+                SELECT $1, $2, $3, $4, $5, $6, $7
+                WHERE NOT EXISTS (SELECT 1 FROM payment_receipts WHERE payment_hash = $3)
+                  AND (SELECT COUNT(*) FROM envelope_deferrals WHERE payment_hash = $3 AND expires_at_ms > $8) < $9
+                  AND (SELECT COUNT(*) FROM envelope_deferrals WHERE sender = $2 AND expires_at_ms > $8) < $10
+                ON CONFLICT(message_id) DO NOTHING")
+            .bind(&id).bind(&sender).bind(&ph).bind(rtype).bind(&rid).bind(amount)
+            .bind(expires).bind(now)
+            .bind(MAX_DEFERRALS_PER_PROOF).bind(MAX_DEFERRALS_PER_SENDER)
+            .execute(&mut *tx).await?;
+        let deferred: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = $1 AND sender = $2 AND payment_hash = $3 AND recipient_type = $4 AND recipient_id = $5 AND amount_msat = $6 AND expires_at_ms > $7)")
+            .bind(&id).bind(&sender).bind(&ph).bind(rtype).bind(&rid).bind(amount).bind(now)
+            .fetch_one(&mut *tx).await?;
         tx.commit().await?;
-        Ok(Accepted)
+        Ok(deferred)
+    }
+
+    async fn is_envelope_deferred(&self, envelope: &UkmEnvelope) -> Result<bool, StorageError> {
+        let (rtype, rid) = recipient_to_parts(&envelope.recipient);
+        let amount = i64::try_from(envelope.payment_proof.amount_msat)
+            .map_err(|_| StorageError::Conversion("deferral amount overflows i64".into()))?;
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM envelope_deferrals WHERE message_id = $1 AND sender = $2 AND payment_hash = $3 AND recipient_type = $4 AND recipient_id = $5 AND amount_msat = $6 AND expires_at_ms > $7)")
+            .bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
+            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(rtype).bind(&rid).bind(amount)
+            .bind(crate::traits::deferral_now_ms())
+            .fetch_one(&self.pool).await.map_err(Into::into)
+    }
+
+    async fn session_repair_expires_at(&self, own: &NodeId, peer: &NodeId) -> Result<Option<i64>, StorageError> {
+        let now = crate::traits::deferral_now_ms();
+        sqlx::query_scalar("SELECT MAX(expires_at_ms) FROM (SELECT d.expires_at_ms FROM envelope_deferrals d WHERE d.sender = $2 AND d.recipient_type = 'node' AND d.recipient_id = $1 AND d.amount_msat > 0 AND d.expires_at_ms > $3 AND NOT EXISTS (SELECT 1 FROM payment_receipts r WHERE r.payment_hash = d.payment_hash) UNION ALL SELECT $4 WHERE EXISTS (SELECT 1 FROM outbox_operations o JOIN pending_deliveries p ON p.message_id = o.message_id AND p.recipient_id = o.recipient JOIN messages m ON m.id = o.message_id WHERE o.recipient = $2 AND o.state IN ('paid', 'sent', 'rejected_retryable') AND substr(o.last_error, 1, 17) = 'session_handover:' AND p.state IN ('pending', 'stalled') AND p.dispatched = 1 AND p.rejection_reason = o.last_error AND m.sender = $1 AND m.recipient_type = 'node' AND m.recipient_id = $2 AND m.kind = o.kind AND m.amount_msat > 0 AND o.settled_msat = m.amount_msat AND o.payment_hash = m.payment_hash) ) repair")
+            .bind(own.to_hex()).bind(peer.to_hex()).bind(now)
+            .bind(now.saturating_add(crate::ENVELOPE_DEFERRAL_TTL_MS))
+            .fetch_one(&self.pool).await.map_err(Into::into)
+    }
+
+    async fn cleanup_expired_deferrals(&self, now_ms: i64, max: u32) -> Result<u64, StorageError> {
+        Ok(sqlx::query("DELETE FROM envelope_deferrals WHERE message_id IN (SELECT message_id FROM envelope_deferrals WHERE expires_at_ms <= $1 ORDER BY expires_at_ms, message_id LIMIT $2)")
+            .bind(now_ms).bind(i64::from(max.min(crate::DEFERRAL_CLEANUP_BATCH)))
+            .execute(&self.pool).await?.rows_affected())
+    }
+
+    async fn paid_envelope_status(&self, envelope: &UkmEnvelope) -> Result<Option<crate::PaidAcceptance>, StorageError> {
+        self.accept_paid_envelope_inner(envelope, false, false).await
+    }
+
+    async fn accept_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.accept_paid_envelope_inner(envelope, true, false).await?
+            .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
+    }
+
+    async fn accept_held_paid_envelope(&self, envelope: &UkmEnvelope) -> Result<crate::PaidAcceptance, StorageError> {
+        self.accept_paid_envelope_inner(envelope, true, true).await?
+            .ok_or_else(|| StorageError::Conversion("paid acceptance returned no outcome".into()))
     }
 
     async fn update_message_wrapper(&self, envelope: &UkmEnvelope) -> Result<(), StorageError> {
@@ -1254,6 +1549,12 @@ impl Storage for PostgresStorage {
 
     async fn is_pending_dispatched(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
         Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = $1 AND p.recipient_id = $2 AND p.dispatched = 1 AND p.state != 'failed_paid' AND m.sender = $3)").bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex()).fetch_one(&self.pool).await?)
+    }
+
+    async fn pending_was_undecryptable(&self, id: &MessageId, peer: &NodeId, sender: &NodeId) -> Result<bool, StorageError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pending_deliveries p JOIN messages m ON m.id = p.message_id WHERE p.message_id = $1 AND p.recipient_id = $2 AND m.sender = $3 AND p.dispatched = 1 AND p.state != 'failed_paid' AND substr(p.rejection_reason, 1, 14) = 'undecryptable:')")
+            .bind(id.to_hex()).bind(peer.to_hex()).bind(sender.to_hex())
+            .fetch_one(&self.pool).await.map_err(Into::into)
     }
 
     async fn reject_pending(&self, id: &MessageId, peer: &NodeId, sender: &NodeId, reason: &str, terminal: bool) -> Result<bool, StorageError> {
@@ -1292,30 +1593,11 @@ impl Storage for PostgresStorage {
     }
 
     async fn get_message(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
-        let id_hex = id.to_hex();
+        self.load_message_record(id, false).await
+    }
 
-        let row = sqlx::query_as::<_, (
-            String, i64, String, String, String, i64, Vec<u8>, String, String, i64, String,
-            String, String,
-        )>(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, \
-             ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json \
-             FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND id = $1",
-        )
-        .bind(&id_hex)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            Some(r) => {
-                let envelope = row_to_envelope(
-                    &r.0, r.1, &r.2, &r.3, &r.4, r.5, &r.6, &r.7, &r.8, r.9, &r.10, &r.11,
-                    &r.12,
-                )?;
-                Ok(Some(envelope))
-            }
-            None => Ok(None),
-        }
+    async fn record_upgrade_envelope(&self, id: &MessageId) -> Result<Option<UkmEnvelope>, StorageError> {
+        self.load_message_record(id, true).await
     }
 
     async fn get_messages_for_recipient(&self, recipient: &Recipient, limit: u32, before_timestamp: Option<u64>) -> Result<Vec<UkmEnvelope>, StorageError> {
@@ -1332,7 +1614,7 @@ impl Storage for PostgresStorage {
 
     async fn message_page(&self, scope: &crate::MessageListQuery<'_>, limit: u32, before: Option<u64>, cursor: Option<&crate::ListCursor<u64>>) -> Result<Vec<UkmEnvelope>, StorageError> {
         let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-            "SELECT id, kind, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND "
+            "SELECT id, kind::BIGINT, sender, recipient_type, recipient_id, timestamp_ms, ciphertext, payment_hash, preimage, amount_msat, signature, nonce, references_json FROM messages WHERE id NOT IN (SELECT message_id FROM call_admission_hold) AND "
         );
         match scope {
             crate::MessageListQuery::Recipient(recipient) => {
@@ -1420,9 +1702,11 @@ impl Storage for PostgresStorage {
         let metadata = serde_json::to_string(&room.metadata)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
+        // `created_at` is TIMESTAMPTZ and `$4` is sent as text: cast it, as in
+        // `upsert_peer`.
         sqlx::query(
             "INSERT INTO rooms (id, name, created_by, created_at, metadata_json) \
-             VALUES ($1, $2, $3, $4, $5)",
+             VALUES ($1, $2, $3, $4::timestamptz, $5)",
         )
         .bind(&id)
         .bind(&room.name)
@@ -1438,9 +1722,11 @@ impl Storage for PostgresStorage {
     async fn get_room(&self, id: &RoomId) -> Result<Option<Room>, StorageError> {
         let id_str = id.to_string();
 
-        let row = sqlx::query_as::<_, (String, String, String, String, String)>(
-            "SELECT id, name, created_by, created_at, metadata_json FROM rooms WHERE id = $1",
-        )
+        let row = sqlx::query_as::<_, (String, String, String, String, String)>(concat!(
+            "SELECT id, name, created_by, ",
+            utc_rfc3339!("created_at"),
+            ", metadata_json FROM rooms WHERE id = $1"
+        ))
         .bind(&id_str)
         .fetch_optional(&self.pool)
         .await?;
@@ -1466,9 +1752,11 @@ impl Storage for PostgresStorage {
     }
 
     async fn list_rooms(&self) -> Result<Vec<Room>, StorageError> {
-        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(
-            "SELECT id, name, created_by, created_at, metadata_json FROM rooms ORDER BY created_at DESC LIMIT 1000",
-        )
+        let rows = sqlx::query_as::<_, (String, String, String, String, String)>(concat!(
+            "SELECT id, name, created_by, ",
+            utc_rfc3339!("created_at"),
+            ", metadata_json FROM rooms ORDER BY created_at DESC LIMIT 1000"
+        ))
         .fetch_all(&self.pool)
         .await?;
 
@@ -1574,9 +1862,13 @@ impl Storage for PostgresStorage {
         // overwrite wholesale (the wrapper merges plaintext metadata itself
         // before encrypting). `metadata_json` is a TEXT column, so we cast to
         // jsonb for the merge and back to text for storage.
+        //
+        // `$3` is sent as text. `last_seen` is TIMESTAMPTZ, so it needs an
+        // explicit cast; without it Postgres rejects the statement (42804)
+        // even when the value is NULL.
         sqlx::query(
             "INSERT INTO peers (node_id, address, last_seen, display_name, metadata_json) \
-             VALUES ($1, $2, $3, $4, $5) \
+             VALUES ($1, $2, $3::timestamptz, $4, $5) \
              ON CONFLICT(node_id) DO UPDATE SET \
              address = COALESCE(EXCLUDED.address, peers.address), \
              last_seen = COALESCE(EXCLUDED.last_seen, peers.last_seen), \
@@ -1611,7 +1903,11 @@ impl Storage for PostgresStorage {
         let nid = id.to_hex();
 
         let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>, String)>(
-            "SELECT node_id, address, last_seen, display_name, metadata_json FROM peers WHERE node_id = $1",
+            concat!(
+                "SELECT node_id, address, ",
+                utc_rfc3339!("last_seen"),
+                ", display_name, metadata_json FROM peers WHERE node_id = $1"
+            ),
         )
         .bind(&nid)
         .fetch_optional(&self.pool)
@@ -1764,23 +2060,82 @@ impl Storage for PostgresStorage {
         Ok(result.rows_affected())
     }
 
+    async fn call_media_publish(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<u64, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let id: i64 = sqlx::query_scalar("INSERT INTO call_media_detach_intents(peer, call_id, event, only_unpaid, may_hangup_live) VALUES ($1, $2, 'attached', 0, 1) RETURNING id")
+            .bind(peer.to_hex()).bind(call_id).fetch_one(&mut *tx).await?;
+        sqlx::query("INSERT INTO call_media_heads(peer, call_id, generation, latest_event, completed) VALUES ($1, $2, $3, $4, 0) ON CONFLICT(peer, call_id) DO UPDATE SET generation = excluded.generation, latest_event = excluded.latest_event, completed = 0")
+            .bind(peer.to_hex()).bind(call_id).bind(id).bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        u64::try_from(id).map_err(|_| StorageError::Conversion("invalid attachment generation".into()))
+    }
+
+    async fn call_media_generation(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<u64>, StorageError> {
+        let id: Option<i64> = sqlx::query_scalar("SELECT generation FROM call_media_heads WHERE peer = $1 AND call_id = $2")
+            .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
+        id.map(|id| u64::try_from(id).map_err(|_| StorageError::Conversion("invalid attachment generation".into()))).transpose()
+    }
+
+    async fn call_media_has_pending(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<bool, StorageError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_media_heads WHERE peer = $1 AND call_id = $2 AND completed = 0")
+            .bind(peer.to_hex()).bind(call_id).fetch_one(&self.pool).await?;
+        Ok(count == 1)
+    }
+
+    async fn call_media_record_detach(&self, intent: &crate::call_media::PendingMediaDetach, completed: bool) -> Result<(), StorageError> {
+        let generation = i64::try_from(intent.generation).map_err(|_| StorageError::Conversion("attachment generation overflow".into()))?;
+        let mut tx = self.pool.begin().await?;
+        // Lock the current projection before appending; completed or superseded
+        // generations can never be reopened by a delayed callback.
+        let previous: Option<i64> = sqlx::query_scalar("UPDATE call_media_heads SET latest_event = latest_event WHERE peer = $1 AND call_id = $2 AND generation = $3 AND completed = 0 RETURNING latest_event")
+            .bind(intent.peer.to_hex()).bind(&intent.call_id).bind(generation).fetch_optional(&mut *tx).await?;
+        let previous = previous.ok_or_else(|| StorageError::Conversion("media attachment no longer pending".into()))?;
+        let policy: (String, i32, i32) = sqlx::query_as("SELECT event, only_unpaid, may_hangup_live FROM call_media_detach_intents WHERE id = $1")
+            .bind(previous).fetch_one(&mut *tx).await?;
+        if !completed && policy == ("detach".into(), i32::from(intent.only_unpaid), i32::from(intent.may_hangup_live)) {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let id: i64 = sqlx::query_scalar("INSERT INTO call_media_detach_intents(peer, call_id, generation, event, only_unpaid, may_hangup_live) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id")
+            .bind(intent.peer.to_hex()).bind(&intent.call_id).bind(generation)
+            .bind(if completed { "complete" } else { "detach" }).bind(i32::from(intent.only_unpaid)).bind(i32::from(intent.may_hangup_live))
+            .fetch_one(&mut *tx).await?;
+        sqlx::query("UPDATE call_media_heads SET latest_event = $1, completed = $2 WHERE peer = $3 AND call_id = $4 AND generation = $5")
+            .bind(id).bind(i32::from(completed)).bind(intent.peer.to_hex()).bind(&intent.call_id).bind(generation).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn call_media_pending(&self, after: u64, max: u32) -> Result<Vec<crate::call_media::PendingMediaDetach>, StorageError> {
+        let mut after = i64::try_from(after).map_err(|_| StorageError::Conversion("attachment generation overflow".into()))?;
+        loop {
+            let rows: Vec<crate::call_media::IntentRow> = sqlx::query_as("SELECT h.generation, h.peer, h.call_id, e.only_unpaid, e.may_hangup_live, CASE WHEN e.event = 'attached' THEN 0 ELSE 1 END FROM call_media_heads h JOIN call_media_detach_intents e ON e.id = h.latest_event WHERE h.completed = 0 AND h.generation > $1 ORDER BY h.generation LIMIT $2")
+                .bind(after).bind(i64::from(max)).fetch_all(&self.pool).await?;
+            let Some(last) = rows.last() else { return Ok(Vec::new()) };
+            after = last.0;
+            let decoded = crate::call_media::decode_intents(rows);
+            if !decoded.is_empty() { return Ok(decoded); }
+            // Advance through undecodable pages while retaining their pending heads.
+        }
+    }
+
     async fn call_get(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<konsensus_core::payloads::call::CallEntry>, StorageError> {
-        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE peer = $1 AND call_id = $2")
+        let row: Option<CallRow> = sqlx::query_as("SELECT side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE peer = $1 AND call_id = $2")
             .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
         row.map(call_entry_from_row).transpose()
     }
 
     async fn call_open_by_peer(&self, peer: &konsensus_core::NodeId, now_ms: u64) -> Result<Vec<(String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
-        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
-            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state \
+        let rows: Vec<(String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state \
              WHERE peer = $1 AND (pending_operation_id IS NOT NULL OR (phase <> 'ended' AND (CASE WHEN phase = 'live' THEN deadline_ms >= $2 ELSE deadline_ms > $2 END))) \
              ORDER BY CASE WHEN pending_operation_id IS NOT NULL THEN 0 ELSE 1 END, call_id LIMIT $3")
             .bind(peer.to_hex()).bind(now)
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS_PER_PEER as i64)
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
-            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+        rows.into_iter().map(|(id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
+            Ok((id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
         }).collect()
     }
 
@@ -1799,6 +2154,65 @@ impl Storage for PostgresStorage {
         Ok(())
     }
 
+    async fn call_invite_deliver(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<bool, StorageError> {
+        let mut tx = self.pool.begin().await?;
+        let (phase, _, accepted) = call_invite_locked(&mut tx, id, peer, call_id).await?;
+        // The awaiting row, not the receipt alone, proves no delivery yet: a
+        // paid acceptance whose Pending mark was never written also reads 1.
+        if phase.as_deref() == Some("awaiting_device") && matches!(accepted, Some(1 | -2)) {
+            sqlx::query("UPDATE payment_receipts SET accepted = 1 WHERE message_id = $1 AND sender = $2 AND kind = 400")
+                .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+            call_upsert(peer, call_id, entry)?.execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(true);
+        }
+        if call_invite_delivered(phase.as_deref(), accepted) {
+            return Ok(false);
+        }
+        Err(StorageError::Conversion("call invite receipt not pending".into()))
+    }
+
+    async fn call_offer_bind(&self, peer: &konsensus_core::NodeId, call_id: &str, offer: &MessageId) -> Result<(), StorageError> {
+        let bound = sqlx::query("UPDATE call_state SET offer_id = $1 WHERE peer = $2 AND call_id = $3 AND side = 'caller'")
+            .bind(offer.to_hex()).bind(peer.to_hex()).bind(call_id).execute(&self.pool).await?;
+        if bound.rows_affected() != 1 {
+            return Err(StorageError::Conversion("no caller call row to bind its offer to".into()));
+        }
+        Ok(())
+    }
+
+    async fn call_offer(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<Option<MessageId>, StorageError> {
+        let offer: Option<Option<String>> = sqlx::query_scalar("SELECT offer_id FROM call_state WHERE peer = $1 AND call_id = $2")
+            .bind(peer.to_hex()).bind(call_id).fetch_optional(&self.pool).await?;
+        offer.flatten().map(|hex| MessageId::from_hex(&hex).map_err(|e| StorageError::Conversion(e.to_string()))).transpose()
+    }
+
+    async fn call_invite_expire(&self, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str, deadline_ms: u64) -> Result<crate::CallInviteExpiry, StorageError> {
+        let deadline = i64::try_from(deadline_ms).map_err(|_| StorageError::Conversion("call deadline overflow".into()))?;
+        let tombstone = deadline.saturating_add(i64::try_from(konsensus_core::payloads::call::TOMBSTONE_MS).unwrap_or(i64::MAX));
+        let mut tx = self.pool.begin().await?;
+        let (phase, row_deadline, accepted) = call_invite_locked(&mut tx, id, peer, call_id).await?;
+        if call_invite_delivered(phase.as_deref(), accepted) {
+            return Ok(crate::CallInviteExpiry::Delivered);
+        }
+        let awaiting = phase.as_deref() == Some("awaiting_device") && row_deadline == Some(deadline);
+        if !awaiting && !matches!(accepted, Some(-2 | -3)) {
+            return Ok(crate::CallInviteExpiry::Gone);
+        }
+        sqlx::query("UPDATE payment_receipts SET accepted = -3 WHERE message_id = $1 AND sender = $2 AND kind = 400 AND accepted IN (1, -2, -3)")
+            .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+        // Held before it is withdrawn: a failed withdrawal stays protected
+        // and the held-message sweep retries it.
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT id, sender, 0 FROM messages WHERE id = $1 AND sender = $2 ON CONFLICT DO NOTHING")
+            .bind(id.to_hex()).bind(peer.to_hex()).execute(&mut *tx).await?;
+        if awaiting {
+            sqlx::query("UPDATE call_state SET phase = 'ended', deadline_ms = $1, replay_until_ms = $2 WHERE peer = $3 AND call_id = $4")
+                .bind(tombstone).bind(tombstone).bind(peer.to_hex()).bind(call_id).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(crate::CallInviteExpiry::Expired)
+    }
+
     async fn call_delete(&self, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(), StorageError> {
         sqlx::query("DELETE FROM call_state WHERE peer = $1 AND call_id = $2")
             .bind(peer.to_hex()).bind(call_id).execute(&self.pool).await?;
@@ -1815,7 +2229,7 @@ impl Storage for PostgresStorage {
                 COALESCE(SUM(CASE WHEN open = 0 AND peer = $2 THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN open = 0 THEN 1 ELSE 0 END), 0) \
              FROM (SELECT peer, CASE WHEN pending_operation_id IS NOT NULL OR (phase <> 'ended' AND (CASE WHEN phase = 'live' THEN deadline_ms >= $3 ELSE deadline_ms > $3 END)) THEN 1 ELSE 0 END AS open \
-                   FROM call_state WHERE replay_until_ms > $4 OR pending_operation_id IS NOT NULL) AS rows")
+                   FROM call_state WHERE replay_until_ms > $4 OR pending_operation_id IS NOT NULL OR free_reply_receipts IS NOT NULL OR EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0)) AS rows")
             .bind(peer.to_hex()).bind(peer.to_hex()).bind(now).bind(now).fetch_one(&self.pool).await?;
         let n = |v: i64| u64::try_from(v).unwrap_or(0);
         Ok(konsensus_core::payloads::call::CallCounts { open_peer: n(open_peer), open_total: n(open_total), burned_peer: n(burned_peer), burned_total: n(burned_total) })
@@ -1825,8 +2239,8 @@ impl Storage for PostgresStorage {
         let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call time overflow".into()));
         let done = sqlx::query(
             "DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state \
-             WHERE ($1::TEXT IS NULL OR peer = $2) AND pending_operation_id IS NULL AND (phase = 'ended' OR deadline_ms <= $3) \
-             AND replay_until_ms <= $4 ORDER BY replay_until_ms LIMIT $5)")
+             WHERE ($1::TEXT IS NULL OR peer = $2) AND pending_operation_id IS NULL AND free_reply_receipts IS NULL AND (phase = 'ended' OR deadline_ms <= $3) \
+             AND replay_until_ms <= $4 AND NOT EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0) ORDER BY replay_until_ms LIMIT $5)")
             .bind(peer.map(|p| p.to_hex())).bind(peer.map(|p| p.to_hex()))
             .bind(ms(now_ms)?).bind(ms(replay_until_at_most)?).bind(ms(max)?)
             .execute(&self.pool).await?;
@@ -1834,23 +2248,29 @@ impl Storage for PostgresStorage {
     }
 
     async fn call_pending(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE pending_operation_id IS NOT NULL")
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE pending_operation_id IS NOT NULL")
             .fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
         }).collect()
     }
 
     async fn call_live(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
-        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64)> = sqlx::query_as(
-            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used FROM call_state WHERE phase = 'live' ORDER BY deadline_ms LIMIT $1")
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE phase = 'live' ORDER BY deadline_ms LIMIT $1")
             .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS as i64).fetch_all(&self.pool).await?;
-        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice)| {
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
             let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
-            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice))?))
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
         }).collect()
+    }
+
+    async fn call_block_invoice_count(&self, peer: &NodeId, call_id: &str, seq: u32) -> Result<u32, StorageError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM call_block_invoices WHERE peer = $1 AND call_id = $2 AND seq = $3")
+            .bind(peer.to_hex()).bind(call_id).bind(i64::from(seq)).fetch_one(&self.pool).await?;
+        u32::try_from(count).map_err(|_| StorageError::Conversion("call block invoice count overflow".into()))
     }
 
     async fn record_call_block_invoice(&self, peer: &NodeId, call_id: &str, seq: u32, payment_hash: &[u8; 32], retain_until_ms: u64) -> Result<(), StorageError> {
@@ -1879,6 +2299,45 @@ impl Storage for PostgresStorage {
         Ok(count == 1)
     }
 
+    async fn call_awaiting(&self) -> Result<Vec<(konsensus_core::NodeId, String, konsensus_core::payloads::call::CallEntry)>, StorageError> {
+        let rows: Vec<(String, String, String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>)> = sqlx::query_as(
+            "SELECT peer, call_id, side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE side = 'callee' AND phase = 'awaiting_device' ORDER BY peer, call_id LIMIT $1")
+            .bind(konsensus_core::payloads::call::MAX_OPEN_CALLS as i64).fetch_all(&self.pool).await?;
+        rows.into_iter().map(|(peer, id, side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts)| {
+            let peer = konsensus_core::NodeId::from_hex(&peer).map_err(|_| StorageError::Conversion("call state: bad peer".into()))?;
+            Ok((peer, id, call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts))?))
+        }).collect()
+    }
+
+    async fn call_with_free_reply_receipts(&self, after: Option<(&[u8], &[u8])>, max: u32) -> Result<crate::FreeReplyReceiptPage, StorageError> {
+        // Untyped rows keyed by their raw bytes, in byte order: every stored
+        // row has a usable key, and a column holding a value of the wrong type
+        // fails only its own row, never the page. Query errors stay errors.
+        let rows = sqlx::query(
+            "SELECT convert_to(peer, 'UTF8'), convert_to(call_id, 'UTF8'), side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts FROM call_state WHERE free_reply_receipts IS NOT NULL AND ($1::BYTEA IS NULL OR convert_to(peer, 'UTF8') > $1 OR (convert_to(peer, 'UTF8') = $1 AND convert_to(call_id, 'UTF8') > $2)) ORDER BY convert_to(peer, 'UTF8'), convert_to(call_id, 'UTF8') LIMIT $3")
+            .bind(after.map(|(p, _)| p)).bind(after.map(|(_, c)| c))
+            .bind(i64::from(max)).fetch_all(&self.pool).await?;
+        let mut page = crate::FreeReplyReceiptPage { rows: Vec::with_capacity(rows.len()), scanned: rows.len(), last_key: None };
+        let mut unkeyed = 0usize;
+        for row in &rows {
+            use sqlx::Row;
+            let peer_key: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(0).ok().flatten().unwrap_or_default();
+            let call_key: Vec<u8> = row.try_get::<Option<Vec<u8>>, _>(1).ok().flatten().unwrap_or_default();
+            match (String::from_utf8(peer_key.clone()), String::from_utf8(call_key.clone())) {
+                (Ok(peer), Ok(id)) => {
+                    let entry = free_reply_receipt_entry(row, &peer);
+                    page.rows.push((peer, id, entry));
+                }
+                _ => unkeyed += 1,
+            }
+            page.last_key = Some((peer_key, call_key));
+        }
+        if unkeyed > 0 {
+            tracing::warn!(rows = unkeyed, "call rows holding free-reply receipts have unreadable keys; left untouched");
+        }
+        Ok(page)
+    }
+
     async fn call_sweep(&self, now_ms: u64, max: u32) -> Result<u64, StorageError> {
         let now = i64::try_from(now_ms).map_err(|_| StorageError::Conversion("call time overflow".into()))?;
         // Reclaim legacy caller reservations once no interval can be resumed.
@@ -1890,7 +2349,7 @@ impl Storage for PostgresStorage {
             .execute(&self.pool).await?;
         sqlx::query("DELETE FROM call_block_invoices WHERE payment_hash IN (SELECT payment_hash FROM call_block_invoices WHERE retain_until_ms < $1 ORDER BY retain_until_ms LIMIT $2)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
-        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= $1 AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) ORDER BY replay_until_ms LIMIT $2)")
+        let done = sqlx::query("DELETE FROM call_state WHERE (peer, call_id) IN (SELECT peer, call_id FROM call_state WHERE replay_until_ms <= $1 AND (pending_operation_id IS NULL OR (phase = 'ended' AND side = 'caller' AND pending_kind = 404)) AND free_reply_receipts IS NULL AND NOT EXISTS (SELECT 1 FROM call_media_heads h WHERE h.peer = call_state.peer AND h.call_id = call_state.call_id AND h.completed = 0) ORDER BY replay_until_ms LIMIT $2)")
             .bind(now).bind(i64::from(max)).execute(&self.pool).await?;
         Ok(done.rows_affected())
     }
@@ -1898,14 +2357,24 @@ impl Storage for PostgresStorage {
     async fn reject_accepted_envelope(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
         let id = envelope.id.to_hex();
         let mut tx = self.pool.begin().await?;
+        // Hold-first lock order, shared with the sweep and the calendar admission.
+        sqlx::query_as::<_, (String,)>("SELECT message_id FROM call_admission_hold WHERE message_id = $1 FOR UPDATE")
+            .bind(&id).fetch_optional(&mut *tx).await?;
         sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
             .bind(&id).bind(envelope.sender.to_hex()).execute(&mut *tx).await?;
-        sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE payment_hash = $1 AND message_id = $2")
+        sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) OR kind = 400 THEN -3 ELSE -1 END WHERE payment_hash = $1 AND message_id = $2")
             .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(&id).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
             .bind(&id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn is_application_rejected(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<bool, StorageError> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_receipts WHERE payment_hash = $1 AND message_id = $2 AND sender = $3 AND accepted = -1")
+            .bind(hex::encode(envelope.payment_proof.payment_hash)).bind(envelope.id.to_hex()).bind(envelope.sender.to_hex())
+            .fetch_one(&self.pool).await?;
+        Ok(n > 0)
     }
 
     async fn call_admission_hold(&self, envelope: &konsensus_core::UkmEnvelope, now_ms: u64) -> Result<bool, StorageError> {
@@ -1914,6 +2383,12 @@ impl Storage for PostgresStorage {
         let done = sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT $1::TEXT, $2::TEXT, $3::BIGINT WHERE NOT EXISTS (SELECT 1 FROM messages WHERE id = $4::TEXT) ON CONFLICT DO NOTHING")
             .bind(&id).bind(envelope.sender.to_hex()).bind(now).bind(&id).execute(&self.pool).await?;
         Ok(done.rows_affected() == 1)
+    }
+
+    async fn call_admission_rehold(&self, envelope: &konsensus_core::UkmEnvelope) -> Result<(), StorageError> {
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) SELECT id, sender, 0 FROM messages WHERE id = $1 AND sender = $2 ON CONFLICT DO NOTHING")
+            .bind(envelope.id.to_hex()).bind(envelope.sender.to_hex()).execute(&self.pool).await?;
+        Ok(())
     }
 
     async fn call_admission_release(&self, id: &MessageId) -> Result<(), StorageError> {
@@ -1931,14 +2406,23 @@ impl Storage for PostgresStorage {
     async fn call_admission_withdraw(&self, held_before_ms: u64) -> Result<u64, StorageError> {
         let before = i64::try_from(held_before_ms).unwrap_or(i64::MAX);
         let mut tx = self.pool.begin().await?;
-        sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE (message_id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1)")
-            .bind(before).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM messages WHERE (id, sender) IN (SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1)")
-            .bind(before).execute(&mut *tx).await?;
-        let done = sqlx::query("DELETE FROM call_admission_hold WHERE held_at_ms < $1")
-            .bind(before).execute(&mut *tx).await?;
+        // Lock the candidate holds first and act only on the locked set: a
+        // concurrent admission that already consumed a hold (it locks the hold
+        // row first as well) is skipped once it commits, and one that starts
+        // after this lock finds the hold gone and rolls back.
+        let held: Vec<(String, String)> = sqlx::query_as("SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1 FOR UPDATE")
+            .bind(before).fetch_all(&mut *tx).await?;
+        let mut done = 0u64;
+        for (message_id, sender) in &held {
+            sqlx::query("UPDATE payment_receipts SET accepted = CASE WHEN accepted IN (-2, -3) OR kind = 400 THEN -3 ELSE -1 END WHERE message_id = $1 AND sender = $2")
+                .bind(message_id).bind(sender).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
+                .bind(message_id).bind(sender).execute(&mut *tx).await?;
+            done += sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+                .bind(message_id).execute(&mut *tx).await?.rows_affected();
+        }
         tx.commit().await?;
-        Ok(done.rows_affected())
+        Ok(done)
     }
 
     async fn has_nonce(&self, nonce: &Nonce) -> Result<bool, StorageError> {
@@ -3407,6 +3891,138 @@ impl Storage for PostgresStorage {
         Ok(())
     }
 
+    async fn store_fiat_rate_snapshot(
+        &self,
+        snapshot: &crate::fiat_snapshots::FiatRateSnapshot,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO fiat_rate_snapshots (date, currency, rate, source)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(date, currency) DO UPDATE SET
+               rate   = EXCLUDED.rate,
+               source = EXCLUDED.source",
+        )
+        .bind(&snapshot.date)
+        .bind(&snapshot.currency)
+        .bind(snapshot.rate)
+        .bind(&snapshot.source)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_fiat_rate_snapshots(
+        &self,
+        from_date: &str,
+        to_date: &str,
+    ) -> Result<Vec<crate::fiat_snapshots::FiatRateSnapshot>, StorageError> {
+        let rows: Vec<(String, String, f64, String, String)> =
+            sqlx::query_as(FIAT_RATE_SNAPSHOTS_SELECT)
+                .bind(from_date)
+                .bind(to_date)
+                .fetch_all(&self.pool)
+                .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(date, currency, rate, source, created_at)| {
+                crate::fiat_snapshots::FiatRateSnapshot {
+                    date,
+                    currency,
+                    rate,
+                    source,
+                    created_at,
+                }
+            })
+            .collect())
+    }
+
+    async fn commit_calendar_admission(
+        &self,
+        envelope: &konsensus_core::UkmEnvelope,
+        admission: &crate::CalendarAdmission,
+    ) -> Result<(), StorageError> {
+        let id = envelope.id.to_hex();
+        let mut tx = self.pool.begin().await?;
+        // Lock the hold row first (the sweep locks holds first too, so the two
+        // serialize without deadlock): if the sweep withdrew the envelope the
+        // row is gone and nothing may be written for it. Then lock the message.
+        let held: Option<(String,)> = sqlx::query_as("SELECT message_id FROM call_admission_hold WHERE message_id = $1 FOR UPDATE")
+            .bind(&id).fetch_optional(&mut *tx).await?;
+        if held.is_none() {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
+        let stored: Option<(String,)> = sqlx::query_as("SELECT id FROM messages WHERE id = $1 AND sender = $2 FOR UPDATE")
+            .bind(&id).bind(envelope.sender.to_hex()).fetch_optional(&mut *tx).await?;
+        if stored.is_none() {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("accepted envelope {id}")));
+        }
+        match admission {
+            crate::CalendarAdmission::Event(record) => {
+                sqlx::query(
+                    "INSERT INTO calendar_events
+                       (id, message_id, organizer, title, description, start_ms, end_ms, tz,
+                        location, attendees_json, recurrence_json, color, parent_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                     ON CONFLICT(id) DO UPDATE SET
+                       message_id      = EXCLUDED.message_id,
+                       title           = EXCLUDED.title,
+                       description     = EXCLUDED.description,
+                       start_ms        = EXCLUDED.start_ms,
+                       end_ms          = EXCLUDED.end_ms,
+                       tz              = EXCLUDED.tz,
+                       location        = EXCLUDED.location,
+                       attendees_json  = EXCLUDED.attendees_json,
+                       recurrence_json = EXCLUDED.recurrence_json,
+                       color           = EXCLUDED.color,
+                       parent_id       = EXCLUDED.parent_id",
+                )
+                .bind(&record.id)
+                .bind(&record.message_id)
+                .bind(&record.organizer)
+                .bind(&record.title)
+                .bind(&record.description)
+                .bind(record.start_ms as i64)
+                .bind(record.end_ms as i64)
+                .bind(&record.tz)
+                .bind(&record.location)
+                .bind(&record.attendees_json)
+                .bind(&record.recurrence_json)
+                .bind(&record.color)
+                .bind(&record.parent_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            crate::CalendarAdmission::Rsvp(record) => {
+                sqlx::query(
+                    "INSERT INTO calendar_rsvps (id, event_id, responder, response, comment)
+                     VALUES ($1, $2, $3, $4, $5)
+                     ON CONFLICT(event_id, responder) DO UPDATE SET
+                       response = EXCLUDED.response,
+                       comment  = EXCLUDED.comment",
+                )
+                .bind(&record.id)
+                .bind(&record.event_id)
+                .bind(&record.responder)
+                .bind(&record.response)
+                .bind(&record.comment)
+                .execute(&mut *tx)
+                .await?;
+            }
+            crate::CalendarAdmission::Opaque => {}
+        }
+        let released = sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+            .bind(&id).execute(&mut *tx).await?;
+        if released.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(StorageError::NotFound(format!("admission hold for {id}")));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn upsert_operator_hosting_contract(
         &self,
         contract: &OperatorHostingContract,
@@ -3636,6 +4252,7 @@ mod hard4_guard {
                 "CALENDAR_EXCEPTIONS_IN_RANGE_SELECT",
                 CALENDAR_EXCEPTIONS_IN_RANGE_SELECT,
             ),
+            ("FIAT_RATE_SNAPSHOTS_SELECT", FIAT_RATE_SNAPSHOTS_SELECT),
             (
                 "OPERATOR_HOSTING_CONTRACTS_SELECT",
                 OPERATOR_HOSTING_CONTRACTS_SELECT,
@@ -3700,10 +4317,10 @@ mod migration_recovery_tests {
             .map(|(version, _, _)| *version)
             .collect();
         let max_known = known.iter().copied().max().unwrap();
-        for version in [35, 36, 37] {
+        for version in [35, 36, 37, 38] {
             assert!(
                 known.contains(&version),
-                "call-block migration {version} must be inside the downgrade fence"
+                "migration {version} must be inside the downgrade fence"
             );
         }
         assert!(PostgresStorage::unknown_applied_migrations(&known, &known).is_empty());
@@ -3737,6 +4354,19 @@ mod migration_recovery_tests {
         assert!(text.contains("Refusing to start"));
         assert!(!text.contains("postgres://"));
         assert!(!text.contains("password"));
+
+        assert!(
+            PostgresStorage::refuse_future_schema(&[1, 7, 8, 9]).is_ok(),
+            "withdrawn versions 7-9 must not block startup"
+        );
+        let reserved = PostgresStorage::refuse_future_schema(&[1, 34]).unwrap_err();
+        match reserved {
+            StorageError::FutureSchema { versions, max_known: reported } => {
+                assert_eq!(versions, vec![34]);
+                assert_eq!(reported, max_known);
+            }
+            other => panic!("expected FutureSchema, got {other}"),
+        }
     }
 
     #[tokio::test]
@@ -3797,7 +4427,97 @@ mod migration_recovery_tests {
         db.call_sweep(stalled.deadline_ms, 1).await.unwrap();
         assert!(db.call_get(&peer, call_id).await.unwrap().is_none());
         db.pool.close().await;
-        sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
+        admin.close().await;
+    }
+
+    /// Free-reply receipts on Postgres: a row written before migration 042
+    /// reads with none; receipts round-trip exactly, page by row key, keep
+    /// their row through sweep and eviction, and survive a reconnect.
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn call_free_reply_receipts_upgrade_round_trip_and_page() {
+        use konsensus_core::payloads::call::{CallEntry, FreeReplyReceipt, Phase, Side, TOMBSTONE_MS};
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+        let admin = PgPool::connect(&url).await.unwrap();
+        let name = format!("call_receipts_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+        let db_url = format!("{}/{name}", url.rsplit_once('/').unwrap().0);
+        let call_id = "0123456789abcdef0123456789abcdef";
+        let old_peer = NodeId::from_bytes([1; 32]);
+        // A row written by a node before migration 042.
+        let pool = PgPool::connect(&db_url).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .execute(&pool).await.unwrap();
+        for (version, description, sql) in PostgresStorage::pg_migrations().into_iter().filter(|(v, _, _)| *v < 42) {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO _konsensus_migrations VALUES ($1, $2)")
+                .bind(version).bind(description).execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash) VALUES ($1, $2, 'callee', 'ringing', 5000, 86405000, 'op', 401, 'digest')")
+            .bind(old_peer.to_hex()).bind(call_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        let db = PostgresStorage::connect(&db_url).await.unwrap();
+        let old = db.call_get(&old_peer, call_id).await.unwrap().unwrap();
+        assert!(old.free_reply_receipts.is_empty());
+        assert_eq!(old.pending.as_ref().map(|p| p.operation_id.as_str()), Some("op"));
+        assert!(db.call_with_free_reply_receipts(None, 10).await.unwrap().rows.is_empty());
+
+        let receipt = |peer: &NodeId, op: &str| FreeReplyReceipt {
+            peer: peer.to_hex(), call_id: call_id.into(), kind: 401, operation_id: op.into(),
+            request_hash: "digest".into(), phase: "live".into(), applied_ms: 1_000,
+        };
+        let held = |peer: &NodeId, op: &str| CallEntry {
+            side: Side::Callee, phase: Phase::Ended, deadline_ms: TOMBSTONE_MS, pending: None,
+            paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false,
+            free_reply_receipts: vec![receipt(peer, op)],
+        };
+        let peers: Vec<NodeId> = (2..=4u8).map(|b| NodeId::from_bytes([b; 32])).collect();
+        for (n, peer) in peers.iter().enumerate() {
+            db.call_put(peer, call_id, &held(peer, &format!("op{n}"))).await.unwrap();
+        }
+        // Exact round trip, then key-ordered pages after a cursor.
+        assert_eq!(db.call_get(&peers[0], call_id).await.unwrap(), Some(held(&peers[0], "op0")));
+        let first = db.call_with_free_reply_receipts(None, 2).await.unwrap().rows;
+        assert_eq!(first.iter().map(|(p, _, _)| p.clone()).collect::<Vec<_>>(), peers[..2].iter().map(|p| p.to_hex()).collect::<Vec<_>>());
+        let (last_peer, last_call, _) = first.last().unwrap();
+        let rest = db.call_with_free_reply_receipts(Some((last_peer.as_bytes(), last_call.as_bytes())), 2).await.unwrap().rows;
+        assert_eq!(rest, vec![(peers[2].to_hex(), call_id.to_owned(), Some((peers[2], held(&peers[2], "op2"))))]);
+        // A second call of one peer pages in call id order.
+        let later_call = "fedcba9876543210fedcba9876543210";
+        db.call_put(&peers[1], later_call, &held(&peers[1], "op1b")).await.unwrap();
+        let after_first = db.call_with_free_reply_receipts(Some((peers[1].to_hex().as_bytes(), call_id.as_bytes())), 1).await.unwrap().rows;
+        assert_eq!(after_first.iter().map(|(p, c, _)| (p.clone(), c.clone())).collect::<Vec<_>>(), vec![(peers[1].to_hex(), later_call.to_owned())]);
+        db.call_put(&peers[1], later_call, &CallEntry { free_reply_receipts: Vec::new(), ..held(&peers[1], "op1b") }).await.unwrap();
+        // An undecodable row is listed without its entry, keeps its column, and
+        // a sweep never drops it.
+        sqlx::query("UPDATE call_state SET free_reply_receipts = '{not json' WHERE peer = $1").bind(peers[2].to_hex())
+            .execute(&db.pool).await.unwrap();
+        let listed = db.call_with_free_reply_receipts(None, 10).await.unwrap().rows;
+        assert_eq!(listed.iter().map(|(p, _, e)| (p.clone(), e.is_some())).collect::<Vec<_>>(),
+            peers.iter().map(|p| (p.to_hex(), *p != peers[2])).collect::<Vec<_>>());
+        db.call_sweep(10 * TOMBSTONE_MS, 10).await.unwrap();
+        let raw: Option<String> = sqlx::query_scalar("SELECT free_reply_receipts FROM call_state WHERE peer = $1")
+            .bind(peers[2].to_hex()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(raw.as_deref(), Some("{not json"));
+        db.call_put(&peers[2], call_id, &held(&peers[2], "op2")).await.unwrap();
+        // Held rows survive sweep and eviction long after their tombstone.
+        let far = 10 * TOMBSTONE_MS;
+        db.call_evict_burned(Some(&peers[0]), far, far, 10).await.unwrap();
+        db.call_sweep(far, 10).await.unwrap();
+        assert_eq!(db.call_get(&peers[0], call_id).await.unwrap(), Some(held(&peers[0], "op0")));
+        let counts = db.call_counts(&peers[0], far).await.unwrap();
+        assert_eq!((counts.open_peer, counts.burned_peer), (0, 1));
+        // Released: swept like any other row. The others survive a reconnect.
+        db.call_put(&peers[0], call_id, &CallEntry { free_reply_receipts: Vec::new(), ..held(&peers[0], "op0") }).await.unwrap();
+        db.call_sweep(far, 10).await.unwrap();
+        assert!(db.call_get(&peers[0], call_id).await.unwrap().is_none());
+        db.pool.close().await;
+        let db = PostgresStorage::connect(&db_url).await.unwrap();
+        assert_eq!(db.call_with_free_reply_receipts(None, 10).await.unwrap().rows.len(), 2);
+        assert_eq!(db.call_get(&peers[1], call_id).await.unwrap(), Some(held(&peers[1], "op1")));
+        db.pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
         admin.close().await;
     }
 
@@ -3833,7 +4553,209 @@ mod migration_recovery_tests {
         assert_eq!(db.take_outstanding_web_request(&[1; 32]).await.unwrap(), Some(row(1, 10_000)));
         assert_eq!(db.take_outstanding_web_request(&[1; 32]).await.unwrap(), None);
         db.pool.close().await;
-        sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+        sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
+    }
+
+    /// Calendar admission and the hold sweep serialize on the hold row: while
+    /// a sweep transaction holds the lock, admission blocks; once the sweep has
+    /// withdrawn the envelope, admission finds no hold, rolls back, and writes
+    /// nothing. An envelope with no hold is refused before any write.
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn calendar_admission_serializes_against_the_hold_sweep() {
+        use crate::{CalendarAdmission, RsvpRecord, Storage};
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").unwrap();
+        let admin = PgPool::connect(&url).await.unwrap();
+        let name = format!("caladmit_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {name}")).execute(&admin).await.unwrap();
+        let db_url = format!("{}/{name}", url.rsplit_once('/').unwrap().0);
+        let db = std::sync::Arc::new(PostgresStorage::connect(&db_url).await.unwrap());
+        let sender = NodeId::from_bytes([7u8; 32]);
+        let proof = {
+            use sha2::Digest;
+            let preimage = [9u8; 32];
+            let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
+            konsensus_core::PaymentProof::new(hash, preimage, 1_000)
+        };
+        let env = konsensus_core::UkmEnvelopeBuilder::new(
+            konsensus_core::kind::KIND_RSVP,
+            sender,
+            konsensus_core::Recipient::Node(NodeId::from_bytes([8u8; 32])),
+            vec![1],
+            proof,
+        )
+        .build();
+        let rsvp = CalendarAdmission::Rsvp(RsvpRecord {
+            id: "r1".into(),
+            event_id: "evt-1".into(),
+            responder: sender.to_hex(),
+            response: "accepted".into(),
+            comment: None,
+            created_at: String::new(),
+        });
+        let rsvps = |db: &PostgresStorage| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM calendar_rsvps")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // No hold: refused before any write.
+        db.store_message(&env).await.unwrap();
+        let err = db.commit_calendar_admission(&env, &rsvp).await.unwrap_err();
+        assert!(matches!(err, StorageError::NotFound(_)), "{err}");
+        assert_eq!(rsvps(&db).await, 0);
+
+        // Held, and a sweep transaction has locked the hold: admission blocks
+        // until the sweep commits its withdrawal, then rolls back.
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) VALUES ($1, $2, 1)")
+            .bind(env.id.to_hex()).bind(sender.to_hex()).execute(&db.pool).await.unwrap();
+        let mut sweep = db.pool.begin().await.unwrap();
+        let locked: Vec<(String, String)> = sqlx::query_as("SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1 FOR UPDATE")
+            .bind(i64::MAX).fetch_all(&mut *sweep).await.unwrap();
+        assert_eq!(locked.len(), 1);
+        let admission = tokio::spawn({
+            let db = db.clone();
+            let env = env.clone();
+            let rsvp = rsvp.clone();
+            async move { db.commit_calendar_admission(&env, &rsvp).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!admission.is_finished(), "admission must wait for the sweep's lock");
+        for (message_id, s) in &locked {
+            sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE message_id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+            sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+            sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+                .bind(message_id).execute(&mut *sweep).await.unwrap();
+        }
+        sweep.commit().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), admission)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(StorageError::NotFound(_))), "{outcome:?}");
+        assert_eq!(rsvps(&db).await, 0, "a withdrawn envelope must not leave an RSVP behind");
+        assert!(db.get_message(&env.id).await.unwrap().is_none());
+
+        // Held and stored, no contention: the write and the release commit together.
+        db.store_message(&env).await.unwrap();
+        sqlx::query("INSERT INTO call_admission_hold (message_id, sender, held_at_ms) VALUES ($1, $2, 1)")
+            .bind(env.id.to_hex()).bind(sender.to_hex()).execute(&db.pool).await.unwrap();
+        db.commit_calendar_admission(&env, &rsvp).await.unwrap();
+        assert_eq!(rsvps(&db).await, 1);
+        assert!(!db.call_admission_held(&env.id).await.unwrap());
+        assert_eq!(db.call_admission_withdraw(u64::MAX).await.unwrap(), 0);
+
+        // Held paid acceptance against the sweep: a fresh envelope is held, the
+        // sweep transaction locks that hold, the acceptance blocks on it, and
+        // once the sweep has withdrawn the hold the acceptance is refused with
+        // nothing written. A fresh hold then lets it be accepted.
+        let fresh = konsensus_core::UkmEnvelopeBuilder::new(
+            konsensus_core::kind::KIND_RSVP,
+            sender,
+            konsensus_core::Recipient::Node(NodeId::from_bytes([8u8; 32])),
+            vec![2],
+            {
+                use sha2::Digest;
+                let preimage = [10u8; 32];
+                let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
+                konsensus_core::PaymentProof::new(hash, preimage, 1_000)
+            },
+        )
+        .build();
+        assert!(db.call_admission_hold(&fresh, 1).await.unwrap());
+        let mut sweep = db.pool.begin().await.unwrap();
+        let locked: Vec<(String, String)> = sqlx::query_as("SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1 FOR UPDATE")
+            .bind(i64::MAX).fetch_all(&mut *sweep).await.unwrap();
+        assert_eq!(locked.len(), 1);
+        let acceptance = tokio::spawn({
+            let db = db.clone();
+            let fresh = fresh.clone();
+            async move { db.accept_held_paid_envelope(&fresh).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!acceptance.is_finished(), "held acceptance must wait for the sweep's hold lock");
+        for (message_id, s) in &locked {
+            sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+        }
+        sweep.commit().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), acceptance)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(StorageError::NotFound(_))), "{outcome:?}");
+        assert!(db.get_message(&fresh.id).await.unwrap().is_none());
+        assert!(!db.has_nonce(&fresh.nonce).await.unwrap(), "no replay key burned");
+        assert!(db.call_admission_hold(&fresh, 2).await.unwrap());
+        assert!(matches!(
+            db.accept_held_paid_envelope(&fresh).await.unwrap(),
+            crate::PaidAcceptance::Accepted
+        ));
+        assert!(db.call_admission_held(&fresh.id).await.unwrap());
+
+        // Opaque admission against the sweep: the accepted, held envelope's
+        // opaque admission blocks on the sweep's hold lock and, once the sweep
+        // has withdrawn it, is refused with the envelope gone. A later held
+        // and accepted envelope's opaque admission consumes its hold.
+        let mut sweep = db.pool.begin().await.unwrap();
+        let locked: Vec<(String, String)> = sqlx::query_as("SELECT message_id, sender FROM call_admission_hold WHERE held_at_ms < $1 FOR UPDATE")
+            .bind(i64::MAX).fetch_all(&mut *sweep).await.unwrap();
+        assert_eq!(locked.len(), 1);
+        let opaque = tokio::spawn({
+            let db = db.clone();
+            let fresh = fresh.clone();
+            async move { db.commit_calendar_admission(&fresh, &CalendarAdmission::Opaque).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!opaque.is_finished(), "opaque admission must wait for the sweep's hold lock");
+        for (message_id, s) in &locked {
+            sqlx::query("UPDATE payment_receipts SET accepted = -1 WHERE message_id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+            sqlx::query("DELETE FROM messages WHERE id = $1 AND sender = $2")
+                .bind(message_id).bind(s).execute(&mut *sweep).await.unwrap();
+            sqlx::query("DELETE FROM call_admission_hold WHERE message_id = $1")
+                .bind(message_id).execute(&mut *sweep).await.unwrap();
+        }
+        sweep.commit().await.unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), opaque)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, Err(StorageError::NotFound(_))), "{outcome:?}");
+        assert!(db.get_message(&fresh.id).await.unwrap().is_none());
+        assert!(db.is_application_rejected(&fresh).await.unwrap());
+        assert!(!db.is_paid_envelope_accepted(&fresh).await.unwrap());
+        let later = konsensus_core::UkmEnvelopeBuilder::new(
+            konsensus_core::kind::KIND_CALENDAR_EVENT,
+            sender,
+            konsensus_core::Recipient::Node(NodeId::from_bytes([8u8; 32])),
+            vec![3],
+            {
+                use sha2::Digest;
+                let preimage = [11u8; 32];
+                let hash: [u8; 32] = sha2::Sha256::digest(preimage).into();
+                konsensus_core::PaymentProof::new(hash, preimage, 1_000)
+            },
+        )
+        .build();
+        assert!(db.call_admission_hold(&later, 1).await.unwrap());
+        assert!(matches!(
+            db.accept_held_paid_envelope(&later).await.unwrap(),
+            crate::PaidAcceptance::Accepted
+        ));
+        db.commit_calendar_admission(&later, &CalendarAdmission::Opaque).await.unwrap();
+        assert!(!db.call_admission_held(&later.id).await.unwrap());
+        assert!(db.get_message(&later.id).await.unwrap().is_some());
+        assert!(db.is_paid_envelope_accepted(&later).await.unwrap());
+
+        db.pool.close().await;
+        sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
     }
 
     // This test creates and removes its own databases on a disposable server.
@@ -3863,7 +4785,7 @@ mod migration_recovery_tests {
                 sqlx::raw_sql("DROP TRIGGER interrupt_upgrade ON _konsensus_migrations; DROP FUNCTION interrupt_upgrade()").execute(&db.pool).await.unwrap();
                 if columns != 0 {
                     db.pool.close().await;
-                    sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+                    sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
                     panic!("interrupted migration committed {columns} columns without its version record");
                 }
             } else {
@@ -3965,10 +4887,810 @@ mod migration_recovery_tests {
                 assert_eq!(db.accept_paid_envelope(&changed).await.unwrap(), crate::PaidAcceptance::PaymentReused);
             }
             db.pool.close().await;
-            sqlx::query(&format!("DROP DATABASE {name}")).execute(&admin).await.unwrap();
+            sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)")).execute(&admin).await.unwrap();
             result.unwrap();
         }
         admin.close().await;
+    }
+}
+
+#[cfg(test)]
+mod schema_parity_tests {
+    use super::*;
+    use crate::contacts::ContactRepo;
+    use crate::models::OnboardingStateRecord;
+    use crate::schema_catalog;
+
+    #[test]
+    fn pg_schema_parity_does_not_backfill_old_migration_numbers() {
+        let versions: Vec<i32> = PostgresStorage::pg_migrations()
+            .iter()
+            .map(|(version, _, _)| *version)
+            .collect();
+        assert_eq!(
+            versions,
+            (1..=42).filter(|v| !matches!(v, 7..=9 | 34)).collect::<Vec<_>>()
+        );
+        let sql = include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql");
+        assert!(
+            !sql.starts_with("-- no-transaction"),
+            "version 33 must roll back as a unit"
+        );
+    }
+
+    fn disposable_name(prefix: &str) -> String {
+        format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
+    }
+
+    async fn admin_pool() -> (sqlx::PgPool, String) {
+        let url = std::env::var("BITSOV_TEST_POSTGRES_URL").expect("BITSOV_TEST_POSTGRES_URL");
+        let admin = sqlx::PgPool::connect(&url).await.unwrap();
+        (admin, url)
+    }
+
+    async fn create_database(admin: &sqlx::PgPool, url: &str, name: &str) -> String {
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(admin)
+            .await
+            .unwrap();
+        format!("{}/{name}", url.rsplit_once('/').unwrap().0)
+    }
+
+    async fn drop_database(admin: &sqlx::PgPool, name: &str) {
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .execute(admin)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn postgres_upsert_peer_round_trips_last_seen() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("peer_last_seen");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            // Sub-millisecond on purpose: Postgres keeps microseconds.
+            const SEEN: &str = "2026-11-08T16:44:13.250123Z";
+            let db = PostgresStorage::connect(&db_url).await.unwrap();
+            let id = NodeId::from_bytes([5u8; 32]);
+            let last_seen = |peer: Option<Peer>| peer.expect("peer stored").last_seen;
+
+            // A peer without `last_seen` is stored and reads back as None,
+            // through both readers.
+            db.upsert_peer(&Peer::new(id)).await.unwrap();
+            assert_eq!(last_seen(db.get_peer(&id).await.unwrap()), None);
+            let listed = db.list_peers().await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].last_seen, None);
+
+            let mut peer = Peer::new(id);
+            peer.address = Some("peer.example:9735".into());
+            peer.last_seen = Some(SEEN.into());
+            db.upsert_peer(&peer).await.unwrap();
+            let loaded = db.get_peer(&id).await.unwrap().unwrap();
+            assert_eq!(loaded.last_seen.as_deref(), Some(SEEN));
+            assert_eq!(loaded.address.as_deref(), Some("peer.example:9735"));
+            let listed = db.list_peers().await.unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].last_seen.as_deref(), Some(SEEN));
+
+            // Writing back what was read keeps the same value.
+            db.upsert_peer(&loaded).await.unwrap();
+            let rewritten = last_seen(db.get_peer(&id).await.unwrap());
+            assert_eq!(rewritten.as_deref(), Some(SEEN));
+
+            // An update without `last_seen` keeps the stored value.
+            db.upsert_peer(&Peer::new(id)).await.unwrap();
+            let kept = last_seen(db.get_peer(&id).await.unwrap());
+            assert_eq!(kept.as_deref(), Some(SEEN));
+
+            // An offset timestamp is stored as the same instant and read in UTC.
+            peer.last_seen = Some("2026-11-09T01:00:00+02:00".into());
+            db.upsert_peer(&peer).await.unwrap();
+            let utc = last_seen(db.get_peer(&id).await.unwrap());
+            assert_eq!(utc.as_deref(), Some("2026-11-08T23:00:00.000000Z"));
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn postgres_room_round_trips_created_at() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("room_created_at");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            let db = PostgresStorage::connect(&db_url).await.unwrap();
+            let creator = NodeId::from_bytes([6u8; 32]);
+            let micros = |text: &str| {
+                chrono::DateTime::parse_from_rfc3339(text)
+                    .expect("RFC 3339 created_at")
+                    .timestamp_micros()
+            };
+
+            // `Room::new` writes the current time with nanoseconds and a
+            // `+00:00` offset. It reads back in UTC as the same instant,
+            // rounded to the microsecond.
+            let fresh = Room::new("fresh".into(), creator);
+            db.create_room(&fresh).await.unwrap();
+            let loaded = db.get_room(&fresh.id).await.unwrap().expect("room stored");
+            let loaded_fresh = loaded.created_at.clone();
+            assert_eq!(loaded.name, "fresh");
+            assert_eq!(loaded.created_by, creator);
+            assert!(loaded.created_at.ends_with('Z'), "{}", loaded.created_at);
+            let drift = micros(&loaded.created_at) - micros(&fresh.created_at);
+            let fresh_at = &fresh.created_at;
+            assert!(drift.abs() <= 1, "{loaded_fresh} vs {fresh_at}");
+
+            // An earlier room with an offset and sub-millisecond time.
+            let older = Room {
+                id: RoomId::new(),
+                name: "older".into(),
+                created_by: creator,
+                created_at: "2020-01-02T03:04:05.250123+02:00".into(),
+                metadata: serde_json::json!({}),
+            };
+            db.create_room(&older).await.unwrap();
+            let loaded = db.get_room(&older.id).await.unwrap().expect("room stored");
+            assert_eq!(loaded.created_at, "2020-01-02T01:04:05.250123Z");
+
+            // The list uses the same format, newest first.
+            let listed = db.list_rooms().await.unwrap();
+            let names: Vec<&str> = listed.iter().map(|room| room.name.as_str()).collect();
+            assert_eq!(names, ["fresh", "older"]);
+            assert_eq!(listed[1].created_at, "2020-01-02T01:04:05.250123Z");
+            assert_eq!(listed[0].created_at, loaded_fresh);
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn main_032_postgres_plus_033_matches_fresh_install() {
+        let (admin, url) = admin_pool().await;
+        let upgrade_name = disposable_name("main032");
+        let fresh_name = disposable_name("fresh033");
+        let upgrade_url = create_database(&admin, &url, &upgrade_name).await;
+        let fresh_url = create_database(&admin, &url, &fresh_name).await;
+        let db = PostgresStorage {
+            pool: PgPool::connect(&upgrade_url).await.unwrap(),
+        };
+        sqlx::raw_sql(include_str!("tests/fixtures/main_032/postgres.sql"))
+            .execute(db.pool())
+            .await
+            .expect("apply frozen main migrations through 032");
+        let migration = include_str!("../migrations/postgres/033_calendar_and_schema_parity.sql");
+        sqlx::raw_sql(migration)
+            .execute(db.pool())
+            .await
+            .expect("upgrade main with only migration 033");
+        let upgraded = schema_catalog::load_postgres(db.pool()).await;
+        schema_catalog::assert_parity(&upgraded);
+        let fresh = PostgresStorage::connect(&fresh_url).await.unwrap();
+        assert_eq!(upgraded, schema_catalog::load_postgres(fresh.pool()).await);
+
+        // Even nodes that recorded 007–009 must converge using 033 alone.
+        sqlx::raw_sql(
+            "INSERT INTO _konsensus_migrations (version, name) VALUES
+             (7, 'fiat rate snapshots'), (8, 'recovery'), (9, 'contacts')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.run_migrations().await.unwrap();
+        sqlx::raw_sql(migration)
+            .execute(db.pool())
+            .await
+            .expect("migration 033 must be idempotent");
+        assert_eq!(upgraded, schema_catalog::load_postgres(db.pool()).await);
+        assert_secondary_unique_counts(db.pool()).await;
+        db.pool.close().await;
+        fresh.pool.close().await;
+        drop_database(&admin, &upgrade_name).await;
+        drop_database(&admin, &fresh_name).await;
+        admin.close().await;
+    }
+
+    /// One secondary unique index per column set. A second index on the same
+    /// columns makes `ON CONFLICT` inference fail.
+    async fn assert_secondary_unique_counts(pool: &PgPool) {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT t.relname, COUNT(ix.indexrelid)
+             FROM pg_class t
+             JOIN pg_namespace n ON n.oid = t.relnamespace
+             LEFT JOIN pg_index ix
+               ON ix.indrelid = t.oid
+              AND ix.indisunique
+              AND NOT ix.indisprimary
+              AND ix.indpred IS NULL
+             WHERE n.nspname = current_schema()
+               AND t.relname = ANY($1)
+             GROUP BY t.relname
+             ORDER BY t.relname",
+        )
+        .bind(vec![
+            "calendar_events",
+            "calendar_rsvps",
+            "contacts",
+            "fiat_rate_snapshots",
+            "invites_issued",
+            "onboarding_state",
+            "recovery_schemes",
+            "recovery_shards",
+            "recovery_trustees",
+        ])
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let actual: Vec<(String, i64)> = rows;
+        let expected = [
+            ("calendar_events", 0i64),
+            ("calendar_rsvps", 1),
+            ("contacts", 0),
+            ("fiat_rate_snapshots", 0),
+            ("invites_issued", 1),
+            ("onboarding_state", 0),
+            ("recovery_schemes", 0),
+            ("recovery_shards", 1),
+            ("recovery_trustees", 2),
+        ]
+        .into_iter()
+        .map(|(name, count)| (name.to_string(), count))
+        .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    async fn database_without(skip: &[i32]) -> (sqlx::PgPool, String, PostgresStorage) {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("parity");
+        let db_url = create_database(&admin, &url, &name).await;
+        let db = PostgresStorage {
+            pool: sqlx::PgPool::connect(&db_url).await.unwrap(),
+        };
+        sqlx::raw_sql(
+            "CREATE TABLE _konsensus_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        for (version, migration_name, sql) in PostgresStorage::pg_migrations() {
+            if skip.contains(&version) {
+                continue;
+            }
+            sqlx::raw_sql(sql)
+                .execute(db.pool())
+                .await
+                .unwrap_or_else(|e| panic!("apply old version {version} ({migration_name}): {e}"));
+            sqlx::query("INSERT INTO _konsensus_migrations (version, name) VALUES ($1, $2)")
+                .bind(version)
+                .bind(migration_name)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        (admin, name, db)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn fresh_postgres_matches_sqlite_catalog_and_round_trips() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("parity");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            let db = PostgresStorage::connect(&db_url).await.unwrap();
+            schema_catalog::assert_parity(&schema_catalog::load_postgres(db.pool()).await);
+            assert_secondary_unique_counts(db.pool()).await;
+
+            sqlx::query(
+                "INSERT INTO recovery_schemes (id, scheme_type, threshold, total_shares, created_at, updated_at)
+                 VALUES ('sch', 'shamir', 1, 1, 't', 't')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_trustees (id, scheme_id, trustee_node_id, share_index, created_at)
+                 VALUES ('tr1', 'sch', 'node-a', 0, 't')
+                 ON CONFLICT (scheme_id, trustee_node_id) DO UPDATE SET created_at = EXCLUDED.created_at",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_trustees (id, scheme_id, trustee_node_id, share_index, created_at)
+                 VALUES ('tr2', 'sch', 'node-a', 0, 't2')
+                 ON CONFLICT (scheme_id, share_index) DO UPDATE SET created_at = EXCLUDED.created_at",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_shards (id, owner_node_id, share_index, shard_ciphertext, received_at)
+                 VALUES ('sh1', 'owner', 0, $1, 't')
+                 ON CONFLICT (owner_node_id, share_index)
+                 DO UPDATE SET shard_ciphertext = EXCLUDED.shard_ciphertext",
+            )
+            .bind(vec![1u8])
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_shards (id, owner_node_id, share_index, shard_ciphertext, received_at)
+                 VALUES ('sh2', 'owner', 0, $1, 't2')
+                 ON CONFLICT (owner_node_id, share_index)
+                 DO UPDATE SET shard_ciphertext = EXCLUDED.shard_ciphertext",
+            )
+            .bind(vec![2u8])
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let shard: Vec<u8> = sqlx::query_scalar(
+                "SELECT shard_ciphertext FROM recovery_shards WHERE owner_node_id = 'owner'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(shard, vec![2u8]);
+
+            let snapshot = crate::fiat_snapshots::FiatRateSnapshot {
+                date: "2026-04-21".into(),
+                currency: "USD".into(),
+                rate: 65_000.5,
+                source: "MempoolSpace".into(),
+                created_at: String::new(),
+            };
+            db.store_fiat_rate_snapshot(&snapshot).await.unwrap();
+            let mut again = snapshot.clone();
+            again.rate = 66_000.0;
+            db.store_fiat_rate_snapshot(&again).await.unwrap();
+            let snaps = db
+                .list_fiat_rate_snapshots("2026-04-01", "2026-04-30")
+                .await
+                .unwrap();
+            assert_eq!(snaps.len(), 1);
+            assert_eq!(snaps[0].rate, 66_000.0);
+            assert!(!snaps[0].created_at.is_empty());
+
+            let event = crate::calendar::CalendarEventRecord {
+                id: "event-1".into(),
+                message_id: None,
+                organizer: "aa".repeat(32),
+                title: "signet standup".into(),
+                description: None,
+                start_ms: 1_700_000_000_000,
+                end_ms: 1_700_000_360_000,
+                tz: "UTC".into(),
+                location: None,
+                attendees_json: "[]".into(),
+                recurrence_json: None,
+                color: None,
+                created_at: String::new(),
+                parent_id: None,
+            };
+            db.store_calendar_event(&event).await.unwrap();
+            let stored = db.get_calendar_event("event-1").await.unwrap().unwrap();
+            assert_eq!(stored.title, "signet standup");
+            assert!(!stored.created_at.is_empty());
+            let mut updated = event.clone();
+            updated.title = "moved".into();
+            db.store_calendar_event(&updated).await.unwrap();
+            let after = db.get_calendar_event("event-1").await.unwrap().unwrap();
+            assert_eq!(after.title, "moved");
+            assert_eq!(after.created_at, stored.created_at);
+
+            let rsvp = crate::calendar::RsvpRecord {
+                id: "rsvp-1".into(),
+                event_id: "event-1".into(),
+                responder: "bb".repeat(32),
+                response: "accepted".into(),
+                comment: None,
+                created_at: String::new(),
+            };
+            db.store_rsvp(&rsvp).await.unwrap();
+            let mut changed = rsvp.clone();
+            changed.id = "rsvp-2".into();
+            changed.response = "declined".into();
+            db.store_rsvp(&changed).await.unwrap();
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM calendar_rsvps WHERE event_id = 'event-1'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(count, 1);
+
+            let state = OnboardingStateRecord {
+                invite_id: None,
+                inviter_pubkey: None,
+                inviter_ln_pubkey: None,
+                current_step: "funding".into(),
+                tier: Some("full".into()),
+                funding_address: Some("bcrt1qexample".into()),
+                funding_amount_sats_required: Some(u32::MAX),
+                funding_amount_sats_received: u32::MAX,
+                last_poll_at: Some(1_700_000_123),
+                funding_evidence: Some("wallet_balance_observed".into()),
+            };
+            db.upsert_onboarding_state(&state).await.unwrap();
+            let loaded = db.get_onboarding_state().await.unwrap().unwrap();
+            assert_eq!(loaded.funding_amount_sats_received, u32::MAX);
+            assert_eq!(loaded.funding_amount_sats_required, Some(u32::MAX));
+
+            let duplicate = sqlx::query(
+                "INSERT INTO invites_issued (id, invitee_pubkey, expiry_unix, nonce, state, created_at)
+                 VALUES ($1, $2, 10, $3, 'pending', 10), ($4, $2, 11, $3, 'pending', 11)",
+            )
+            .bind([1u8; 16].as_slice())
+            .bind([2u8; 32].as_slice())
+            .bind([3u8; 16].as_slice())
+            .bind([4u8; 16].as_slice())
+            .execute(db.pool())
+            .await;
+            assert!(duplicate.is_err(), "nonce must be unique");
+
+            db.run_migrations().await.unwrap();
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn previous_postgres_version_upgrades_without_data_loss() {
+        let (admin, url) = admin_pool().await;
+        let name = disposable_name("upgrade");
+        let db_url = create_database(&admin, &url, &name).await;
+        let result = async {
+            let db = PostgresStorage {
+                pool: sqlx::PgPool::connect(&db_url).await.unwrap(),
+            };
+            sqlx::raw_sql(include_str!("tests/fixtures/main_032/postgres.sql"))
+                .execute(db.pool())
+                .await
+                .expect("apply frozen main migrations through 032");
+            // Simulate nodes that already marked these versions applied. Only
+            // the forward migration may repair the hand-built tables below.
+            sqlx::raw_sql(
+                "INSERT INTO _konsensus_migrations (version, name) VALUES
+                 (7, 'fiat rate snapshots'), (8, 'recovery'), (9, 'contacts')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            let peer = NodeId::from_bytes([9u8; 32]);
+            sqlx::query("INSERT INTO peers (node_id, metadata_json) VALUES ($1, '{}')")
+                .bind(peer.to_hex())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let nonce = [0x33u8; 16];
+            sqlx::query(
+                "INSERT INTO invites_issued (
+                    id, invitee_pubkey, expiry_unix, channel_size_hint_sats, addr,
+                    max_fee_rate_sat_per_vb, channel_open_intent_expiry_unix, nonce, state, created_at
+                 ) VALUES ($1, $2, 1700000000, 50000, '127.0.0.1:9735', 5, 1700000100, $3, 'pending', 1700000000)",
+            )
+            .bind([0x11u8; 16].as_slice())
+            .bind([0x22u8; 32].as_slice())
+            .bind(nonce.as_slice())
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "UPDATE onboarding_state
+                 SET current_step = 'funding',
+                     funding_amount_sats_received = 1000,
+                     funding_amount_sats = 4000,
+                     funding_txid = 'txid-keep',
+                     confirmations = 3
+                 WHERE id = 1",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            sqlx::raw_sql(
+                "CREATE TABLE fiat_rate_snapshots (
+                    date TEXT NOT NULL,
+                    currency TEXT NOT NULL,
+                    rate REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (date, currency)
+                 )",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO fiat_rate_snapshots (date, currency, rate, source, created_at)
+                 VALUES ('2026-04-21', 'USD', 1.25, 'hand', '2026-04-21T00:00:00.000Z')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE calendar_events (
+                    id TEXT PRIMARY KEY,
+                    message_id TEXT,
+                    organizer TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    start_ms BIGINT,
+                    end_ms BIGINT,
+                    tz TEXT,
+                    location TEXT,
+                    attendees_json TEXT,
+                    recurrence_json TEXT,
+                    color TEXT,
+                    created_at TEXT NOT NULL DEFAULT '',
+                    parent_id TEXT
+                 )",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO calendar_events (id, organizer, title, start_ms, end_ms, tz, attendees_json, created_at)
+                 VALUES ('hand-event', 'org', 'kept title', 10, 20, 'UTC', '[]', '2026-01-01T00:00:00Z')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            // A hand-built boolean contact book and recovery tables that already
+            // have their unique keys. Version 33 must keep the rows and must
+            // not add a second unique index.
+            sqlx::raw_sql(
+                "CREATE TABLE contacts (
+                    node_id TEXT PRIMARY KEY,
+                    muted BOOLEAN NOT NULL DEFAULT FALSE,
+                    blocked BOOLEAN NOT NULL DEFAULT FALSE
+                 );
+                 CREATE TABLE recovery_schemes (
+                    id TEXT PRIMARY KEY,
+                    scheme_type TEXT NOT NULL,
+                    threshold INTEGER NOT NULL CHECK (threshold > 0),
+                    total_shares INTEGER NOT NULL CHECK (total_shares >= threshold),
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE recovery_trustees (
+                    id TEXT PRIMARY KEY,
+                    scheme_id TEXT NOT NULL REFERENCES recovery_schemes(id) ON DELETE CASCADE,
+                    trustee_node_id TEXT NOT NULL,
+                    share_index INTEGER NOT NULL,
+                    shard_commitment TEXT,
+                    delivered_at TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE (scheme_id, trustee_node_id),
+                    UNIQUE (scheme_id, share_index)
+                 );
+                 CREATE TABLE recovery_shards (
+                    id TEXT PRIMARY KEY,
+                    owner_node_id TEXT NOT NULL,
+                    share_index INTEGER NOT NULL,
+                    shard_ciphertext BYTEA NOT NULL,
+                    scheme_metadata_json TEXT NOT NULL DEFAULT '{}',
+                    received_at TEXT NOT NULL,
+                    UNIQUE (owner_node_id, share_index)
+                 );",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO contacts (node_id, muted, blocked) VALUES ('peer-bool', TRUE, FALSE)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_schemes (id, scheme_type, threshold, total_shares, created_at, updated_at)
+                 VALUES ('sch-keep', 'shamir', 2, 3, 'c', 'u')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO recovery_shards (id, owner_node_id, share_index, shard_ciphertext, received_at)
+                 VALUES ('shard-keep', 'owner-keep', 1, $1, 'then')",
+            )
+            .bind(vec![7u8, 7])
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+            db.run_migrations().await.unwrap();
+            db.run_migrations().await.unwrap();
+
+            let loaded_peer = db.get_peer(&peer).await.unwrap().expect("peer survived");
+            assert_eq!(loaded_peer.node_id, peer);
+            let invites = db.list_invites_issued().await.unwrap();
+            assert_eq!(invites.len(), 1);
+            assert_eq!(invites[0].nonce, nonce);
+            assert_eq!(invites[0].addr, "127.0.0.1:9735");
+
+            let state = db.get_onboarding_state().await.unwrap().unwrap();
+            assert_eq!(state.current_step, "funding");
+            assert_eq!(state.funding_amount_sats_received, 1000);
+            let legacy: (i64, String, i32) = sqlx::query_as(
+                "SELECT funding_amount_sats, funding_txid, confirmations
+                 FROM onboarding_state WHERE id = 1",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(legacy, (4000, "txid-keep".into(), 3));
+
+            let mut full = state;
+            full.funding_amount_sats_received = u32::MAX;
+            db.upsert_onboarding_state(&full).await.unwrap();
+            let widened = db.get_onboarding_state().await.unwrap().unwrap();
+            assert_eq!(widened.funding_amount_sats_received, u32::MAX);
+
+            let snaps = db
+                .list_fiat_rate_snapshots("2026-04-21", "2026-04-21")
+                .await
+                .unwrap();
+            assert_eq!(snaps.len(), 1);
+            assert_eq!(snaps[0].rate, 1.25);
+            assert_eq!(snaps[0].source, "hand");
+            let hand = db.get_calendar_event("hand-event").await.unwrap().unwrap();
+            assert_eq!(hand.title, "kept title");
+
+            let duplicate = sqlx::query(
+                "INSERT INTO invites_issued (id, invitee_pubkey, expiry_unix, nonce, state, created_at)
+                 VALUES ($1, $2, 11, $3, 'pending', 11)",
+            )
+            .bind([0x44u8; 16].as_slice())
+            .bind([0x22u8; 32].as_slice())
+            .bind(nonce.as_slice())
+            .execute(db.pool())
+            .await;
+            assert!(duplicate.is_err(), "upgrade must enforce nonce uniqueness");
+
+            let flags: (i32, i32) = sqlx::query_as(
+                "SELECT muted, blocked FROM contacts WHERE node_id = 'peer-bool'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(flags, (1, 0));
+            let contact = crate::contacts::PostgresContactRepo::new(db.pool().clone())
+                .get_contact("peer-bool")
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(contact.muted);
+            assert!(!contact.blocked);
+
+            let kept: Vec<u8> = sqlx::query_scalar(
+                "SELECT shard_ciphertext FROM recovery_shards WHERE id = 'shard-keep'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(kept, vec![7u8, 7]);
+            sqlx::query(
+                "INSERT INTO recovery_shards (id, owner_node_id, share_index, shard_ciphertext, received_at)
+                 VALUES ('shard-new', 'owner-keep', 1, $1, 'now')
+                 ON CONFLICT (owner_node_id, share_index)
+                 DO UPDATE SET shard_ciphertext = EXCLUDED.shard_ciphertext",
+            )
+            .bind(vec![8u8])
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let updated: Vec<u8> = sqlx::query_scalar(
+                "SELECT shard_ciphertext FROM recovery_shards WHERE owner_node_id = 'owner-keep'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(updated, vec![8u8]);
+            assert_secondary_unique_counts(db.pool()).await;
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    async fn assert_version_33_rolled_back(db: &PostgresStorage) {
+        let err = db.run_migrations().await;
+        assert!(err.is_err(), "migration 33 must refuse and roll back");
+        let recorded: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM _konsensus_migrations WHERE version = 33)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(!recorded, "failed migration must not be recorded");
+        let calendar: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'calendar_events'
+             )",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            !calendar,
+            "calendar tables created by version 33 must roll back"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn postgres_refuses_to_delete_duplicate_invite_nonces() {
+        let (admin, name, db) = database_without(&[33]).await;
+        let result = async {
+            sqlx::query(
+                "INSERT INTO invites_issued (id, invitee_pubkey, expiry_unix, nonce, state, created_at)
+                 VALUES ($1, $2, 10, $3, 'pending', 10), ($4, $2, 11, $3, 'pending', 11)",
+            )
+            .bind([1u8; 16].as_slice())
+            .bind([2u8; 32].as_slice())
+            .bind([3u8; 16].as_slice())
+            .bind([4u8; 16].as_slice())
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_version_33_rolled_back(&db).await;
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invites_issued")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(rows, 2);
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BITSOV_TEST_POSTGRES_URL pointing to a disposable PostgreSQL server"]
+    async fn postgres_refuses_to_delete_extra_onboarding_rows() {
+        let (admin, name, db) = database_without(&[33]).await;
+        let result = async {
+            sqlx::query(
+                "INSERT INTO onboarding_state (id, current_step) VALUES (2, 'paste-invite')",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            assert_version_33_rolled_back(&db).await;
+            let ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM onboarding_state ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(ids, vec![1, 2]);
+            db.pool.close().await;
+        }
+        .await;
+        drop_database(&admin, &name).await;
+        admin.close().await;
+        result
     }
 }
 
@@ -3988,8 +5710,8 @@ fn outstanding_from_row(
 /// Insert or replace one call row, on the pool or inside a transaction.
 fn call_upsert<'q>(peer: &konsensus_core::NodeId, call_id: &'q str, entry: &konsensus_core::payloads::call::CallEntry) -> Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>, StorageError> {
     let ms = |v: u64| i64::try_from(v).map_err(|_| StorageError::Conversion("call deadline overflow".into()));
-    Ok(sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
-            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used")
+    Ok(sqlx::query("INSERT INTO call_state (peer, call_id, side, phase, deadline_ms, replay_until_ms, pending_operation_id, pending_kind, pending_request_hash, paid_until_ms, next_block_seq, end_reason, unpaid_notice_used, free_reply_receipts) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+            ON CONFLICT(peer, call_id) DO UPDATE SET side = excluded.side, phase = excluded.phase, deadline_ms = excluded.deadline_ms, replay_until_ms = excluded.replay_until_ms, pending_operation_id = excluded.pending_operation_id, pending_kind = excluded.pending_kind, pending_request_hash = excluded.pending_request_hash, paid_until_ms = excluded.paid_until_ms, next_block_seq = excluded.next_block_seq, end_reason = excluded.end_reason, unpaid_notice_used = excluded.unpaid_notice_used, free_reply_receipts = excluded.free_reply_receipts")
         .bind(peer.to_hex()).bind(call_id)
         .bind(entry.side.as_str()).bind(entry.phase.as_str())
         .bind(ms(entry.deadline_ms)?).bind(ms(entry.replay_until_ms())?)
@@ -3999,14 +5721,30 @@ fn call_upsert<'q>(peer: &konsensus_core::NodeId, call_id: &'q str, entry: &kons
         .bind(entry.paid_until_ms.map(ms).transpose()?)
         .bind(i64::from(entry.next_block_seq))
         .bind(entry.end_reason.map(|reason| reason.as_str()))
-        .bind(i64::from(entry.unpaid_notice_used)))
+        .bind(i64::from(entry.unpaid_notice_used))
+        .bind(if entry.free_reply_receipts.is_empty() { None } else {
+            Some(serde_json::to_string(&entry.free_reply_receipts).map_err(|e| StorageError::Conversion(format!("call state: free reply receipts: {e}")))?)
+        }))
 }
 
 /// `(side, phase, deadline_ms, pending_operation_id, pending_kind, pending_request_hash)` of `call_state`.
-type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64);
+type CallRow = (String, String, i64, Option<String>, Option<i64>, Option<String>, Option<i64>, i64, Option<String>, i64, Option<String>);
+
+/// The entry of one listed receipt row, decoded column by column; `None`
+/// when any column (or the peer) cannot be decoded.
+fn free_reply_receipt_entry(row: &sqlx::postgres::PgRow, peer: &str) -> Option<(konsensus_core::NodeId, konsensus_core::payloads::call::CallEntry)> {
+    use sqlx::Row;
+    let node = konsensus_core::NodeId::from_hex(peer).ok()?;
+    let columns: CallRow = (
+        row.try_get(2).ok()?, row.try_get(3).ok()?, row.try_get(4).ok()?, row.try_get(5).ok()?,
+        row.try_get(6).ok()?, row.try_get(7).ok()?, row.try_get(8).ok()?, row.try_get(9).ok()?,
+        row.try_get(10).ok()?, row.try_get(11).ok()?, row.try_get(12).ok()?,
+    );
+    call_entry_from_row(columns).ok().map(|entry| (node, entry))
+}
 
 /// A stored call row. A corrupt row is an error, never a call.
-fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
+fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason, notice, receipts): CallRow) -> Result<konsensus_core::payloads::call::CallEntry, StorageError> {
     use konsensus_core::payloads::call::{CallEntry, Pending, Phase, Side};
     let bad = |what: &str| StorageError::Conversion(format!("call state: bad {what}"));
     let pending = match (op, kind) {
@@ -4023,5 +5761,26 @@ fn call_entry_from_row((side, phase, deadline, op, kind, hash, paid, seq, reason
         end_reason: reason.map(|v| konsensus_core::payloads::call::HangupReason::parse(&v).ok_or_else(|| bad("end reason"))).transpose()?,
         unpaid_notice_used: match notice { 0 => false, 1 => true, _ => return Err(bad("unpaid notice")) },
         pending,
+        // NULL on rows written before receipts existed.
+        free_reply_receipts: receipts.map(|v| serde_json::from_str(&v).map_err(|_| bad("free reply receipts"))).transpose()?.unwrap_or_default(),
     })
+}
+
+/// Lock an invite's call row first, so delivery and expiry of the same wait
+/// serialize, then read the row phase/deadline and the receipt state.
+async fn call_invite_locked(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, id: &MessageId, peer: &konsensus_core::NodeId, call_id: &str) -> Result<(Option<String>, Option<i64>, Option<i32>), StorageError> {
+    sqlx::query("UPDATE call_state SET phase = phase WHERE peer = $1 AND call_id = $2")
+        .bind(peer.to_hex()).bind(call_id).execute(&mut **tx).await?;
+    let row: Option<(String, i64)> = sqlx::query_as("SELECT phase, deadline_ms FROM call_state WHERE peer = $1 AND call_id = $2")
+        .bind(peer.to_hex()).bind(call_id).fetch_optional(&mut **tx).await?;
+    let accepted: Option<i32> = sqlx::query_scalar("SELECT accepted FROM payment_receipts WHERE message_id = $1 AND sender = $2 AND kind = 400")
+        .bind(id.to_hex()).bind(peer.to_hex()).fetch_optional(&mut **tx).await?;
+    let (phase, deadline) = row.unzip();
+    Ok((phase, deadline, accepted))
+}
+
+/// Committed device delivery: the receipt reads delivered and the row moved
+/// on to ringing or live. Never the receipt alone.
+fn call_invite_delivered(phase: Option<&str>, accepted: Option<i32>) -> bool {
+    accepted == Some(1) && matches!(phase, Some("ringing" | "live"))
 }

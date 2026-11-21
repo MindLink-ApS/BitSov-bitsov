@@ -413,6 +413,17 @@ fn owner_cli_confirmation_succeeds() {
     let durable = service.reload_from_disk().unwrap();
     assert_eq!(durable.grants.len(), 1);
     assert_eq!(durable.grants[0].client_id, client.client_id);
+    // The confirmation names the end of the window in UTC, with the Unix time.
+    let expires_at = durable.grants[0].expires_at;
+    let ControlResponse::Ok { detail } = &ok else { unreachable!() };
+    assert!(
+        detail.contains(&format!(
+            "until {} (unix {expires_at})",
+            control::utc_iso8601(expires_at)
+        )),
+        "{detail}"
+    );
+    assert!(control::utc_iso8601(expires_at).ends_with('Z'), "{detail}");
     assert!(
         durable.pending_elevations.is_empty(),
         "the pending request is consumed by the grant"

@@ -186,7 +186,7 @@ that ignore unknown headers (all rc7-era clients) are unaffected. A client
 talking to a node that predates this change sees no header and must fall back
 to "age unknown".
 
-Note for the app side: the pre-implementation spec (bitsov-app F4) proposed
+Note for the app side: the app's pre-implementation spec proposed
 `BitSov-Data-As-Of` as ASCII digits (ms since epoch). The node sends RFC 3339
 UTC instead; the app's header parser must accept that form.
 The deviation is deliberate; see the reconciled spec,

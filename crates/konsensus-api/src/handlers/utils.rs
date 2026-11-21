@@ -16,9 +16,9 @@ use sha2::{Digest, Sha256};
 ///
 /// Returns: (hash, preimage, amount_msat)
 pub fn generate_valid_proof(amount_msat: u64) -> ([u8; 32], [u8; 32], u64) {
-    use rand::RngCore;
+    use rand::Rng;
     let mut preimage = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut preimage);
+    rand::rng().fill_bytes(&mut preimage);
     let hash: [u8; 32] = Sha256::digest(preimage).into();
     (hash, preimage, amount_msat)
 }

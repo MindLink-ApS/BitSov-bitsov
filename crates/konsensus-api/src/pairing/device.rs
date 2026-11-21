@@ -15,18 +15,19 @@
 //! hardware (macOS offers no attestation to an app outside the App Store). The
 //! owner's one-time console approval is the root of that trust.
 
-use rand::RngCore;
+use rand::{Rng, TryRng};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use super::{Inner, PairingError, PairingRefusal, PairingService, SpendGrant, ELEVATION_TTL_SECS};
+use super::{GrantEnd, Inner, PairingError, PairingRefusal, PairingService, SpendGrant, ELEVATION_TTL_SECS};
 use crate::auth::Scope;
 use crate::spend_budget::{GrantBudget, GrantView, MAX_SPEND_GRANT_TTL_SECS};
 
 /// Reason code: the node runs from a plaintext recovery phrase.
 pub const SEED_NOT_ENCRYPTED: &str = "seed_not_encrypted";
 /// Reason code: the encrypted phrase's password came from a flag or file, not
-/// typed at start, so a same-user program could have it.
+/// typed at start, so a same-user program could have it, and the owner has not
+/// chosen `[pairing] unattended_device_approvals` or it was refused for this start.
 pub const SEED_PASSWORD_NOT_TYPED: &str = "seed_password_not_typed";
 /// Reason code: no owner-approval key was configured at start.
 pub const OWNER_KEY_UNAVAILABLE: &str = "owner_key_unavailable";
@@ -42,7 +43,8 @@ pub fn device_approvals_off_message(reason: &str) -> &'static str {
         SEED_PASSWORD_NOT_TYPED => {
             "Touch ID approvals are off on this node: it was started with the recovery-phrase \
              password from a flag or file. Restart it and type the password at start to enable \
-             Touch ID approvals."
+             Touch ID approvals, or choose `[pairing] unattended_device_approvals` for an \
+             unattended box and accept its trade (docs/operations/password-input.md)."
         }
         _ => "Touch ID approvals are off on this node: it has no owner-approval key.",
     }
@@ -67,6 +69,9 @@ pub const RELATION_MAX_BUDGET_MSAT: u64 = 100_000_000;
 
 /// Relation intents one client may apply per hour (new or renewed envelopes).
 pub const RELATION_INTENTS_PER_HOUR: usize = 30;
+
+/// Advertised on `GET /api/v1/status` once relation intents sign the pairing epoch.
+pub const RELATION_INTENT_V2_CAPABILITY: &str = "relation_intent_v2";
 
 /// `level` values. Only Contact is accepted before step 4 (first contact).
 pub const LEVEL_CONTACT: u8 = 1;
@@ -326,16 +331,27 @@ pub fn registration_message(node: &str, client_id: &str, public_key_hex: &str) -
     )
 }
 
-/// Exact bytes a device signs for a relation intent. `node` and `client_id`
-/// come from the node's own state and the caller's token, never the body, so
-/// a signature cannot be replayed to another node or pairing. V1 has no epoch
-/// field: the server checks the key record against the token epoch. Re-approving
-/// the same public key in a new epoch can accept an unused intent still within
-/// the clock window.
-pub fn intent_message(node: &str, client_id: &str, intent: &RelationIntent) -> String {
+/// Exact bytes a device signs for a relation intent.
+///
+/// `node`, `client_id` and `epoch` come from the node's own state and the
+/// caller's token, never the body. The pairing epoch is that pairing's
+/// version of state. V1 (`bitsov-relation-intent-v1`) left it out, so after
+/// an epoch bump, re-approving the same public key could still verify an
+/// unused intent inside the clock window.
+///
+/// V1 is not accepted. Owner-delegation v1/v2 and ticket v1/v2 keep an older
+/// domain only when that domain is a different operation whose own bytes are
+/// fully bound. Accepting v1 here would leave the cross-epoch replay open for
+/// the whole transition. An in-flight v1 intent fails closed and the device
+/// signs these v2 bytes again; the acceptance window is ±300 seconds.
+///
+/// Re-approving the same public key without an epoch bump does not change
+/// this string. That case is outside the epoch binding.
+pub fn intent_message(node: &str, client_id: &str, epoch: u64, intent: &RelationIntent) -> String {
     format!(
-        "bitsov-relation-intent-v1\nnode:{node}\nclient:{client_id}\ndevice:{}\npeer:{}\nlevel:{}\n\
-         budget_msat:{}\nper_act_max_msat:{}\nwindow_secs:{}\nissued_at:{}\nnonce:{}",
+        "bitsov-relation-intent-v2\nnode:{node}\nclient:{client_id}\nepoch:{epoch}\ndevice:{}\n\
+         peer:{}\nlevel:{}\nbudget_msat:{}\nper_act_max_msat:{}\nwindow_secs:{}\nissued_at:{}\n\
+         nonce:{}",
         intent.device_key_id,
         intent.peer,
         intent.level,
@@ -529,7 +545,7 @@ impl PairingService {
         let raw = parse_public_key(&public_key_hex)?;
         let name = clean_name(name)?;
         let mut op_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut op_bytes);
+        rand::rng().fill_bytes(&mut op_bytes);
 
         // Verify before taking the pairing lock: a flood of bad proofs must not
         // hold up every token check on the node.
@@ -644,7 +660,9 @@ impl PairingService {
             let device = crate::sas::device_key(&public_key_hex)
                 .map_err(|e| PairingError::Malformed(e.into()))?;
             let mut nonce = [0; 16];
-            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut nonce)
+                .expect("OS randomness unavailable");
             Some(DeviceSas {
                 nonce,
                 digest: if v2 {
@@ -660,7 +678,7 @@ impl PairingService {
             None
         };
         let mut nonce = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         let op = PendingDeviceKey {
             op_id: hex::encode(op_bytes),
             client_id: client_id.to_string(),
@@ -1210,6 +1228,7 @@ impl PairingService {
                 && grant.budget.as_ref().is_some_and(|b| b.recipients_only)
             {
                 grant.budget = None;
+                grant.ended = Some(GrantEnd::Revoked);
             }
         }
     }
@@ -1257,7 +1276,7 @@ impl PairingService {
     ///
     /// Checked, in order, before anything is written: owner-run node; the key
     /// is registered to this client at its current epoch; the signature is
-    /// over [`intent_message`] with this node and this client; `issued_at` is
+    /// over [`intent_message`] with this node, this client and this epoch; `issued_at` is
     /// within [`INTENT_MAX_SKEW_SECS`]; the nonce is unused; the terms are in
     /// bounds; the client is under [`RELATION_INTENTS_PER_HOUR`]. The nonce
     /// is recorded durably with the envelope, so neither a replay nor a
@@ -1338,7 +1357,7 @@ impl PairingService {
         let raw = parse_public_key(&key.public_key)?;
         verify_p256(
             &raw,
-            intent_message(&node, client_id, intent).as_bytes(),
+            intent_message(&node, client_id, epoch, intent).as_bytes(),
             signature_hex,
         )?;
 
@@ -1377,7 +1396,8 @@ impl PairingService {
                 "a live console grant must be revoked through the owner console before opening a relation grant".into(),
             ), "console_grant_live"));
         }
-        let before = (inner.file.grants.clone(), inner.file.intent_nonces.clone());
+        // The whole file: a new relation window can also move call funding.
+        let before = inner.file.clone();
 
         let nonce_key = format!("{}:{}", key.key_id, intent.nonce);
         inner
@@ -1413,14 +1433,9 @@ impl PairingService {
             None => {
                 // Retire expired grants before opening a new relation window.
                 // A live console budget was refused above.
-                for old in &mut inner.file.grants {
-                    if old.client_id == client_id {
-                        old.budget = None;
-                    }
-                }
                 let mut op = [0u8; 12];
-                rand::thread_rng().fill_bytes(&mut op);
-                inner.file.grants.push(SpendGrant {
+                rand::rng().fill_bytes(&mut op);
+                let mut grant = SpendGrant {
                     owner_approval: None,
                     op_id: format!("rel-{}", hex::encode(op)),
                     client_id: client_id.to_string(),
@@ -1431,10 +1446,16 @@ impl PairingService {
                     epoch,
                     granted_by: format!("device:{}", key.key_id),
                     budget: Some(GrantBudget::relations()),
-                });
+                    ended: None,
+                };
+                if !self.call_continuity {
+                    inner.file.replace_grants(&mut grant, false);
+                }
+                inner.file.grants.push(grant);
                 inner.file.grants.len() - 1
             }
         };
+        let fresh = live_idx.is_none();
         let grant = &mut inner.file.grants[idx];
         let budget = grant
             .budget
@@ -1454,14 +1475,25 @@ impl PairingService {
         grant.granted_at = now;
         grant.expires_at = last;
         grant.granted_by = format!("device:{}", key.key_id);
+        // With continuity, retire the earlier grants only now that the new
+        // window's envelope is open, so a call to this peer can be checked
+        // against it before its hold is carried over.
+        let idx = if fresh && self.call_continuity {
+            let mut grant = inner.file.grants.remove(idx);
+            inner.file.replace_grants(&mut grant, true);
+            inner.file.grants.push(grant);
+            inner.file.grants.len() - 1
+        } else { idx };
+        let grant = &inner.file.grants[idx];
         let view = super::grant_view(grant).ok_or(PairingError::Io("grant vanished".into()))?;
         inner.file.intent_nonces.insert(
             nonce_key,
             (client_id.to_string(), intent.issued_at.max(now)),
         );
         if let Err(e) = self.persist(&mut inner.file) {
-            // Never leave authority live in memory that the disk did not take.
-            (inner.file.grants, inner.file.intent_nonces) = before;
+            // Never leave authority live in memory that the disk did not take,
+            // nor call funding pointing at a grant that was not written.
+            inner.file = before;
             return Err(e.into());
         }
         tracing::info!(
@@ -1734,7 +1766,7 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         for (peer, window) in [(&a, 60), (&b, 3600)] {
             let mut nonce = [0u8; 16];
-            rand::thread_rng().fill_bytes(&mut nonce);
+            rand::rng().fill_bytes(&mut nonce);
             let intent = RelationIntent {
                 device_key_id: key_id.clone(),
                 peer: peer.clone(),
@@ -1745,7 +1777,7 @@ mod tests {
                 issued_at: now,
                 nonce: hex::encode(nonce),
             };
-            let msg = intent_message(&"f".repeat(32), &client.client_id, &intent);
+            let msg = intent_message(&"f".repeat(32), &client.client_id, client.epoch, &intent);
             let sig = hex::encode(device.sign(&rng, msg.as_bytes()).unwrap().as_ref());
             service
                 .apply_relation_intent(&client.client_id, client.epoch, &intent, &sig)
@@ -1832,5 +1864,43 @@ mod clock_tests {
             "the clock must be sampled while holding the lock"
         );
         assert!(matches!(out, Err(BudgetRefusal::NoGrant)));
+    }
+}
+
+#[cfg(test)]
+mod refusal_reason_tests {
+    use super::super::{PairingError, PairingRefusal};
+
+    #[test]
+    fn every_pairing_error_has_its_own_refusal_reason() {
+        let samples = [
+            PairingError::Closed,
+            PairingError::TooManyPending,
+            PairingError::UnknownPending,
+            PairingError::BadProof,
+            PairingError::Malformed("x".into()),
+            PairingError::UnknownClient,
+            PairingError::PairingInvalid("x".into()),
+            PairingError::NotGrantable("x".into()),
+            PairingError::UnknownOperation,
+            PairingError::ConfirmationMismatch,
+            PairingError::WrongOwnerCode(1),
+            PairingError::ConfirmationLost,
+            PairingError::DeviceApprovalsDisabled(super::SEED_NOT_ENCRYPTED),
+            PairingError::ShortCodesOff,
+            PairingError::Expired,
+            PairingError::NotApproved,
+            PairingError::BindingMismatch,
+            PairingError::OwnerChannelUnavailable,
+            PairingError::OwnerApprovalUnavailable,
+            PairingError::Io("x".into()),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for error in samples {
+            let reason = PairingRefusal::from(error).reason;
+            assert!(seen.insert(reason), "duplicate refusal reason {reason}");
+            assert_ne!(reason, "pairing_refused");
+        }
+        assert_eq!(seen.len(), 20);
     }
 }

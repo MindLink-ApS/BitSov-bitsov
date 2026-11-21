@@ -2,9 +2,10 @@
 
 Loopback TCP is not proof that a request came from a trusted local application:
 web browsers can connect to loopback after resolving an attacker-controlled DNS
-name. The local token mint and routes using the shared local-connection guard
-(WebSocket admission, energy, and membrane reads) therefore also validate HTTP
-request headers before granting local trust.
+name. The local token mint, `GET /api/v1/owner/claim-code`, and routes using
+the shared local-connection guard (WebSocket admission, call media, energy,
+and membrane reads) therefore also validate HTTP request headers before
+granting local trust.
 
 The allowed `Host` values are `localhost`, `127.0.0.1`, and `[::1]`, each with the
 API listener's port, plus the concrete IP address configured by `api.listen_addr`

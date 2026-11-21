@@ -132,6 +132,13 @@ pub(crate) fn merge_peer_metadata_preserving_invite_ref(
     let Some(existing_obj) = existing.and_then(|value| value.as_object()) else {
         return merged;
     };
+    let untrusted = existing_obj
+        .get("storage_legacy_untrusted")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if untrusted && !merged.is_object() {
+        merged = serde_json::json!({});
+    }
     let Some(merged_obj) = merged.as_object_mut() else {
         return merged;
     };
@@ -140,6 +147,10 @@ pub(crate) fn merge_peer_metadata_preserving_invite_ref(
         if let Some(value) = existing_obj.get(key) {
             merged_obj.insert(key.to_string(), value.clone());
         }
+    }
+
+    if untrusted {
+        merged_obj.insert("storage_legacy_untrusted".into(), true.into());
     }
 
     merged

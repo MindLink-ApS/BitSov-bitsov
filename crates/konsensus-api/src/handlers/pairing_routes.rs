@@ -489,7 +489,14 @@ async fn elevation_request(
             body.budget.map(BudgetProposal::into_terms),
         )
         .map_err(map_err)?;
-    let owner_action = if svc.owner_control_enabled() {
+    // A window the node opened inside the owner's standing allowance needs
+    // nothing from the owner.
+    let opened_by_allowance = svc.standing_allowance_enabled()
+        && matches!(svc.elevation_status(&binding.client_id, &op.op_id), Ok(ElevationStatus::Granted))
+        && svc.snapshot().pending_elevations.iter().all(|e| e.op_id != op.op_id);
+    let owner_action = if opened_by_allowance {
+        "none: opened within the owner's standing allowance".to_string()
+    } else if svc.owner_control_enabled() {
         svc.owner_grant_command(&op.op_id)
     } else {
         "unavailable in this deployment: the node was not started in owner-run mode, so there \
@@ -757,8 +764,10 @@ pub fn routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
 /// Device-key requests, status, cancellation and listing confer no authority;
 /// owner-device ticket issuance and SAS delegation require an enrolled key.
 /// Relation intents require a registered device key's signature bound to the
-/// node, client and epoch, with a fresh nonce; provisional sessions cannot use
-/// them. Console approval, key revocation and first-contact grants stay owner-local.
+/// node, client and pairing epoch, over the same authenticated Noise session
+/// as the other signed tunnel intents, with a fresh nonce. Provisional
+/// sessions cannot use them. Console approval, key revocation and
+/// first-contact grants stay owner-local.
 /// Locked mode uses its own four-route router, never this one.
 pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
     if !pairing_enabled {
@@ -830,7 +839,7 @@ pub fn remote_routes(pairing_enabled: bool) -> Router<Arc<AppState>> {
         )
         .route(
             "/api/v1/pair/relation-intent",
-            post(super::device_routes::relation_intent),
+            post(super::owner_device_routes::relation_intent),
         )
 }
 

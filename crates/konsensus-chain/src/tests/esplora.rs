@@ -4,6 +4,9 @@ use axum::{extract::Path, routing::get, Router};
 #[path = "height_cache.rs"]
 mod height_cache;
 
+#[path = "esplora_startup.rs"]
+mod startup;
+
 /// Start a mock Esplora server and return (config, server_handle).
 async fn mock_esplora() -> (EsploraConfig, tokio::task::JoinHandle<()>) {
     let app = Router::new()

@@ -217,6 +217,11 @@ features = [
 ]
 default-features = false
 
+[dependencies.tokio-util]
+version = "0.7.10"
+features = ["rt"]
+default-features = false
+
 [dependencies.uniffi]
 version = "0.28.3"
 features = ["build"]

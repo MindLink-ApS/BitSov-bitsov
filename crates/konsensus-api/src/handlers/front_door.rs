@@ -58,12 +58,16 @@ pub struct FrontDoorStore {
 impl FrontDoorStore {
     /// Re-derive a published card from the gate tariff, including cards saved by
     /// older versions. Persist and re-sign only when the price changes; reads
-    /// neither renew the expiry nor change the owner's profile.
+    /// neither renew the expiry nor change the owner's profile. A changed price
+    /// is signed only against a usable chain tip, whose difficulty epoch it
+    /// then carries; without one the read is refused (`chain_unavailable`)
+    /// and the stored card stays as it is.
     pub async fn priced_card(
         &self,
         identity: &konsensus_core::identity::NodeIdentity,
         pricing: &dyn konsensus_core::traits::pricing::PricingEngine,
         gate: &konsensus_core::gate::PaymentGate,
+        chain: &dyn konsensus_core::traits::chain::ChainProvider,
     ) -> Result<Option<FrontDoorCard>, ApiError> {
         let price = porch_page_price(pricing, gate).await?;
         let mut store = self.card.lock().await;
@@ -73,6 +77,7 @@ impl FrontDoorStore {
         if card.prices.page_msat == price {
             return Ok(Some(card.clone()));
         }
+        let height = crate::error::chain_tip_of(chain).await?;
         let mut floor = self.seq_floor.lock().await;
         let seq = card
             .seq
@@ -81,6 +86,7 @@ impl FrontDoorStore {
             .ok_or_else(|| ApiError::Conflict("front-door sequence exhausted".into()))?;
         let mut prices = card.prices.clone();
         prices.page_msat = price;
+        prices.price_epoch = height / 2016;
         let updated = FrontDoorCard::issue(
             identity,
             FrontDoorFields {
@@ -417,7 +423,7 @@ async fn get_front_door(
 ) -> Result<impl IntoResponse, ApiError> {
     let card = state
         .front_door
-        .priced_card(&state.identity, state.pricing.as_ref(), &state.gate)
+        .priced_card(&state.identity, state.pricing.as_ref(), &state.gate, state.chain.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound("front_door_missing: publish one first".into()))?;
     let body = response_for(card, state.introduction.network.as_deref(), now_unix()?)?;
@@ -440,14 +446,15 @@ async fn put_front_door(
         )
     })?;
     let endpoint = state.introduction.require_endpoint("front_door_unavailable")?;
+    // The tip first: no price is read or signed without one.
+    let height = crate::error::chain_tip(&state).await?;
     let chat = state
         .pricing
         .get_price_msat(konsensus_core::kind::KIND_CHAT)
         .await
-        .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
+        .map_err(|e| crate::error::pricing_error_or(e, |e| ApiError::Internal(format!("price unavailable: {e}"))))?;
     let (default_admission, default_message) = first_contact_prices(chat, state.gate.min_admission_cost_msat());
     let page_msat = porch_page_price(state.pricing.as_ref(), &state.gate).await?;
-    let height = state.chain.get_block_height().await.unwrap_or(0);
 
     let mut store = state.front_door.card.lock().await;
     let mut floor = state.front_door.seq_floor.lock().await;
@@ -642,6 +649,6 @@ pub async fn porch_page_price(
     let base = pricing
         .get_price_msat(kind)
         .await
-        .map_err(|e| ApiError::Internal(format!("price unavailable: {e}")))?;
+        .map_err(|e| crate::error::pricing_error_or(e, |e| ApiError::Internal(format!("price unavailable: {e}"))))?;
     Ok(gate.price_with_floor_msat(base))
 }

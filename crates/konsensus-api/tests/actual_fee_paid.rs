@@ -165,11 +165,10 @@ async fn compose_and_operation_replay_report_fee_without_repaying() {
             vec![peer],
             state.invoice_requests.clone(),
         ));
-        state
-            .peer_ln_pubkeys
-            .lock()
-            .await
-            .insert(peer, format!("02{}", "aa".repeat(32)));
+        state.peer_ln_pubkeys.lock().await.insert(
+            peer,
+            konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))),
+        );
         let request = json!({"recipient":peer.to_hex(),"plaintext":"paid fee","kind":1,"max_total_msat":2000,"max_routing_fee_msat":1000,"wait_ack_ms":0});
         let paid = call(&state, "POST", "/api/v1/messages/compose", request.clone()).await;
         assert_eq!(paid["max_routing_fee_msat"], 1000);
@@ -214,11 +213,10 @@ async fn file_send_reports_the_actual_ldk_fee_and_omits_an_unknown_one() {
             vec![peer],
             state.invoice_requests.clone(),
         ));
-        state
-            .peer_ln_pubkeys
-            .lock()
-            .await
-            .insert(peer, format!("02{}", "aa".repeat(32)));
+        state.peer_ln_pubkeys.lock().await.insert(
+            peer,
+            konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))),
+        );
         let file = call(
             &state,
             "POST",
@@ -267,11 +265,10 @@ async fn room_fee_is_complete_sum_or_omitted_if_any_payment_is_unknown() {
                 .add_room_member(&room.id, &peer)
                 .await
                 .unwrap();
-            state
-                .peer_ln_pubkeys
-                .lock()
-                .await
-                .insert(peer, format!("02{}", "aa".repeat(32)));
+            state.peer_ln_pubkeys.lock().await.insert(
+                peer,
+                konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))),
+            );
         }
         if pending {
             wallet.defer_next_keysend_settlement(u32::MAX).await;
@@ -309,11 +306,10 @@ async fn changing_backend_does_not_turn_mock_history_into_ldk_fee_evidence() {
         vec![peer],
         state.invoice_requests.clone(),
     ));
-    state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(peer, format!("02{}", "aa".repeat(32)));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))),
+    );
     let paid = call(
         &state,
         "POST",

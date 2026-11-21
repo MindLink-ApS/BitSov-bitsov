@@ -84,9 +84,13 @@ impl ChannelPeers {
 
     fn check(&self, peer_pubkey: &str) -> Result<(), LightningError> {
         match self {
-            Self::HubOnly(hubs) if !hubs.iter().any(|hub| hub.eq_ignore_ascii_case(peer_pubkey)) => {
+            Self::HubOnly(hubs)
+                if !hubs.iter().any(|hub| hub.eq_ignore_ascii_case(peer_pubkey)) =>
+            {
                 tracing::warn!(peer = %peer_pubkey, code = HUB_ONLY_WHILE_LOCKABLE, "refused channel open to a non-hub peer");
-                Err(LightningError::PaymentNotDispatched(HUB_ONLY_WHILE_LOCKABLE.into()))
+                Err(LightningError::PaymentNotDispatched(
+                    HUB_ONLY_WHILE_LOCKABLE.into(),
+                ))
             }
             _ => Ok(()),
         }
@@ -163,6 +167,9 @@ impl LightningProvider for GuardedLightning {
     async fn money_ready(&self) -> bool {
         self.inner.money_ready().await
     }
+    async fn receive_invoice_capable(&self) -> bool {
+        self.inner.receive_invoice_capable().await
+    }
     async fn readiness(&self) -> LightningReadiness {
         self.inner.readiness().await
     }
@@ -211,6 +218,15 @@ impl LightningProvider for GuardedLightning {
             .create_invoice(amount_msat, description, expiry_secs)
             .await
     }
+    async fn forget_pending_invoice(&self, payment_hash: &str) -> Result<bool, LightningError> {
+        self.inner.forget_pending_invoice(payment_hash).await
+    }
+    async fn purge_expired_pending_invoices(&self, now_unix: u64) -> Result<u32, LightningError> {
+        self.inner.purge_expired_pending_invoices(now_unix).await
+    }
+    async fn pending_invoice_expiries(&self) -> Result<Vec<(String, u64)>, LightningError> {
+        self.inner.pending_invoice_expiries().await
+    }
     async fn create_stateless_invoice(
         &self,
         amount_msat: u64,
@@ -256,6 +272,12 @@ impl LightningProvider for GuardedLightning {
         payment_hash: &str,
     ) -> Result<PaymentDetails, LightningError> {
         self.inner.get_payment_status(payment_hash).await
+    }
+    async fn gate_payment_status(
+        &self,
+        payment_hash: &str,
+    ) -> Result<PaymentDetails, LightningError> {
+        self.inner.gate_payment_status(payment_hash).await
     }
     fn outgoing_payment_updates(&self) -> Option<BoxStream<'static, String>> {
         self.inner.outgoing_payment_updates()

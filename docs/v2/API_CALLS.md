@@ -34,7 +34,7 @@ The bound also applies if the stored data exceeds the admission bound.
 ```
 
 - `id`: the call id, scoped to the requested peer.
-- `state`: `reserved`, `ringing`, `live`, or `ended`, aged at read time.
+- `state`: `reserved`, `awaiting_device`, `ringing`, `live`, or `ended`, aged at read time.
 - `direction`: `outgoing` (this node offered) or `incoming` (the peer offered).
 - `unresolved_paid_admission`: boolean; conservatively true whenever the call
   retains a pending signal reservation. The read does not reconcile payment
@@ -57,7 +57,7 @@ The bound also applies if the stored data exceeds the admission bound.
   funds. It is an observation, never new payment authority. The original
   reservation amount and per-block ceilings stay fixed for the call.
 
-Open means an unexpired reserved/ringing/live call **or any call with a pending
+Open means an unexpired reserved/awaiting-device/ringing/live call **or any call with a pending
 signal**, including calls whose ringing/live deadline and replay tombstone
 have expired. Ended/expired calls without a pending signal are omitted.
 
@@ -93,6 +93,9 @@ Restart the node to apply a config change. A paired-app reservation pins its
 cap when created, so a config change never resizes an existing hold. Holds
 created before this setting existed retain their original 240-minute cap.
 Owner-authorized calls without a grant use the current node setting.
+`GET /api/v1/status` reports the current value read-only as `max_call_minutes`,
+so an app can compute the hold before ringing. It is absent from the public
+`/api/v1/health`.
 
 Before a caller's offer is dispatched, the node reserves `max_call_minutes`
 60-second blocks at the callee's current kind-404 price, plus the enforced
@@ -225,6 +228,44 @@ allow those call tombstones to expire as well before downgrading.
 
 This slice adds no SQL migration. Any new migration needs the owner's GO.
 
+## Incoming invite device wait
+
+On the callee node an admitted kind-400 invite starts as `awaiting_device`.
+Its device deadline is 15 seconds after local arrival. The first fetch by a
+currently paired app through message GET, plaintext GET, or message listing,
+or the first successful authorized paired WebSocket write, changes it to
+`ringing` with a deadline 60 seconds after that delivery. Further devices do
+not restart the clock. Internal broadcast subscribers and resync enqueue alone
+do not count; resync can start ringing only through an actual device stream.
+
+An expired row is aged to `ended` before classification. A late fetch or
+resend cannot revive it. The node retains ordinary replay tombstones, bounds
+device waits with the existing call limits, and expires them in the call-state
+sweep. Startup ends awaiting calls rather than binding retained old invites to
+them. The current offer for each call is recorded by migration 041
+(`041_call_offer_binding.sql`).
+
+The invite's existing `MessageAck` is delayed until device delivery. The
+background control writer sends it within its 100 ms sweep cadence, without
+peer I/O on the device request. A resend during the wait remains pending and
+receives the same eventual outcome; it is never decrypted or forwarded twice.
+The 15-second wait is below the sender's 60-second periodic resend scan.
+
+A wait with no device delivery ends with the existing `MessageReject` frame,
+using the new stable reason string **`call_not_reachable`** and the invite's
+message ID. Apps can display this as the person's device being offline.
+Callers that do not recognize the reason use their existing generic rejection
+handling. The refused envelope and cached plaintext are withdrawn; its payment
+hash and nonce remain spent. Pending, fetched, and not-reachable outcomes use
+the existing payment receipt, without a new table. An authenticated
+resend matching its immutable receipt receives the same ACK or refusal after
+withdrawal, content retention, or restart, without new pricing or settlement.
+Startup withdraws pending device waits and retains a not-reachable refusal;
+it must finish this recovery before serving devices or receiving messages.
+The refusal uses the existing paid-but-refused path, with no extra caller
+charge. There is no additional payment, invoice, caller
+timer anchoring, or new wire acknowledgment field.
+
 ## Contract goldens (app–node)
 
 The responses the app consumes for calls and for the owner-only STUN fields
@@ -237,7 +278,7 @@ on either side fails there and here before it reaches a user.
 
 | Fixture | Request | Status | Contract |
 |---|---|---|---|
-| `status_stun_own.json` | `GET /api/v1/status` | 200 | Own STUN responder (`[calls] stun_listen`) at a dialable advertised host: `stun_port`, `stun_url` (`stun:<peer host>:<stun_port>`), `stun_source` `own`, `peer_endpoint`, `peer_endpoint_source` `advertised`. |
+| `status_stun_own.json` | `GET /api/v1/status` | 200 | Own STUN responder (`[calls] stun_listen`) at a dialable advertised host: `stun_port`, `stun_url` (`stun:<peer host>:<stun_port>`), `stun_source` `own`, `peer_endpoint`, `peer_endpoint_source` `advertised`. All three `status_stun_*` fixtures also pin `max_call_minutes`, at the default of 60, and carry `node_version` (the running release, masked). |
 | `status_stun_configured.json` | `GET /api/v1/status` | 200 | Own responder without a dialable host but a valid `[network] stun_server`: `stun_port`, `stun_url` from the configured server, `stun_source` `configured`, `peer_endpoint_reason` `no_dialable_endpoint`. |
 | `status_stun_absent.json` | `GET /api/v1/status` | 200 | No responder, no dialable host, no configured server: `stun_port`, `stun_url`, `stun_source`, `peer_endpoint` and `peer_endpoint_source` are absent; `peer_endpoint_reason` `no_dialable_endpoint`. |
 | `peer_call_price.json` | `GET /api/v1/pricing/peers/:id/call` | 200 | The callee's live call price: `peer_id`, `offer_msat` (kind 400, asked of the callee), `signal_msat` (kind 401). |
@@ -271,6 +312,7 @@ kept literally.
 | `/body/lightning_node_pubkey` | 66 lower-case hex chars | `<hex66>` |
 | `/body/message_id`, `/body/payment_hash` | 64 lower-case hex chars | `<hex64>` |
 | `/body/uptime_secs` | non-negative integer | `<uint>` |
+| `/body/node_version` | exactly the workspace release version (`konsensus --version`) | `<pkg_version>` |
 | `/body/*/next_block_due_ms` | non-negative integer ≥ 10^12 (Unix milliseconds) | `<unix_ms>` |
 | `/body/*/created` | non-negative integer ≥ 10^12 (Unix milliseconds) | `<unix_ms>` |
 

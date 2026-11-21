@@ -5,7 +5,7 @@ use crate::auth::Scope;
 use crate::spend_budget::{
     BreakerStatus, BudgetRefusal, DeviceBreakerReset, GrantBudget, GrantTerms,
 };
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
@@ -468,7 +468,7 @@ impl PairingService {
         }
         rate(&mut inner.owner_approvals.requests, client_id)?;
         let mut nonce = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         let op = ApprovalOperation {
             op_id: uuid::Uuid::new_v4().to_string(),
             node: inner.identity_fingerprint.clone(),
@@ -632,7 +632,7 @@ impl PairingService {
             ApprovalRequest::SpendGrant { .. } => {
                 let terms = op.request.spend_terms()?;
                 let budget = GrantBudget::from_terms(&terms);
-                let grant = SpendGrant {
+                let mut grant = SpendGrant {
                     op_id: op.op_id.clone(),
                     client_id: op.client_id.clone(),
                     scopes: vec![Scope::Spend],
@@ -647,13 +647,10 @@ impl PairingService {
                         approver,
                         signature: signature.into(),
                     }),
+                    ended: None,
                 };
                 let before = inner.file.clone();
-                for old in &mut inner.file.grants {
-                    if old.client_id == op.client_id {
-                        old.budget = None;
-                    }
-                }
+                inner.file.replace_grants(&mut grant, self.call_continuity);
                 inner.file.grants.push(grant);
                 if let Err(e) = self.persist(&mut inner.file) {
                     inner.file = before;

@@ -8,3 +8,16 @@ Cargo.lock            @RaslaTL19
 crates/konsensus-core/**       @RaslaTL19
 crates/konsensus-crypto/**     @RaslaTL19
 crates/konsensus-lightning/**  @RaslaTL19
+
+# Verifier, release and money paths: changes here need the maintainer's eye
+# (CI definitions, release/signing tooling, storage migrations, pairing, vendored Lightning code).
+CODEOWNERS                                @RaslaTL19
+rust-toolchain*                           @RaslaTL19
+scripts/release-*                         @RaslaTL19
+scripts/check-security-key.sh             @RaslaTL19
+scripts/configure-sccache.sh              @RaslaTL19
+crates/konsensus-storage/migrations/**    @RaslaTL19
+crates/konsensus-api/src/pairing/**       @RaslaTL19
+vendor/**                                 @RaslaTL19
+docs/releases/**                          @RaslaTL19
+docs/security/**                          @RaslaTL19

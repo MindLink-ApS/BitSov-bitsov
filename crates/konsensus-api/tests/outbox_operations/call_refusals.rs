@@ -23,6 +23,7 @@ fn ringing() -> CallEntry {
         deadline_ms: u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap() + 60_000,
         pending: None,
         paid_until_ms: None, next_block_seq: 0, end_reason: None, unpaid_notice_used: false,
+        free_reply_receipts: Vec::new(),
     }
 }
 

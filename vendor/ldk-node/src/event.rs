@@ -2412,6 +2412,77 @@ mod bitsov_stateless_tests {
 			deadline - 1
 		));
 	}
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn pending_cleanup_racing_payment_claimed_preserves_receipt() {
+		use bitcoin::hashes::Hash;
+		let dir = tempfile::tempdir().unwrap();
+		let mut builder = crate::Builder::new();
+		builder.set_network(bitcoin::Network::Regtest);
+		builder.set_entropy_seed_bytes([44; 64]);
+		builder.set_storage_dir_path(dir.path().to_str().unwrap().into());
+		let node = Arc::new(builder.build_with_fs_store().unwrap());
+		let handler = EventHandler::new(
+			node.event_queue.clone(),
+			node.wallet.clone(),
+			Arc::new(BumpTransactionEventHandler::new(
+				node.tx_broadcaster.clone(),
+				Arc::new(LdkWallet::new(node.wallet.clone(), node.logger.clone())),
+				node.keys_manager.clone(),
+				node.logger.clone(),
+			)),
+			node.channel_manager.clone(),
+			node.connection_manager.clone(),
+			node.output_sweeper.clone(),
+			node.network_graph.clone(),
+			None,
+			node.payment_store.clone(),
+			node.peer_store.clone(),
+			None,
+			node.onion_messenger.clone(),
+			None,
+			node.runtime.clone(),
+			node.logger.clone(),
+			node.config.clone(),
+		);
+		let mut ids = Vec::new();
+		for n in 0..64 {
+			let invoice = node.bolt11_payment().receive(2000,
+				&lightning_invoice::Bolt11InvoiceDescription::Direct(
+					lightning_invoice::Description::new("cleanup race".into()).unwrap()), 120).unwrap();
+			let hash = PaymentHash(invoice.payment_hash().to_byte_array());
+			let id = PaymentId(hash.0);
+			let preimage = node.channel_manager.get_payment_preimage(hash, *invoice.payment_secret()).unwrap();
+			let claimed = LdkEvent::PaymentClaimed {
+				payment_hash: hash,
+				purpose: PaymentPurpose::Bolt11InvoicePayment {
+					payment_preimage: Some(preimage), payment_secret: *invoice.payment_secret(),
+				},
+				amount_msat: 2000, receiver_node_id: Some(node.node_id()), htlcs: Vec::new(),
+				sender_intended_total_msat: Some(2000), onion_fields: None, payment_id: Some(id),
+			};
+			// Include both ordered outcomes as well as simultaneous contenders.
+			if n == 0 { handler.handle_event(claimed.clone()).await.unwrap(); }
+			if n == 1 { assert!(node.remove_pending_inbound_payment(&id).unwrap()); }
+			let barrier = Arc::new(std::sync::Barrier::new(2));
+			let cleanup = {
+				let node = node.clone();
+				let barrier = barrier.clone();
+				std::thread::spawn(move || { barrier.wait(); node.remove_pending_inbound_payment(&id).unwrap() })
+			};
+			barrier.wait();
+			handler.handle_event(claimed).await.unwrap();
+			cleanup.join().unwrap();
+			let receipt = node.payment(&id).expect("cleanup erased settlement");
+			assert_eq!(receipt.status, PaymentStatus::Succeeded);
+			assert!(matches!(receipt.kind, PaymentKind::Bolt11 { preimage: Some(p), .. } if p == preimage));
+			ids.push(id);
+		}
+		drop(handler);
+		drop(node);
+		let restarted = builder.build_with_fs_store().unwrap();
+		for id in ids { assert_eq!(restarted.payment(&id).unwrap().status, PaymentStatus::Succeeded); }
+	}
+
 }
 
 #[cfg(test)]

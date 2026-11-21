@@ -1,0 +1,38 @@
+name: New crate names
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: new-crates-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  new-crates:
+    name: New crate names (optional)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test crate-name comparisons
+        run: python3 scripts/test-new-crates.py -v
+
+      - name: Compare with the PR base
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git show "${PR_BASE_SHA}:Cargo.lock" > "$RUNNER_TEMP/base-Cargo.lock"
+          python3 scripts/check-new-crates.py \
+            --base-lock "$RUNNER_TEMP/base-Cargo.lock" \
+            --head-lock Cargo.lock \
+            --allowlist .github/crate-allowlist.txt | tee -a "$GITHUB_STEP_SUMMARY"

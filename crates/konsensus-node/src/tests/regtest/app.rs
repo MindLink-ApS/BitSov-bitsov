@@ -107,6 +107,9 @@ pub struct Options {
     pub identity: Arc<NodeIdentity>,
     pub chain_url: String,
     pub calls: Option<CallOptions>,
+    /// The production readiness wrappers and settlement check on this node's
+    /// gate. Lets a scenario watch what it does while its chain sync has lapsed.
+    pub readiness_gated: bool,
     pub owner_approval_key: Option<ed25519_dalek::VerifyingKey>,
 }
 
@@ -289,11 +292,33 @@ impl App {
                 Arc::new(crate::call_media::PaidCallAdmission::new(storage.clone())),
             )
         });
+        let readiness_gated = options.as_ref().is_some_and(|o| o.readiness_gated);
+        let lightning: Arc<dyn LightningProvider> = if readiness_gated {
+            let policy = wallet.routing_fee_policy();
+            let backend = wallet.clone() as Arc<dyn LightningProvider>;
+            let recovering = konsensus_lightning::RecoveringLightning::new(
+                move || {
+                    let backend = backend.clone();
+                    async move { Ok(backend) }
+                },
+                policy,
+            )
+            .await
+            .unwrap();
+            Arc::new(crate::guarded_lightning::GuardedLightning {
+                inner: Arc::new(recovering),
+                disk: Arc::new(crate::safety::DiskGuard::new(dir.to_path_buf(), 0)),
+                channel_peers: Default::default(),
+                _state_guard: Arc::new(std::fs::File::open(dir).unwrap()),
+            })
+        } else {
+            wallet.clone()
+        };
         let state = Arc::new(konsensus_api::AppState {
             starter: Default::default(),
             identity: Arc::clone(identity),
             storage,
-            lightning: wallet.clone(),
+            lightning,
             chain: Arc::new(
                 konsensus_chain::EsploraProvider::new(konsensus_chain::EsploraConfig::custom(
                     options
@@ -313,18 +338,22 @@ impl App {
                     ..Default::default()
                 },
             )),
-            gate: Arc::new(konsensus_core::PaymentGate::new()),
+            gate: Arc::new(konsensus_core::PaymentGate::with_config(konsensus_core::gate::GateConfig {
+                verify_lightning_settlement: readiness_gated,
+                ..Default::default()
+            })),
             peer_registry: Arc::new(tokio::sync::RwLock::new(registry)),
             transport: Arc::clone(transport) as Arc<dyn MessageTransport>,
             session_manager: Arc::clone(sessions),
             jwt_secret: JWT_SECRET.into(),
-            auth_challenges: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            auth_challenges: konsensus_api::AuthChallenges::new(),
             pairing: Some(pairing.0.clone()),
             cors_enabled: false,
             operator_probes_enabled: true,
             sensitive_identity_routes_enabled: true,
             has_identity_passphrase: false,
             ws_broadcast: tokio::sync::broadcast::channel(16).0,
+            call_devices: Default::default(),
             ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
             rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),
             mnemonic_reveal_limiter: Arc::new(
@@ -360,6 +389,7 @@ impl App {
             sponsor: Default::default(),
             stun_port: None,
             max_call_minutes: calls.map_or(60, |c| c.max_minutes),
+            call_reply_free: false,
             configured_stun_server: None,
             custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
             call_media: media
@@ -439,6 +469,8 @@ impl App {
                 plaintext_cipher: Arc::new(konsensus_crypto::PlaintextCacheCipher::new(
                     identity.aes_key(),
                 )),
+                call_devices: state.call_devices.clone(),
+                call_reply_free: false,
                 ws_tx: state.ws_broadcast.clone(),
                 audit_log: state.audit_log.clone(),
                 admission_mode: ReachabilityMode::PriceOpen,
@@ -650,6 +682,7 @@ impl App {
             .await;
         assert_eq!(status, StatusCode::OK, "compose: {body}");
         assert_eq!(body["delivered"], true, "{body}");
+        assert_eq!(body["accepted"], true, "{body}");
         let message = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let message = receiver.received.recv().await.unwrap();

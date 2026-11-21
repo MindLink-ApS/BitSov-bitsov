@@ -94,6 +94,8 @@ rules:
         # plaintext_cache.rs uses .expect() with explanatory messages in production
         # code; .unwrap() only appears inside #[cfg(test)] inline test blocks.
         - "**/plaintext_cache.rs"
+        # record_cipher.rs unwraps are confined to the inline #[cfg(test)] module.
+        - "**/record_cipher.rs"
 
   # ── P2: Lightning Gate ────────────────────────────────────────────────────────
   #

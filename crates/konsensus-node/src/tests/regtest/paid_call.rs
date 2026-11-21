@@ -4,8 +4,10 @@
 use super::*;
 use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
-use konsensus_core::payloads::call::{CallEntry, HangupReason, Phase};
+use konsensus_core::payloads::call::{CallEntry, HangupReason, Phase, CALLER_ANSWER_WINDOW_MS};
+use konsensus_core::traits::lightning::LightningError;
 use konsensus_core::NodeId;
+use konsensus_crypto::SessionManager;
 use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, Message},
     MaybeTlsStream, WebSocketStream,
@@ -33,8 +35,12 @@ async fn entry(app: &app::App, peer: &NodeId) -> CallEntry {
 }
 
 async fn socket(app: &app::App, peer: &NodeId) -> Result<Socket, u16> {
+    socket_for(app, peer, CALL).await
+}
+
+async fn socket_for(app: &app::App, peer: &NodeId, call_id: &str) -> Result<Socket, u16> {
     let mut request = format!(
-        "ws://{}/api/v1/calls/{CALL}/media?peer={}",
+        "ws://{}/api/v1/calls/{call_id}/media?peer={}",
         app.media_addr.unwrap(),
         peer.to_hex()
     )
@@ -64,7 +70,7 @@ async fn next_binary(socket: &mut Socket) -> Vec<u8> {
                 .expect("paid socket open")
                 .expect("media read")
             {
-                Message::Binary(bytes) => return bytes,
+                Message::Binary(bytes) => return bytes.to_vec(),
                 Message::Ping(_) | Message::Pong(_) | Message::Text(_) => {}
                 other => panic!("unexpected paid media: {other:?}"),
             }
@@ -86,8 +92,8 @@ async fn audio_until(a: &mut Socket, b: &mut Socket, until: u64, seq: &mut u32) 
         tick.tick().await;
         let ab = packet(*seq, 0xa0);
         let ba = packet(*seq, 0xb0);
-        a.send(Message::Binary(ab.clone())).await.unwrap();
-        b.send(Message::Binary(ba.clone())).await.unwrap();
+        a.send(Message::Binary(ab.clone().into())).await.unwrap();
+        b.send(Message::Binary(ba.clone().into())).await.unwrap();
         let (at_b, at_a) = tokio::join!(next_binary(b), next_binary(a));
         assert_eq!(at_b, ab, "A -> B ordered frame {seq}");
         assert_eq!(at_a, ba, "B -> A ordered frame {seq}");
@@ -97,7 +103,7 @@ async fn audio_until(a: &mut Socket, b: &mut Socket, until: u64, seq: &mut u32) 
 
 async fn closed_without_media(socket: &mut Socket) {
     // Try to send even if the close frame has not yet reached this app.
-    let _ = socket.send(Message::Binary(packet(u32::MAX, 0xee))).await;
+    let _ = socket.send(Message::Binary(packet(u32::MAX, 0xee).into())).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match socket.next().await {
@@ -130,6 +136,14 @@ async fn compose(
         request["max_hold_msat"] = json!(u64::from(app.state.max_call_minutes) * PRICE);
     }
     app.post("/api/v1/messages/compose", request, false).await
+}
+
+/// A sending chain can still belong to the session being replaced. Wait for
+/// confirmation and handover before sending traffic under the recovered session.
+async fn session_recovered(sessions: &SessionManager, peer: &NodeId) -> bool {
+    sessions.can_send(peer).await
+        && !sessions.awaiting_confirmation(peer).await
+        && !sessions.replacement_pending(peer).await
 }
 
 /// Shared production pair: callers choose tariffs, limits and approval roots.
@@ -200,6 +214,7 @@ impl Pair {
                     ),
                     chain_url: chain.api_url.clone(),
                     calls: Some(calls),
+                    readiness_gated: false,
                     owner_approval_key: approval_keys[if index == first { 0 } else { 1 }],
                 }),
             )
@@ -248,8 +263,8 @@ impl Pair {
         // Listing contacts can race the first supervised handshake. A transport
         // connection alone does not prove the prekey exchange has completed.
         wait("both signaling sessions established", || async {
-            caller.state.session_manager.can_send(&bid).await
-                && callee.state.session_manager.can_send(&aid).await
+            session_recovered(&caller.state.session_manager, &bid).await
+                && session_recovered(&callee.state.session_manager, &aid).await
         })
         .await;
 
@@ -367,7 +382,7 @@ async fn one_call(lane: Lane, max_minutes: u16, paid_blocks: u32, reason: Hangup
     let offer = json!({"v":1, "call_id":CALL, "media":"audio", "sdp":SDP});
     let (status, body) = compose(&caller, &bid, 400, offer, SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "offer: {body}");
-    recv_kind(&mut callee, &aid, 400).await;
+    device_rings(&mut callee, &aid, CALL).await;
     let held = caller
         .service
         .call_spend_status(&bid.to_hex(), CALL)
@@ -690,7 +705,7 @@ async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
     let offer = json!({"v":1, "call_id":LOST, "media":"audio", "sdp":SDP});
     let (status, body) = compose(caller, &bid, 400, offer, SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "offer: {body}");
-    recv_kind(callee, &aid, 400).await;
+    device_rings(callee, &aid, LOST).await;
     let answer = json!({"v":1, "call_id":LOST, "sdp":SDP});
     let (status, body) = compose(callee, &aid, 401, answer, SIGNAL_PRICE).await;
     assert_eq!(status, StatusCode::OK, "answer: {body}");
@@ -720,6 +735,7 @@ async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
     assert!(callee.state.session_manager.remove_session(&aid).await);
     let (status, body) = compose(caller, &bid, 404, block(1), PRICE).await;
     let lost_throughout = !callee.state.session_manager.has_session(&aid).await;
+    crate::session_handler::HOLD_RECOVERY_RATCHET_INIT.store(true, Ordering::SeqCst);
     crate::session_handler::HOLD_PREKEY_ANSWERS.store(false, Ordering::SeqCst);
     let lost_at = std::time::Instant::now();
     assert!(lost_throughout, "the barrier held");
@@ -730,12 +746,35 @@ async fn lost_session_recovers_on_the_connection_and_the_next_call_works() {
     assert_eq!((hold.spent_msat, hold.closed), (spent, false), "the hold is untouched");
     lane.steps.pass("the block for a lost session is refused before payment");
 
-    wait("the callee has a session again", || async {
+    // Start B's first message while handover is still pending. The test barrier
+    // holds A's RatchetInit, so scheduler speed cannot skip this state.
+    wait("the recovered initiator has a sending chain", || async {
         assert!(lost_at.elapsed() < RECOVERY_BOUND, "not recovered within the bound");
         callee.state.session_manager.can_send(&aid).await
-            && caller.state.session_manager.can_send(&bid).await
-    })
-    .await;
+            && caller.state.session_manager.replacement_pending(&bid).await
+    }).await;
+    let first = json!({"operation_id": uuid::Uuid::new_v4().to_string(),
+        "recipient": bid.to_hex(), "kind": 0, "plaintext": "first message during recovery"});
+    let (status, body) = caller.post("/api/v1/messages/compose", first.clone(), false).await;
+    crate::session_handler::HOLD_RECOVERY_RATCHET_INIT.store(false, Ordering::SeqCst);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["reason"], "session_handover", "{body}");
+    assert_eq!(body["retry_allowed"], true, "{body}");
+    assert_eq!(a.list_payments(100).await.unwrap().len(), payments, "handover defers payment");
+    println!("RECOVERY HANDOVER FIRST SEND deferred");
+    // Retry the same operation immediately; production owns session readiness.
+    // No test handover predicate is used to authorize this first message.
+    loop {
+        assert!(lost_at.elapsed() < RECOVERY_BOUND, "first recovery message: {body}");
+        let (status, body) = caller.post("/api/v1/messages/compose", first.clone(), false).await;
+        if status == StatusCode::OK {
+            assert_eq!(body["accepted"], true, "{body}");
+            recv_kind(callee, &aid, 0).await;
+            break;
+        }
+        assert_eq!(body["reason"], "session_handover", "{body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     println!("SESSION RECOVERED after {:?}", lost_at.elapsed());
     assert_eq!(
         (connection(caller, bid).await, connection(callee, aid).await),
@@ -772,8 +811,387 @@ async fn unpaid_after_three_paid_blocks() {
     scenario(5, 3, HangupReason::Unpaid).await;
 }
 
+#[tokio::test]
+async fn recovery_waits_until_both_sessions_have_switched() {
+    let (_, initiator) = NodeIdentity::generate().unwrap();
+    let (_, responder) = NodeIdentity::generate().unwrap();
+    let (aid, bid) = (*initiator.node_id(), *responder.node_id());
+    let a = SessionManager::new(Arc::new(initiator));
+    let b = SessionManager::new(Arc::new(responder));
+    assert!(!session_recovered(&a, &bid).await);
+
+    let init = a.initiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
+    b.accept_session(&aid, &init).await.unwrap();
+    assert!(!session_recovered(&b, &aid).await, "no sending chain yet");
+    assert!(a.confirm_session(&bid).await);
+    let first = a.encrypt(&bid, b"initial session").await.unwrap();
+    assert_eq!(b.decrypt(&aid, &first).await.unwrap(), b"initial session");
+    assert!(session_recovered(&a, &bid).await);
+    assert!(session_recovered(&b, &aid).await);
+
+    assert!(a.remove_session(&bid).await);
+    let init = a.reinitiate_session(&bid, &b.prekey_bundle().await).await.unwrap();
+    b.reaccept_session(&aid, &init).await.unwrap();
+    assert!(a.can_send(&bid).await && b.can_send(&aid).await);
+    assert!(!session_recovered(&a, &bid).await, "SessionAck is still outstanding");
+    assert!(a.confirm_session(&bid).await);
+    assert!(session_recovered(&a, &bid).await);
+    assert!(!session_recovered(&b, &aid).await, "the responder still sends on the previous session");
+
+    let init = a.encrypt(&bid, b"ratchet-init").await.unwrap();
+    assert_eq!(b.decrypt(&aid, &init).await.unwrap(), b"ratchet-init");
+    assert!(session_recovered(&a, &bid).await && session_recovered(&b, &aid).await);
+    let reply = b.encrypt(&aid, b"after recovery").await.unwrap();
+    assert_eq!(a.decrypt(&bid, &reply).await.unwrap(), b"after recovery");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "real Bitcoin Core + electrs; scripts/regress/two_node_paid_call_e2e.sh"]
 async fn one_minute_duration_cap() {
     scenario(1, 1, HangupReason::DurationCap).await;
+}
+
+/// Real LDK settlement, then a callee whose chain sync has lapsed: acts it has
+/// been paid for count for a bounded time, and it takes on no new money work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real Bitcoin Core + electrs; scripts/regress/two_node_paid_call_e2e.sh"]
+async fn paid_signals_count_briefly_while_callee_is_not_ready() {
+    let mut steps = Steps::new();
+    let chain = infra::Chain::start().await;
+    let fault = three_node::fault_proxy::FaultProxy::start(&chain.url).await;
+    let dirs = [(); 2].map(|_| tempfile::tempdir().unwrap());
+    let caller_config = infra::lightning_config(dirs[0].path(), &chain.url);
+    let mut callee_config = infra::lightning_config(dirs[1].path(), &fault.url);
+    // Only the callee's wallet sync goes through the fault; its chain API does not.
+    callee_config.esplora_sync_intervals.lightning_wallet_sync_interval_secs = Some(10);
+    let a = Arc::new(
+        LdkProvider::new(caller_config.clone())
+            .await
+            .unwrap()
+            .with_routing_fee_policy(three_node::direct_channel_fee_policy()),
+    );
+    let b = Arc::new(
+        LdkProvider::new(callee_config.clone())
+            .await
+            .unwrap()
+            .with_routing_fee_policy(three_node::direct_channel_fee_policy()),
+    );
+    chain.fund(a.node()).await;
+    chain.fund(b.node()).await;
+    let options = |config: &konsensus_lightning::LdkConfig, block_msat, readiness_gated| {
+        Some(app::Options {
+            identity: Arc::new(NodeIdentity::from_mnemonic(&config.mnemonic, "").unwrap()),
+            chain_url: chain.api_url.clone(),
+            calls: Some(app::CallOptions {
+                block_msat,
+                max_minutes: 5,
+                offer_msat: SIGNAL_PRICE,
+                chat_msat: 2_001,
+            }),
+            readiness_gated,
+            owner_approval_key: None,
+        })
+    };
+    let mut caller = app::App::start_with_options(
+        dirs[0].path(),
+        &chain,
+        a.clone(),
+        options(&caller_config, 7_001, false),
+    )
+    .await;
+    let mut callee = app::App::start_with_options(
+        dirs[1].path(),
+        &chain,
+        b.clone(),
+        options(&callee_config, PRICE, true),
+    )
+    .await;
+    let aid = *caller.state.identity.node_id();
+    let bid = *callee.state.identity.node_id();
+    let (status, body) = caller
+        .post(
+            "/api/v1/payments/open-channel",
+            json!({
+                "peer_pubkey": b.node().node_id().to_string(),
+                "peer_addr": callee_config.listening_address,
+                "amount_sats": 1_000_000, "announce": false,
+            }),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "owner channel open: {body}");
+    chain.confirm_channel(a.node(), b.node(), &[]).await;
+    let money = callee.state.lightning.clone();
+    wait("both wallets ready", || async {
+        a.money_ready().await && money.money_ready().await
+    })
+    .await;
+    three_node::list_contact(&caller, &callee, "owners list their call peer").await;
+    three_node::list_contact(&callee, &caller, "owners list their call peer").await;
+    three_node::connect(&caller, &callee, "Noise connection").await;
+    wait("both signaling sessions established", || async {
+        caller.state.session_manager.can_send(&bid).await
+            && callee.state.session_manager.can_send(&aid).await
+    })
+    .await;
+    three_node::elevate(&mut caller, &[bid.to_hex()]).await;
+    three_node::elevate(&mut callee, &[aid.to_hex()]).await;
+    caller.compose(&mut callee, "while ready").await;
+    // The callee's real key, as its Lightning info frame would deliver it, so
+    // these acts go by keysend: that path has no readiness check before paying.
+    caller
+        .state
+        .peer_ln_pubkeys
+        .lock()
+        .await
+        .insert(
+            bid,
+            konsensus_api::state::PeerLightningKey::Verified(b.node().node_id().to_string()),
+        );
+    steps.pass("two funded nodes, direct channel, callee behind the readiness wrappers");
+
+    fault.set_limited(true);
+    wait("callee chain sync lapses", || async {
+        fault.rejected() > 0 && !money.money_ready().await
+    })
+    .await;
+    let received_before = b
+        .list_payments(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.direction == PaymentDirection::Incoming)
+        .count();
+
+    // No pre-check protects a keysend: this is settled before the gate sees it.
+    caller.compose(&mut callee, "paid while the callee cannot sync").await;
+    let received: Vec<_> = b
+        .list_payments(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.direction == PaymentDirection::Incoming)
+        .collect();
+    assert_eq!(received.len(), received_before + 1, "exactly one new settlement");
+    assert!(!money.money_ready().await, "still not ready when admitted");
+    steps.pass("settled message admitted and delivered while not ready");
+
+    // Nothing else opened: new invoices and other status readers still refuse.
+    let settled = received
+        .iter()
+        .find(|p| p.status == PaymentStatus::Settled)
+        .unwrap();
+    assert!(matches!(
+        money.get_payment_status(&settled.payment_hash).await,
+        Err(LightningError::NotReady)
+    ));
+    assert!(matches!(
+        money.create_invoice(1_000, "regtest", 60).await,
+        Err(LightningError::NotReady)
+    ));
+
+    // A paid offer rings now, not as a late resend after the caller has gone.
+    let offer = json!({"v":1, "call_id":CALL, "media":"audio", "sdp":SDP});
+    let (status, body) = compose(&caller, &bid, 400, offer, SIGNAL_PRICE).await;
+    assert_eq!(status, StatusCode::OK, "offer: {body}");
+    assert_eq!(body["delivered"], true, "offer: {body}");
+    device_rings(&mut callee, &aid, CALL).await;
+    assert_eq!(entry(&callee, &aid).await.phase, Phase::Ringing);
+    // The callee cannot pay for its answer yet. That refusal costs nothing and
+    // leaves the call ringing.
+    let (status, body) = compose(
+        &callee,
+        &aid,
+        401,
+        json!({"v":1, "call_id":CALL, "sdp":SDP}),
+        SIGNAL_PRICE,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "answer: {body}");
+    assert_eq!(body["code"], "not_ready", "answer: {body}");
+    assert_eq!(entry(&callee, &aid).await.phase, Phase::Ringing);
+    assert!(!money.money_ready().await, "still not ready after the offer");
+    // A paid hangup reaches it too, so the ring ends with the caller.
+    let (status, body) = compose(
+        &caller,
+        &bid,
+        403,
+        json!({"v":1, "call_id":CALL, "reason":"hangup"}),
+        SIGNAL_PRICE,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "hangup: {body}");
+    recv_kind(&mut callee, &aid, 403).await;
+    assert_eq!(entry(&callee, &aid).await.phase, Phase::Ended);
+    assert!(!money.money_ready().await, "still not ready after the hangup");
+    steps.pass("offer rings, unpayable answer refused, hangup ends the ring, all while not ready");
+
+    // Past the bound a fresh settlement is not confirmed: refused as it would
+    // have been, nothing burned, and the sender's normal resend delivers it.
+    let cutoff = b.gate_settlement_cutoff().expect("a good sync is on record");
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while now_ms() / 1000 <= cutoff {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .expect("the settlement cutoff passes");
+    assert!(!money.money_ready().await, "still not ready past the cutoff");
+    assert_eq!(b.gate_settlement_cutoff(), Some(cutoff), "no sync moved the cutoff");
+    const LATE: &str = "settled past the cutoff";
+    let operation = uuid::Uuid::new_v4().to_string();
+    let (status, body) = caller
+        .post(
+            "/api/v1/messages/compose",
+            json!({"operation_id": operation, "recipient": bid.to_hex(), "kind": 0, "plaintext": LATE}),
+            false,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "late message: {body}");
+    let late_state = || async {
+        let (status, body) = caller
+            .get(&format!("/api/v1/messages/operations/{operation}"), false)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["state"].as_str().unwrap().to_owned()
+    };
+    wait("the late message is refused, retryably", || async {
+        late_state().await == "rejected_retryable"
+    })
+    .await;
+    assert!(!money.money_ready().await, "still not ready when refused");
+    steps.pass("settlement past the bound refused while not ready");
+
+    fault.set_limited(false);
+    // Failed syncs have backed off by now, so this can take a few minutes.
+    tokio::time::timeout(Duration::from_secs(360), async {
+        while !money.money_ready().await {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("callee recovers");
+    assert_ne!(late_state().await, "failed_paid", "a refusal past the bound stays retryable");
+    caller.compose(&mut callee, "after recovery").await;
+    steps.pass("recovery needs no restart; delivery continues");
+    println!("GATE WHILE NOT READY PASS");
+    caller.stop().await;
+    callee.stop().await;
+    a.shutdown().await.unwrap();
+    money.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real Bitcoin Core + electrs; scripts/regress/two_node_paid_call_e2e.sh"]
+async fn client_detach_stops_renewals_and_unanswered_calls_still_expire() {
+    let mut lane = lane(5, false).await;
+    let (aid, bid) = (lane.aid, lane.bid);
+    for (call_id, cut_callee) in [
+        ("10000000000000000000000000000001", true),
+        ("10000000000000000000000000000002", false),
+    ] {
+        let (caller, callee) = (&mut lane.caller, &mut lane.callee);
+        let (status, body) = compose(caller, &bid, 400,
+            json!({"v":1, "call_id":call_id, "media":"audio", "sdp":SDP}), SIGNAL_PRICE).await;
+        assert_eq!(status, StatusCode::OK, "offer: {body}");
+        device_rings(callee, &aid, call_id).await;
+        let (status, body) = compose(callee, &aid, 401,
+            json!({"v":1, "call_id":call_id, "sdp":SDP}), SIGNAL_PRICE).await;
+        assert_eq!(status, StatusCode::OK, "answer: {body}");
+        recv_kind(caller, &bid, 401).await;
+        let (status, body) = compose(caller, &bid, 404,
+            json!({"call_id":call_id, "seq":0}), PRICE).await;
+        assert_eq!(status, StatusCode::OK, "block zero: {body}");
+        recv_kind(callee, &aid, 404).await;
+        settle(&lane.a, body["payment_hash"].as_str().unwrap()).await;
+        settle(&lane.b, body["payment_hash"].as_str().unwrap()).await;
+        let initial = caller.state.storage.call_get(&bid, call_id).await.unwrap().unwrap();
+        let mut a_socket = socket_for(caller, &bid, call_id).await.unwrap();
+        let mut b_socket = socket_for(callee, &aid, call_id).await.unwrap();
+        let mut seq = 0;
+        audio_until(&mut a_socket, &mut b_socket, now_ms() + 5_000, &mut seq).await;
+        let before = lane.a.list_payments(100).await.unwrap().into_iter()
+            .filter(|p| p.direction == PaymentDirection::Outgoing && p.amount_msat == PRICE).count();
+        let cut = std::time::Instant::now();
+        let mut survivor = if cut_callee { drop(b_socket); a_socket } else { drop(a_socket); b_socket };
+        let generations = (
+            caller.state.transport.connected_since(&bid).await.unwrap(),
+            callee.state.transport.connected_since(&aid).await.unwrap(),
+        );
+        let mut renewal_attempted = false;
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                tick.tick().await;
+                // The surviving client keeps sending even with no received audio.
+                let _ = survivor.send(Message::Binary(packet(seq, 0xa0).into())).await;
+                seq += 1;
+                let a_entry = caller.state.storage.call_get(&bid, call_id).await.unwrap().unwrap();
+                let b_entry = callee.state.storage.call_get(&aid, call_id).await.unwrap().unwrap();
+                if cut_callee && !renewal_attempted && now_ms() >= initial.next_block_due_ms().unwrap() {
+                    renewal_attempted = true;
+                    let (status, body) = compose(caller, &bid, 404,
+                        json!({"call_id":call_id, "seq":1}), PRICE).await;
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "detached callee must refuse renewal: {body}");
+                    assert_eq!(body["reason"], "call_block_unpayable", "{body}");
+                }
+                if a_entry.phase == Phase::Ended && b_entry.phase == Phase::Ended { break; }
+            }
+        }).await.expect("both calls must end within 90 seconds of client cut");
+        assert_eq!(renewal_attempted, cut_callee);
+        for (app, peer) in [(&*caller, bid), (&*callee, aid)] {
+            let ended = app.state.storage.call_get(&peer, call_id).await.unwrap().unwrap();
+            assert_eq!(ended.next_block_seq, 1, "no post-cut block admitted");
+            if cut_callee && peer == aid {
+                assert_eq!(ended.end_reason, Some(HangupReason::Hangup));
+            } else {
+                assert_eq!(ended.end_reason, Some(HangupReason::Unpaid));
+            }
+        }
+        assert_eq!(lane.a.list_payments(100).await.unwrap().into_iter()
+            .filter(|p| p.direction == PaymentDirection::Outgoing && p.amount_msat == PRICE).count(), before,
+            "no new media payment after the cut");
+        assert_eq!((caller.state.transport.connected_since(&bid).await.unwrap(),
+            callee.state.transport.connected_since(&aid).await.unwrap()), generations, "both nodes stay connected");
+        // Pre-cut frames may already be buffered in the survivor's receive queue.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(Ok(message)) = survivor.next().await {
+                if matches!(message, Message::Close(_)) { break; }
+            }
+        }).await.expect("surviving media socket closes");
+        wait("cut call reservation released", || async {
+            caller.service.call_spend_status(&bid.to_hex(), call_id).unwrap().closed
+        }).await;
+        println!("client detach callee={cut_callee} closed_ms={} paid_blocks=1", cut.elapsed().as_millis());
+    }
+    let call_id = "10000000000000000000000000000003";
+    let (status, body) = compose(&lane.caller, &bid, 400,
+        json!({"v":1, "call_id":call_id, "media":"audio", "sdp":SDP}), SIGNAL_PRICE).await;
+    assert_eq!(status, StatusCode::OK, "unanswered offer: {body}");
+    device_rings(&mut lane.callee, &aid, call_id).await;
+    // The caller keeps an unanswered call until its own answer window ends; the callee does not
+    // tell it when the ring runs out. Wait for that window plus a margin, not a fixed time.
+    tokio::time::timeout(Duration::from_millis(CALLER_ANSWER_WINDOW_MS + 30_000), async {
+        loop {
+            let mut open = false;
+            for (app, peer) in [(&lane.caller, bid), (&lane.callee, aid)] {
+                let (status, calls) = app.get(&format!("/api/v1/calls?peer={}", peer.to_hex()), false).await;
+                assert_eq!(status, StatusCode::OK, "{calls}");
+                open |= calls.as_array().unwrap().iter().any(|c| c["id"] == call_id);
+            }
+            if !open { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }).await.expect("unanswered call expires");
+    for (app, peer) in [(&lane.caller, bid), (&lane.callee, aid)] {
+        let ended = app.state.storage.call_get(&peer, call_id).await.unwrap().unwrap().at(now_ms()).unwrap();
+        assert_eq!(ended.phase, Phase::Ended);
+        assert_eq!(ended.end_reason, Some(HangupReason::Timeout));
+        assert_eq!(ended.next_block_seq, 0);
+        assert_eq!(ended.paid_until_ms, None);
+    }
+    lane.caller.stop().await;
+    lane.callee.stop().await;
+    lane.a.shutdown().await.unwrap();
+    lane.b.shutdown().await.unwrap();
 }

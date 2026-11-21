@@ -42,7 +42,20 @@ enum Meter {
     Grant { client_id: String, epoch: u64 },
     /// Maintenance can charge only the grant that funded this call. This
     /// identity remains metered even after that grant has been removed.
+    ///
+    /// It carries no client id or epoch: the grant is pinned to one pairing
+    /// epoch, and both the draw on its closing reserve
+    /// (`PairingService::reserve_call_closing_spend`) and every dispatch poll
+    /// (`PairingService::with_call_payment_authority`) take the pairing from
+    /// that grant under the ledger lock and require it still current: same
+    /// epoch and identity, grant not revoked. A revocation, epoch bump,
+    /// pairing removal or identity change after admission therefore pays
+    /// nothing.
     CallClosing { grant_op_id: Option<String>, peer: String, call_id: String },
+    /// Live-call continuity only (see [`ComposeSpend`]): a paired client
+    /// without `spend` paying the next minute block of the one call it owns,
+    /// from that call's existing hold. Every other debit is refused.
+    CallBlock { client_id: String, epoch: u64, peer: String, call_id: String },
 }
 
 impl std::ops::Deref for MeteredSpend {
@@ -109,8 +122,17 @@ impl MeteredSpend {
         !matches!(self.meter, Meter::Owner)
     }
 
+    /// A minute-block-only caller has no other spending authority.
+    fn refuse_call_block_only(&self) -> Result<(), ApiError> {
+        if matches!(self.meter, Meter::CallBlock { .. }) {
+            return Err(ApiError::BudgetExceeded(BudgetRefusal::NoGrant));
+        }
+        Ok(())
+    }
+
     pub(crate) fn reserve_call(&self, state: &AppState, terms: crate::spend_budget::CallSpendTerms,
         capacity: u64) -> Result<(), ApiError> {
+        self.refuse_call_block_only()?;
         let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(()) };
         state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?
             .reserve_call_spend(client_id, *epoch, terms, capacity).map_err(ApiError::BudgetExceeded)?;
@@ -124,6 +146,7 @@ impl MeteredSpend {
     pub(crate) fn debit_call_with_offer(&self, state: &AppState, terms: crate::spend_budget::CallSpendTerms,
         capacity: u64, charges: Vec<Charge>, cap: Option<u64>,
         operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        self.refuse_call_block_only()?;
         let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()) };
         let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
         let reservation = service.reserve_call_with_offer(client_id, *epoch, terms, capacity, charges, cap,
@@ -133,7 +156,14 @@ impl MeteredSpend {
 
     pub(crate) fn debit_call_block(&self, state: &AppState, signal: &konsensus_core::payloads::call::CallSignal,
         peer: &str, price: u64, fee: u64, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
-        let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()) };
+        let (client_id, epoch) = match &self.meter {
+            Meter::Grant { client_id, epoch } => (client_id, epoch),
+            // Only the call this authority was admitted for, on its hold.
+            Meter::CallBlock { client_id, epoch, peer: own_peer, call_id }
+                if own_peer == peer && *call_id == signal.call_id => (client_id, epoch),
+            Meter::CallBlock { .. } => return Err(ApiError::BudgetExceeded(BudgetRefusal::NoGrant)),
+            _ => return Ok(Debit::unmetered()),
+        };
         let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
         let reservation = service.draw_call_spend(client_id, *epoch, peer, &signal.call_id,
             signal.seq.ok_or_else(|| ApiError::BadRequest("missing call block sequence".into()))?,
@@ -164,6 +194,7 @@ impl MeteredSpend {
                 .as_ref()
                 .and_then(|service| service.grant_view_for(client_id))
                 .is_some(),
+            Meter::CallBlock { .. } => false,
         }
     }
 
@@ -182,6 +213,7 @@ impl MeteredSpend {
     /// metered. A paired client without a live matching first-contact grant is
     /// refused before anything is requested or paid.
     pub fn take_first_contact(&self, state: &AppState, recipient: &str) -> Result<Option<FirstContactAuthorization>, ApiError> {
+        self.refuse_call_block_only()?;
         let Meter::Grant { client_id, epoch } = &self.meter else {
             return Ok(None);
         };
@@ -200,6 +232,7 @@ impl MeteredSpend {
     }
 
     pub(crate) fn debit_operation(&self, state: &AppState, charges: Vec<Charge>, approval: Option<FirstContactAuthorization>, cap: Option<u64>, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        self.refuse_call_block_only()?;
         if let Meter::CallClosing { grant_op_id, peer, call_id } = &self.meter {
             let grant_op_id = grant_op_id.as_deref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
             let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
@@ -223,6 +256,7 @@ impl MeteredSpend {
     /// Debit a call offer under its call's hold, bounded by the caller's
     /// consented `cap` (or the hold's per-block ceiling) and the owner's limit.
     pub(crate) fn debit_call_offer(&self, state: &AppState, charges: Vec<Charge>, call_id: &str, cap: Option<u64>, operation: &crate::handlers::messages::operations::Operation) -> Result<Debit, ApiError> {
+        self.refuse_call_block_only()?;
         let Meter::Grant { client_id, epoch } = &self.meter else { return Ok(Debit::unmetered()); };
         let service = state.pairing.as_ref().ok_or(ApiError::BudgetExceeded(BudgetRefusal::NoGrant))?;
         let reservation = service.reserve_call_offer_spend(client_id, *epoch, charges, call_id, cap, operation.reservation_link(false))
@@ -258,6 +292,7 @@ impl MeteredSpend {
         if let Some(hash) = payment_hash {
             ids.push(format!("hash:{hash}"));
         }
+        self.refuse_call_block_only()?;
         let Meter::Grant { client_id, epoch } = &self.meter else {
             return Ok(Debit::unmetered());
         };
@@ -277,6 +312,7 @@ impl MeteredSpend {
         &self, state: &AppState, charges: Vec<Charge>,
         persist_link: impl FnOnce(Option<&Reservation>) -> Result<(), BudgetRefusal>,
     ) -> Result<Debit, ApiError> {
+        self.refuse_call_block_only()?;
         let Meter::Grant { client_id, epoch } = &self.meter else {
             persist_link(None).map_err(ApiError::BudgetExceeded)?;
             return Ok(Debit::unmetered());
@@ -293,6 +329,7 @@ impl MeteredSpend {
     }
 
     fn debit_purpose(&self, state: &AppState, charges: Vec<Charge>, liquidity: bool) -> Result<Debit, ApiError> {
+        self.refuse_call_block_only()?;
         let Meter::Grant { client_id, epoch } = &self.meter else {
             return Ok(Debit::unmetered());
         };
@@ -311,6 +348,98 @@ impl MeteredSpend {
             "spend grant debited before dispatch"
         );
         Ok(Debit::reserved(Arc::clone(service), reservation))
+    }
+}
+
+/// Authority for `POST /api/v1/messages/compose`, and only there: a
+/// [`MeteredSpend`] as on every other paid route, or, with live-call
+/// continuity on, a paired caller whose token has no `spend` because its
+/// grant ended by expiry. That caller may pay only the next minute block of
+/// the one call it owns, or that call's one hangup, from that call's existing
+/// hold (see [`ComposeSpend::for_request`]); every other request gets the
+/// refusal [`MeteredSpend`] gave.
+pub(crate) enum ComposeSpend {
+    Metered(MeteredSpend),
+    CallBlockOnly { user: AuthUser, refusal: Response },
+}
+
+#[axum::async_trait]
+impl FromRequestParts<Arc<AppState>> for ComposeSpend {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &Arc<AppState>) -> Result<Self, Self::Rejection> {
+        let refusal = match MeteredSpend::from_request_parts(parts, state).await {
+            Ok(auth) => return Ok(Self::Metered(auth)),
+            Err(refusal) => refusal,
+        };
+        if !state.pairing.as_ref().is_some_and(|service| service.call_continuity_enabled()) {
+            return Err(refusal);
+        }
+        match AuthUser::from_request_parts(parts, state).await {
+            Ok(user) if user.pairing.is_some() && !user.has(Scope::Spend) => Ok(Self::CallBlockOnly { user, refusal }),
+            _ => Err(refusal),
+        }
+    }
+}
+
+impl ComposeSpend {
+    /// The authority for this request. A caller without `spend` passes only
+    /// for a 1:1 minute block (kind 404), or a plain hangup (kind 403 with no
+    /// reason or `hangup`), of a call its pairing owns (the binding that
+    /// placed it, same epoch and identity) while that call's hold is still
+    /// funded (`PairingService::call_hold_live`). A block is then drawn on
+    /// that hold alone, at its pinned price, fee, minute limit and amount. A
+    /// hangup is drawn on the closing reserve the hold set aside for it at
+    /// admission, as the node's own closing notice would be: at most that
+    /// reserve, at most once per call. Anything else gets the original refusal.
+    pub(crate) fn for_request(self, state: &AppState, req: &crate::handlers::messages::ComposeRequest)
+        -> Result<MeteredSpend, Box<Response>> {
+        use konsensus_core::kind::{KIND_CALL_BLOCK, KIND_CALL_HANGUP};
+        use konsensus_core::payloads::call::{CallSignal, HangupReason};
+        let (user, refusal) = match self {
+            Self::Metered(auth) => return Ok(auth),
+            Self::CallBlockOnly { user, refusal } => (user, refusal),
+        };
+        let allowed = (|| {
+            if !matches!(req.kind, KIND_CALL_BLOCK | KIND_CALL_HANGUP) || req.is_room {
+                return None;
+            }
+            let peer = konsensus_core::NodeId::from_hex(&req.recipient).ok()?.to_hex();
+            let signal = CallSignal::parse(req.kind, &req.plaintext).ok()?;
+            if req.kind == KIND_CALL_HANGUP && !matches!(signal.reason, None | Some(HangupReason::Hangup)) {
+                return None;
+            }
+            let binding = user.pairing.as_ref()?;
+            let service = state.pairing.as_ref()?;
+            if !(service.call_hold_live(binding, &peer, &signal.call_id)
+                && service.owns_call_media(binding, &peer, &signal.call_id)) {
+                return None;
+            }
+            if req.kind == KIND_CALL_HANGUP {
+                // The grant that holds this call now; its closing reserve
+                // pays the hangup, bounded as the node's own closing notice.
+                //
+                // Its price is not pinned here. The hangup pays the callee's
+                // hangup quote as read once when this request starts (the
+                // background quote loop's latest), and the payment is for
+                // exactly that amount. The draw refuses it, routing ceiling
+                // included, above the closing reserve pinned at admission
+                // or above the grant's per-payment limit for a call signal
+                // (`draw_call_spend_for_grant`). A quote that rose past the
+                // reserve is refused unpaid; the reserve, not the quote,
+                // bounds what this hangup can cost. One signal per call is
+                // in flight at a time, and the closing sequence draws once.
+                let grant_op_id = service.call_spend_grant(&peer, &signal.call_id)?;
+                return Some(Meter::CallClosing { grant_op_id: Some(grant_op_id), peer, call_id: signal.call_id });
+            }
+            Some(Meter::CallBlock {
+                client_id: binding.client_id.clone(), epoch: binding.epoch, peer, call_id: signal.call_id,
+            })
+        })();
+        match allowed {
+            Some(meter) => Ok(MeteredSpend { user, meter }),
+            None => Err(Box::new(refusal)),
+        }
     }
 }
 
@@ -367,25 +496,28 @@ impl Debit {
         self
     }
 
-    pub(crate) fn invoice_purpose(&self) -> String {
+    /// Call blocks name their call and sequence; other messages name their
+    /// kind so the recipient can price the invoice locally (#403).
+    pub(crate) fn invoice_purpose(&self, kind: Option<u16>) -> String {
         self.call_block.as_ref().and_then(|(_, plaintext)|
             konsensus_core::payloads::call::CallSignal::parse(konsensus_core::kind::KIND_CALL_BLOCK, plaintext).ok()
         ).map(|signal| format!("{}{}:{}", konsensus_core::payloads::call::CALL_BLOCK_INVOICE_PREFIX,
             signal.call_id, signal.seq.unwrap_or_default()))
+        .or_else(|| kind.map(konsensus_core::gate::service_invoice_purpose))
         .unwrap_or_else(|| "konsensus message".into())
     }
 
-    pub(crate) async fn dispatch_message<F>(&self, state: &AppState, hash: Option<String>, amount: u64, future: F) -> Result<F::Output, ApiError>
+    pub(crate) async fn dispatch_message<F>(&self, state: &AppState, hash: Option<String>, amount: u64, tip: &crate::error::ObservedTip, future: F) -> Result<F::Output, ApiError>
     where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
         match &self.operation {
-            Some(op) => op.dispatch(self, hash, amount, future).await,
-            None => self.dispatch_message_payment(state, future).await,
+            Some(op) => op.dispatch(self, hash, amount, tip, future).await,
+            None => self.dispatch_message_payment(state, tip, future).await,
         }
     }
 
     /// Called after dispatch intent is durable. Fresh call validation and spend
     /// authority both remain serialized through the first wallet poll.
-    pub(crate) async fn dispatch_message_payment<F>(&self, state: &AppState, future: F) -> Result<F::Output, ApiError>
+    pub(crate) async fn dispatch_message_payment<F>(&self, state: &AppState, tip: &crate::error::ObservedTip, future: F) -> Result<F::Output, ApiError>
     where F: Future<Output=Result<konsensus_core::traits::lightning::PaymentDetails, konsensus_core::traits::lightning::LightningError>> {
         let (mut call_guard, deadline) = if let Some((peer, plaintext)) = &self.call_block {
             match crate::calls::block_dispatch_guard(state, peer, plaintext).await {
@@ -398,6 +530,9 @@ impl Debit {
                 Err(error) => return Ok(Err(konsensus_core::traits::lightning::LightningError::PaymentNotDispatched(error.to_string()))),
             }
         } else { (None, None) };
+        // Journal writes and call guards can wait before the wallet is polled.
+        // A refusal here proves that this payment was never submitted.
+        tip.recheck(state).await?;
         let mut future = std::pin::pin!(future);
         let mut polled = false;
         let guarded = futures::future::poll_fn(|cx| {
