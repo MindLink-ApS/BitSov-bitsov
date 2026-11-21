@@ -269,6 +269,8 @@ async fn a_live_owner_window_with_narrower_terms_does_not_read_granted() {
         let read = fx.token_as(&client, &key).await;
         expect_statuses(&fx, &read, &format!("payees, switch {switch}"), vec![
             (with(json!({"payee_allowlist": [OTHER_LN]})), "granted"),
+            // An explicit null allowlist asks for any payee, like leaving it out.
+            (with(json!({"payee_allowlist": null})), "pending"),
             (wide.clone(), "pending"),
             (with(json!({"payee_allowlist": [PEER_LN]})), "pending"),
             (with(json!({"payee_allowlist": [OTHER_LN, PEER_LN]})), "pending"),
