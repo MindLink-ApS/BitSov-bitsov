@@ -286,6 +286,9 @@ async fn a_live_owner_window_with_narrower_terms_does_not_read_granted() {
             (with(json!({"per_recipient_msat": {OTHER_LN: 100_000}})), "granted"),
             (wide.clone(), "pending"),
             (with(json!({"per_recipient_msat": {OTHER_LN: 150_000}})), "pending"),
+            // A request that cannot pay the capped recipient is not held to its cap.
+            (with(json!({"payee_allowlist": [PEER_LN]})), "granted"),
+            (with(json!({"payee_allowlist": [PEER_LN, OTHER_LN]})), "pending"),
         ])
         .await;
         assert_eq!(owner_window(&fx, &client), before, "switch {switch}");

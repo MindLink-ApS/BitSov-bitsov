@@ -4742,8 +4742,11 @@ fn owner_window_covers(g: &SpendGrant, op: &PendingElevation) -> bool {
         (Some(_), None) => false,
         (Some(granted), Some(asked)) => asked.is_subset(granted),
     };
+    // A recipient the request cannot pay (outside its own allowlist) does not
+    // hold the request to that recipient's cap.
+    let may_pay = |key: &String| terms.payee_allowlist.as_ref().is_none_or(|asked| asked.contains(key));
     payees
-        && budget.per_recipient_msat.iter().all(|(key, cap)| {
+        && budget.per_recipient_msat.iter().filter(|(key, _)| may_pay(key)).all(|(key, cap)| {
             let left = cap.saturating_sub(budget.used_by_recipient.get(key).copied().unwrap_or(0));
             left >= terms.per_recipient_msat.get(key).copied().unwrap_or(terms.budget_msat)
         })
