@@ -8,6 +8,88 @@ use konsensus_storage::{SqliteStorage, Storage};
 
 const ID: &str = "0123456789abcdef0123456789abcdef";
 
+#[tokio::test]
+async fn overdue_socket_detach_closes_resume_before_expiry_and_survives_restart() {
+    use calls::{detach_callee_media, MediaDetach, MediaDetachOutcome};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("calls.db");
+    let store = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    let peer = NodeId::from_bytes([17; 32]);
+    let paid = rules::receive_block(Some(rules::commit(rules::reserve(
+        Some(rules::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap()), 401, "answer", "hash", 1_000,
+    ).unwrap(), "answer", 1_000).unwrap()), 0, 1_000).unwrap();
+    let paid = rules::reserve(Some(paid), 403, "notice", "notice-hash", 71_001).unwrap();
+    // Keep the stored overdue Live phase while retaining pending notice evidence.
+    let paid = rules::CallEntry { phase: Phase::Live, end_reason: None,
+        deadline_ms: 71_000, ..paid };
+    store.call_put(&peer, ID, &paid).await.unwrap();
+    let mut detach = MediaDetach {
+        generation: Arc::new(tokio::sync::Mutex::new(2)), expected_generation: 1, only_unpaid: false, may_hangup_live: true,
+    };
+    assert_eq!(detach_callee_media(&store, &peer, ID, 71_001, &detach).await.unwrap(), MediaDetachOutcome::Complete);
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(paid.clone()));
+    detach.expected_generation = 2;
+    detach.only_unpaid = true;
+    assert_eq!(detach_callee_media(&store, &peer, ID, 71_001, &detach).await.unwrap(), MediaDetachOutcome::PendingExpiry);
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(paid.clone()));
+    detach.only_unpaid = false;
+    assert_eq!(detach_callee_media(&store, &peer, ID, 71_001, &detach).await.unwrap(), MediaDetachOutcome::PendingExpiry);
+    let closed = rules::CallEntry { paid_until_ms: Some(0), ..paid };
+    assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(closed.clone()));
+    let reopened = SqliteStorage::open(path.to_str().unwrap()).await.unwrap();
+    assert_eq!(reopened.call_get(&peer, ID).await.unwrap(), Some(closed.clone()));
+    assert_eq!(rules::receive_block(Some(closed.clone()), 1, 71_001), Err(rules::CallRefusal::UnknownCall));
+    *detach.generation.lock().await = 3;
+    assert_eq!(detach_callee_media(&reopened, &peer, ID, 71_001, &detach).await.unwrap(), MediaDetachOutcome::Complete);
+    assert!(!calls::call_media_admitted(&reopened, &peer, ID, 71_001).await);
+    assert_eq!(calls::expire_calls(&reopened, 71_001).await.unwrap(), vec![(peer, ID.into())]);
+    let expired = reopened.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(expired, rules::CallEntry { phase: Phase::Ended,
+        end_reason: Some(HangupReason::Unpaid), deadline_ms: 71_000 + rules::TOMBSTONE_MS, ..closed });
+    assert_eq!(rules::receive_block(Some(expired), 1, 71_001), Err(rules::CallRefusal::UnknownCall));
+    assert!(calls::expire_calls(&reopened, 71_002).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn zero_block_grant_preserves_unpaid_caller_and_pending_evidence() {
+    use konsensus_core::{UkmEnvelopeBuilder, Recipient, PaymentProof};
+    let store = SqliteStorage::in_memory().await.unwrap();
+    let own = NodeId::from_bytes([18; 32]);
+    let peer = NodeId::from_bytes([19; 32]);
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let caller = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Live,
+        deadline_ms: now + 30_000, paid_until_ms: None, next_block_seq: 0,
+        pending: None, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new() };
+    let pending = rules::reserve_block(Some(caller), 0, "zero-grant", "request", now).unwrap();
+    let envelope = UkmEnvelopeBuilder::new(404, own, Recipient::Node(peer), vec![],
+        PaymentProof::new([20; 32], [21; 32], 23_000)).build();
+    store.store_message(&envelope).await.unwrap();
+    let mut op = konsensus_storage::OutboxOperation::prepared("zero-grant".into(), peer.to_hex(), 404, "request".into());
+    op.state = "sent".into();
+    op.message_id = Some(envelope.id.to_hex());
+    op.recovery = serde_json::to_vec(&serde_json::json!({
+        "call_block": [ID, 0], "dispatched": true, "expected_msat": 23_000,
+        "fee_ceiling_msat": 0, "admission_msat": 0,
+    })).unwrap();
+    store.insert_outbox_operation(&op).await.unwrap();
+    store.queue_pending_delivery(&envelope.id, &peer).await.unwrap();
+    store.mark_pending_sent(&envelope.id, &peer).await.unwrap();
+    let cipher = konsensus_crypto::PlaintextCacheCipher::new(&[22; 32]);
+    for entry in [pending.clone(), pending.at(now + 30_001).unwrap()] {
+        store.call_put(&peer, ID, &entry).await.unwrap();
+        calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, 0).await.unwrap();
+        assert_eq!(store.call_get(&peer, ID).await.unwrap(), Some(entry));
+        assert!(store.is_pending_dispatched(&envelope.id, &peer, &own).await.unwrap());
+    }
+    calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.unwrap();
+    let granted = store.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(granted.phase, Phase::Live);
+    assert_eq!(granted.paid_until_ms, Some(now + 60_000));
+    assert_eq!(granted.next_block_seq, 1);
+    assert!(granted.pending.is_none());
+}
+
 async fn answer_block_price_query(
     state: &konsensus_api::state::AppState,
     transport: &common::ConnectedStubTransport,
@@ -37,7 +119,7 @@ async fn answer_block_price_query(
 // SQLx must progress on another worker while the invoice responder records
 // the callee's binding. The wallet supports keysend, as a real LN peer does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
+async fn known_ln_peer_call_block_uses_undiscounted_bound_invoice_and_is_admitted() {
     use axum::{body::Body, http::Request};
     use konsensus_core::traits::lightning::LightningProvider;
     use konsensus_lightning::MockLightningProvider;
@@ -83,7 +165,10 @@ async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
     mutable.transport = transport.clone();
     mutable.storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
     // LightningInfo fills this map in a money-ready connection.
-    state.peer_ln_pubkeys.lock().await.insert(peer, ln_pubkey);
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(ln_pubkey),
+    );
     let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
     state.session_manager.initiate_session(&peer, &target.prekey_bundle().await).await.unwrap();
     let now = chrono::Utc::now().timestamp_millis() as u64;
@@ -92,6 +177,10 @@ async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
     ).unwrap()), 401, None, now).unwrap();
     callee_store.call_put(&caller_id, ID, &rules::CallEntry { side: rules::Side::Callee, ..caller.clone() }).await.unwrap();
     state.storage.call_put(&peer, ID, &caller).await.unwrap();
+    // A prior price table's trust discount must not alter the fresh minute tariff.
+    state.peer_prices.update(peer, std::collections::HashMap::from([
+        ("kind:404".into(), 23_000),
+    ]), 850_000, 0, 0.25).await;
     let plaintext = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
     let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
         .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
@@ -121,13 +210,293 @@ async fn known_ln_peer_call_block_uses_bound_invoice_and_is_admitted() {
     assert!(calls::call_media_admitted(callee_store.as_ref(), &caller_id, ID, now + 1).await);
 }
 
+const ADMISSION_FLOOR_MSAT: u64 = 30_000;
+/// Callee tariff below its admission floor: the minute is payable at the floor.
+const FLOORED_TARIFF_MSAT: u64 = 23_000;
+/// Callee tariff above its admission floor. The caller's cached trust discount
+/// would take it below the floor, so a discounted quote would be the floor
+/// (30_000) while the callee mints only the undiscounted tariff (50_000).
+const ABOVE_FLOOR_TARIFF_MSAT: u64 = 50_000;
+/// The trust discount on the caller's cached price table for the callee.
+const TABLE_TRUST_DISCOUNT: f64 = 0.5;
+
+/// What the callee's mint check accepts for a minute at this tariff: the
+/// tariff raised to the floor, with no trust discount.
+fn callee_minute_price(tariff: u64) -> u64 {
+    let payable = tariff.max(ADMISSION_FLOOR_MSAT);
+    assert_eq!(konsensus_core::gate::call_minute_price_msat(tariff, ADMISSION_FLOOR_MSAT), payable,
+        "the mint check must price a minute at the floored tariff");
+    payable
+}
+
+/// The price a trust-discounted path would quote for a minute at this tariff.
+fn discounted_minute_price(tariff: u64) -> u64 {
+    konsensus_core::gate::price_with_floor_msat(
+        konsensus_pricing::peer_prices::apply_trust_discount(tariff, TABLE_TRUST_DISCOUNT),
+        ADMISSION_FLOOR_MSAT,
+    )
+}
+
+/// A raw table a callee may announce: a per-kind minute tariff, or only the
+/// realtime category a minute falls back to. Both carry the admission floor.
+fn floored_minute_table(category_fallback: bool, tariff: u64) -> std::collections::HashMap<String, u64> {
+    use konsensus_pricing::peer_prices::ADMISSION_FLOOR_KEY;
+    if category_fallback {
+        return std::collections::HashMap::from([
+            ("realtime_signaling".into(), tariff),
+            (ADMISSION_FLOOR_KEY.into(), ADMISSION_FLOOR_MSAT),
+        ]);
+    }
+    std::collections::HashMap::from([
+        ("kind:404".into(), tariff), ("realtime_signaling".into(), 1_000),
+        (ADMISSION_FLOOR_KEY.into(), ADMISSION_FLOOR_MSAT),
+    ])
+}
+
+/// The callee answers the minute query (already floored), then a full price
+/// table replaces the cached entry before the caller reads its quote.
+async fn answer_then_replace_table(
+    state: &konsensus_api::state::AppState,
+    transport: &common::ConnectedStubTransport,
+    peer: NodeId,
+    category_fallback: bool,
+    tariff: u64,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !transport.raw_frames.lock().unwrap().iter().any(|bytes| matches!(
+            konsensus_message::wire::Frame::from_bytes(bytes).unwrap(),
+            konsensus_message::wire::Frame::PriceQuery { kind: 404 }
+        )) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the caller must ask for the minute price");
+    state.peer_prices.update_kind_price(peer, 404, callee_minute_price(tariff), 850_000).await;
+    let table = floored_minute_table(category_fallback, tariff);
+    state.peer_prices.update(peer, table, 850_000, 0, TABLE_TRUST_DISCOUNT).await;
+}
+
+#[tokio::test]
+async fn table_backed_minute_quote_equals_the_callee_floored_price() {
+    floored_minute_quote(false, FLOORED_TARIFF_MSAT).await;
+}
+
+#[tokio::test]
+async fn category_fallback_minute_quote_equals_the_callee_floored_price() {
+    floored_minute_quote(true, FLOORED_TARIFF_MSAT).await;
+}
+
+// A tariff above the floor that a trust discount would lower to the floor:
+// the minute quote must stay at the undiscounted tariff the callee mints.
+#[tokio::test]
+async fn table_backed_minute_quote_above_the_floor_ignores_the_trust_discount() {
+    assert_ne!(discounted_minute_price(ABOVE_FLOOR_TARIFF_MSAT), callee_minute_price(ABOVE_FLOOR_TARIFF_MSAT));
+    assert_eq!(callee_minute_price(ABOVE_FLOOR_TARIFF_MSAT), ABOVE_FLOOR_TARIFF_MSAT);
+    floored_minute_quote(false, ABOVE_FLOOR_TARIFF_MSAT).await;
+}
+
+#[tokio::test]
+async fn category_fallback_minute_quote_above_the_floor_ignores_the_trust_discount() {
+    assert_ne!(discounted_minute_price(ABOVE_FLOOR_TARIFF_MSAT), callee_minute_price(ABOVE_FLOOR_TARIFF_MSAT));
+    floored_minute_quote(true, ABOVE_FLOOR_TARIFF_MSAT).await;
+}
+
+async fn floored_minute_quote(category_fallback: bool, tariff: u64) {
+    let mut state = common::test_state();
+    let (_, identity) = konsensus_core::NodeIdentity::generate().unwrap();
+    let peer = *identity.node_id();
+    let transport = std::sync::Arc::new(common::ConnectedStubTransport::new(
+        vec![peer],
+        state.invoice_requests.clone(),
+    ));
+    std::sync::Arc::get_mut(&mut state).unwrap().transport = transport.clone();
+    let (price, ()) = tokio::join!(
+        calls::peer_call_kind_price(&state, &peer, 404),
+        answer_then_replace_table(&state, &transport, peer, category_fallback, tariff),
+    );
+    assert_eq!(price.unwrap(), callee_minute_price(tariff));
+}
+
+// A floor above the minute tariff must not make the caller ask for less than
+// the callee mints, which would end a live call with call_price_changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_backed_floored_minute_is_paid_without_price_change() {
+    floored_minute_invoice_is_paid(false, FLOORED_TARIFF_MSAT).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn category_fallback_floored_minute_is_paid_without_price_change() {
+    floored_minute_invoice_is_paid(true, FLOORED_TARIFF_MSAT).await;
+}
+
+// A trust-discounted quote would be the floor, below the tariff the callee
+// mints: the caller must request and pay the undiscounted tariff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn table_backed_minute_above_the_floor_is_paid_without_the_trust_discount() {
+    floored_minute_invoice_is_paid(false, ABOVE_FLOOR_TARIFF_MSAT).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn category_fallback_minute_above_the_floor_is_paid_without_the_trust_discount() {
+    floored_minute_invoice_is_paid(true, ABOVE_FLOOR_TARIFF_MSAT).await;
+}
+
+async fn floored_minute_invoice_is_paid(category_fallback: bool, tariff: u64) {
+    use axum::{body::Body, http::Request};
+    use konsensus_core::traits::lightning::LightningProvider;
+    use konsensus_lightning::MockLightningProvider;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    let case = format!("{} at tariff {tariff}", if category_fallback { "category fallback" } else { "table-backed" });
+    let payable = callee_minute_price(tariff);
+    let payer = Arc::new(MockLightningProvider::new());
+    let payee = Arc::new(MockLightningProvider::new());
+    let initial_balance = payer.get_balance_msat().await.unwrap();
+    let mut state = common::test_state_with_lightning(payer.clone());
+    let (_, identity) = konsensus_core::NodeIdentity::generate().unwrap();
+    let peer = *identity.node_id();
+    let caller_id = *state.identity.node_id();
+    let callee_store = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let invoice_store = callee_store.clone();
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let observed = requested.clone();
+    let identity_invoice = payee.create_invoice(1_000, "identity", 60).await.unwrap();
+    let ln_pubkey = identity_invoice.bolt11.parse::<lightning_invoice::Bolt11Invoice>()
+        .unwrap().recover_payee_pub_key().to_string();
+    let requests = state.invoice_requests.clone();
+    let transport = Arc::new(
+        common::ConnectedStubTransport::new(vec![peer], state.invoice_requests.clone())
+            .with_invoice_responder(move |id, amount| {
+                observed.lock().unwrap().push(amount);
+                // The callee's mint check: only the current floored minute price.
+                if amount != payable {
+                    let requests = requests.clone();
+                    tokio::spawn(async move {
+                        if let Some(tx) = requests.lock().await.remove(&id) {
+                            let _ = tx.send(Err(konsensus_api::state::InvoiceResponseError {
+                                recipient: peer, reason: "konsensus:call_price_changed".into(),
+                            }));
+                        }
+                    });
+                    return None;
+                }
+                let invoice = futures::executor::block_on(async {
+                    let entry = invoice_store.call_get(&caller_id, ID).await.unwrap().unwrap();
+                    let invoice = payee.create_invoice(amount, "call block", rules::CALL_BLOCK_INVOICE_EXPIRY_SECS).await.unwrap();
+                    invoice_store.record_call_block_invoice(&caller_id, ID, 0,
+                        &hex::decode(&invoice.payment_hash).unwrap().try_into().unwrap(),
+                        entry.deadline_ms + rules::CALL_BLOCK_RESUME_MS).await.unwrap();
+                    invoice
+                });
+                Some(konsensus_api::state::InvoiceResponseData {
+                    recipient: peer, bolt11: invoice.bolt11, payment_hash: invoice.payment_hash,
+                })
+            }),
+    );
+    let mutable = Arc::get_mut(&mut state).unwrap();
+    mutable.transport = transport.clone();
+    mutable.storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer,
+        konsensus_api::state::PeerLightningKey::Verified(ln_pubkey),
+    );
+    let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
+    state.session_manager.initiate_session(&peer, &target.prekey_bundle().await).await.unwrap();
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let caller = rules::receive(Some(rules::commit(
+        rules::reserve(None, 400, "offer", "hash", now).unwrap(), "offer", now,
+    ).unwrap()), 401, None, now).unwrap();
+    callee_store.call_put(&caller_id, ID, &rules::CallEntry { side: rules::Side::Callee, ..caller.clone() }).await.unwrap();
+    state.storage.call_put(&peer, ID, &caller).await.unwrap();
+    let plaintext = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
+    let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"operation_id":uuid::Uuid::new_v4().to_string(),"recipient":peer.to_hex(),"kind":404,"plaintext":plaintext,"wait_ack_ms":0}).to_string())).unwrap();
+    let (response, ()) = tokio::join!(common::test_router(state.clone()).oneshot(request),
+        answer_then_replace_table(&state, &transport, peer, category_fallback, tariff));
+    let response = response.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert!(!body.contains("call_price_changed"), "{case}: {body}");
+    assert_eq!(status, axum::http::StatusCode::OK, "{case}: {body}");
+    assert_eq!(*requested.lock().unwrap(), vec![payable], "{case}");
+    assert_eq!(initial_balance - payer.get_balance_msat().await.unwrap(), payable, "{case}");
+    let entry = state.storage.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(entry.phase, Phase::Live, "{case}");
+}
+
+#[tokio::test]
+async fn owner_call_block_price_refusal_ends_the_call_without_payment_or_retry() {
+    use axum::{body::Body, http::{Request, StatusCode}};
+    use konsensus_core::traits::lightning::LightningProvider;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let wallet = Arc::new(konsensus_lightning::MockLightningProvider::new());
+    let balance = wallet.get_balance_msat().await.unwrap();
+    let mut state = common::test_state_with_lightning(wallet.clone());
+    let (_, identity) = konsensus_core::NodeIdentity::generate().unwrap();
+    let peer = *identity.node_id();
+    let target = konsensus_crypto::SessionManager::new(Arc::new(identity));
+    state.session_manager.initiate_session(&peer, &target.prekey_bundle().await).await.unwrap();
+    let requests = state.invoice_requests.clone();
+    let transport = Arc::new(common::ConnectedStubTransport::new(vec![peer], requests.clone())
+        .with_invoice_responder(move |id, _| {
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                if let Some(tx) = requests.lock().await.remove(&id) {
+                    let _ = tx.send(Err(konsensus_api::state::InvoiceResponseError {
+                        recipient: peer, reason: "konsensus:call_price_changed".into(),
+                    }));
+                }
+            });
+            None
+        }));
+    let mutable = Arc::get_mut(&mut state).unwrap();
+    mutable.transport = transport.clone();
+    mutable.storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let caller = rules::receive(Some(rules::commit(
+        rules::reserve(None, 400, "offer", "hash", now).unwrap(), "offer", now,
+    ).unwrap()), 401, None, now).unwrap();
+    state.storage.call_put(&peer, ID, &caller).await.unwrap();
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let request = Request::builder().method("POST").uri("/api/v1/messages/compose")
+        .header("authorization", common::auth_header(&state)).header("content-type", "application/json")
+        .body(Body::from(serde_json::json!({"operation_id":operation_id,"recipient":peer.to_hex(),
+            "kind":404,"plaintext":format!(r#"{{"call_id":"{ID}","seq":0}}"#),"wait_ack_ms":0}).to_string())).unwrap();
+    let (response, ()) = tokio::join!(common::test_router(state.clone()).oneshot(request),
+        answer_block_price_query(&state, &transport, peer));
+    let response = response.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 65536).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "call_price_changed", "{body}");
+    assert_eq!(body["retry_allowed"], false, "{body}");
+    let entry = state.storage.call_get(&peer, ID).await.unwrap().unwrap();
+    assert_eq!(entry.phase, Phase::Ended);
+    assert_eq!(entry.end_reason, Some(HangupReason::Failed));
+    assert!(entry.pending.is_none());
+    let op = state.storage.get_outbox_operation(&operation_id).await.unwrap().unwrap();
+    assert_eq!(op.settled_msat, 0);
+    assert!(op.payment_hash.is_none());
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+    assert_eq!(wallet.get_balance_msat().await.unwrap(), balance);
+    assert!(transport.sent_envelopes.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn unpaid_notice_is_single_use_callee_only_and_reason_checked() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let own = NodeId::from_bytes([1; 32]);
     let peer = NodeId::from_bytes([2; 32]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap();
+    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap().device_fetched(now - 31_000).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", now - 31_000).unwrap();
     let ended = rules::commit(pending, "answer", now - 31_000).unwrap().at(now).unwrap();
     let unpaid = format!(r#"{{"v":1,"call_id":"{ID}","reason":"unpaid"}}"#);
@@ -157,7 +526,7 @@ async fn block_admission_keeps_its_decision_through_acceptance_and_expiry() {
     let peer = NodeId::from_bytes([9; 32]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let answered_at = now;
-    let ringing = rules::receive(None, 400, None, answered_at).unwrap();
+    let ringing = rules::receive(None, 400, None, answered_at).unwrap().device_fetched(answered_at).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", answered_at).unwrap();
     let entry = rules::commit(pending, "answer", answered_at).unwrap();
     let deadline = entry.deadline_ms;
@@ -190,7 +559,7 @@ async fn expiry_ends_both_sides_but_only_callee_needs_notification() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let caller_peer = NodeId::from_bytes([7; 32]);
     let callee_peer = NodeId::from_bytes([8; 32]);
-    let ringing = rules::receive(None, 400, None, 0).unwrap();
+    let ringing = rules::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", 1_000).unwrap();
     let callee = rules::commit(pending, "answer", 1_000).unwrap();
     let caller = rules::CallEntry { side: rules::Side::Caller, ..callee.clone() };
@@ -210,7 +579,7 @@ async fn expiry_ends_both_sides_but_only_callee_needs_notification() {
 async fn paid_blocks_survive_storage_roundtrip_and_admit_only_the_right_call() {
     let store = SqliteStorage::in_memory().await.unwrap();
     let peer = NodeId::from_bytes([1; 32]);
-    let ringing = rules::receive(None, 400, None, 0).unwrap();
+    let ringing = rules::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", 1_000).unwrap();
     let live = rules::commit(pending, "answer", 1_000).unwrap();
     assert!(!live.media_admitted(1_000));
@@ -242,7 +611,7 @@ async fn incoming_block_and_outgoing_block_reservations_use_normal_call_admissio
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let entry = rules::commit(
         rules::reserve(
-            Some(rules::receive(None, 400, None, now).unwrap()),
+            Some(rules::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap()),
             401,
             "answer",
             "hash",
@@ -280,7 +649,7 @@ async fn unpaid_expiry_notification_cannot_grant_media_even_if_dispatch_fails() 
     let peer = NodeId::from_bytes([3; 32]);
     let entry = rules::commit(
         rules::reserve(
-            Some(rules::receive(None, 400, None, 0).unwrap()),
+            Some(rules::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap()),
             401,
             "answer",
             "hash",
@@ -428,7 +797,7 @@ async fn grace_endpoint_still_counts_against_call_bounds() {
     let peer = NodeId::from_bytes([6; 32]);
     let entry = rules::commit(
         rules::reserve(
-            Some(rules::receive(None, 400, None, 0).unwrap()),
+            Some(rules::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap()),
             401,
             "answer",
             "hash",
@@ -508,7 +877,7 @@ async fn unpaid_notice_reservation_survives_encrypted_storage_restart() {
     let own = NodeId::from_bytes([1; 32]);
     let peer = NodeId::from_bytes([2; 32]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap();
+    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap().device_fetched(now - 31_000).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", now - 31_000).unwrap();
     let ended = rules::commit(pending, "answer", now - 31_000).unwrap().at(now).unwrap();
     let body = format!(r#"{{"v":1,"call_id":"{ID}","reason":"unpaid"}}"#);
@@ -579,7 +948,7 @@ async fn explicit_hangup_after_local_unpaid_expiry_prevents_late_resume() {
     let ended = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Ended,
         deadline_ms: now - 1_000 + rules::TOMBSTONE_MS, paid_until_ms: None, next_block_seq: 0,
         pending: Some(rules::Pending { operation_id: "block".into(), kind: 404, request_hash: "hash".into() }),
-        end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: true };
+        end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: true, free_reply_receipts: Vec::new() };
     store.call_put(&peer, ID, &ended).await.unwrap();
     let hangup = format!(r#"{{"v":1,"call_id":"{ID}","reason":"hangup"}}"#);
     calls::admit_incoming(&store, &own, &peer, 403, Some(&hangup)).await.unwrap();
@@ -602,7 +971,7 @@ async fn legacy_ended_pending_blocks_are_reclaimed_by_settlement_and_sweep() {
     let ended = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Ended,
         deadline_ms: now + rules::TOMBSTONE_MS, paid_until_ms: None, next_block_seq: 0,
         pending: Some(rules::Pending { operation_id: "block".into(), kind: 404, request_hash: "hash".into() }),
-        end_reason: Some(HangupReason::Hangup), unpaid_notice_used: false };
+        end_reason: Some(HangupReason::Hangup), unpaid_notice_used: false, free_reply_receipts: Vec::new() };
     let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
     store.call_put(&peer, ID, &ended).await.unwrap();
     calls::commit_outgoing(&store, &peer, &body, "block", "hash").await.unwrap();
@@ -627,7 +996,7 @@ async fn callee_grant_resumes_caller_after_unpaid_notice_and_is_bound_to_paid_me
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let ended = rules::CallEntry { side: rules::Side::Caller, phase: Phase::Ended,
         deadline_ms: now + rules::TOMBSTONE_MS, paid_until_ms: None, next_block_seq: 0,
-        pending: None, end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: true };
+        pending: None, end_reason: Some(HangupReason::Unpaid), unpaid_notice_used: true, free_reply_receipts: Vec::new() };
     store.call_put(&peer, ID, &ended).await.unwrap();
     let envelope = UkmEnvelopeBuilder::new(404, own, Recipient::Node(peer), vec![], PaymentProof::new([24; 32], [25; 32], 23_000)).build();
     store.store_message(&envelope).await.unwrap();
@@ -672,7 +1041,7 @@ async fn callee_grant_resumes_caller_after_unpaid_notice_and_is_bound_to_paid_me
     assert!(calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.is_err());
     assert!(store.is_pending_dispatched(&envelope.id, &peer, &own).await.unwrap());
     let body = format!(r#"{{"call_id":"{ID}","seq":0}}"#);
-    store.store_message_plaintext(&envelope.id, &cipher.encrypt(body.as_bytes()).unwrap()).await.unwrap();
+    store.store_message_plaintext(&envelope.id, &cipher.encrypt(&envelope.id.to_hex(), body.as_bytes()).unwrap()).await.unwrap();
     calls::receive_block_grant(&store, &cipher, &own, &peer, &envelope.id, now + 60_000).await.unwrap();
     let upgraded = store.get_outbox_operation_by_message(&envelope.id).await.unwrap().unwrap();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&upgraded.recovery).unwrap()["call_block"], serde_json::json!([ID, 0]));
@@ -699,7 +1068,7 @@ async fn callee_grant_accepts_exact_resume_boundary_for_initial_and_renewal_bloc
         let before = rules::CallEntry {
             side: rules::Side::Caller, phase: Phase::Live, deadline_ms: deadline,
             paid_until_ms: previous_paid, next_block_seq: seq,
-            pending: None, end_reason: None, unpaid_notice_used: false,
+            pending: None, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
         };
         let callee = rules::CallEntry { side: rules::Side::Callee, ..before.clone() };
         let grant = rules::receive_block(Some(callee), seq, now).unwrap();
@@ -744,7 +1113,7 @@ async fn callee_grant_clears_only_its_own_pending_block() {
     let before = rules::CallEntry {
         side: rules::Side::Caller, phase: Phase::Live, deadline_ms: now + 60_000,
         paid_until_ms: Some(now + 50_000), next_block_seq: 1,
-        pending: None, end_reason: None, unpaid_notice_used: false,
+        pending: None, end_reason: None, unpaid_notice_used: false, free_reply_receipts: Vec::new(),
     };
     let pending = rules::reserve_block(Some(before), 1, "block-grant", "request", now + 30_000).unwrap();
     // Dispatch happened on time, but a backwards clock step makes the local

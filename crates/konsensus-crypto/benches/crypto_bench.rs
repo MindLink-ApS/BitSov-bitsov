@@ -110,11 +110,11 @@ fn bench_noise_roundtrip(c: &mut Criterion) {
 fn bench_x3dh_key_agreement(c: &mut Criterion) {
     c.bench_function("X3DH key agreement (initiate + respond)", |b| {
         b.iter(|| {
-            let alice_identity_secret = StaticSecret::random_from_rng(rand::thread_rng());
+            let alice_identity_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
             let alice_identity_public = PublicKey::from(&alice_identity_secret);
-            let bob_identity_secret = StaticSecret::random_from_rng(rand::thread_rng());
+            let bob_identity_secret = StaticSecret::random_from_rng(aes_gcm::aead::OsRng);
             let bob_identity_public = PublicKey::from(&bob_identity_secret);
-            let bob_signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            let bob_signing_key = ed25519_dalek::SigningKey::generate(&mut aes_gcm::aead::OsRng);
             let bob_spk = SignedPreKey::generate();
             let bob_opk = OneTimePreKey::generate(2);
 
@@ -148,7 +148,7 @@ fn bench_x3dh_key_agreement(c: &mut Criterion) {
 fn bench_x3dh_key_generation(c: &mut Criterion) {
     c.bench_function("X3DH::StaticSecret::random_from_rng", |b| {
         b.iter(|| {
-            black_box(StaticSecret::random_from_rng(rand::thread_rng()));
+            black_box(StaticSecret::random_from_rng(aes_gcm::aead::OsRng));
         });
     });
 }

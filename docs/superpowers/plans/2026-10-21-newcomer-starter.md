@@ -2,7 +2,7 @@
 
 > Execute inline using executing-plans and test-driven-development; review the completed branch before pushing.
 
-**Goal:** Deliver the owner-requested signet starter API and worker, including C3 and F4.
+**Goal:** Deliver the owner-requested signet starter API and worker, including durable channel evidence and bounded retries.
 **Architecture:** Keep hub admission and open operations from PR-1. Persist newcomer operations in migration 031's existing table. Capture initial push in LDK channel persistence so verification remains sound after spending. A refusal can create a bounded successor; uncertainty can only replay its original operation.
 **Tech Stack:** Rust, Tokio, Axum, SQLite/PostgreSQL, embedded LDK.
 **Spec:** docs/design/N-M7A-STARTER-REQUEST.md and docs/ops/starter-hub.md.
@@ -49,10 +49,10 @@
 
 ## Implementation decisions and review fixes
 
-- C3 uses durable initial-push evidence, permitting verification after an ordinary
+- Channel verification uses durable initial-push evidence, permitting verification after an ordinary
   spend; the previous current-balance heuristic was racy. Unknown old records
   remain unverified. LDK's normal readiness checks govern spending.
-- F4 bounds each mesh connection to eight sends, rearming the same operation on
+- The retry policy bounds each mesh connection to eight sends, rearming the same operation on
   reconnect or explicit POST. Three refusal successors remain the persistent
   limit, with 10/20/40-minute minimum backoff. This reconciles the user's bounded
   retry requirement with the design's late-funding/reconnect recovery.

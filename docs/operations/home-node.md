@@ -100,8 +100,33 @@ user, starts at boot, and restarts after failures and setup exit 75. The older
 [konsensus.service user unit](konsensus.service) remains available for existing
 installations. Run only one service against a data directory.
 
-On a Linux system with systemd, from the repository root, install the verified
-binary at `/usr/bin/konsensus` and create the account and data directory:
+On a Linux system with systemd, from the repository root, verify the release
+directory and install the Linux binary at `/usr/bin/konsensus`. The install
+runs only when the verifier exits 0. The verifier checks the detached
+signature's primary-key fingerprint and every hash in `SHA256SUMS`. It copies
+`SHA256SUMS`, `SHA256SUMS.asc`, and each of the seventeen payloads into a
+private mode-0700 seal directory and hashes those copies. Copying the manifest
+does not seal the payloads. Install from the seal path the script prints.
+Mode 0700 stops a different user from writing the seal. It does not stop a
+process running as the same user. The script does not install and does not
+download the key or the binaries. `RELEASE_KEY.asc` is the reviewed copy, not
+a file fetched from `main`.
+
+```sh
+out=$(bash scripts/verify-release.sh /path/to/download RELEASE_KEY.asc) &&
+  printf '%s\n' "$out" &&
+  seal=$(printf '%s\n' "$out" | sed -n 's/^verify-release: sealed //p') &&
+  test -n "$seal" &&
+  test -f "$seal/bitsov-linux-x86_64" &&
+  test ! -L "$seal/bitsov-linux-x86_64" &&
+  sudo install -m 0755 "$seal/bitsov-linux-x86_64" /usr/bin/konsensus &&
+  bash scripts/verify-release.sh --cleanup "$seal"
+```
+
+On `aarch64`, install `bitsov-linux-aarch64` from that same seal in place of
+`bitsov-linux-x86_64`.
+
+Then create the account and data directory:
 
 ```sh
 sudo useradd --system --user-group --home-dir /var/lib/bitsov --shell /usr/sbin/nologin bitsov
@@ -595,9 +620,12 @@ The physical claim code comes only from the sticker or trusted local console.
 
 1. Click **Start setup**. The page shows a QR, link and copyable text for a
    five-minute, one-use bootstrap ticket. Clicking again rotates it.
-2. The app pins the box key, pairs, commits its device key and password hash,
-   and shows the recovery phrase and backup check. Only one client can claim
-   the box. The page shows the claimed device; it hides the ticket.
+2. The app pins the box key, pairs, reads the box's configured Bitcoin network
+   from `GET /api/v1/bootstrap/state` (`network`: `bitcoin`, `testnet`,
+   `signet` or `regtest`) and must refuse to continue if it is not the network
+   it expects. It then commits its device key and password hash, and shows
+   the recovery phrase and backup check. Only one client can claim the box.
+   The page shows the claimed device; it hides the ticket.
 3. Compare the four SAS words in the app and page. Click **Approve** on the
    page, then finish the backup check and device proof in the app. The app
    sends its password only over the pinned Noise tunnel. Finalize before box
@@ -612,7 +640,7 @@ restart the box to reopen it. Tickets cannot outlive that window. In LOCKED or
 UNLOCKED, the page contains only label, state, fingerprint and “Use the BitSov
 app”; no QR, approval controls or secrets. Adding later devices still requires
 an existing owner device or the trusted console flow, with SAS on claimed boxes.
-Client app support is delivered separately (A1); old clients cannot downgrade a
+Client app support is delivered separately; old clients cannot downgrade a
 box that has a claim code.
 
 **Ticket authority (design open item 9):** in home SETUP, the daemon's single
@@ -756,6 +784,9 @@ no first-use authenticity. The setup page and per-box claim-code ceremony are
 separate later onboarding work.
 ## Copied directories and hardware moves (#271)
 
+Choose the command in [restore paths](restore-paths.md). `rebind-instance` does
+not prove freshness.
+
 **Never restore a copied data directory, rsync backup, VM snapshot or SD-card
 image as a running Lightning node.** It may contain revoked commitments:
 broadcasting one can lose the whole channel balance, even before reconnecting
@@ -880,7 +911,7 @@ Only one ceremony can be pending. Setup closes after 15 minutes, or after three
 mismatches/cancels; restart to reopen it. Reconnecting requires cancelling the
 pending SAS ceremony and starting again.
 
-The node box page is available; app integration follows in A1. On boxes with
+The node box page is available; app integration follows separately. On boxes with
 a claim code, enrollment without `sas_version` is refused, including legacy
 console/delegation pending operations. Already initialized legacy boxes without
 a claim code retain their existing path; this does not migrate a funded box. See [the SAS wire contract](../security/pairing.md#sas-v1-and-the-box-claim-code-n3)

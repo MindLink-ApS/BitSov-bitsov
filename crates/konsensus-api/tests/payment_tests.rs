@@ -308,13 +308,14 @@ async fn pricing_own_chain_aware_reports_mode() {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(konsensus_api::rate_limit::RateLimiter::mnemonic_reveal_default()),
@@ -337,6 +338,7 @@ async fn pricing_own_chain_aware_reports_mode() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1342,13 +1344,14 @@ async fn health_lightning_unavailable_shows_null_balance() {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1371,6 +1374,7 @@ async fn health_lightning_unavailable_shows_null_balance() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1851,13 +1855,14 @@ async fn chain_status_with_failing_provider() {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -1880,6 +1885,7 @@ async fn chain_status_with_failing_provider() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1973,13 +1979,14 @@ async fn chain_status_partial_failure() {
         session_manager,
         jwt_secret: "test-jwt-secret-for-api-tests".into(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: false,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: tokio::sync::broadcast::channel(16).0,
+        call_devices: Default::default(),
         ws_delivery_broadcast: tokio::sync::broadcast::channel(16).0,
         rate_limiter: Arc::new(RateLimiter::new(100)),
         mnemonic_reveal_limiter: Arc::new(RateLimiter::mnemonic_reveal_default()),
@@ -2002,6 +2009,7 @@ async fn chain_status_partial_failure() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2314,13 +2322,14 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         session_manager: Arc::clone(&base.session_manager),
         jwt_secret: base.jwt_secret.clone(),
         file_staging: Default::default(),
-        auth_challenges: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        auth_challenges: konsensus_api::AuthChallenges::new(),
         pairing: None,
         cors_enabled: base.cors_enabled,
         operator_probes_enabled: true,
         sensitive_identity_routes_enabled: true,
         has_identity_passphrase: false,
         ws_broadcast: base.ws_broadcast.clone(),
+        call_devices: base.call_devices.clone(),
         ws_delivery_broadcast: base.ws_delivery_broadcast.clone(),
         rate_limiter: Arc::clone(&base.rate_limiter),
         mnemonic_reveal_limiter: Arc::clone(&base.mnemonic_reveal_limiter),
@@ -2343,6 +2352,7 @@ async fn send_onchain_broadcast_unconfirmed_returns_202() {
         sponsor: Default::default(),
         stun_port: None,
         max_call_minutes: 60,
+        call_reply_free: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2562,4 +2572,68 @@ fn funding_priority_and_preview_are_accepted() {
         );
         assert!(result.is_ok(), "{priority}: {}", result.err().unwrap());
     }
+}
+
+/// T2: a peer table's block validity is checked against the local tip. A tip
+/// that cannot be read leaves every table stale (unknown), never fresh by
+/// comparison with height 0.
+#[tokio::test]
+async fn peer_tables_are_stale_without_a_chain_tip() {
+    let base = test_state();
+    let chain = Arc::new(TipDownChain::down());
+    let state = Arc::new(AppState { chain: chain.clone(), ..(*base).clone() });
+    let auth = auth_header(&state);
+    let peer_id = NodeId::from_bytes([0xCD; 32]);
+    let mut prices = std::collections::HashMap::new();
+    prices.insert("communication".to_string(), 20u64);
+    // Fresh against StubChain's tip (850 000), as `pricing_peers_list` shows.
+    state.peer_prices.update(peer_id, prices, 886_000, 144, 0.0).await;
+
+    for uri in ["/api/v1/pricing/peers".to_string(), format!("/api/v1/pricing/peers/{}", peer_id.to_hex())] {
+        let req = Request::builder().uri(&uri).header("authorization", &auth).body(Body::empty()).unwrap();
+        let resp = build_router(Arc::clone(&state)).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let entry = if json.is_array() { json[0].clone() } else { json };
+        assert_eq!(entry["stale"], true, "{uri}: {entry}");
+        assert_eq!(entry["prices"]["communication"], 20, "{uri}: the table is still listed");
+    }
+    assert_eq!(chain.reads(), 2);
+}
+
+async fn own_pricing(state: Arc<AppState>) -> (u16, serde_json::Value) {
+    let req = Request::builder()
+        .uri("/api/v1/pricing")
+        .header("authorization", auth_header(&state))
+        .body(Body::empty())
+        .unwrap();
+    let resp = build_router(state).oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let body = axum::body::to_bytes(resp.into_body(), 65_536).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// T2: the own price table needs a tip, with the chain refusal (not the
+/// Lightning one) when there is none.
+#[tokio::test]
+async fn own_pricing_without_a_chain_tip_is_the_chain_refusal() {
+    let base = test_state();
+    let state = Arc::new(AppState { chain: Arc::new(TipDownChain::down()), ..(*base).clone() });
+    let (status, body) = own_pricing(state).await;
+    assert_chain_not_ready(status, &body);
+}
+
+/// T2: a chain-aware engine that loses the tip after the route's own check
+/// refuses the table; it is never served partial or empty.
+#[tokio::test]
+async fn own_pricing_refuses_when_chain_aware_prices_lose_the_tip() {
+    let base = test_state();
+    let chain = Arc::new(TipDownChain::after(1));
+    let pricing = Arc::new(konsensus_pricing::ChainAwarePricingEngine::new(Default::default(), chain.clone()));
+    let state = Arc::new(AppState { chain: chain.clone(), pricing, ..(*base).clone() });
+    let (status, body) = own_pricing(state).await;
+    assert_chain_not_ready(status, &body);
+    assert!(body.get("prices").is_none(), "{body}");
+    assert_eq!(chain.reads(), 2, "the route's check, then the engine's");
 }

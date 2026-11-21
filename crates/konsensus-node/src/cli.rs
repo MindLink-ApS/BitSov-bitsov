@@ -40,8 +40,23 @@ pub enum Command {
         #[arg(long)]
         qr: bool,
         /// Ticket lifetime: positive seconds, minutes, hours or days (s/m/h/d).
-        #[arg(long, default_value = "24h", default_value_if("second_device", "true", "10m"), value_parser = crate::ticket_cmd::parse_ttl)]
+        /// With --allow: 15m by default and at most 1h.
+        #[arg(long, default_value = "24h", default_value_if("second_device", "true", "10m"), default_value_if("allow", clap::builder::ArgPredicate::IsPresent, "15m"), value_parser = crate::ticket_cmd::parse_ttl)]
         ttl: std::time::Duration,
+        /// Attach a standing allowance to the pairing this ticket creates:
+        /// the most its app may spend in any 24 hours, in sats (2500 if no
+        /// value is given). Needs `[pairing] standing_allowance_v1 = true`
+        /// and a node started with its owner control socket.
+        #[arg(long, num_args = 0..=1, default_missing_value = "2500", conflicts_with_all = ["second_device", "legacy"], value_parser = clap::value_parser!(u64).range(1..))]
+        allow: Option<u64>,
+        /// With --allow: the most one call may reserve in all (its minutes,
+        /// closing signal and offers), in sats (700, or the daily cap if
+        /// lower, if not given).
+        #[arg(long = "per-call", requires = "allow", value_parser = clap::value_parser!(u64).range(1..))]
+        per_call: Option<u64>,
+        /// With --allow: how many days the allowance lasts (30 if not given).
+        #[arg(long, requires = "allow", value_parser = clap::value_parser!(u32).range(1..=365))]
+        days: Option<u32>,
     },
     /// Reject a v2 enrollment and remove its provisional pairing.
     PairCancel {
@@ -89,6 +104,12 @@ pub enum Command {
         /// (0 = stdin). UTF-8, at most 4096 bytes; trailing CR/LF is removed.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with = "encrypt")]
         password_fd: Option<i32>,
+
+        /// Bitcoin network to write into the config: `[lightning] network` and
+        /// the `[lightning]` and `[chain]` server URLs. Mainnet is not supported
+        /// in this beta: `start` refuses it unless `[node] allow_mainnet = true`.
+        #[arg(long, value_parser = crate::config::INIT_NETWORKS, default_value = crate::config::DEFAULT_INIT_NETWORK)]
+        network: String,
     },
 
     /// Start the node using an existing configuration.
@@ -108,13 +129,15 @@ pub enum Command {
         /// Read that password from a file instead of prompting. Opt-in: only a
         /// regular file readable by its owner alone (chmod 600) is accepted.
         /// Any program running as you can read it, including a paired app, so
-        /// it protects the seed from other OS users only.
+        /// it protects the seed from other OS users only. Touch ID stays off unless
+        /// the owner sets [pairing] unattended_device_approvals.
         #[arg(long)]
         password_file: Option<PathBuf>,
 
         /// Read the password once to EOF from an inherited descriptor (0 = stdin).
         /// UTF-8, at most 4096 bytes; trailing CR/LF is removed. Touch ID requires
-        /// --local-owner-device too. Nonzero descriptors require Unix.
+        /// --local-owner-device too, or the owner's [pairing] unattended_device_approvals.
+        /// Nonzero descriptors require Unix.
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(i32).range(0..), conflicts_with_all = ["password", "password_file"], group = "owner_password")]
         password_fd: Option<i32>,
 
@@ -227,6 +250,12 @@ pub enum Command {
         /// Encrypt the mnemonic file; empty or whitespace-only passwords are rejected.
         #[arg(long)]
         encrypt: Option<Option<String>>,
+
+        /// Bitcoin network to write into the config: `[lightning] network` and
+        /// the `[lightning]` and `[chain]` server URLs. Mainnet is not supported
+        /// in this beta: `start` refuses it unless `[node] allow_mainnet = true`.
+        #[arg(long, value_parser = crate::config::INIT_NETWORKS, default_value = crate::config::DEFAULT_INIT_NETWORK)]
+        network: String,
     },
 
     /// Sign an auth challenge and print the hex Ed25519 signature.
@@ -300,6 +329,10 @@ pub enum Command {
         #[command(subcommand)]
         command: SeedCommand,
     },
+
+    /// Show the chain tip source and whether it is a public explorer this node
+    /// never explicitly accepted. Read-only: changes nothing.
+    ChainTip(crate::chain_tip_cmd::ChainTipArgs),
 
     /// Paired device keys: approve one once, list, or revoke.
     ///
@@ -543,7 +576,7 @@ pub enum RepairCommand {
 
 #[derive(Subcommand)]
 pub enum ScbCommand {
-    /// Disabled: stale SCB state can lose funds. Use move-home on the current live node.
+    /// Disabled: stale SCB state can lose funds. Use `konsensus move-home` on the current live node, or `konsensus recover` on the owner console after disk loss.
     Restore {
         /// Path to the encrypted backup file (`*.aes`).
         #[arg(long)]
@@ -1032,7 +1065,34 @@ mod second_device_console_tests {
                 "{args:?}"
             );
         }
+        // A standing allowance on a ticket: defaults, and a short ticket.
+        let Command::PairTicket { ttl, allow, per_call, days, .. } =
+            Cli::try_parse_from(["konsensus", "pair-ticket", "--allow"]).unwrap().command
+        else {
+            panic!("ticket");
+        };
+        assert_eq!((ttl.as_secs(), allow, per_call, days), (900, Some(2500), None, None));
+        let Command::PairTicket { ttl, allow, per_call, days, .. } = Cli::try_parse_from([
+            "konsensus", "pair-ticket", "--allow", "1000", "--per-call", "300", "--days", "7", "--ttl", "1h",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("ticket");
+        };
+        assert_eq!((ttl.as_secs(), allow, per_call, days), (3600, Some(1000), Some(300), Some(7)));
+        let Command::PairTicket { allow, .. } = Cli::try_parse_from(["konsensus", "pair-ticket"]).unwrap().command else {
+            panic!("ticket");
+        };
+        assert_eq!(allow, None);
         for args in [
+            vec!["pair-ticket", "--per-call", "300"],
+            vec!["pair-ticket", "--days", "7"],
+            vec!["pair-ticket", "--allow", "0"],
+            vec!["pair-ticket", "--allow", "--days", "0"],
+            vec!["pair-ticket", "--allow", "--days", "366"],
+            vec!["pair-ticket", "--allow", "--second-device"],
+            vec!["pair-ticket", "--allow", "--legacy"],
             vec!["pair-ticket", "--second-device", "--legacy"],
             vec!["device", "revoke"],
             vec!["device", "revoke", "--key", "a", "--approved-by", "b"],

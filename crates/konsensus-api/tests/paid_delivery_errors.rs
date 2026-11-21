@@ -26,8 +26,9 @@ async fn file_and_calendar_queue_failures_report_settlement_and_preserve_reconci
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("sender.sqlite");
             let db = Arc::new(SqliteStorage::open(path.to_str().unwrap()).await.unwrap());
-            // Supply calendar content tables for this fixture; core migrations do not create them.
-            sqlx::raw_sql("CREATE TABLE calendar_events (id TEXT PRIMARY KEY, message_id TEXT, organizer TEXT NOT NULL, title TEXT NOT NULL, description TEXT, start_ms BIGINT, end_ms BIGINT, tz TEXT, location TEXT, attendees_json TEXT, recurrence_json TEXT, color TEXT, created_at TEXT NOT NULL DEFAULT '', parent_id TEXT)").execute(db.pool()).await.unwrap();
+            // Storage migrations create calendar_events. Keep this for older builds
+            // whose migrator did not, and no-op when the table is already there.
+            sqlx::raw_sql("CREATE TABLE IF NOT EXISTS calendar_events (id TEXT PRIMARY KEY, message_id TEXT, organizer TEXT NOT NULL, title TEXT NOT NULL, description TEXT, start_ms BIGINT, end_ms BIGINT, tz TEXT, location TEXT, attendees_json TEXT, recurrence_json TEXT, color TEXT, created_at TEXT NOT NULL DEFAULT '', parent_id TEXT)").execute(db.pool()).await.unwrap();
             let ledger = dir.path().join("payments.sqlite");
             let payer = Arc::new(SharedMockProvider::new(&ledger, "a", 10000).unwrap());
             let payee = Arc::new(SharedMockProvider::new(&ledger, "b", 0).unwrap());

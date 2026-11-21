@@ -357,7 +357,7 @@ fi
 # 5. Sign, verify, attach only after the reproducibility gate.
 gpg --list-secret-keys "$KEY_FPR" >/dev/null 2>&1 || die "release key $KEY_FPR is not on this machine"
 gpg --armor --detach-sign --local-user "$KEY_FPR" --output SHA256SUMS.asc SHA256SUMS
-gpg --status-fd 1 --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null | signed_by_key || die "signature check failed"
+gpg --status-fd 1 --no-auto-key-retrieve --verify SHA256SUMS.asc SHA256SUMS 2>/dev/null | signed_by_key || die "signature check failed"
 # Signing may involve an interactive pinentry. Re-fetch immediately before
 # upload as well, so changes during signing cannot receive this stale manifest.
 require_unchanged_release

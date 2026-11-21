@@ -1902,6 +1902,66 @@ fn lightning_config_backend_name() {
 // ── Config load/save roundtrip tests ───────────────────────────────
 
 #[test]
+fn generated_config_documents_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    for tier in [NodeTier::Cloud, NodeTier::Light, NodeTier::Full] {
+        let config = NodeConfig::default_for_tier(tier, PathBuf::from("/dev/null"), dir.path());
+        let path = dir.path().join("konsensus.toml");
+        config.save(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let document: toml::Table = content.parse().unwrap();
+        assert_eq!(document["tier"].as_str(), Some(tier.to_string().as_str()));
+        assert_eq!(document["pricing"]["chat_msat"].as_integer(), Some(10));
+        assert_eq!(document["relay"]["enabled"].as_bool(), Some(false));
+
+        let parsed: NodeConfig = toml::from_str(&content).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&config).unwrap()
+        );
+        let loaded = NodeConfig::load(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&config).unwrap()
+        );
+        loaded.save(&path).unwrap();
+        let saved: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(saved, document);
+    }
+}
+
+#[test]
+fn edited_config_document_preserves_fields_on_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let config =
+        NodeConfig::default_for_tier(NodeTier::Light, PathBuf::from("/dev/null"), dir.path());
+    let mut document: toml::Table = toml::to_string_pretty(&config).unwrap().parse().unwrap();
+    document["node"]
+        .as_table_mut()
+        .unwrap()
+        .insert("hosted_by".into(), "Workshop \"box\" \\ shelf".into());
+    document["pricing"]["chat_msat"] = 1234.into();
+    let path = dir.path().join("konsensus.toml");
+    std::fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+
+    let loaded = NodeConfig::load(&path).unwrap();
+    assert_eq!(
+        loaded.node.hosted_by.as_deref(),
+        Some("Workshop \"box\" \\ shelf")
+    );
+    assert_eq!(loaded.pricing.chat_msat, 1234);
+    assert_eq!(loaded.tier, NodeTier::Light);
+    assert!(!loaded.relay.enabled);
+    loaded.save(&path).unwrap();
+    let reloaded = NodeConfig::load(&path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&reloaded).unwrap(),
+        serde_json::to_value(&loaded).unwrap()
+    );
+}
+
+#[test]
 fn config_save_and_load_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let mnemonic_path = dir.path().join("mnemonic.txt");
@@ -2799,6 +2859,104 @@ fn introduction_network_normalizes_ldk_names() {
     }
 }
 
+/// `network` as published by `GET /api/v1/bootstrap/state` for this
+/// `[lightning]` section, built the way bootstrap mode builds it.
+async fn bootstrap_state_network(lightning_toml: &str) -> Option<String> {
+    use tower::ServiceExt;
+    let lightning: LightningConfig = toml::from_str(lightning_toml).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let pairing = std::sync::Arc::new(
+        konsensus_api::pairing::PairingService::open(dir.path(), String::new(), false)
+            .unwrap()
+            .without_stdout_code(),
+    );
+    let state = std::sync::Arc::new(
+        konsensus_api::bootstrap::BootstrapState::new(
+            konsensus_api::bootstrap::DataDirLayout::new(dir.path()),
+            pairing,
+        )
+        .with_network(lightning.bitcoin_network()),
+    );
+    let response = konsensus_api::bootstrap::build_bootstrap_router(state)
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/bootstrap/state")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    body.get("network").map(|network| {
+        network
+            .as_str()
+            .expect("network is a string when present")
+            .to_owned()
+    })
+}
+
+#[tokio::test]
+async fn bootstrap_state_publishes_the_canonical_network_for_each_backend() {
+    let cln = |network: &str| {
+        format!(
+            "backend = \"cln\"\nrest_url = \"https://127.0.0.1:3010\"\n\
+             ca_cert_path = \"/tmp/ca.pem\"\nrune_file = \"/tmp/rune\"\n\
+             network = \"{network}\"\n"
+        )
+    };
+    let ldk = |network: &str| format!("backend = \"ldk\"\nnetwork = \"{network}\"\n");
+    // LDK and CLN state a network: canonical names, the `mainnet` and
+    // `testnet3` aliases and any letter case all publish the canonical name.
+    for (configured, canonical) in [
+        ("bitcoin", Some("bitcoin")),
+        ("mainnet", Some("bitcoin")),
+        ("Bitcoin", Some("bitcoin")),
+        ("MAINNET", Some("bitcoin")),
+        ("testnet", Some("testnet")),
+        ("testnet3", Some("testnet")),
+        ("Testnet3", Some("testnet")),
+        ("signet", Some("signet")),
+        ("Signet", Some("signet")),
+        ("SIGNET", Some("signet")),
+        ("regtest", Some("regtest")),
+        ("Regtest", Some("regtest")),
+        // Not one of the four published names: the field is left out.
+        ("testnet4", None),
+        ("my custom chain", None),
+        ("", None),
+    ] {
+        for (backend, section) in [("ldk", ldk(configured)), ("cln", cln(configured))] {
+            assert_eq!(
+                bootstrap_state_network(&section).await.as_deref(),
+                canonical,
+                "{backend} network = {configured:?}"
+            );
+        }
+    }
+    // LND and LNbits do not state a network: the field is left out.
+    for section in [
+        "backend = \"lnd\"\napi_url = \"https://127.0.0.1:8080\"\nmacaroon_hex = \"00\"\n",
+        "backend = \"lnbits\"\napi_url = \"https://127.0.0.1:5000\"\nadmin_key = \"k\"\n",
+    ] {
+        assert_eq!(bootstrap_state_network(section).await, None, "{section}");
+    }
+    // Mock backends pay on regtest.
+    for section in [
+        "backend = \"mock\"\n",
+        "backend = \"shared_mock\"\nledger_path = \"/tmp/ledger\"\n",
+    ] {
+        assert_eq!(
+            bootstrap_state_network(section).await.as_deref(),
+            Some("regtest"),
+            "{section}"
+        );
+    }
+}
+
 #[test]
 fn sponsor_is_off_by_default_and_clamped_to_the_spec() {
     let cfg: SponsorConfig = toml::from_str("").unwrap();
@@ -3678,6 +3836,7 @@ fn endpoint_debug_redacts_url_credentials() {
             api_url: url.into(),
             esplora_url_fallback: Some(url.into()),
             credentials_file: None,
+            accept_third_party_tip: false,
         };
         assert_debug_redacted(
             &config,
@@ -4016,4 +4175,89 @@ fn calls_duration_setting_defaults_and_rejects_out_of_bounds() {
     for minutes in [0, 241, -1] {
         assert!(toml::from_str::<crate::config::CallsConfig>(&format!("max_call_minutes = {minutes}")).is_err());
     }
+}
+
+#[test]
+fn call_continuity_is_off_unless_set_to_true() {
+    let base = r#"
+[identity]
+mnemonic_file = "/tmp/m.txt"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+"#;
+    let unset: NodeConfig = toml::from_str(base).unwrap();
+    assert!(!unset.calls.call_continuity_v1);
+    assert!(!crate::config::CallsConfig::default().call_continuity_v1);
+    let on: NodeConfig = toml::from_str(&format!("{base}\n[calls]\ncall_continuity_v1 = true\n")).unwrap();
+    assert!(on.calls.call_continuity_v1);
+    for value in ["false", "\"true\"", "\"yes\"", "1", "0", "1.0", "[true]", "{ on = true }"] {
+        let parsed: NodeConfig = toml::from_str(&format!("{base}\n[calls]\ncall_continuity_v1 = {value}\n"))
+            .unwrap_or_else(|e| panic!("{value}: {e}"));
+        assert!(!parsed.calls.call_continuity_v1, "{value} must leave continuity off");
+    }
+    // A misspelled switch is refused like every other unknown key.
+    assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\ncall_continuity = true\n")).is_err());
+    // Off is not written back out.
+    assert!(!toml::to_string(&unset.calls).unwrap().contains("call_continuity_v1"));
+}
+
+#[test]
+fn call_reply_free_is_off_unless_set_to_true() {
+    let base = r#"
+[identity]
+mnemonic_file = "/tmp/m.txt"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+"#;
+    let unset: NodeConfig = toml::from_str(base).unwrap();
+    assert!(!unset.calls.call_reply_free_v1);
+    assert!(!crate::config::CallsConfig::default().call_reply_free_v1);
+    let on: NodeConfig = toml::from_str(&format!("{base}\n[calls]\ncall_reply_free_v1 = true\n")).unwrap();
+    assert!(on.calls.call_reply_free_v1);
+    for value in ["false", "\"true\"", "\"yes\"", "1", "0", "1.0", "[true]", "{ on = true }"] {
+        let parsed: NodeConfig = toml::from_str(&format!("{base}\n[calls]\ncall_reply_free_v1 = {value}\n"))
+            .unwrap_or_else(|e| panic!("{value}: {e}"));
+        assert!(!parsed.calls.call_reply_free_v1, "{value} must leave free replies off");
+    }
+    assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[calls]\ncall_reply_free = true\n")).is_err());
+    assert!(!toml::to_string(&unset.calls).unwrap().contains("call_reply_free_v1"));
+}
+
+#[test]
+fn standing_allowance_is_off_unless_set_to_true() {
+    let base = r#"
+[identity]
+mnemonic_file = "/tmp/m.txt"
+[network]
+[lightning]
+backend = "mock"
+[chain]
+backend = "mock"
+[storage]
+backend = "sqlite"
+"#;
+    let unset: NodeConfig = toml::from_str(base).unwrap();
+    assert!(!unset.pairing.standing_allowance_v1);
+    assert!(!crate::config::PairingConfig::default().standing_allowance_v1);
+    let on: NodeConfig = toml::from_str(&format!("{base}\n[pairing]\nstanding_allowance_v1 = true\n")).unwrap();
+    assert!(on.pairing.standing_allowance_v1);
+    for value in ["false", "\"true\"", "\"yes\"", "1", "0", "1.0", "[true]", "{ on = true }"] {
+        let parsed: NodeConfig = toml::from_str(&format!("{base}\n[pairing]\nstanding_allowance_v1 = {value}\n"))
+            .unwrap_or_else(|e| panic!("{value}: {e}"));
+        assert!(!parsed.pairing.standing_allowance_v1, "{value} must leave the allowance off");
+    }
+    // A misspelled switch is refused like every other unknown key.
+    assert!(toml::from_str::<NodeConfig>(&format!("{base}\n[pairing]\nstanding_allowance = true\n")).is_err());
+    // Off is not written back out.
+    assert!(!toml::to_string(&unset.pairing).unwrap().contains("standing_allowance_v1"));
 }

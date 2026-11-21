@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 
 use crate::config::{NodeConfig, NodeTier, StorageConfig};
 use konsensus_api::bootstrap::{self, DataDirLayout, StartupMode};
-use konsensus_api::control::{self, ControlRequest, ControlResponse};
+use konsensus_api::control::{self, utc_iso8601, ControlRequest, ControlResponse};
 use konsensus_api::pairing::PairingService;
 use konsensus_api::rate_limit::RemoteTunnelClients;
 use konsensus_api::spend_budget::{self, GrantTerms};
@@ -276,6 +276,22 @@ pub fn terminal_safe(text: &str) -> String {
         .collect()
 }
 
+/// Preserve JSON values while escaping terminal-sensitive Unicode.
+fn terminal_json(value: &serde_json::Value) -> Result<String, serde_json::Error> {
+    Ok(serde_json::to_string(value)?
+        .chars()
+        .map(|c| {
+            let invisible = matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}');
+            if c.is_control() || invisible {
+                format!("\\u{:04x}", u32::from(c))
+            } else {
+                c.to_string()
+            }
+        })
+        .collect())
+}
+
 /// `println!` for lines that carry control-socket text: the whole line goes
 /// through [`terminal_safe`].
 macro_rules! safe_println {
@@ -289,17 +305,7 @@ fn report(resp: ControlResponse) -> Result<()> {
             println!("{}", terminal_safe(&detail));
             Ok(())
         }
-        ControlResponse::Error { message } => {
-            if message
-                .split_once(':')
-                .is_some_and(|(code, _)| code == control::MALFORMED_CONTROL_REQUEST)
-            {
-                anyhow::bail!(
-                    "refused: malformed_control_request: invalid control request; check that the owner CLI and node versions match"
-                );
-            }
-            anyhow::bail!("refused: {}", terminal_safe(&message))
-        }
+        ControlResponse::Error { message } => Err(control_error(&message)),
         other => {
             println!("{}", serde_json::to_string_pretty(&other)?);
             Ok(())
@@ -307,11 +313,28 @@ fn report(resp: ControlResponse) -> Result<()> {
     }
 }
 
+/// The error for a node's error response. A shutdown interrupt is an unknown
+/// outcome, not a refusal, so it carries no "refused:" label.
+fn control_error(message: &str) -> anyhow::Error {
+    if message.starts_with("node_stopping:") {
+        return anyhow::anyhow!("{}", terminal_safe(message));
+    }
+    if message
+        .split_once(':')
+        .is_some_and(|(code, _)| code == control::MALFORMED_CONTROL_REQUEST)
+    {
+        return anyhow::anyhow!(
+            "refused: malformed_control_request: invalid control request; check that the owner CLI and node versions match"
+        );
+    }
+    anyhow::anyhow!("refused: {}", terminal_safe(message))
+}
+
 /// `konsensus lock-status` — JSON for local monitors, without a control envelope.
 pub async fn cmd_lock_status(config_path: &Path) -> Result<()> {
     match send(config_path, ControlRequest::LockStatus {}).await? {
         ControlResponse::LockStatus { status } => {
-            println!("{}", serde_json::to_string(&status)?);
+            println!("{}", terminal_json(&status)?);
             Ok(())
         }
         error @ ControlResponse::Error { .. } => report(error),
@@ -337,9 +360,10 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             if let Some(status) = &enrollment {
                 for provisional in &status.provisional {
                     safe_println!(
-                        "PROVISIONAL client={} deadline={}",
+                        "PROVISIONAL client={} deadline={} ({})",
                         provisional.client_id,
-                        provisional.expires_at
+                        provisional.expires_at,
+                        utc_iso8601(provisional.expires_at)
                     );
                 }
             }
@@ -347,7 +371,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                 safe_println!("This QR was used again after you approved {:?}. Revoke it if it wasn't yours. (client={})",alert.name,alert.client_id);
             }
             for p in pending_owner_approvals {
-                safe_println!("PENDING OWNER APPROVAL {} kind={} client={} expires_at={} (approve on a different enrolled owner device)", p.op_id, p.kind, p.client_id, p.expires_at);
+                safe_println!("PENDING OWNER APPROVAL {} kind={} client={} expires_at={} ({}) (approve on a different enrolled owner device)", p.op_id, p.kind, p.client_id, p.expires_at, utc_iso8601(p.expires_at));
             }
             for k in &device_keys {
                 safe_println!(
@@ -359,7 +383,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             }
             for p in pending_device_keys.iter().filter(|p| !p.lost) {
                 if let Some(words) = enrollment.as_ref().and_then(|e| e.words.get(&p.op_id)) {
-                    safe_println!("SAS v2 {}: {}  expires_at={}", p.op_id, words, p.expires_at);
+                    safe_println!("SAS v2 {}: {}  expires_at={} ({})", p.op_id, words, p.expires_at, utc_iso8601(p.expires_at));
                 }
                 safe_println!(
                     "PENDING DEVICE KEY {}  {:?}  client={}\n  approve with: konsensus device approve --op {}",
@@ -381,13 +405,14 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             for g in &grants {
                 safe_println!(
                     "SPEND GRANT client={}  {} of {} sats left  per-call<={} sats  \
-                     messages<={} sats  expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
+                     messages<={} sats  expires_at={} ({})\n  revoke with: konsensus grant-revoke --client-id {}",
                     g.client_id,
                     spend_budget::sats(g.remaining_msat),
                     spend_budget::sats(g.budget_msat),
                     spend_budget::sats(g.per_call_max_msat),
                     spend_budget::sats(g.message_per_payment_max_msat),
                     g.expires_at,
+                    utc_iso8601(g.expires_at),
                     g.client_id
                 );
             }
@@ -402,9 +427,10 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
             for g in &front_door_grants {
                 safe_println!(
                     "FRONT DOOR GRANT client={}  may publish the front-door card only  \
-                     expires_at={}\n  revoke with: konsensus grant-revoke --client-id {}",
+                     expires_at={} ({})\n  revoke with: konsensus grant-revoke --client-id {}",
                     g.client_id,
                     g.expires_at,
+                    utc_iso8601(g.expires_at),
                     g.client_id
                 );
             }
@@ -415,18 +441,19 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                     format!("approve with: konsensus grant --op {}", e.op_id)
                 };
                 safe_println!(
-                    "PENDING ELEVATION op={}  client={} ({})  scopes={}  expires_at={}\n  {next}",
+                    "PENDING ELEVATION op={}  client={} ({})  scopes={}  expires_at={} ({})\n  {next}",
                     e.op_id,
                     e.client_name,
                     e.client_id,
                     e.scopes.join("+"),
                     e.expires_at,
+                    utc_iso8601(e.expires_at),
                 );
             }
             for r in &pending_replacements {
                 safe_println!(
                     "PENDING IDENTITY REPLACEMENT op={}  client={} ({})  current={}  \
-                     replacement={}  expires_at={}  approved={}\n  \
+                     replacement={}  expires_at={} ({})  approved={}\n  \
                      approve with: konsensus approve-replacement --op {}",
                     r.op_id,
                     r.client_name,
@@ -434,6 +461,7 @@ pub async fn cmd_pair_status(config_path: &Path) -> Result<()> {
                     r.current_identity_fingerprint,
                     r.replacement_identity_fingerprint,
                     r.expires_at,
+                    utc_iso8601(r.expires_at),
                     r.approved,
                     r.op_id
                 );
@@ -454,14 +482,20 @@ struct Described {
 }
 
 async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
-    match send(
-        config_path,
-        ControlRequest::Describe {
-            op_id: op_id.to_string(),
-        },
+    described(
+        send(
+            config_path,
+            ControlRequest::Describe {
+                op_id: op_id.to_string(),
+            },
+        )
+        .await?,
     )
-    .await?
-    {
+}
+
+/// The node's answer to a describe request.
+fn described(resp: ControlResponse) -> Result<Described> {
+    match resp {
         ControlResponse::Describe {
             summary,
             confirmation_label,
@@ -475,7 +509,7 @@ async fn describe(config_path: &Path, op_id: &str) -> Result<Described> {
             front_door,
             device,
         }),
-        ControlResponse::Error { message } => anyhow::bail!("refused: {}", terminal_safe(&message)),
+        ControlResponse::Error { message } => Err(control_error(&message)),
         other => anyhow::bail!("unexpected control response: {other:?}"),
     }
 }
@@ -904,12 +938,13 @@ pub async fn cmd_device(command: crate::cli::DeviceCommand) -> Result<()> {
                         format!("approve with: konsensus device approve --op {}", p.op_id)
                     };
                     safe_println!(
-                        "PENDING DEVICE KEY {}  {:?}  client={} ({})  expires_at={}\n  {next}",
+                        "PENDING DEVICE KEY {}  {:?}  client={} ({})  expires_at={} ({})\n  {next}",
                         p.fingerprint,
                         p.name,
                         p.client_name,
                         p.client_id,
-                        p.expires_at
+                        p.expires_at,
+                        utc_iso8601(p.expires_at)
                     );
                 }
                 Ok(())
@@ -1276,6 +1311,7 @@ pub async fn serve_bootstrap_mode(
     );
     let align_path = config_path.to_path_buf();
     let mut state = konsensus_api::bootstrap::BootstrapState::new(layout, pairing)
+        .with_network(config.lightning.bitcoin_network())
         .with_before_marker(move |outcome| {
             align_config_mnemonic(&align_path, &outcome.mnemonic_path)
                 .map_err(|e| konsensus_api::bootstrap::CommitError::Io(e.to_string()))
@@ -1852,7 +1888,7 @@ mod startup_tests {
             let verifier = crate::owner_approval_key(
                 &repaired,
                 Some("crash-test-password"),
-                crate::PasswordSource::Descriptor,
+                crate::PasswordSource::Descriptor(crate::InputAccess::OwnerOnly),
                 true,
             )
             .unwrap();
@@ -2129,6 +2165,26 @@ mod startup_tests {
             (t.budget_msat, t.per_call_max_msat, t.ttl_secs),
             (50_000, 50_000, 1800)
         );
+    }
+
+    #[test]
+    fn describe_reports_a_shutdown_interrupt_as_report_does() {
+        let message = "node_stopping: the node is shutting down; the outcome is unknown";
+        let error = described(ControlResponse::Error { message: message.into() })
+            .err()
+            .expect("an error response is an error")
+            .to_string();
+        assert!(!error.starts_with("refused:"), "{error}");
+        let reported = report(ControlResponse::Error { message: message.into() })
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, reported);
+        // A real refusal keeps its label on both paths.
+        let refused = described(ControlResponse::Error { message: "unknown_op: no such operation".into() })
+            .err()
+            .expect("an error response is an error")
+            .to_string();
+        assert!(refused.starts_with("refused:"), "{refused}");
     }
 
     #[test]

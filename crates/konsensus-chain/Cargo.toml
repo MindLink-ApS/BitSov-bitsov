@@ -8,6 +8,7 @@ license.workspace = true
 konsensus-recovery = { path = "../konsensus-recovery" }
 konsensus-core = { path = "../konsensus-core" }
 tokio.workspace = true
+futures.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 bitcoin.workspace = true

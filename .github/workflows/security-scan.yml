@@ -45,7 +45,7 @@ jobs:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
 
       - name: Cache cargo registry
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/bin/
@@ -123,6 +123,13 @@ jobs:
             --exit-code 0 > /tmp/gitleaks.log 2>&1 || status=$?
           echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
 
+      # cargo-audit and cargo-deny have no expiry for an ignore. Keep going so the
+      # report is still published; the fail step below reads this outcome.
+      - name: Check advisory waiver deadlines
+        id: waiver_deadlines
+        continue-on-error: true
+        run: python3 scripts/check-waiver-deadlines.py
+
       # ── Ensure label exists in repository ─────────────────────────────────
 
       - name: Ensure security-scanning label
@@ -142,6 +149,7 @@ jobs:
           CARGO_EXIT_CODE: ${{ steps.cargo_audit.outputs.exit_code }}
           OSV_EXIT_CODE: ${{ steps.osv_scan.outputs.exit_code }}
           GITLEAKS_EXIT_CODE: ${{ steps.gitleaks.outputs.exit_code }}
+          WAIVER_DEADLINES_OUTCOME: ${{ steps.waiver_deadlines.outcome }}
         run: |
           SCAN_DATE=$(date -u +"%Y-%m-%d")
           SCAN_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -212,23 +220,9 @@ jobs:
             LEAK_ERROR=true
           fi
 
-          # ── Overall status ──
-          HAS_FINDINGS=false
-          [ "${CARGO_VULN_COUNT}" -gt 0 ] && HAS_FINDINGS=true
-          [ "${OSV_COUNT}"        -gt 0 ] && HAS_FINDINGS=true
-          [ "${LEAK_COUNT}"       -gt 0 ] && HAS_FINDINGS=true
-
-          cargo_status=$([ "${CARGO_VULN_COUNT}" -gt 0 ] && echo "FINDINGS (${CARGO_VULN_COUNT})" || echo "clean")
-          osv_status=$([ "${OSV_COUNT}"           -gt 0 ] && echo "FINDINGS (${OSV_COUNT})"        || echo "clean")
-          leak_status=$([ "${LEAK_COUNT}"         -gt 0 ] && echo "FINDINGS (${LEAK_COUNT})"       || echo "clean")
-          overall=$([ "${HAS_FINDINGS}" = "true" ]         && echo "REQUIRES REVIEW"               || echo "ALL CLEAR")
-          if [ "$CARGO_ERROR" = true ] || [ "$OSV_ERROR" = true ] || [ "$LEAK_ERROR" = true ]; then
-            SCAN_ERROR=true
-            overall="SCAN ERROR — triage privately"
-          fi
-          [ "$CARGO_ERROR" = true ] && cargo_status="SCAN ERROR"
-          [ "$OSV_ERROR" = true ] && osv_status="SCAN ERROR"
-          [ "$LEAK_ERROR" = true ] && leak_status="SCAN ERROR"
+          # ── Overall status ── (ALL CLEAR needs clean scanners and a passed waiver-deadline check)
+          source scripts/security-report-status.sh
+          security_overall
 
           # ── Build cargo-audit detail section ──
           CARGO_DETAIL="No vulnerabilities found."
@@ -281,7 +275,8 @@ jobs:
             printf '|---------|--------|\n'
             printf '| cargo-audit | %s |\n' "${cargo_status}"
             printf '| osv-scanner | %s |\n' "${osv_status}"
-            printf '| gitleaks | %s |\n\n' "${leak_status}"
+            printf '| gitleaks | %s |\n' "${leak_status}"
+            printf '| waiver deadlines | %s |\n\n' "${waiver_status}"
             printf '%s\n\n' '---'
             printf '## cargo-audit\n\n'
             printf '%s\n\n' "${CARGO_DETAIL}"
@@ -306,7 +301,7 @@ jobs:
       # ── Upload report as artifact (always) ────────────────────────────────
 
       - name: Upload security report
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-report-${{ steps.report.outputs.scan_date }}
           path: ${{ steps.report.outputs.report_file }}
@@ -316,7 +311,7 @@ jobs:
       # Do not commit leak metadata or open public PRs with confirmed file paths.
 
       - name: Fail on security findings or scan errors
-        if: steps.report.outputs.has_findings == 'true' || steps.report.outputs.scan_error == 'true'
+        if: steps.report.outputs.has_findings == 'true' || steps.report.outputs.scan_error == 'true' || steps.waiver_deadlines.outcome != 'success'
         run: |
           echo "Security scan found issues or could not be verified. Triage privately; do not publish leak metadata in a PR."
           exit 1

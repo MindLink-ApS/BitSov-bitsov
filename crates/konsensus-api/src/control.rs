@@ -276,6 +276,12 @@ pub enum ControlResponse {
 /// Stable error code for a control request that could not be decoded.
 pub const MALFORMED_CONTROL_REQUEST: &str = "malformed_control_request";
 
+/// A shutdown timeout cannot establish whether an operation took effect.
+pub const CONTROL_OPERATION_INTERRUPTED: &str = "node_stopping: the operation outcome is unknown; check status after restart";
+
+#[cfg(unix)]
+const CONTROL_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A paired client as rendered to the owner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientSummary {
@@ -576,7 +582,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                         .collect::<Vec<_>>()
                         .join("+"),
                     g.client_id,
-                    g.expires_at,
+                    utc_and_unix(g.expires_at),
                     g.epoch,
                     g.budget
                         .as_ref()
@@ -601,7 +607,10 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
                     "granted front_door to client {} until {} (epoch {}): it may publish or \
                      update this node's front-door card and nothing else; it moves no value. \
                      Revoke any time with: konsensus grant-revoke --client-id {}",
-                    g.client_id, g.expires_at, g.epoch, g.client_id,
+                    g.client_id,
+                    utc_and_unix(g.expires_at),
+                    g.epoch,
+                    g.client_id,
                 ),
             },
             Err(e) => error(e),
@@ -613,7 +622,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
         ) {
             Ok(grant) => ControlResponse::Ok {
                 detail: format!("approved first contact for client {client_id}, grant {grant_op_id}, recipient {}, maximum {} msat; expires at {} (single use)",
-                    grant.recipient, grant.max_total_msat, grant.expires_at),
+                    grant.recipient, grant.max_total_msat, utc_and_unix(grant.expires_at)),
             },
             Err(e) => ControlResponse::Error { message: e.to_string() },
         },
@@ -714,7 +723,7 @@ pub fn handle(ctx: &ControlContext, req: ControlRequest) -> ControlResponse {
         ControlRequest::OpenWindow { seconds } => {
             let until = service.open_pairing_window(std::time::Duration::from_secs(seconds));
             ControlResponse::Ok {
-                detail: format!("pairing window open until {until}"),
+                detail: format!("pairing window open until {}", utc_and_unix(until)),
             }
         }
     }
@@ -814,6 +823,20 @@ fn approve_and_execute_replacement(
     }
 }
 
+/// A Unix time in seconds as ISO-8601 UTC, `2026-11-09T16:01:22Z`, for console
+/// output. A value outside chrono's range prints as the plain number.
+pub fn utc_iso8601(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| secs.to_string())
+}
+
+/// `2026-11-09T16:01:22Z (unix 1794240082)`: readable first, with the number
+/// kept for anyone who copies it.
+pub fn utc_and_unix(secs: i64) -> String {
+    format!("{} (unix {secs})", utc_iso8601(secs))
+}
+
 fn error(e: PairingError) -> ControlResponse {
     ControlResponse::Error {
         message: e.to_string(),
@@ -844,7 +867,10 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
              profile, links and the prices shown on the card. It moves no value, reaches no \
              other route, and lasts until the window closes (1 h unless you pass --for, 24 h at \
              most). Revoke with konsensus grant-revoke.",
-            op.op_id, op.client_name, op.client_id, op.expires_at
+            op.op_id,
+            op.client_name,
+            op.client_id,
+            utc_and_unix(op.expires_at)
         );
         return ControlResponse::Describe {
             confirmation_label: grant_confirmation_phrase(op),
@@ -876,7 +902,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
                 .join("+"),
-            op.expires_at
+            utc_and_unix(op.expires_at)
         );
         return ControlResponse::Describe {
             confirmation_label: grant_confirmation_phrase(op),
@@ -906,7 +932,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             p.client_id,
             p.name,
             crate::pairing::device::key_fingerprint(&p.key_id),
-            p.expires_at,
+            utc_and_unix(p.expires_at),
             p.key_id
         );
         return ControlResponse::Describe {
@@ -944,7 +970,7 @@ fn describe(service: &PairingService, op_id: &str) -> ControlResponse {
             a.client_id,
             a.current_identity_fingerprint,
             a.replacement_identity_fingerprint,
-            a.expires_at
+            utc_and_unix(a.expires_at)
         );
         return ControlResponse::Describe {
             confirmation_label: replacement_confirmation_phrase(a),
@@ -1063,6 +1089,7 @@ impl ControlServer {
     /// Serve until `shutdown_rx` fires.
     pub async fn serve(self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
         let mut connections = tokio::task::JoinSet::new();
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(None);
         loop {
             if *shutdown_rx.borrow() {
                 break;
@@ -1076,8 +1103,9 @@ impl ControlServer {
                             let ctx = self.ctx.clone();
                             let approval_state = self.approval_state.clone();
                             let lock_status = self.lock_status.clone();
+                            let stop = stop_rx.clone();
                             connections.spawn(async move {
-                                if let Err(e) = serve_connection(stream, ctx, approval_state, lock_status).await {
+                                if let Err(e) = serve_connection(stream, ctx, approval_state, lock_status, stop).await {
                                     tracing::warn!(error = %e, "control socket connection failed");
                                 }
                             });
@@ -1090,8 +1118,17 @@ impl ControlServer {
                 }
             }
         }
-        // No connection may retain a stale locked snapshot after transition.
-        connections.shutdown().await;
+        // Close idle connections immediately and bound already-started work.
+        let deadline = tokio::time::Instant::now() + CONTROL_SHUTDOWN_GRACE;
+        let _ = stop_tx.send(Some(deadline));
+        let drain = async { while connections.join_next().await.is_some() {} };
+        // Allow a bounded final response write after the operation deadline.
+        if tokio::time::timeout_at(deadline + std::time::Duration::from_secs(1), drain)
+            .await
+            .is_err()
+        {
+            connections.shutdown().await;
+        }
     }
 }
 
@@ -1148,31 +1185,57 @@ async fn serve_connection(
     ctx: Option<Arc<ControlContext>>,
     approval_state: Option<Arc<crate::state::AppState>>,
     lock_status: Option<Arc<dyn Fn() -> serde_json::Value + Send + Sync>>,
+    mut stop: tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let line = tokio::select! {
+            biased;
+            _ = control_shutdown_deadline(&mut stop) => return Ok(()),
+            line = lines.next_line() => match line? {
+                Some(line) => line,
+                None => return Ok(()),
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<ControlRequest>(&line) {
-            Ok(ControlRequest::LockStatus {}) if lock_status.is_some() => {
-                ControlResponse::LockStatus {
-                    status: lock_status.as_ref().unwrap()(),
+        let response = {
+            let operation = async {
+                match serde_json::from_str::<ControlRequest>(&line) {
+                    Ok(ControlRequest::LockStatus {}) if lock_status.is_some() => {
+                        ControlResponse::LockStatus {
+                            status: lock_status.as_ref().unwrap()(),
+                        }
+                    }
+                    Ok(req) => match ctx.as_ref() {
+                        Some(ctx) => handle_local(ctx, approval_state.as_ref(), req).await,
+                        None => ControlResponse::Error {
+                            message: "owner_approval_unavailable: status-only control socket"
+                                .into(),
+                        },
+                    },
+                    // Serde diagnostics may quote secret-bearing input. Never echo them.
+                    Err(_) => ControlResponse::Error {
+                        message: format!("{MALFORMED_CONTROL_REQUEST}: invalid control request"),
+                    },
                 }
-            }
-            Ok(req) => match ctx.as_ref() {
-                Some(ctx) => handle_local(ctx, approval_state.as_ref(), req).await,
-                None => ControlResponse::Error {
-                    message: "owner_approval_unavailable: status-only control socket".into(),
+            };
+            tokio::pin!(operation);
+            tokio::select! {
+                biased;
+                response = &mut operation => response,
+                deadline = control_shutdown_deadline(&mut stop) => {
+                    tokio::time::timeout_at(deadline, &mut operation)
+                        .await
+                        .unwrap_or_else(|_| ControlResponse::Error {
+                            message: CONTROL_OPERATION_INTERRUPTED.into(),
+                        })
                 },
-            },
-            // Serde diagnostics may quote secret-bearing input. Never echo them.
-            Err(_) => ControlResponse::Error {
-                message: format!("{MALFORMED_CONTROL_REQUEST}: invalid control request"),
-            },
+            }
         };
         let mut bytes = serde_json::to_vec(&response).unwrap_or_else(|_| {
             br#"{"result":"error","message":"failed to encode response"}"#.to_vec()
@@ -1181,7 +1244,16 @@ async fn serve_connection(
         write_half.write_all(&bytes).await?;
         write_half.flush().await?;
     }
-    Ok(())
+}
+
+#[cfg(unix)]
+async fn control_shutdown_deadline(
+    stop: &mut tokio::sync::watch::Receiver<Option<tokio::time::Instant>>,
+) -> tokio::time::Instant {
+    match stop.wait_for(|deadline| deadline.is_some()).await {
+        Ok(deadline) => deadline.expect("shutdown deadline is present"),
+        Err(_) => tokio::time::Instant::now(),
+    }
 }
 
 // Keep wire encoding at the transport boundary: the secret-bearing request
@@ -1466,5 +1538,23 @@ mod wire_tests {
             let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(actual, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::{utc_and_unix, utc_iso8601};
+
+    #[test]
+    fn unix_seconds_print_as_iso8601_utc() {
+        assert_eq!(utc_iso8601(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_iso8601(1_794_240_082), "2026-11-09T16:01:22Z");
+        assert_eq!(
+            utc_and_unix(1_794_240_082),
+            "2026-11-09T16:01:22Z (unix 1794240082)"
+        );
+        // Out of chrono's range: the number, never a panic or a wrong date.
+        assert_eq!(utc_iso8601(i64::MAX), i64::MAX.to_string());
+        assert_eq!(utc_iso8601(i64::MIN), i64::MIN.to_string());
     }
 }

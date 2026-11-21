@@ -75,12 +75,40 @@ Pre-release; not for production use. Copy this template for each new RC.
 
 ## Independently verify and publish
 
-- [ ] In a fresh download directory, verify the tag commit/signature, checksum
-      signature and all 17 source assets against `SHA256SUMS`: five binaries,
-      their five `.sha256` files, five `.sbom.spdx.json` files, and
-      `bitsov-darwin-aarch64.toolchain.txt` and `bitsov-darwin-x86_64.toolchain.txt`.
+- [ ] For #458, inspect the first `v*` tag whose commit includes the action update
+      (rc25 if selected, otherwise the next qualifying release). In that tag's
+      `CI` run, confirm `Upload to Release` completed successfully in every
+      `Release CLI` matrix job: currently five targets across Linux, macOS and
+      Windows. PR runs do not exercise this tag-only job. Record the tag, full
+      commit SHA, run URL and per-target upload results in release evidence.
+      Confirm the release is still a **draft** after all uploads; resolve any
+      missing upload or unexpected publication before proceeding.
+- [ ] In a fresh download directory, run
+      `bash scripts/verify-release.sh <download-dir> RELEASE_KEY.asc` with the
+      reviewed key file. Do not fetch that key from `main`. The script accepts
+      a signature only when `[GNUPG:] VALIDSIG` field 10 is the release key.
+      It requires `SHA256SUMS` to name exactly the seventeen source assets:
+      five binaries, their five `.sha256` files, five `.sbom.spdx.json` files,
+      and `bitsov-darwin-aarch64.toolchain.txt` and
+      `bitsov-darwin-x86_64.toolchain.txt`. A shorter list or any other file
+      in the directory is refused. Check the tag with `git verify-tag` against
+      the same key. A bare `gpg --verify` exit code is not this check.
 - [ ] Check SBOM, provenance and release notes. Record unverified targets as such;
       their signed checksums do not prove they were independently rebuilt.
+- [ ] For #459, inspect the first `v*` tag whose commit includes the action update
+      (rc25 if selected, otherwise the next qualifying release). Check
+      `Attest binary provenance` separately in every `Release CLI` matrix job:
+      currently five targets across Linux, macOS and Windows. The step uses
+      `continue-on-error: true`, so a green job alone does not establish success.
+      In a public repository, confirm the step completed successfully and each
+      uploaded binary has an attestation binding its SHA-256 to the tagged commit.
+      Record the tag, full commit SHA, run URL and per-target attestation evidence.
+      In a private repository the step is skipped; record the missing evidence
+      explicitly. CI treats this step as optional, but publication still requires
+      a GitHub artifact attestation or equivalent provenance under the
+      [release provenance requirements](../ops/RELEASE_POLICY.md#required-for-public-releases).
+      Resolve missing evidence before publication; a skipped step alone does not
+      supply it.
 - [ ] Obtain operator publication sign-off. The signing script never publishes.
 - [ ] Only after publication and verification, update distribution pins and follow
       the release's migration/rollback checklist.

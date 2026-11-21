@@ -191,8 +191,9 @@ async fn l0b_session_restore_downgrade_resistance() {
     {
         let identity = make_identity();
         let store = MemorySessionStore::new();
-        let manager =
-            SessionManager::with_store(Arc::clone(&identity), Arc::clone(&store) as _);
+        let migration_dir = tempfile::tempdir().unwrap();
+        let manager = SessionManager::with_store(Arc::clone(&identity), Arc::clone(&store) as _)
+            .with_record_policy(konsensus_crypto::record_cipher::LegacyReadPolicy::in_data_dir(migration_dir.path()));
 
         let peer_id = make_node_id(11);
         let plaintext_blob = attacker_plaintext_ratchet_blob();

@@ -143,7 +143,7 @@ fn encrypt_decrypt_raw() {
     let sqlite_dummy_key = key;
     // Direct test of encrypt/decrypt without storage
     let cipher =
-        Aes256Gcm::new_from_slice(&sqlite_dummy_key).unwrap();
+        RecordCipher::new(&sqlite_dummy_key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (), // won't be used
         cipher,
@@ -152,9 +152,9 @@ fn encrypt_decrypt_raw() {
     };
 
     let plaintext = b"Principle 4: no plaintext at any layer";
-    let encrypted = wrapper.encrypt(plaintext).unwrap();
+    let encrypted = wrapper.encrypt("test", "value", "row", plaintext).unwrap();
     assert_ne!(&encrypted[12..], plaintext); // ciphertext differs
-    let decrypted = wrapper.decrypt(&encrypted).unwrap();
+    let decrypted = wrapper.decrypt("test", "value", "row", &encrypted).unwrap();
     assert_eq!(decrypted, plaintext);
 }
 
@@ -164,7 +164,8 @@ fn encrypt_decrypt_raw() {
 fn decrypt_truncated_data_too_short() {
     // Data shorter than 12 bytes (nonce size) — should fail
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::in_data_dir(dir.path()));
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -172,17 +173,18 @@ fn decrypt_truncated_data_too_short() {
         peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
-    let result = wrapper.decrypt(&[1, 2, 3, 4, 5]);
+    let result = wrapper.decrypt("test", "value", "row", &[1, 2, 3, 4, 5]);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("too short"), "got: {err}");
+    assert!(err.contains("truncated"), "got: {err}");
 }
 
 #[test]
 fn decrypt_exactly_12_bytes_nonce_only() {
     // Exactly 12 bytes = nonce but zero ciphertext — AEAD decryption fails
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::in_data_dir(dir.path()));
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -190,17 +192,17 @@ fn decrypt_exactly_12_bytes_nonce_only() {
         peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
-    let result = wrapper.decrypt(&[0u8; 12]);
+    let result = wrapper.decrypt("test", "value", "row", &[0u8; 12]);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("decrypt"), "got: {err}");
+    assert!(err.contains("truncated"), "got: {err}");
 }
 
 #[test]
 fn decrypt_corrupted_aead_tag() {
     // Encrypt valid data, then corrupt the AEAD tag
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -209,13 +211,13 @@ fn decrypt_corrupted_aead_tag() {
     };
 
     let plaintext = b"sensitive data";
-    let mut encrypted = wrapper.encrypt(plaintext).unwrap();
+    let mut encrypted = wrapper.encrypt("test", "value", "row", plaintext).unwrap();
 
     // Flip last byte (part of the AEAD tag)
     let last = encrypted.len() - 1;
     encrypted[last] ^= 0xFF;
 
-    let result = wrapper.decrypt(&encrypted);
+    let result = wrapper.decrypt("test", "value", "row", &encrypted);
     assert!(result.is_err(), "corrupted AEAD tag should fail decryption");
 }
 
@@ -223,7 +225,7 @@ fn decrypt_corrupted_aead_tag() {
 fn decrypt_corrupted_nonce() {
     // Encrypt valid data, then corrupt the nonce
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -232,12 +234,12 @@ fn decrypt_corrupted_nonce() {
     };
 
     let plaintext = b"sensitive data";
-    let mut encrypted = wrapper.encrypt(plaintext).unwrap();
+    let mut encrypted = wrapper.encrypt("test", "value", "row", plaintext).unwrap();
 
     // Flip first byte of nonce
     encrypted[0] ^= 0xFF;
 
-    let result = wrapper.decrypt(&encrypted);
+    let result = wrapper.decrypt("test", "value", "row", &encrypted);
     assert!(result.is_err(), "corrupted nonce should fail decryption");
 }
 
@@ -245,7 +247,7 @@ fn decrypt_corrupted_nonce() {
 fn encrypt_empty_plaintext() {
     // Empty plaintext should still encrypt/decrypt successfully
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -253,11 +255,11 @@ fn encrypt_empty_plaintext() {
         peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
-    let encrypted = wrapper.encrypt(b"").unwrap();
-    // Should be 12 (nonce) + 16 (AEAD tag) = 28 bytes minimum
-    assert_eq!(encrypted.len(), 28);
+    let encrypted = wrapper.encrypt("test", "value", "row", b"").unwrap();
+    // Header, nonce and authentication tag also frame an empty payload.
+    assert_eq!(encrypted.len(), 36);
 
-    let decrypted = wrapper.decrypt(&encrypted).unwrap();
+    let decrypted = wrapper.decrypt("test", "value", "row", &encrypted).unwrap();
     assert!(decrypted.is_empty());
 }
 
@@ -265,7 +267,7 @@ fn encrypt_empty_plaintext() {
 fn encrypt_produces_different_ciphertext_each_time() {
     // Random nonce means same plaintext produces different ciphertext
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -274,15 +276,15 @@ fn encrypt_produces_different_ciphertext_each_time() {
     };
 
     let plaintext = b"same plaintext";
-    let enc1 = wrapper.encrypt(plaintext).unwrap();
-    let enc2 = wrapper.encrypt(plaintext).unwrap();
+    let enc1 = wrapper.encrypt("test", "value", "row", plaintext).unwrap();
+    let enc2 = wrapper.encrypt("test", "value", "row", plaintext).unwrap();
 
     // Nonces should differ (random), so ciphertexts differ
     assert_ne!(enc1, enc2);
 
     // But both decrypt to the same plaintext
-    let dec1 = wrapper.decrypt(&enc1).unwrap();
-    let dec2 = wrapper.decrypt(&enc2).unwrap();
+    let dec1 = wrapper.decrypt("test", "value", "row", &enc1).unwrap();
+    let dec2 = wrapper.decrypt("test", "value", "row", &enc2).unwrap();
     assert_eq!(dec1, dec2);
     assert_eq!(dec1, plaintext);
 }
@@ -315,7 +317,7 @@ async fn onboarding_state_encrypted_wrapper_passthrough() {
 fn decrypt_empty_data() {
     // Completely empty data — too short for nonce
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -323,7 +325,7 @@ fn decrypt_empty_data() {
         peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
-    let result = wrapper.decrypt(&[]);
+    let result = wrapper.decrypt("test", "value", "row", &[]);
     assert!(result.is_err());
 }
 
@@ -332,7 +334,7 @@ fn decrypt_empty_data() {
 #[test]
 fn encrypt_decrypt_string_roundtrip() {
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -341,18 +343,18 @@ fn encrypt_decrypt_string_roundtrip() {
     };
 
     let original = "192.0.2.11:9736";
-    let encrypted = wrapper.encrypt_string(original).unwrap();
+    let encrypted = wrapper.encrypt_string("test", "value", "row", original).unwrap();
     // Encrypted should be a hex string, not the original
     assert_ne!(encrypted, original);
     assert!(encrypted.len() > original.len());
-    let decrypted = wrapper.decrypt_string(&encrypted).unwrap();
+    let decrypted = wrapper.decrypt_string("test", "value", "row", &encrypted).unwrap();
     assert_eq!(decrypted, original);
 }
 
 #[test]
 fn encrypt_opt_string_none_stays_none() {
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -360,16 +362,16 @@ fn encrypt_opt_string_none_stays_none() {
         peer_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
-    let result = wrapper.encrypt_opt_string(&None).unwrap();
+    let result = wrapper.encrypt_opt_string("test", "value", "row", &None).unwrap();
     assert!(result.is_none());
-    let result = wrapper.decrypt_opt_string(&None).unwrap();
+    let result = wrapper.decrypt_opt_string("test", "value", "row", &None).unwrap();
     assert!(result.is_none());
 }
 
 #[test]
 fn encrypt_opt_string_some_roundtrips() {
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -378,17 +380,17 @@ fn encrypt_opt_string_some_roundtrips() {
     };
 
     let original = Some("Alice".to_string());
-    let encrypted = wrapper.encrypt_opt_string(&original).unwrap();
+    let encrypted = wrapper.encrypt_opt_string("test", "value", "row", &original).unwrap();
     assert!(encrypted.is_some());
     assert_ne!(encrypted.as_deref(), Some("Alice"));
-    let decrypted = wrapper.decrypt_opt_string(&encrypted).unwrap();
+    let decrypted = wrapper.decrypt_opt_string("test", "value", "row", &encrypted).unwrap();
     assert_eq!(decrypted, original);
 }
 
 #[test]
 fn encrypt_json_roundtrip() {
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -397,17 +399,17 @@ fn encrypt_json_roundtrip() {
     };
 
     let original = serde_json::json!({"role": "admin", "notes": "trusted peer"});
-    let encrypted = wrapper.encrypt_json(&original).unwrap();
+    let encrypted = wrapper.encrypt_json("test", "value", "row", &original).unwrap();
     // Encrypted should be a JSON string containing hex
     assert!(encrypted.is_string());
-    let decrypted = wrapper.decrypt_json(&encrypted).unwrap();
+    let decrypted = wrapper.decrypt_json("test", "value", "row", &encrypted).unwrap();
     assert_eq!(decrypted, original);
 }
 
 #[test]
 fn encrypt_json_empty_object() {
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -416,16 +418,16 @@ fn encrypt_json_empty_object() {
     };
 
     let original = serde_json::json!({});
-    let encrypted = wrapper.encrypt_json(&original).unwrap();
-    let decrypted = wrapper.decrypt_json(&encrypted).unwrap();
+    let encrypted = wrapper.encrypt_json("test", "value", "row", &original).unwrap();
+    let decrypted = wrapper.decrypt_json("test", "value", "row", &encrypted).unwrap();
     assert_eq!(decrypted, original);
 }
 
 #[test]
-fn decrypt_json_unencrypted_passthrough() {
-    // Non-string JSON values pass through as-is (backward compat)
+fn decrypt_json_requires_encrypted_value() {
+    // Ordinary reads require an encrypted JSON value.
     let key = [42u8; 32];
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let cipher = RecordCipher::new(&key, LegacyReadPolicy::default());
     let wrapper = EncryptedStorage {
         inner: (),
         cipher,
@@ -434,8 +436,7 @@ fn decrypt_json_unencrypted_passthrough() {
     };
 
     let original = serde_json::json!({"key": "value"});
-    let result = wrapper.decrypt_json(&original).unwrap();
-    assert_eq!(result, original);
+    assert!(wrapper.decrypt_json("test", "value", "row", &original).is_err());
 }
 
 #[tokio::test]
@@ -1075,7 +1076,7 @@ async fn encrypted_add_invite_and_whitelist_metadata_is_ciphertext_at_rest() {
     );
     // Decrypting the blob with the storage key yields the real plaintext object.
     let decrypted = store
-        .decrypt_json(&raw.metadata)
+        .decrypt_json("peers", "metadata_json", &raw.node_id.to_hex(), &raw.metadata)
         .expect("ciphertext blob must decrypt with the storage key");
     assert_eq!(decrypted["invite_ref"], invite_id_str);
     assert_eq!(decrypted["whitelist_source"], "invite");
@@ -1128,7 +1129,7 @@ async fn encrypted_add_whitelisted_peer_metadata_is_ciphertext_at_rest() {
             && !raw_blob.contains("prior-secret"),
         "invite tag or prior metadata leaked as plaintext at rest: {raw_blob}"
     );
-    let decrypted = store.decrypt_json(&raw.metadata).unwrap();
+    let decrypted = store.decrypt_json("peers", "metadata_json", &raw.node_id.to_hex(), &raw.metadata).unwrap();
     assert_eq!(decrypted["invite_ref"], invite_id.to_string());
     assert_eq!(decrypted["whitelist_source"], "invite");
     assert_eq!(decrypted["note"], "prior-secret");
@@ -1534,4 +1535,199 @@ async fn staged_file_cursor_within_a_millisecond_does_not_skip_stored_files() {
     let cursor = crate::ListCursor { timestamp: "2026-01-01T00:00:00.123456+00:00".into(), id: "stage-a".into() };
     let page = store.file_page_with_diagnostics(1, Some(&cursor)).await.unwrap();
     assert_eq!(page.items[0].id, "z");
+}
+
+#[tokio::test]
+async fn record_binding_rejects_relocated_peer_fields() {
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let mut peer = Peer::new(NodeId::from_bytes([31; 32]));
+    peer.address = Some("peer.example:9735".into());
+    peer.display_name = Some("Peer".into());
+    store.upsert_peer(&peer).await.unwrap();
+    sqlx::query("UPDATE peers SET display_name = address WHERE node_id = ?")
+        .bind(peer.node_id.to_hex()).execute(store.inner().pool()).await.unwrap();
+    assert!(store.get_peer(&peer.node_id).await.is_err());
+}
+
+#[tokio::test]
+async fn record_binding_rejects_plaintext_peer_metadata() {
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let peer = Peer::new(NodeId::from_bytes([32; 32]));
+    store.inner().upsert_peer(&peer).await.unwrap();
+    assert!(store.get_peer(&peer.node_id).await.is_err());
+    assert!(store.list_peers().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn record_binding_rejects_envelope_id_mismatch() {
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let envelope = UkmEnvelopeBuilder::new(KIND_CHAT, NodeId::from_bytes([1; 32]),
+        Recipient::Node(NodeId::from_bytes([2; 32])), b"message".to_vec(), make_proof()).build();
+    store.store_message(&envelope).await.unwrap();
+    sqlx::query("UPDATE messages SET nonce = ? WHERE id = ?")
+        .bind(hex::encode([3; 24])).bind(envelope.id.to_hex())
+        .execute(store.inner().pool()).await.unwrap();
+    assert!(store.get_message(&envelope.id).await.is_err());
+}
+
+#[tokio::test]
+async fn record_binding_rejects_peer_row_relocation() {
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let original = Peer::new(NodeId::from_bytes([31; 32]));
+    store.upsert_peer(&original).await.unwrap();
+    let mut moved = store.inner().get_peer(&original.node_id).await.unwrap().unwrap();
+    moved.node_id = NodeId::from_bytes([32; 32]);
+    store.inner().upsert_peer(&moved).await.unwrap();
+    assert!(store.get_peer(&moved.node_id).await.is_err());
+    assert!(store.get_peer(&original.node_id).await.unwrap().is_some());
+}
+
+
+#[tokio::test]
+async fn default_encrypted_storage_refuses_v1_records() {
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let nonce = [3u8; 12];
+    let mut v1 = nonce.to_vec();
+    v1.extend(
+        Aes256Gcm::new_from_slice(&[7; 32])
+            .unwrap()
+            .encrypt((&nonce).into(), b"{}".as_slice())
+            .unwrap(),
+    );
+    let mut peer = Peer::new(NodeId::from_bytes([5; 32]));
+    peer.metadata = hex::encode(v1).into();
+    store.inner().upsert_peer(&peer).await.unwrap();
+    assert!(store.get_peer(&peer.node_id).await.is_err());
+}
+
+async fn read_path_rejects_relocated_fields(table: crate::record_upgrade::RecordTable) {
+    use crate::record_upgrade::RecordTable;
+    use crate::{ChannelOpenOperation, OutboxOperation};
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let peer = NodeId::from_bytes([5; 32]);
+    for id in ["a", "b"] {
+        match table {
+            RecordTable::Rooms => {
+                let room = Room::new(format!("room-{id}"), peer);
+                store.create_room(&room).await.unwrap();
+            }
+            RecordTable::Files => {
+                let file = FileRecord {
+                    id: id.into(),
+                    filename: format!("file-{id}"),
+                    mime_type: "text/plain".into(),
+                    size_bytes: 4,
+                    blake3_hash: "hash".into(),
+                    sender: peer.to_hex(),
+                    message_id: None,
+                    data: b"file".to_vec(),
+                    created_at: String::new(),
+                };
+                store.store_file(&file).await.unwrap();
+            }
+            RecordTable::Outbox => {
+                let mut op =
+                    OutboxOperation::prepared(id.into(), peer.to_hex(), 100, "hash".into());
+                op.recovery = b"recovery".to_vec();
+                store.insert_outbox_operation(&op).await.unwrap();
+            }
+            RecordTable::Channel => {
+                let mut op =
+                    ChannelOpenOperation::pending(id.into(), "hash".into(), b"request".to_vec());
+                op.result = Some(b"result".to_vec());
+                store.insert_channel_open_operation(&op).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+    let rows = store.record_upgrade_rows(table, None, 10).await.unwrap();
+    let mut moved = rows[1].clone();
+    moved.values = rows[0].values.clone();
+    assert!(store
+        .record_upgrade_replace(table, &rows[1], &moved)
+        .await
+        .unwrap());
+    match table {
+        RecordTable::Rooms => {
+            let original: RoomId = RoomId::parse(&rows[0].id).unwrap();
+            let target: RoomId = RoomId::parse(&rows[1].id).unwrap();
+            assert!(store.get_room(&original).await.unwrap().is_some());
+            assert!(store.get_room(&target).await.is_err());
+        }
+        RecordTable::Files => {
+            assert!(store.get_file(&rows[0].id).await.unwrap().is_some());
+            assert!(store.get_file(&rows[1].id).await.is_err());
+        }
+        RecordTable::Outbox => {
+            assert!(store
+                .get_outbox_operation(&rows[0].id)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store.get_outbox_operation(&rows[1].id).await.is_err());
+        }
+        RecordTable::Channel => {
+            assert!(store
+                .get_channel_open_operation(&rows[0].id)
+                .await
+                .unwrap()
+                .is_some());
+            assert!(store.get_channel_open_operation(&rows[1].id).await.is_err());
+        }
+        _ => unreachable!(),
+    }
+}
+
+macro_rules! relocation_read_test {
+    ($name:ident, $table:ident) => {
+        #[tokio::test]
+        async fn $name() {
+            read_path_rejects_relocated_fields(crate::record_upgrade::RecordTable::$table).await;
+        }
+    };
+}
+relocation_read_test!(room_read_rejects_relocated_fields, Rooms);
+relocation_read_test!(file_read_rejects_relocated_fields, Files);
+relocation_read_test!(outbox_read_rejects_relocated_fields, Outbox);
+relocation_read_test!(channel_read_rejects_relocated_fields, Channel);
+
+
+#[tokio::test]
+async fn untrusted_peer_flag_is_sticky_until_explicit_invite() {
+    let store = EncryptedStorage::new(SqliteStorage::in_memory().await.unwrap(), &[7; 32]);
+    let node = NodeId::from_bytes([8; 32]);
+    let mut peer = Peer::new(node);
+    peer.metadata = serde_json::json!({"storage_legacy_untrusted": true});
+    store.upsert_peer(&peer).await.unwrap();
+    for metadata in [
+        serde_json::json!({"updated": true}),
+        serde_json::json!({"storage_legacy_untrusted": false}),
+        serde_json::Value::Null,
+    ] {
+        let mut update = Peer::new(node);
+        update.metadata = metadata;
+        store.upsert_peer(&update).await.unwrap();
+        assert_eq!(
+            store.get_peer(&node).await.unwrap().unwrap().metadata["storage_legacy_untrusted"],
+            true
+        );
+    }
+    let invite = uuid::Uuid::new_v4();
+    store
+        .add_whitelisted_peer_with_invite_ref(*node.as_bytes(), invite)
+        .await
+        .unwrap();
+    let trusted = store.get_peer(&node).await.unwrap().unwrap();
+    assert!(trusted.metadata.get("storage_legacy_untrusted").is_none());
+    assert_eq!(trusted.metadata["whitelist_source"], "invite");
+    store.upsert_peer(&Peer::new(node)).await.unwrap();
+    assert!(store
+        .get_peer(&node)
+        .await
+        .unwrap()
+        .unwrap()
+        .metadata
+        .get("storage_legacy_untrusted")
+        .is_none());
 }

@@ -94,11 +94,10 @@ async fn call_ready(mut fx: Fx) -> Fx {
         .initiate_session(&fx.peer, &target.prekey_bundle().await)
         .await
         .unwrap();
-    fx.state
-        .peer_ln_pubkeys
-        .lock()
-        .await
-        .insert(fx.peer, invoice_payee());
+    fx.state.peer_ln_pubkeys.lock().await.insert(
+        fx.peer,
+        konsensus_api::state::PeerLightningKey::Verified(invoice_payee()),
+    );
     // Exercise the production encrypted call storage as well as the pairing file.
     let store = SqliteStorage::open(fx.tmp.path().join("calls.sqlite").to_str().unwrap())
         .await
@@ -488,7 +487,7 @@ async fn slow_liquidity_query_does_not_block_another_calls_transitions() {
     fx.wallet.pause_capacity.store(true, Ordering::SeqCst);
     let peer = NodeId::from_bytes([8; 32]);
     let now = chrono::Utc::now().timestamp_millis() as u64;
-    let entry = rules::receive(None, 400, None, now).unwrap();
+    let entry = rules::receive(None, 400, None, now).unwrap().device_fetched(now).unwrap();
     let entry = rules::commit(
         rules::reserve(Some(entry), 401, "answer", "hash", now).unwrap(),
         "answer",
@@ -604,7 +603,7 @@ async fn broken_hold_cleanup_preserves_paid_response_and_other_expiry_notificati
     fx.state.storage.call_put(&fx.peer, other, &ended).await.unwrap();
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let notification_id = "bbbbbbbb222243338444555555555555";
-    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap();
+    let ringing = rules::receive(None, 400, None, now - 31_000).unwrap().device_fetched(now - 31_000).unwrap();
     let pending = rules::reserve(Some(ringing), 401, "answer", "hash", now - 31_000).unwrap();
     let live = rules::commit(pending, "answer", now - 31_000).unwrap();
     fx.state.storage.call_put(&fx.peer, notification_id, &live).await.unwrap();
@@ -732,6 +731,12 @@ async fn recovered_failure_cannot_repay_when_call_cleanup_write_fails() {
 mod consent;
 #[path = "calls_settlement.rs"]
 mod settlement;
+#[path = "calls_continuity.rs"]
+mod continuity;
+#[path = "calls_free_reply.rs"]
+mod free_reply;
+#[path = "calls_free_reply_receipts.rs"]
+mod free_reply_receipts;
 
 #[tokio::test]
 async fn an_answer_recovered_after_an_ambiguous_payment_keeps_its_media_client() {
@@ -741,6 +746,10 @@ async fn an_answer_recovered_after_an_ambiguous_payment_keeps_its_media_client()
         konsensus_crypto::PlaintextCacheCipher::new(&[7; 32]))), ..(*fx.state).clone() });
     konsensus_api::calls::admit_incoming(fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, 400,
         Some(&json!({"v":1,"call_id":CALL,"sdp":"offer","media":"audio"}).to_string())).await.unwrap();
+    // A paired device fetched the invite: it rings.
+    let fetched = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap()
+        .device_fetched(konsensus_api::calls::now_ms()).unwrap();
+    fx.state.storage.call_put(&fx.peer, CALL, &fetched).await.unwrap();
     fx.wallet.set(UNKNOWN);
     let (status, body) = send_request(&fx, &token, 7000, json!({
         "operation_id": uuid::Uuid::new_v4().to_string(), "recipient": fx.peer.to_hex(), "kind": 401,
@@ -1440,6 +1449,7 @@ async fn relation_call_with_held_invoice(per_act: u64)
                 Some(invoice_for(peer, amount))
             })),
         max_call_minutes: 1,
+        call_reply_free: false,
         ..(*fx.state).clone()
     });
     let (fx, token, _, renewal) =
@@ -1502,4 +1512,256 @@ async fn a_hangup_pending_in_the_wallet_keeps_its_liability_after_a_lower_renewa
     assert!(status.is_server_error(), "{status} {body}");
     // Polled once: the payment may be in flight, so it stays reserved.
     assert_eq!(fx.used(), used + 3_000, "{body}");
+}
+
+async fn recover_refused_call_without_pending_reservation(restart: bool) {
+    let (mut fx, token) = prepared().await;
+    assert_eq!(send(&fx, &token, 400, 7_000, 0).await.0, StatusCode::OK);
+    answer(&fx).await;
+    let requests = fx.state.invoice_requests.clone();
+    let peer = fx.peer;
+    fx.state = Arc::new(AppState {
+        transport: Arc::new(ConnectedStubTransport::new(vec![peer], requests.clone())
+            .with_invoice_responder(move |id, _| {
+                let requests = requests.clone();
+                tokio::spawn(async move {
+                    if let Some(tx) = requests.lock().await.remove(&id) {
+                        let _ = tx.send(Err(konsensus_api::state::InvoiceResponseError {
+                            recipient: peer, reason: "konsensus:call_price_changed".into(),
+                        }));
+                    }
+                });
+                None
+            })),
+        ..(*fx.state).clone()
+    });
+    let pool = sqlx::SqlitePool::connect(fx.tmp.path().join("calls.sqlite").to_str().unwrap()).await.unwrap();
+    sqlx::query("CREATE TRIGGER refuse_call_end BEFORE UPDATE ON call_state WHEN NEW.phase = 'ended' BEGIN SELECT RAISE(FAIL, 'test call write failure'); END")
+        .execute(&pool).await.unwrap();
+    let op_id = uuid::Uuid::new_v4().to_string();
+    let (status, body) = send_operation(&fx, &token, 404, 7_000, 0, CALL, &op_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "call_price_changed", "{body}");
+    assert_eq!(body["retry_allowed"], false);
+    let mut stranded = fx.state.storage.call_get(&peer, CALL).await.unwrap().unwrap();
+    assert_eq!(stranded.phase, Phase::Live);
+    // Reproduce the old crash window even if the new implementation keeps pending.
+    stranded.pending = None;
+    fx.state.storage.call_put(&peer, CALL, &stranded).await.unwrap();
+    assert!(!fx.service.call_spend_status(&peer.to_hex(), CALL).unwrap().closed);
+    sqlx::query("DROP TRIGGER refuse_call_end").execute(&pool).await.unwrap();
+    if restart {
+        let fingerprint = pairing::identity_fingerprint(&fx.state.identity.node_id().to_hex());
+        let service = open_owner_service(fx.tmp.path(), &fingerprint, &fx.console);
+        let store = SqliteStorage::open(fx.tmp.path().join("calls.sqlite").to_str().unwrap()).await.unwrap();
+        fx.state = Arc::new(AppState { pairing: Some(service.clone()),
+            storage: Arc::new(EncryptedStorage::new(store, &[7; 32])), ..(*fx.state).clone() });
+        fx.service = service;
+        konsensus_api::calls::recover(fx.state.storage.as_ref()).await.unwrap();
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+        konsensus_api::calls::maintain_calls(&fx.state, chrono::Utc::now().timestamp_millis() as u64).await.unwrap();
+    } else {
+        let (_, duplicate) = send_operation(&fx, &token, 404, 7_000, 0, CALL, &op_id).await;
+        assert_eq!(duplicate["reason"], "call_price_changed");
+    }
+    let ended = fx.state.storage.call_get(&peer, CALL).await.unwrap().unwrap();
+    assert_eq!(ended.phase, Phase::Ended, "terminal refusal must finish cleanup without a pending reservation");
+    assert_eq!(ended.end_reason, Some(HangupReason::Failed));
+    assert!(ended.pending.is_none());
+    let hold = fx.service.call_spend_status(&peer.to_hex(), CALL).unwrap();
+    assert!(hold.closed);
+    assert_eq!(hold.remaining_msat, 0);
+    assert_eq!((fx.wallet.money(), fx.used()), (1, 1_000));
+    // Cleanup remains idempotent, and a fresh operation cannot pay another block.
+    for _ in 0..2 {
+        let (_, duplicate) = send_operation(&fx, &token, 404, 7_000, 0, CALL, &op_id).await;
+        assert_eq!(duplicate["reason"], "call_price_changed");
+        assert_eq!(duplicate["retry_allowed"], false);
+        konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    }
+    assert_ne!(send(&fx, &token, 404, 7_000, 0).await.0, StatusCode::OK);
+    assert_eq!((fx.wallet.money(), fx.used()), (1, 1_000));
+}
+
+#[tokio::test]
+async fn call_price_refusal_duplicate_finishes_failed_cleanup_without_pending() {
+    recover_refused_call_without_pending_reservation(false).await;
+}
+
+#[tokio::test]
+async fn call_price_refusal_restart_finishes_failed_cleanup_without_pending() {
+    recover_refused_call_without_pending_reservation(true).await;
+}
+
+#[tokio::test]
+async fn existing_call_is_unchanged_by_another_clients_block_request() {
+    let (fx, token) = prepared().await;
+    assert_eq!(send(&fx, &token, 400, 7_000, 0).await.0, StatusCode::OK);
+    answer(&fx).await;
+    let before = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    assert!(!before.closed);
+    let paid_before = fx.wallet.money();
+    let (other_id, other_key) = fx.pair_another(99);
+    let other_token = fx.grant_as(&other_id, &other_key, None, GrantTerms::new(5_000_000)).await;
+    fx.state.peer_prices.update_kind_price(fx.peer, 404, 8_000, 850_000).await;
+    let (status, body) = send(&fx, &other_token, 404, 8_000, 0).await;
+    assert_eq!(fx.wallet.money(), paid_before);
+    let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    let after = fx.service.call_spend_status(&fx.peer.to_hex(), CALL).unwrap();
+    assert_eq!(
+        (entry.phase, after.closed, after.remaining_msat),
+        (Phase::Live, false, before.remaining_msat), "{body}",
+    );
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn refused_call_cleanup_finishes_after_its_grant_is_revoked() {
+    let (mut fx, token) = prepared().await;
+    assert_eq!(send(&fx, &token, 400, 7_000, 0).await.0, StatusCode::OK);
+    answer(&fx).await;
+    let requests = fx.state.invoice_requests.clone();
+    let peer = fx.peer;
+    fx.state = Arc::new(AppState {
+        transport: Arc::new(ConnectedStubTransport::new(vec![peer], requests.clone())
+            .with_invoice_responder(move |id, _| {
+                let requests = requests.clone();
+                tokio::spawn(async move {
+                    if let Some(tx) = requests.lock().await.remove(&id) {
+                        let _ = tx.send(Err(konsensus_api::state::InvoiceResponseError {
+                            recipient: peer, reason: "konsensus:call_price_changed".into(),
+                        }));
+                    }
+                });
+                None
+            })),
+        ..(*fx.state).clone()
+    });
+    let pool = sqlx::SqlitePool::connect(fx.tmp.path().join("calls.sqlite").to_str().unwrap()).await.unwrap();
+    sqlx::query("CREATE TRIGGER refuse_call_end BEFORE UPDATE ON call_state WHEN NEW.phase = 'ended' BEGIN SELECT RAISE(FAIL, 'test call write failure'); END")
+        .execute(&pool).await.unwrap();
+    let (status, body) = send(&fx, &token, 404, 7_000, 0).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["reason"], "call_price_changed", "{body}");
+    // The cleanup is interrupted, then the owner revokes the caller's grant.
+    assert_eq!(fx.state.storage.call_get(&peer, CALL).await.unwrap().unwrap().phase, Phase::Live);
+    let resp = control::handle(&fx.control(), ControlRequest::RevokeGrant { client_id: Some(fx.client_id.clone()) });
+    assert!(matches!(resp, ControlResponse::Ok { .. }), "{resp:?}");
+    sqlx::query("DROP TRIGGER refuse_call_end").execute(&pool).await.unwrap();
+    fx.restart();
+    konsensus_api::calls::recover(fx.state.storage.as_ref()).await.unwrap();
+    konsensus_api::handlers::messages::reconcile_operations(&fx.state).await.unwrap();
+    konsensus_api::calls::maintain_calls(&fx.state, chrono::Utc::now().timestamp_millis() as u64).await.unwrap();
+    let ended = fx.state.storage.call_get(&peer, CALL).await.unwrap().unwrap();
+    assert_eq!((ended.phase, ended.end_reason), (Phase::Ended, Some(HangupReason::Failed)));
+    assert!(ended.pending.is_none());
+    assert!(fx.service.call_spend_status(&peer.to_hex(), CALL).is_none_or(|hold| hold.closed && hold.remaining_msat == 0));
+    assert_eq!(fx.wallet.money(), 1);
+}
+
+/// A `call_not_reachable` refusal ends the caller's ringing
+/// call so its unused whole-call hold is released at once, not at the ringing
+/// deadline. The offer itself stays paid (unchanged admission rule).
+#[tokio::test]
+async fn unreachable_invite_ends_the_call_and_releases_its_hold() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(fx.used(), 422_000, "one offer plus one hold");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let ringing = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(ringing.phase, Phase::Ringing);
+    assert!(konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!((ended.phase, ended.end_reason), (Phase::Ended, Some(HangupReason::Timeout)));
+    konsensus_api::calls::reconcile_call_spend(&fx.state, chrono::Utc::now().timestamp_millis() as u64)
+        .await
+        .unwrap();
+    assert_eq!(fx.used(), 1_000, "only the paid offer remains");
+    // Another peer, or a second refusal, cannot end anything else.
+    assert!(!konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+}
+
+
+/// A pending cancellation must not keep an
+/// unreachable call ringing with its hold.
+#[tokio::test]
+async fn unreachable_invite_ends_the_call_even_with_a_pending_cancellation() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let mut ringing = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    ringing.pending = Some(konsensus_core::payloads::call::Pending {
+        operation_id: "cancel".into(), kind: konsensus_core::kind::KIND_CALL_HANGUP, request_hash: "h".into(),
+    });
+    fx.state.storage.call_put(&fx.peer, CALL, &ringing).await.unwrap();
+    assert!(konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(ended.phase, Phase::Ended);
+    assert!(ended.pending.is_some(), "the cancellation's own mark is kept for its commit/release");
+}
+
+/// A stale refusal for an old offer never ends a newer call: the offer must be
+/// recent enough to be the one now ringing.
+#[tokio::test]
+async fn stale_unreachable_refusal_cannot_end_a_newer_call() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.tmp.path().join("calls.sqlite").display()))
+        .await
+        .unwrap();
+    // A newer draft of the operation replaced this offer: its refusal is stale.
+    let newer = konsensus_core::MessageId::from_hex(&"ab".repeat(32)).unwrap();
+    sqlx::query("UPDATE outbox_operations SET message_id = ? WHERE message_id = ?")
+        .bind(newer.to_hex()).bind(offer.to_hex()).execute(&db).await.unwrap();
+    assert!(!konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    assert_eq!(fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase, Phase::Ringing);
+}
+
+#[tokio::test]
+async fn delayed_operation_refusal_still_ends_its_current_call() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.tmp.path().join("calls.sqlite").display()))
+        .await
+        .unwrap();
+    // A retry or late settlement long after the operation was created still
+    // dispatches this offer; operation age never voids its refusal.
+    sqlx::query("UPDATE outbox_operations SET created_at = 0 WHERE message_id = ?")
+        .bind(offer.to_hex()).execute(&db).await.unwrap();
+    assert!(konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    let ended = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!((ended.phase, ended.end_reason), (Phase::Ended, Some(HangupReason::Timeout)));
+}
+
+#[tokio::test]
+async fn refusal_of_an_intact_older_operation_cannot_end_a_newer_offer() {
+    let (fx, token) = prepared().await;
+    let (status, body) = send(&fx, &token, 400, 7_000, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offer = konsensus_core::MessageId::from_hex(body["message_id"].as_str().unwrap()).unwrap();
+    assert_eq!(fx.state.storage.call_offer(&fx.peer, CALL).await.unwrap(), Some(offer));
+    // A distinct, newer operation reuses the call id and binds its own offer;
+    // the older operation stays intact and still names its own offer.
+    let newer = konsensus_core::MessageId::from_hex(&"cd".repeat(32)).unwrap();
+    fx.state.storage.call_offer_bind(&fx.peer, CALL, &newer).await.unwrap();
+    assert!(!konsensus_api::calls::end_unreachable_invite(
+        fx.state.storage.as_ref(), fx.state.identity.node_id(), &fx.peer, &offer,
+    ).await.unwrap());
+    assert_eq!(fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap().phase, Phase::Ringing);
 }

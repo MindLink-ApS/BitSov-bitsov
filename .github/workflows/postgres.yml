@@ -101,12 +101,41 @@ jobs:
           cache-workspace-crates: "true"
 
       - name: sccache
+        id: sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
-      - name: Enable sccache for Cargo
+      - name: Configure Cargo compiler cache
+        run: bash scripts/configure-sccache.sh '${{ steps.sccache.outcome }}'
+
+      # Pinned checks: these must run and pass by exact name. A rename, a
+      # move or a filter that no longer selects one fails the job instead of
+      # quietly running nothing. They also run in the full suite below.
+      - name: cargo test (pinned PostgreSQL checks)
         run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          set -o pipefail
+          for name in \
+            postgres::migration_recovery_tests::call_free_reply_receipts_upgrade_round_trip_and_page
+          do
+            cargo test -p konsensus-storage --locked --lib -- --ignored --exact "${name}" 2>&1 | tee pinned.log
+            if ! grep -qxF "test ${name} ... ok" pinned.log || ! grep -qE '^test result: ok\. 1 passed; 0 failed' pinned.log; then
+              echo "::error title=Pinned PostgreSQL check did not pass::${name}"
+              exit 1
+            fi
+          done
+
+      - name: cargo test (pinned API PostgreSQL checks)
+        run: |
+          set -o pipefail
+          for name in \
+            postgres_sweep_clears_stored_empty_receipt_lists_and_keeps_recoverable_ones
+          do
+            cargo test -p konsensus-api --locked --test free_reply_receipt_sweep -- --ignored --exact "${name}" 2>&1 | tee pinned-api.log
+            if ! grep -qxF "test ${name} ... ok" pinned-api.log || ! grep -qE '^test result: ok\. 1 passed; 0 failed' pinned-api.log; then
+              echo "::error title=Pinned PostgreSQL check did not pass::${name}"
+              exit 1
+            fi
+          done
 
       - name: cargo test (ignored PostgreSQL tests)
         run: |

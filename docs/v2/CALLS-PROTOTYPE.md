@@ -166,6 +166,107 @@ node at the default rates sends no such header and answers as it always did.
 Nothing here changes a price or admission: a call is admitted and paid the same
 whatever it carries and whatever these limits are.
 
+## Live-call continuity
+
+`[calls] call_continuity_v1` is off by default. Only the value `true` turns it
+on; any other value leaves it off. While it is on, `GET /api/v1/status` lists
+`call_continuity_v1` in `api_capabilities`.
+
+With it on, a call admitted while the paired app held a live spend grant
+survives that grant ending by expiry or by the owner writing a newer grant:
+
+- The app keeps the call's media socket, and may reattach to that same call
+  with a fresh token that no longer carries `spend`, while the call's hold is
+  open and the app's pairing owns the call.
+- Minute blocks keep drawing on the hold reserved at admission, within its
+  pinned price, routing ceiling, minute limit and amount. Nothing new is
+  reserved: no second call, offer or other payment can use the ended grant.
+- A newer grant takes over the call's open hold once, charged only what the
+  hold still has; minutes already paid are not charged again, and the hold's
+  release returns its unspent part once. It takes the hold over only if it
+  could fund it as a new reservation: not paused, the peer allowed by its
+  payee list, the per-block and closing amounts within its per-payment limits
+  (and a live envelope for the peer on a device relation grant), and room in
+  its recipient budget and total. Otherwise the call's hold is closed: its
+  unpaid part is released at once, and a block already in flight settles on
+  the earlier grant, which is kept inert only until then. The newer grant's
+  own limits apply from then on, so a lower per-payment value closes the hold.
+  A renewal whose write fails leaves the hold and its funding exactly as
+  they were. This holds for console renewals too, with the switch on or
+  off: a failed write restores the whole pairing state in memory, so it
+  never differs from what is on disk.
+- On a device relation grant the same holds for the peer's envelope: its
+  deadline ends new spending for that peer, but an admitted call's own hold
+  keeps paying past it within the same bounds, unless revoked.
+- The grant record stays on file, marked `ended: expired`, until its calls
+  close, and at most the longest call (240 minutes) plus a minute after its
+  window. A restart drops it, as it drops call media ownership.
+
+A revocation, an epoch bump, a removed pairing or an identity change ends the
+grant as revoked: draws are refused and the media socket closes at its next
+one-second recheck, with the switch on or off. With the switch off, expiry and
+replacement end a call's grant authority exactly as before.
+
+After an expiry with no renewal the app's fresh token has no `spend`. On
+`POST /api/v1/messages/compose`, and only there, such a paired token may still
+send a minute block (kind 404) of a call its pairing owns, while that call's
+hold is funded as above. The block is drawn on that hold alone, at its pinned
+price, routing ceiling, minute limit and amount. The same token may also hang
+up that call once: a hangup (kind 403) with no reason or reason `hangup` is
+paid from the closing reserve the hold set aside at admission, within that
+reserve and the per-payment limit a closing signal is held to, exactly as the
+node's own closing notice would be. Nothing new is reserved, and a price above
+the reserve is refused unpaid. The hangup pays the callee's latest hangup
+quote as read when the request starts; that quote is not pinned, the reserve
+is what bounds it. A revocation or re-pairing after the hangup was admitted
+still stops its payment, and two hangups sent at once pay one. Once the hangup is paid the call ends, its
+minutes stop and the rest of the hold is released; a second hangup is refused
+unpaid. Any other request
+without `spend` on that route (another call, a new call, an offer, another
+call's hangup, a hangup with any other reason, a chat message) and every other
+paid route refuse it exactly as before. With the switch off the route refuses
+it too. A renewal gives the token `spend` again, on the same hold.
+Only the party that placed a call holds a hold for it, so only that party's app
+can pay a minute block or this hangup without `spend`.
+## Free call replies
+
+`[calls] call_reply_free_v1` is off by default. Only the value `true` turns it
+on; any other value leaves it off. While it is on, the node lists
+`call_reply_free_v1` in `GET /api/v1/status` `api_capabilities` and advertises
+it to peers in its handshake (`Custom("call_reply_free_v1")`).
+
+With it on, two replies to a ringing call cost nothing:
+
+- **Sending (callee).** An answer, or a hangup whose reason is `declined`, for
+  a call this node is ringing for (a decline also while the call still waits
+  for a device to fetch it) goes out with no quote, no invoice, no grant
+  debit, no reservation and no payment, but only to a connected caller whose
+  node advertised the capability and only with no other reference. The
+  envelope carries amount 0, a fresh preimage that only keeps its replay keys
+  unique, and one reference derived from the call id. It is journaled and
+  resent like any other signal, so a double tap or a lost receipt still
+  sends one reply; it is never retried as a paid one. Once both nodes offer
+  the free reply, a call that cannot be read, or is no longer ringing when the
+  reply is judged or right before it goes out, refuses the reply unsent; it is
+  never paid instead. The paid path stays only for compatibility: the switch
+  off here, a caller that does not advertise it, or a signal that is not an
+  answer or decline.
+- **Receiving (caller).** The payment gate accepts such a reply without
+  payment only when its sender is the callee of a call this node placed,
+  whose paid offer is bound and which is still ringing, and its reference
+  names that call. After decryption the payload must be that exact answer or
+  decline; anything else is withdrawn. A late reply, a second reply, a reply
+  for another call or peer, or an unsolicited one meets the price floor and
+  is refused as before. The reply's nonce and preimage are burned like any
+  accepted envelope's, so the same reply is never admitted twice.
+
+A free reply is not a free message channel: it is bound to an offer the
+caller already paid for, at most one per call, inside the ring window.
+
+The callee's app still needs a token with `spend` to submit the answer, and
+its media socket still needs `spend` for an answered call: this switch makes
+the reply free, not grant-free.
+
 ## Persistence, recovery and bounds
 
 `call_state` stores side, phase, effective deadline, replay deadline,

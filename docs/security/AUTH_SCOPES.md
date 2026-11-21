@@ -1,10 +1,10 @@
-# Route → scope matrix (genome #72, ticket 1)
+# Route → scope matrix (genome #72)
 
 Today every authenticated route is equivalent: `Claims {sub, iat, exp}`, `AuthUser {node_id}`,
 and `POST /auth/local` mints that token for **any process that can reach loopback**. Reading a
 balance and spending the balance are the same grant.
 
-This document is the contract for ticket 1: **constrained issuance + enforcement**. Pairing,
+This document is the contract for **constrained issuance + enforcement**. Pairing,
 hardware-bound keys and anything touching protocol admission are out of scope.
 
 ## Why the app requesting less is not enough
@@ -40,12 +40,12 @@ request" — *cannot obtain*.
 
 `/auth/token` keeps full authority **explicitly**. Both issuers currently call the same
 `create_token(node_id, jwt_secret)`, so a change there would silently alter the key-proof path
-too. Ticket 1 makes each issuer name its own scope set at the call site, so neither can drift
+too. Constrained issuance makes each issuer name its own scope set at the call site, so neither can drift
 into the other by accident.
 
 Note what the key-proof flow is and is not: it proves possession of the node's identity key.
 That is not by itself a recovery flow, and it is not usable by a local UI that deliberately never
-holds the key — which is why pairing (ticket 2) exists.
+holds the key — which is why pairing exists.
 
 ## Matrix
 
@@ -99,7 +99,7 @@ beyond the peer list. `/export/bundle` remains `admin` for the full data bundle.
 
 Session initiate/accept are `admin` rather than `read` because they establish durable
 relationship state with a peer. This is the local owner API, not the wire admission path —
-inbound packets remain governed by settled payment at the gate, unchanged by this ticket.
+inbound packets remain governed by settled payment at the gate, unchanged by these scope rules.
 
 ### spend, additionally
 
@@ -183,7 +183,7 @@ remembered to list. Each is now stated as an invariant over the source instead.
 ## What the tests can and cannot show
 
 Negative tests can prove **a specific token is refused specific operations**. That is the claim
-this ticket makes.
+these scope rules make.
 
 They cannot prove that local malware "can only read the balance". Any process can still call
 `/auth/local` and obtain `read` + `receive` — which means reading history and generating

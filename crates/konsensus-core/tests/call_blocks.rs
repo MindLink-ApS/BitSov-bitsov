@@ -3,9 +3,18 @@ use konsensus_core::payloads::call::{
 };
 
 fn answered() -> CallEntry {
-    let ringing = calls::receive(None, 400, None, 0).unwrap();
+    let ringing = calls::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap();
     let pending = calls::reserve(Some(ringing), 401, "answer", "hash", 1_000).unwrap();
     calls::commit(pending, "answer", 1_000).unwrap()
+}
+
+#[test]
+fn closed_callee_marker_refuses_late_blocks_before_and_after_expiry() {
+    let paid = calls::receive_block(Some(answered()), 0, 1_000).unwrap();
+    let cut = CallEntry { paid_until_ms: Some(0), ..paid };
+    for entry in [cut.clone(), cut.at(71_001).unwrap()] {
+        assert_eq!(calls::receive_block(Some(entry), 1, 71_001), Err(CallRefusal::UnknownCall));
+    }
 }
 
 #[test]
@@ -79,7 +88,7 @@ fn call_blocks_expiry_ends_unpaid_and_preserves_the_tombstone() {
 #[test]
 fn call_blocks_refuse_duplicates_gaps_early_unknown_ended_and_wrong_side() {
     assert!(calls::receive_block(None, 0, 1_000).is_err());
-    let ringing = calls::receive(None, 400, None, 0).unwrap();
+    let ringing = calls::receive(None, 400, None, 0).unwrap().device_fetched(0).unwrap();
     assert!(calls::receive_block(Some(ringing), 0, 1_000).is_err());
     let first = calls::receive_block(Some(answered()), 0, 1_000).unwrap();
     for (seq, at) in [(0, 41_000), (2, 41_000), (u32::MAX, 41_000), (1, 40_999)] {

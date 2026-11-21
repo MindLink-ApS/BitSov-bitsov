@@ -132,7 +132,7 @@ async fn approve(app: &mut app::App, root: &OwnerApprovalKey, requested_max: u64
 async fn pair(minutes: u16, caller_max: u64) -> paid_call::Pair {
     let roots = [(); 2].map(|_| {
         let mut seed = [0; 64];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         OwnerApprovalKey::from_seed(&seed, &[9; 32]).unwrap()
     });
     let calls = |block_msat| app::CallOptions {
@@ -195,7 +195,9 @@ async fn wait_direct_channel(app: &app::App, peer: &NodeId) {
             app.state.identity.node_id()
         ),
         || async {
-            let Some(key) = app.state.peer_ln_pubkeys.lock().await.get(peer).cloned() else {
+            let Some(konsensus_api::state::PeerLightningKey::Verified(key)) =
+                app.state.peer_ln_pubkeys.lock().await.get(peer).cloned()
+            else {
                 return false;
             };
             app.state
@@ -391,7 +393,7 @@ async fn paid_call_and_unused_hold_release() {
     let (status, body) = signal(&pair.caller, &bid, 400, offer()).await;
     assert_eq!(status, StatusCode::OK, "offer: {body}");
     receipt(&pair, &body, 10_000, true).await;
-    recv_kind(&mut pair.callee, &aid, 400).await;
+    device_rings(&mut pair.callee, &aid, CALL).await;
     let hold = pair
         .caller
         .service

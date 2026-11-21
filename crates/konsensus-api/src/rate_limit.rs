@@ -124,7 +124,7 @@ impl Drop for RemoteTunnelRegistration {
 }
 
 #[derive(Clone)]
-pub(crate) struct RemotePairingRateLimitKey(Arc<str>);
+pub(crate) struct RemotePairingRateLimitKey(pub(crate) Arc<str>);
 
 /// Install outside the remote router's rate limiter. Unregistered connections
 /// fail closed, including direct local connections to the internal listener.
@@ -249,6 +249,31 @@ impl RateLimiter {
         // Increment and check
         bucket.count += 1;
         bucket.count <= self.max_requests
+    }
+
+    /// Like [`check_key`](Self::check_key), but a key with no bucket is refused
+    /// once `max_keys` buckets exist, so rotating keys cannot grow the map.
+    /// Existing keys keep their counters; expired buckets are dropped first.
+    pub fn check_key_capped(&self, key: &str, max_keys: usize) -> bool {
+        {
+            // See check_key() for poisoning rationale.
+            let mut buckets = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+            if !buckets.contains_key(key) && buckets.len() >= max_keys {
+                let now = Instant::now();
+                let expiry = self.window * 2;
+                buckets.retain(|_, bucket| now.duration_since(bucket.window_start) < expiry);
+                if buckets.len() >= max_keys {
+                    return false;
+                }
+            }
+        }
+        self.check_key(key)
+    }
+
+    /// Number of tracked keys (tests only).
+    #[cfg(test)]
+    pub(crate) fn tracked_keys(&self) -> usize {
+        self.buckets.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Check if a request from the given IP is allowed.
@@ -380,6 +405,23 @@ pub fn spawn_cleanup_task(limiter: Arc<RateLimiter>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capped_limiter_refuses_new_keys_when_full_without_resetting_others() {
+        let limiter = RateLimiter::with_window(2, Duration::from_secs(60));
+        assert!(limiter.check_key_capped("a", 2));
+        assert!(limiter.check_key_capped("b", 2));
+        // Full: a new key is refused and gets no bucket.
+        assert!(!limiter.check_key_capped("c", 2));
+        assert_eq!(limiter.buckets.lock().unwrap().len(), 2);
+        // Existing keys keep counting within their window.
+        assert!(limiter.check_key_capped("a", 2));
+        assert!(!limiter.check_key_capped("a", 2));
+        // An expired bucket makes room for a new key.
+        limiter.expire_key("b");
+        limiter.expire_key("b");
+        assert!(limiter.check_key_capped("c", 2));
+    }
 
     #[test]
     fn allows_requests_within_limit() {
