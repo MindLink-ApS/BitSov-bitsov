@@ -104,7 +104,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Generate regression-test locales
         run: |
           sudo localedef -i da_DK -f ISO-8859-1 da_DK.ISO8859-1
@@ -119,7 +119,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Dropped-link recovery steps match and name the app's buttons
         run: bash scripts/test-known-limit-steps.sh
 
@@ -132,7 +132,7 @@ jobs:
     # used on pull_request, because that would skip this job too.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Protocol repo has no frontend
         run: |
@@ -163,7 +163,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Read Rust toolchain pin
         id: rust-toolchain
@@ -264,7 +264,7 @@ jobs:
       # Both standalone vendor manifests reuse this job's cached target tree.
       CARGO_TARGET_DIR: ${{ github.workspace }}/vendor/ldk-node/target
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read Rust toolchain pin
         id: rust-toolchain
         run: echo "channel=$(bash scripts/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
@@ -303,7 +303,7 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.audit == 'true') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Security key ↔ policy consistency
         run: bash scripts/test-security-key.sh && bash scripts/check-security-key.sh
@@ -345,7 +345,7 @@ jobs:
     name: Semgrep Security Rules
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install semgrep
         run: pip install "semgrep==1.179.0"  # 1.180.0 ships without semgrep-core (sdist build); bump deliberately
@@ -397,7 +397,7 @@ jobs:
             runner: windows-latest
             artifact: bitsov-windows-x86_64
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # xcode-27 is the versioned Apple Silicon image (both Darwin targets).
       # Fail closed if GitHub retires the exact Xcode build; never fall back.
