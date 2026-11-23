@@ -747,3 +747,72 @@ fn a_failed_renewal_write_restores_the_pairing_file_with_continuity_on() {
 fn a_failed_renewal_write_restores_the_pairing_file_with_continuity_off() {
     failed_console_renewal_restores_the_file(false);
 }
+
+/// A paid invite admitted the call with a `PRICE` closing reserve for its
+/// hangup, as a metered offer does.
+fn admit_with_closing(fx: &Fx, call: &str) {
+    let terms = CallSpendTerms::new(&peer(), call, PRICE, 0, MINUTES).unwrap().with_closing_signal(PRICE, 0).unwrap();
+    fx.service.reserve_call_spend(&fx.client, fx.binding.epoch, terms, 1_000_000).unwrap();
+    fx.service.remember_call_client(Some(&fx.binding), &peer(), call, "invite", "request").unwrap();
+    fx.service.commit_call_client(None, &peer(), call, "invite", "request").unwrap();
+    fx.service.finish_call_client(&peer(), call, "invite", "request");
+}
+
+/// The app's hangup after expiry, admitted as the compose route admits it
+/// without `spend`: its binding still holds and owns the call, and the meter
+/// keeps the grant that funds the call.
+fn admit_hangup(fx: &Fx, call: &str) -> String {
+    assert!(fx.service.call_hold_live(&fx.binding, &peer(), call));
+    assert!(fx.service.owns_call_media(&fx.binding, &peer(), call));
+    fx.service.call_spend_grant(&peer(), call).expect("the grant that funds the call")
+}
+
+/// The hangup's draw on the closing reserve, as `Meter::CallClosing` makes it.
+fn closing(fx: &Fx, grant_op_id: &str, call: &str, id: &str) -> Result<Reservation, BudgetRefusal> {
+    fx.service.reserve_call_closing_spend(grant_op_id, &peer(), call,
+        vec![Charge { recipient: peer(), amount_msat: PRICE }], link(id))
+}
+
+/// One dispatch poll of the hangup's payment, as the compose route makes it.
+fn dispatch_closing(fx: &Fx, reservation: &Reservation, call: &str, paid: &mut bool) -> Result<(), BudgetRefusal> {
+    fx.service.with_call_payment_authority(reservation, Some((&peer(), call)),
+        Some(crate::spend_budget::CallPayment::Signal), || *paid = true)
+}
+
+/// An expired app's live call, with block 0 paid and its hangup admitted.
+fn admitted_hangup() -> (Fx, String) {
+    let fx = fixture(true);
+    grant(&fx, 100_000);
+    admit_with_closing(&fx, "call");
+    pay(&fx, "call", 0);
+    expire(&fx);
+    let grant_op_id = admit_hangup(&fx, "call");
+    (fx, grant_op_id)
+}
+
+#[test]
+fn a_closing_admitted_on_a_binding_is_refused_once_that_binding_is_stale() {
+    // Control: with nothing changed the admitted hangup reserves and dispatches.
+    let (fx, grant_op_id) = admitted_hangup();
+    let reserved = closing(&fx, &grant_op_id, "call", "hangup").expect("the admitted hangup draws its closing reserve");
+    let mut paid = false;
+    dispatch_closing(&fx, &reserved, "call", &mut paid).expect("and may be dispatched");
+    assert!(paid);
+
+    for how in [End::RevokeGrants, End::RemovePairing, End::BumpEpoch, End::NewIdentity] {
+        // Admitted, then the binding goes stale before the closing is reserved.
+        let (fx, grant_op_id) = admitted_hangup();
+        let before = status(&fx, "call");
+        end(&fx, how);
+        assert_eq!(closing(&fx, &grant_op_id, "call", "hangup"), Err(BudgetRefusal::NoGrant), "{how:?}: reserved");
+        assert!(status(&fx, "call").is_none_or(|now| Some(now) == before), "{how:?}: the refusal moved the hold");
+
+        // Admitted and reserved, then the binding goes stale before dispatch.
+        let (fx, grant_op_id) = admitted_hangup();
+        let reserved = closing(&fx, &grant_op_id, "call", "hangup").unwrap();
+        end(&fx, how);
+        let mut paid = false;
+        assert_eq!(dispatch_closing(&fx, &reserved, "call", &mut paid), Err(BudgetRefusal::NoGrant), "{how:?}: dispatched");
+        assert!(!paid, "{how:?}: nothing is dispatched");
+    }
+}
