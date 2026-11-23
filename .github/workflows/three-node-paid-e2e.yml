@@ -41,7 +41,7 @@ jobs:
       ELECTRS_COMMIT: 'a33e97e1a1fc63fa9c20a116bb92579bbf43b254'
       ELECTRS_SHA256: '865e26a96e8df77df01d96f2f569dcf9622fc87a8d99a9b8fe30861a4db9ddf1'
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read Rust toolchain pin
         id: rust-toolchain
         run: echo "channel=$(bash scripts/rust-toolchain-channel.sh)" >> "$GITHUB_OUTPUT"
