@@ -126,7 +126,7 @@ snapshot_regular() {
   if [ -L "$dest" ] || [ ! -f "$dest" ]; then
     die "$label is not a regular file"
   fi
-  chmod 600 -- "$dest"
+  chmod 600 "$dest"
 }
 
 # ls -nd is used because the mode and owner must be read without GNU stat.
@@ -155,7 +155,8 @@ remove_seal() {
   owner=$(seal_owner_uid "$dir")
   [ "$owner" = "$(id -u)" ] || die "seal directory is not owned by this user"
   case "$mode" in
-    drwx------|drwx------.|drwx------+) ;;
+    # macOS adds "@" when extended attributes (such as com.apple.provenance) exist.
+    drwx------|drwx------.|drwx------+|drwx------@) ;;
     *) die "seal directory is not mode 0700" ;;
   esac
   if [ ! -f "$dir/.verify-release-seal" ] || [ -L "$dir/.verify-release-seal" ]; then
@@ -256,6 +257,9 @@ main() {
 
   SEAL=$(mktemp -d "${TMPDIR:-/tmp}/verify-release-seal.XXXXXX")
   chmod 700 "$SEAL"
+  # Use the canonical path from here on (on macOS /tmp is /private/tmp), so
+  # every read, the printed path and the recorded marker name the same place.
+  SEAL=$(cd -- "$SEAL" && pwd -P) || die "seal directory is not a directory"
   cd -- "$dir" || die "download directory not found: $dir"
   # Freeze the sums before they are parsed. Each payload is copied into this
   # same directory after the membership walk. Hashes read those copies.
@@ -326,8 +330,8 @@ main() {
 
   canonical=$(cd -- "$SEAL" && pwd -P)
   printf 'verify-release-seal-v1\n%s\n' "$canonical" > "$SEAL/.verify-release-seal"
-  chmod 600 -- "$SEAL/.verify-release-seal"
-  chmod 700 -- "$SEAL"
+  chmod 600 "$SEAL/.verify-release-seal"
+  chmod 700 "$SEAL"
   SEAL_KEEP=1
   listed=$(wc -l < "$WORK/names" | tr -d ' ')
   echo "verify-release: $listed sealed files match a signature by $KEY_FPR"
