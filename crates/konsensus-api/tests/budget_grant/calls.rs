@@ -737,6 +737,8 @@ mod continuity;
 mod free_reply;
 #[path = "calls_free_reply_receipts.rs"]
 mod free_reply_receipts;
+#[path = "calls_hangup_invoice.rs"]
+mod hangup_invoice;
 
 #[tokio::test]
 async fn an_answer_recovered_after_an_ambiguous_payment_keeps_its_media_client() {
@@ -1450,6 +1452,7 @@ async fn relation_call_with_held_invoice(per_act: u64)
             })),
         max_call_minutes: 1,
         call_reply_free: false,
+        call_hangup_invoice: false,
         ..(*fx.state).clone()
     });
     let (fx, token, _, renewal) =

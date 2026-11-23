@@ -5,6 +5,23 @@ also live on the corresponding GitHub pre-release pages.
 
 ## Unreleased
 
+- Add `[calls] call_hangup_invoice_v1` (off by default; anything but `true`
+  leaves it off). With it on at both ends, a hangup of a live call is paid
+  only through an invoice the other node issues for that call
+  (`konsensus:call_hangup:<call_id>:<side>`) after checking the call is still
+  live there, never by keysend, at the ordinary hangup price. If the other
+  node answers that the call already ended, or does not answer within ten
+  seconds, nothing is paid: the call ends here and compose answers with the
+  terminal reason `call_ended` or `call_hangup_unanswered` and
+  `retry_allowed: false`, instead of a paid hangup that the other node
+  refuses as `rejected_retryable`. A hangup paid through such an invoice is
+  delivered even if the call ended there after the invoice was issued. The
+  node advertises `call_hangup_invoice_v1` to peers and in
+  `GET /api/v1/status` only while the switch is on; with it off, or to a peer
+  without it, hangups are paid as before. Unpaid and duration-cap notices
+  keep their existing path. No migration: the invoice is bound in the
+  existing call invoice bindings.
+
 ## [0.3.0-rc25] — 2026-11-22
 
 - Add `[calls] call_continuity_v1` (off by default; anything but `true`

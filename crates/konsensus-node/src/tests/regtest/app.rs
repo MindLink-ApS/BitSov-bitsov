@@ -390,6 +390,7 @@ impl App {
             stun_port: None,
             max_call_minutes: calls.map_or(60, |c| c.max_minutes),
             call_reply_free: false,
+            call_hangup_invoice: false,
             configured_stun_server: None,
             custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
             call_media: media
@@ -414,6 +415,7 @@ impl App {
         let (auto_channel_tx, _auto_channel_rx) = tokio::sync::mpsc::channel(64);
         let session = tokio::spawn(crate::session_handler::run(
             crate::session_handler::SessionHandlerDeps {
+                call_hangup_invoice: false,
                 content_server: None,
                 front_door: state.front_door.clone(),
                 min_admission_cost_msat: 0,

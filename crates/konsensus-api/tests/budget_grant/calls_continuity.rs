@@ -508,6 +508,61 @@ async fn after_expiry_a_hangup_quote_that_rises_above_the_closing_reserve_is_nev
     assert!(spent <= reserved && spent - BLOCK <= 1_000, "{spent}");
 }
 
+/// [`live_call`] with call-bound hangups on here and advertised by the peer.
+async fn live_call_with_bound_hangups() -> (Fx, Arc<ConnectedStubTransport>) {
+    let (mut fx, _) = live_call(true).await;
+    let peer = fx.peer;
+    let transport = Arc::new(ConnectedStubTransport::new(vec![peer], fx.state.invoice_requests.clone())
+        .with_invoice_responder(move |_, amount| Some(super::invoice_for(peer, amount))));
+    transport.advertise(peer, &["Custom(\"call_hangup_invoice_v1\")"]);
+    fx.state = Arc::new(AppState { transport: transport.clone(), call_hangup_invoice: true, ..(*fx.state).clone() });
+    (fx, transport)
+}
+
+#[tokio::test]
+async fn after_expiry_a_call_bound_hangup_is_paid_once_from_the_closing_reserve() {
+    let (fx, transport) = live_call_with_bound_hangups().await;
+    let reserved = hold(&fx).reserved_msat;
+    let used = fx.used();
+    let token = expire(&fx).await;
+    let (money, left) = (fx.wallet.money(), fx.wallet.left());
+    let purposes = |transport: &ConnectedStubTransport| transport.invoice_purposes.lock().unwrap().clone();
+    let bound = konsensus_core::payloads::call::hangup_invoice_purpose(CALL, konsensus_core::payloads::call::Side::Caller);
+    let (status, body) = hangup_with(&fx, &token, CALL, Some("hangup")).await;
+    assert_eq!(status, StatusCode::OK, "own hangup after expiry: {body}");
+    assert_eq!(fx.wallet.money(), money + 1, "exactly one payment: the hangup");
+    assert_eq!(fx.wallet.left(), left + 1_000, "one hangup price left the wallet");
+    // Through the call-bound invoice only.
+    assert_eq!(purposes(&transport), vec![bound.clone()], "one call-bound invoice request");
+    let sent: Vec<_> = transport.sent_envelopes.lock().unwrap().iter().filter(|(_, e)| e.kind == 403).map(|(_, e)| e.id).collect();
+    assert_eq!(sent.len(), 1);
+    // From the call's hold: block 0 and the hangup; the rest released once,
+    // and nothing new reserved on the expired grant.
+    match fx.service.call_spend_status(&fx.peer.to_hex(), CALL) {
+        Some(view) => {
+            assert!(view.closed, "{view:?}");
+            assert_eq!(view.spent_msat, BLOCK + 1_000, "block 0 and the hangup, both from the hold");
+            assert_eq!(view.spent_msat + view.released_msat, reserved);
+        }
+        None => assert!(fx.service.reload_from_disk().unwrap().grants.is_empty()),
+    }
+    assert!(fx.used() <= used, "nothing new was reserved on the ended grant");
+    let entry = fx.state.storage.call_get(&fx.peer, CALL).await.unwrap().unwrap();
+    assert_eq!(entry.phase, konsensus_core::payloads::call::Phase::Ended);
+
+    // A second hangup, with or without a reason, pays nothing and asks nothing.
+    for reason in [Some("hangup"), None] {
+        let (status, body) = hangup_with(&fx, &token, CALL, reason).await;
+        assert_ne!(status, StatusCode::OK, "{reason:?}: {body}");
+        assert_eq!(fx.wallet.money(), money + 1, "{reason:?}: a second hangup was paid");
+        assert_eq!(purposes(&transport).len(), 1, "{reason:?}: a second invoice was asked for");
+    }
+    for _ in 0..2 {
+        konsensus_api::calls::reconcile_call_spend(&fx.state, chrono::Utc::now().timestamp_millis() as u64).await.unwrap();
+    }
+    assert_eq!(fx.wallet.left(), left + 1_000, "ending the call paid nothing more");
+}
+
 /// Every grant's recorded liability, in file order: total used, used per
 /// recipient, and each outstanding reservation with what it holds per recipient.
 type Liability = Vec<(u64, std::collections::BTreeMap<String, u64>, std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>)>;

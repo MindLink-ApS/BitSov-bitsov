@@ -1557,6 +1557,7 @@ pub fn test_state() -> Arc<AppState> {
         stun_port: None,
         max_call_minutes: 60,
         call_reply_free: false,
+        call_hangup_invoice: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1628,6 +1629,7 @@ pub fn test_state_with_storage_and_cipher(storage: Arc<dyn Storage>) -> Arc<AppS
         stun_port: None,
         max_call_minutes: 60,
         call_reply_free: false,
+        call_hangup_invoice: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1687,6 +1689,7 @@ pub fn test_state_with_storage(storage: Arc<dyn Storage>) -> Arc<AppState> {
         stun_port: None,
         max_call_minutes: 60,
         call_reply_free: false,
+        call_hangup_invoice: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1756,6 +1759,7 @@ pub fn test_state_with_content_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         stun_port: None,
         max_call_minutes: 60,
         call_reply_free: false,
+        call_hangup_invoice: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1815,6 +1819,7 @@ pub fn test_state_with_data_dir(dir: std::path::PathBuf) -> Arc<AppState> {
         stun_port: None,
         max_call_minutes: 60,
         call_reply_free: false,
+        call_hangup_invoice: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -1856,7 +1861,21 @@ pub struct ConnectedStubTransport {
     /// Capabilities each connected peer advertised (as `peer_info` renders
     /// them); a peer without an entry reports no peer info.
     pub peer_capabilities: std::sync::Mutex<HashMap<NodeId, Vec<String>>>,
+    /// The purpose of every invoice request, in order.
+    pub invoice_purposes: std::sync::Mutex<Vec<String>>,
+    /// Answers an invoice request by its purpose before the responder does:
+    /// `Some(Some(reason))` refuses it, `Some(None)` never answers it, `None`
+    /// leaves it to the responder.
+    pub invoice_refuser: Option<Box<InvoiceRefuser>>,
+    /// Invoice requests whose purpose starts with one of these fail to send
+    /// (`send_raw_frame` errs), as on a disconnect after the connected check.
+    pub fail_send_for: std::sync::Mutex<Vec<String>>,
+    /// Invoice requests whose purpose starts with one of these are sent, but
+    /// their pending answer channel is dropped without an answer.
+    pub drop_answer_for: std::sync::Mutex<Vec<String>>,
 }
+
+type InvoiceRefuser = dyn Fn(&str) -> Option<Option<String>> + Send + Sync;
 
 impl ConnectedStubTransport {
     pub fn new(
@@ -1878,7 +1897,20 @@ impl ConnectedStubTransport {
             since: Some(std::time::Instant::now()),
             raw_frames: std::sync::Mutex::new(Vec::new()),
             peer_capabilities: std::sync::Mutex::new(HashMap::new()),
+            invoice_purposes: std::sync::Mutex::new(Vec::new()),
+            invoice_refuser: None,
+            fail_send_for: std::sync::Mutex::new(Vec::new()),
+            drop_answer_for: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// See [`ConnectedStubTransport::invoice_refuser`].
+    pub fn with_invoice_refuser(
+        mut self,
+        refuser: impl Fn(&str) -> Option<Option<String>> + Send + Sync + 'static,
+    ) -> Self {
+        self.invoice_refuser = Some(Box::new(refuser));
+        self
     }
 
     /// `peer` advertised `capabilities` in its Hello (e.g. `Custom("room_binding_v1")`).
@@ -1952,7 +1984,7 @@ impl MessageTransport for ConnectedStubTransport {
 
     async fn send_raw_frame(
         &self,
-        _peer: &NodeId,
+        peer: &NodeId,
         frame_bytes: &[u8],
     ) -> Result<(), TransportError> {
         self.raw_frames.lock().unwrap().push(frame_bytes.to_vec());
@@ -1960,9 +1992,34 @@ impl MessageTransport for ConnectedStubTransport {
         if let Ok(konsensus_message::wire::Frame::RequestInvoice {
             ref request_id,
             amount_msat,
-            ..
+            ref purpose,
         }) = konsensus_message::wire::Frame::from_bytes(frame_bytes)
         {
+            self.invoice_purposes.lock().unwrap().push(purpose.clone());
+            if self.fail_send_for.lock().unwrap().iter().any(|prefix| purpose.starts_with(prefix.as_str())) {
+                return Err(TransportError::ConnectionFailed("stub: send failed".into()));
+            }
+            if self.drop_answer_for.lock().unwrap().iter().any(|prefix| purpose.starts_with(prefix.as_str())) {
+                let (invoice_requests, req_id) = (Arc::clone(&self.invoice_requests), request_id.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    drop(invoice_requests.lock().await.remove(&req_id));
+                });
+                return Ok(());
+            }
+            if let Some(answer) = self.invoice_refuser.as_ref().and_then(|refuser| refuser(purpose)) {
+                if let Some(reason) = answer {
+                    let (invoice_requests, req_id, recipient) =
+                        (Arc::clone(&self.invoice_requests), request_id.clone(), *peer);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        if let Some(tx) = invoice_requests.lock().await.remove(&req_id) {
+                            let _ = tx.send(Err(konsensus_api::state::InvoiceResponseError { recipient, reason }));
+                        }
+                    });
+                }
+                return Ok(());
+            }
             if let Some(ref responder) = self.invoice_responder {
                 if let Some(response_data) = responder(request_id.clone(), amount_msat) {
                     let invoice_requests = Arc::clone(&self.invoice_requests);
@@ -2102,6 +2159,7 @@ pub fn test_state_with_gossip() -> Arc<AppState> {
         stun_port: None,
         max_call_minutes: 60,
         call_reply_free: false,
+        call_hangup_invoice: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,
@@ -2367,6 +2425,7 @@ pub fn test_state_with_lightning_and_storage(
         stun_port: None,
         max_call_minutes: 60,
         call_reply_free: false,
+        call_hangup_invoice: false,
         configured_stun_server: None,
         custody_mode: konsensus_api::custody::CustodyMode::LocalSeed,
         call_media: None,

@@ -189,6 +189,7 @@ impl Devices {
             &signal,
             now_ms,
             arrived_ms,
+            Some(&envelope.payment_proof.payment_hash),
         )
         .await?;
         if envelope.kind == konsensus_core::kind::KIND_CALL_INVITE {

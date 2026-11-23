@@ -104,6 +104,50 @@ pub const MEETING_CAPABILITY: &str = "call_meeting_v1";
 /// hangup that reply to its own ringing offer (see [`is_free_reply_shape`]).
 pub const FREE_REPLY_CAPABILITY: &str = "call_reply_free_v1";
 
+/// A node advertising this issues call-bound hangup invoices: a hangup for a
+/// live call is paid only through an invoice the recipient issued for that
+/// call after checking it is still live (see [`hangup_invoice_purpose`]).
+pub const HANGUP_INVOICE_CAPABILITY: &str = "call_hangup_invoice_v1";
+/// Invoice requests for a call-bound hangup: `konsensus:call_hangup:<call_id>:<sender side>`.
+pub const CALL_HANGUP_INVOICE_PREFIX: &str = "konsensus:call_hangup:";
+/// The binding slot a hangup invoice takes in the call invoice bindings. It is
+/// past every block sequence a call can reach, so a hangup invoice can never
+/// buy a block and a block invoice can never pay a bound hangup.
+pub const HANGUP_INVOICE_SEQ: u32 = u32::MAX;
+
+/// The invoice purpose for a hangup of `call_id` sent by the `sender` side.
+pub fn hangup_invoice_purpose(call_id: &str, sender: Side) -> String {
+    format!("{CALL_HANGUP_INVOICE_PREFIX}{call_id}:{}", sender.as_str())
+}
+
+/// The call id and sender side a hangup invoice request names. `None` for any
+/// other purpose, including a malformed hangup purpose.
+pub fn parse_hangup_invoice_purpose(purpose: &str) -> Option<(String, Side)> {
+    let (call_id, side) = purpose.strip_prefix(CALL_HANGUP_INVOICE_PREFIX)?.split_once(':')?;
+    (is_call_id(call_id)).then_some(())?;
+    Some((call_id.to_owned(), Side::parse(side)?))
+}
+
+/// Whether this hangup goes through a call-bound invoice: an ordinary end of
+/// a call this node holds live. End notices for a call that is already over
+/// (`unpaid`, `duration_cap`) and replies to a ringing call keep their paths.
+pub fn hangup_uses_invoice(entry: Option<&CallEntry>, reason: Option<HangupReason>) -> bool {
+    !matches!(reason, Some(HangupReason::Unpaid | HangupReason::DurationCap))
+        && entry.is_some_and(|e| e.phase == Phase::Live)
+}
+
+/// The recipient's check before it issues a hangup invoice: its own row for
+/// this call (already passed through [`CallEntry::at`]) is live and on the
+/// other side from the sender. Anything else means the call is over here and
+/// no invoice is issued, so nothing is paid.
+pub fn validate_hangup_invoice(entry: Option<&CallEntry>, sender: Side) -> Result<(), CallRefusal> {
+    match entry {
+        Some(e) if e.side == sender => Err(CallRefusal::WrongSide),
+        Some(e) if e.phase == Phase::Live => Ok(()),
+        _ => Err(CallRefusal::UnknownCall),
+    }
+}
+
 /// The single reference a free reply carries: it names the call it answers
 /// without revealing the call id outside the encrypted payload.
 pub fn free_reply_reference(call_id: &str) -> crate::types::MessageId {
@@ -1227,6 +1271,60 @@ mod tests {
 
 }
 
+
+#[cfg(test)]
+mod hangup_invoice_tests {
+    use super::*;
+
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn live(side: Side) -> CallEntry {
+        let caller = commit(reserve(None, 400, "offer", "hash", 0).unwrap(), "offer", 0).unwrap();
+        CallEntry { side, phase: Phase::Live, deadline_ms: 90_000, ..caller }
+    }
+
+    #[test]
+    fn hangup_purpose_round_trips_and_rejects_malformed() {
+        for side in [Side::Caller, Side::Callee] {
+            assert_eq!(parse_hangup_invoice_purpose(&hangup_invoice_purpose(ID, side)), Some((ID.into(), side)));
+        }
+        for bad in [
+            "konsensus:call_hangup:", "konsensus:call_hangup:0123:caller",
+            &format!("konsensus:call_hangup:{ID}"), &format!("konsensus:call_hangup:{ID}:both"),
+            &format!("konsensus:call_block:{ID}:0"), &format!("konsensus:call_hangup:{}:caller", ID.to_uppercase()),
+        ] {
+            assert_eq!(parse_hangup_invoice_purpose(bad), None, "{bad}");
+        }
+        assert!(HANGUP_INVOICE_SEQ as u64 >= MAX_CALL_MS / CALL_BLOCK_MS, "a hangup binding must never be a block sequence");
+    }
+
+    #[test]
+    fn only_an_ordinary_hangup_of_a_live_call_uses_the_invoice() {
+        let entry = live(Side::Caller);
+        for reason in [None, Some(HangupReason::Hangup), Some(HangupReason::Failed), Some(HangupReason::Busy)] {
+            assert!(hangup_uses_invoice(Some(&entry), reason), "{reason:?}");
+        }
+        for reason in [Some(HangupReason::Unpaid), Some(HangupReason::DurationCap)] {
+            assert!(!hangup_uses_invoice(Some(&entry), reason), "{reason:?}");
+        }
+        for phase in [Phase::Reserved, Phase::AwaitingDevice, Phase::Ringing, Phase::Ended] {
+            assert!(!hangup_uses_invoice(Some(&CallEntry { phase, ..entry.clone() }), None), "{phase:?}");
+        }
+        assert!(!hangup_uses_invoice(None, None));
+    }
+
+    #[test]
+    fn a_hangup_invoice_is_issued_only_for_a_live_call_from_the_other_side() {
+        let callee = live(Side::Callee);
+        assert_eq!(validate_hangup_invoice(Some(&callee), Side::Caller), Ok(()));
+        assert_eq!(validate_hangup_invoice(Some(&live(Side::Caller)), Side::Callee), Ok(()));
+        assert_eq!(validate_hangup_invoice(Some(&callee), Side::Callee), Err(CallRefusal::WrongSide));
+        let ended = CallEntry { phase: Phase::Ended, end_reason: Some(HangupReason::Hangup), ..callee.clone() };
+        assert_eq!(validate_hangup_invoice(Some(&ended), Side::Caller), Err(CallRefusal::UnknownCall));
+        assert_eq!(validate_hangup_invoice(Some(&CallEntry { phase: Phase::Ringing, ..callee }), Side::Caller), Err(CallRefusal::UnknownCall));
+        assert_eq!(validate_hangup_invoice(None, Side::Caller), Err(CallRefusal::UnknownCall));
+    }
+}
 
 #[cfg(test)]
 mod duration_cap_tests {

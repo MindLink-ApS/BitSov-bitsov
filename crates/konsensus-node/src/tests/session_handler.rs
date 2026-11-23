@@ -2540,6 +2540,7 @@ async fn stranger_quote_over_noise_creates_no_application_state() {
     let (pending, _pending_rx) = mpsc::channel(8);
     let (auto, _auto_rx) = mpsc::channel(8);
     let worker = tokio::spawn(run(SessionHandlerDeps {
+        call_hangup_invoice: false,
         content_server: None,
         front_door: Default::default(),
         min_admission_cost_msat: 0,
@@ -4735,6 +4736,7 @@ async fn starter_full_or_closed_queue_disconnects_noise_peer_with_counted_reason
             starter_rx.close();
         }
         let worker = tokio::spawn(run(SessionHandlerDeps {
+            call_hangup_invoice: false,
             content_server: None,
             front_door: Default::default(),
             min_admission_cost_msat: 0,
@@ -8053,4 +8055,112 @@ async fn pending_media_invoice_serializes_lifecycle_and_head_reads() {
     assert!(blocked, "invoice validation must wait for the lifecycle transition's call lock");
     assert_eq!(result.unwrap_err(), konsensus_api::invoice_refusal::CALL_BLOCK_UNPAYABLE);
     assert_eq!(wallet.creates.load(Ordering::SeqCst), 0);
+}
+
+fn hangup_pricing(amount_msat: u64) -> konsensus_pricing::StaticPricingEngine {
+    konsensus_pricing::StaticPricingEngine::new(konsensus_pricing::StaticPricingConfig {
+        realtime_signal_msat: amount_msat,
+        ..Default::default()
+    })
+}
+
+/// A live call on this (callee) node from `peer`.
+async fn live_callee_call(storage: &konsensus_storage::SqliteStorage, peer: &NodeId, id: &str) -> konsensus_core::payloads::call::CallEntry {
+    use konsensus_core::payloads::call as calls;
+    let now = chrono::Utc::now().timestamp_millis() as u64;
+    let ringing = calls::receive(None, 400, None, now - 1_000).unwrap().device_fetched(now - 1_000).unwrap();
+    let pending = calls::reserve(Some(ringing), 401, "answer", "hash", now - 1_000).unwrap();
+    let live = calls::CallEntry { deadline_ms: now + 60_000, ..calls::commit(pending, "answer", now - 1_000).unwrap() };
+    storage.call_put(peer, id, &live).await.unwrap();
+    live
+}
+
+#[tokio::test]
+async fn call_hangup_invoice_is_issued_and_bound_only_for_a_live_call() {
+    use konsensus_core::payloads::call as calls;
+    let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    let live = live_callee_call(&storage, &peer, id).await;
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let sessions = session_with(&peer).await;
+    let mut invoices = ready_invoice_book().await;
+    let purpose = calls::hangup_invoice_purpose(id, calls::Side::Caller);
+
+    let issued = prepare_call_hangup_invoice(&storage, &hangup_pricing(3_000), &sessions, &peer, &purpose, 3_000, "hangup", &wallet, 0, &mut invoices)
+        .await.unwrap();
+    assert_eq!(issued.amount_msat, 3_000);
+    assert_eq!(issued.expiry_secs, calls::CALL_BLOCK_INVOICE_EXPIRY_SECS);
+    let hash: [u8; 32] = hex::decode(&issued.payment_hash).unwrap().try_into().unwrap();
+    assert!(storage.has_call_block_invoice(&peer, id, calls::HANGUP_INVOICE_SEQ, &hash).await.unwrap());
+    // A hangup binding never names a block.
+    assert!(!storage.has_call_block_invoice(&peer, id, 0, &hash).await.unwrap());
+
+    // The call ended here (media detach): nothing is issued, so nothing is paid.
+    let created = wallet.list_payments(100).await.unwrap().len();
+    storage.call_put(&peer, id, &calls::CallEntry { phase: calls::Phase::Ended, end_reason: Some(calls::HangupReason::Hangup),
+        deadline_ms: live.deadline_ms + calls::TOMBSTONE_MS, ..live.clone() }).await.unwrap();
+    let refused = prepare_call_hangup_invoice(&storage, &hangup_pricing(3_000), &sessions, &peer, &purpose, 3_000, "ended", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_HANGUP_ENDED);
+    assert_eq!(wallet.list_payments(100).await.unwrap().len(), created, "no invoice was created");
+
+    // So is a call this pair never had, a hangup naming our own side, or a malformed purpose.
+    storage.call_put(&peer, id, &live).await.unwrap();
+    let other = calls::hangup_invoice_purpose("fedcba9876543210fedcba9876543210", calls::Side::Caller);
+    let refused = prepare_call_hangup_invoice(&storage, &hangup_pricing(3_000), &sessions, &peer, &other, 3_000, "other", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_HANGUP_ENDED);
+    let own_side = calls::hangup_invoice_purpose(id, calls::Side::Callee);
+    let refused = prepare_call_hangup_invoice(&storage, &hangup_pricing(3_000), &sessions, &peer, &own_side, 3_000, "side", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::CALL_HANGUP_ENDED);
+    let refused = prepare_call_hangup_invoice(&storage, &hangup_pricing(3_000), &sessions, &peer, "konsensus:call_hangup:nope", 3_000, "bad", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::INVOICE_UNAVAILABLE);
+    assert_eq!(wallet.list_payments(100).await.unwrap().len(), created);
+}
+
+#[tokio::test]
+async fn call_hangup_invoice_keeps_the_hangup_price_bounds_and_needs_a_session() {
+    use konsensus_core::payloads::call as calls;
+    let storage = konsensus_storage::SqliteStorage::in_memory().await.unwrap();
+    let peer = test_peer_id();
+    let id = "0123456789abcdef0123456789abcdef";
+    live_callee_call(&storage, &peer, id).await;
+    let wallet = konsensus_lightning::MockLightningProvider::new();
+    let sessions = session_with(&peer).await;
+    let mut invoices = ready_invoice_book().await;
+    let purpose = calls::hangup_invoice_purpose(id, calls::Side::Caller);
+    let pricing = hangup_pricing(3_000);
+
+    // Above or below this node's hangup price, at zero, or below the admission floor: refused.
+    let refused = prepare_call_hangup_invoice(&storage, &pricing, &sessions, &peer, &purpose, 3_001, "high", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::PRICE_CHANGED);
+    let refused = prepare_call_hangup_invoice(&storage, &pricing, &sessions, &peer, &purpose, 2_999, "low", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::PRICE_CHANGED);
+    let refused = prepare_call_hangup_invoice(&storage, &pricing, &sessions, &peer, &purpose, 0, "zero", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::BELOW_ADMISSION_FLOOR);
+    let refused = prepare_call_hangup_invoice(&storage, &pricing, &sessions, &peer, &purpose, 2_000, "floor", &wallet, 2_500, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::BELOW_ADMISSION_FLOOR);
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+
+    // Without a readable session the hangup could not be read: refused, retryable.
+    assert!(sessions.remove_session(&peer).await);
+    let refused = prepare_call_hangup_invoice(&storage, &pricing, &sessions, &peer, &purpose, 3_000, "session", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::SESSION_HANDOVER);
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+
+    // The binding cap bounds repeats for one call.
+    let sessions = session_with(&peer).await;
+    for n in 0..calls::MAX_CALL_BLOCK_INVOICES {
+        storage.record_call_block_invoice(&peer, id, calls::HANGUP_INVOICE_SEQ, &[n as u8; 32], u64::MAX / 2).await.unwrap();
+    }
+    let refused = prepare_call_hangup_invoice(&storage, &pricing, &sessions, &peer, &purpose, 3_000, "cap", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::INVOICE_LIMITED);
+    assert!(wallet.list_payments(10).await.unwrap().is_empty());
+    // The cap holds at the binding itself, not only at the early count: a
+    // request that passed the count before the slot filled cannot bind a
+    // further invoice, so it is never returned to the peer.
+    assert!(storage.record_call_block_invoice(&peer, id, calls::HANGUP_INVOICE_SEQ, &[0xee; 32], u64::MAX / 2).await.is_err());
+    assert_eq!(
+        storage.call_block_invoice_count(&peer, id, calls::HANGUP_INVOICE_SEQ).await.unwrap(),
+        calls::MAX_CALL_BLOCK_INVOICES,
+    );
 }

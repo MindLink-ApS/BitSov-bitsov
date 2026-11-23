@@ -1435,6 +1435,14 @@ pub struct CallsConfig {
     /// it off.
     #[serde(default, deserialize_with = "deserialize_fail_closed_switch", skip_serializing_if = "std::ops::Not::not")]
     pub call_reply_free_v1: bool,
+    /// Call-bound hangups. A hangup of a live call is paid only through an
+    /// invoice its recipient issues for that call after checking it is still
+    /// live there; a call already over there is ended here without paying.
+    /// Used only with a peer that advertises the same switch; every other
+    /// hangup is paid as before. Off by default; only the value `true` turns
+    /// it on, and any other value leaves it off.
+    #[serde(default, deserialize_with = "deserialize_fail_closed_switch", skip_serializing_if = "std::ops::Not::not")]
+    pub call_hangup_invoice_v1: bool,
 }
 
 /// A switch that fails closed: a literal `true` turns it on; `false` or any
@@ -1506,6 +1514,7 @@ impl Default for CallsConfig {
             media_drop_bulk_over_share: false,
             call_continuity_v1: false,
             call_reply_free_v1: false,
+            call_hangup_invoice_v1: false,
         }
     }
 }

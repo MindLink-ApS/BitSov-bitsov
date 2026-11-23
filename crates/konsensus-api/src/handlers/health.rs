@@ -476,6 +476,9 @@ async fn status(
             if state.call_reply_free {
                 capabilities.push(konsensus_core::payloads::call::FREE_REPLY_CAPABILITY);
             }
+            if state.call_hangup_invoice {
+                capabilities.push(konsensus_core::payloads::call::HANGUP_INVOICE_CAPABILITY);
+            }
             if state
                 .pairing
                 .as_ref()

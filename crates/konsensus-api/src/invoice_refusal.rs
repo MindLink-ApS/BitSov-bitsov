@@ -45,6 +45,10 @@ pub const PRICE_CHANGED: &str = "konsensus:price_changed";
 /// No block invoice was issued: wrong call/sequence or too close to its deadline.
 pub const CALL_BLOCK_UNPAYABLE: &str = "konsensus:call_block_unpayable";
 
+/// No hangup invoice was issued: the call is not live here any more (it ended,
+/// or it was never this pair's call). The sender pays nothing and ends the call.
+pub const CALL_HANGUP_ENDED: &str = "konsensus:call_hangup_ended";
+
 /// No block invoice was created: the amount differs from the current kind-404 price.
 pub const CALL_PRICE_CHANGED: &str = "konsensus:call_price_changed";
 

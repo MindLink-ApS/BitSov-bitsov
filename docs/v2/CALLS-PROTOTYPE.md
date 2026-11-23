@@ -267,6 +267,47 @@ The callee's app still needs a token with `spend` to submit the answer, and
 its media socket still needs `spend` for an answered call: this switch makes
 the reply free, not grant-free.
 
+## Call-bound hangups
+
+`[calls] call_hangup_invoice_v1` is off by default. Only the value `true`
+turns it on; any other value leaves it off. While it is on, the node lists
+`call_hangup_invoice_v1` in `GET /api/v1/status` `api_capabilities` and
+advertises it to peers in its handshake (`Custom("call_hangup_invoice_v1")`).
+
+With it on, and to a connected peer that advertises it, a hangup (403) of a
+call this node holds live is paid only through an invoice bound to that call:
+
+- **Sending.** Instead of keysend or a generic invoice, the node asks the peer
+  for an invoice with purpose `konsensus:call_hangup:<call_id>:<side>`, where
+  `<side>` is this node's side of the call (`caller` or `callee`), for the
+  ordinary hangup price. It pays only that invoice. If the peer answers
+  `konsensus:call_hangup_ended`, or does not answer within ten seconds,
+  nothing is paid: the call ends here (no media, its hold is released), and
+  compose answers `not_dispatched` with reason `call_ended` or
+  `call_hangup_unanswered` and `retry_allowed: false`. A second tap, of the
+  same operation or a new one, finds the call ended and pays nothing. Any
+  other refusal (session handover, price change, limits) leaves the call live
+  and the hangup retryable, with nothing paid.
+- **Issuing.** The peer issues the invoice only while its own row for that
+  call and pair is live, on the other side, and (as callee) its media is
+  still attached; it checks again after the wallet and before answering. A
+  call that ended there, by media detach or otherwise, is answered
+  `call_hangup_ended`. The price bounds are those of an ordinary hangup:
+  above zero, at least the admission floor, at most its kind-403 price. The
+  invoice has the short call-invoice expiry and is bound to the peer and
+  call in `call_block_invoices` under the reserved slot `u32::MAX`, past
+  every block sequence, so it can never buy a block and a block invoice can
+  never pay it. At most eight bindings per call bound repeated requests.
+- **Receiving.** A hangup paid through a bound invoice is delivered even if
+  the call ended at the recipient between issuing the invoice and the hangup
+  arriving: it accepted that hangup by issuing the invoice. The call is not
+  changed. A hangup paid any other way for an ended call is refused as
+  before.
+
+Unpaid and duration-cap notices are for calls already over, and keep their
+paths; so do replies to a ringing call. With the switch off on either node,
+hangups are paid exactly as before.
+
 ## Persistence, recovery and bounds
 
 `call_state` stores side, phase, effective deadline, replay deadline,
