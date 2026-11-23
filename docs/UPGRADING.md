@@ -3,14 +3,6 @@
 This note covers common failure modes when replacing the `konsensus` binary on a
 retained data directory without re-running `konsensus init`.
 
-## Unreleased
-
-`[pairing] unattended_device_approvals` is new and off by default, so nothing
-changes unless you set it. Read [the trade](operations/password-input.md#unattended-box-device-approvals-from-a-stored-password)
-first. An older binary refuses a config that has the key set (`[pairing]` rejects
-unknown fields); remove the line before downgrading. A config saved with the
-setting off does not contain it.
-
 ## Installing a release binary
 
 Release binaries are named `bitsov-<os>-<arch>` (for example
@@ -29,6 +21,95 @@ A running node does not print its release on start. Builds that include #540
 `GET /api/v1/status`; `version` there and in `/api/v1/health` stays the API
 version, `2`. On rc22 and earlier, check the
 binary with `--version`.
+
+## rc24 → rc25
+
+End calls and reconcile pending payments using their existing operation IDs
+before stopping BitSov. On restart, rc25 ends a callee's previously attached
+live call with a hangup, and the remaining prepaid coverage on that call can no
+longer be used (#574). Take a consistent backup of the complete data directory
+and, when used, the PostgreSQL database. Retain config, wallet/channel,
+pairing, session and operation state together. Leave separately managed
+Lightning services running. Do not re-run `init` or rewind current state to an
+older copy.
+
+Verify the future signed artifact for the correct platform, stage it beside
+the retained binary, and check that `--version` reports `konsensus 0.3.0-rc25`.
+Switch the binary and restart with the same config, data and normal owner
+controls. First start applies the forward-only migrations **040, 041 and 042**
+on SQLite and PostgreSQL: durable call media teardown records (#574), the
+caller's current offer per call (#586) and free-reply receipts on the call row
+(#613, #616). Pairing storage remains **v8**; the new pairing fields are
+optional. Nodes coming from rc23 or earlier must also follow
+[rc23 → rc24](#rc23--rc24) and, from rc22 or earlier, [rc22 → rc23](#rc22--rc23).
+
+**Mainnet refusal at start (#581).** `start` refuses a mainnet
+`[lightning] network` with `mainnet_not_approved` unless `[node] allow_mainnet
+= true` is set by hand; `starter_hub.allow_mainnet` does not count. An existing
+mainnet config, including a start with no config file, is refused until that
+key is added. `start` also refuses a known public server on another network
+than `[lightning] network` before any network I/O, and the runtime source
+check reports `chain_network_mismatch`. Check `[lightning] network` and the
+`[chain]` URLs before switching. A CLN `[lightning] network` now reads the same
+way as an LDK one, so a value such as `Signet` maps to `signet` (#589).
+
+**New switches, all off by default.** Anything but a literal `true` leaves
+each one off, and nothing changes unless you set it:
+
+- `[calls] call_continuity_v1` keeps an admitted call through its grant's
+  expiry or renewal, paid only from the hold pinned at admission (#612, #622).
+- `[calls] call_reply_free_v1` makes the answer or decline to a ringing call
+  free, only when the caller's node also advertises `call_reply_free_v1`.
+  Every other reply is paid as before (#613).
+- `[pairing] standing_allowance_v1` lets `pair-ticket --allow` attach a
+  standing allowance to one pairing (#614).
+- `[pairing] unattended_device_approvals` loads the owner's approval verifier
+  on a box with an encrypted seed and its unlock secret in an owner-only file
+  or descriptor (#508). Read [the trade](operations/password-input.md#unattended-box-device-approvals-from-a-stored-password)
+  first.
+
+`GET /api/v1/status` lists `call_continuity_v1`, `call_reply_free_v1` and
+`standing_allowance_v1` only while they are on. An older binary refuses a
+config that sets any of these keys or `[node] allow_mainnet` (`[calls]`,
+`[pairing]` and `[node]` reject unknown fields); remove the lines before
+downgrading. A config saved with a setting off does not contain it.
+
+**Both nodes and the app.** Message payments by keysend now go only to a
+Lightning key the contact's identity signed (#440). A contact on rc24 or
+earlier that advertises an unsigned key is refused with "contact must update",
+and the payment does not fall back to an invoice. An older node can still pay
+an rc25 node. A newcomer onboarding against an older inviter waits until the
+inviter updates. Update both nodes before paid messages in both directions.
+Device-signed relation intents are bound to the pairing epoch
+(`bitsov-relation-intent-v2`); v1 signatures are refused (#478). Call invites
+now wait up to 15 s for a paired device before ringing, and end with
+`call_not_reachable` when no device receives them (#586). A call block invoice
+is minted only at the callee's current, floored minute price; the caller treats
+`call_price_changed` as terminal (#496, #604). As for rc24, update both nodes
+before paid calls and do not run paid calls while versions are mixed.
+
+**Owner API clients.** Every message or call send to a peer without an open
+session (first contact or re-admission) now needs an explicit
+`max_total_msat`; without it the owner's key gets `409 price_cap_exceeded`
+with `total_cap_required` (#578). A value of 0 means pay nothing new. A pending
+elevation request reads as `granted` only when a live owner window covers every
+term it asked for (#620). The unauthenticated `GET /api/v1/bootstrap/state`
+reports `network` when the backend states one (#443).
+
+After start, inspect migration logs and keep every completion marker. Check
+`node_version`, health, identity, contacts, channels, chain source and
+`money_ready`. Initial wallet sync alone does not establish payment readiness.
+Resolve `chain_unavailable` by restoring source availability and freshness
+before priced work. Read session state on both peers and confirm a message in
+each direction on signet. Reconcile pending results before retrying.
+
+Prefer rolling forward. After rc25 first opens the retained data, do not run
+rc24 or older on it: there is no down migration for 040–042 on either
+database. Never delete migration rows or completion markers to make an older
+binary start. Existing [rollback constraints](#rollback-constraints) remain.
+No rc25 → rc24 retained-node rollback rehearsal is recorded. See the
+[rc25 operator checklist](releases/v0.3.0-rc25.md#4-retained-nodes-rc24--rc25)
+for the complete upgrade sequence and remaining release gates.
 
 ## rc23 → rc24
 
