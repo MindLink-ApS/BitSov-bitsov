@@ -1867,6 +1867,12 @@ pub struct ConnectedStubTransport {
     /// `Some(Some(reason))` refuses it, `Some(None)` never answers it, `None`
     /// leaves it to the responder.
     pub invoice_refuser: Option<Box<InvoiceRefuser>>,
+    /// Invoice requests whose purpose starts with one of these fail to send
+    /// (`send_raw_frame` errs), as on a disconnect after the connected check.
+    pub fail_send_for: std::sync::Mutex<Vec<String>>,
+    /// Invoice requests whose purpose starts with one of these are sent, but
+    /// their pending answer channel is dropped without an answer.
+    pub drop_answer_for: std::sync::Mutex<Vec<String>>,
 }
 
 type InvoiceRefuser = dyn Fn(&str) -> Option<Option<String>> + Send + Sync;
@@ -1893,6 +1899,8 @@ impl ConnectedStubTransport {
             peer_capabilities: std::sync::Mutex::new(HashMap::new()),
             invoice_purposes: std::sync::Mutex::new(Vec::new()),
             invoice_refuser: None,
+            fail_send_for: std::sync::Mutex::new(Vec::new()),
+            drop_answer_for: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1988,6 +1996,17 @@ impl MessageTransport for ConnectedStubTransport {
         }) = konsensus_message::wire::Frame::from_bytes(frame_bytes)
         {
             self.invoice_purposes.lock().unwrap().push(purpose.clone());
+            if self.fail_send_for.lock().unwrap().iter().any(|prefix| purpose.starts_with(prefix.as_str())) {
+                return Err(TransportError::ConnectionFailed("stub: send failed".into()));
+            }
+            if self.drop_answer_for.lock().unwrap().iter().any(|prefix| purpose.starts_with(prefix.as_str())) {
+                let (invoice_requests, req_id) = (Arc::clone(&self.invoice_requests), request_id.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    drop(invoice_requests.lock().await.remove(&req_id));
+                });
+                return Ok(());
+            }
             if let Some(answer) = self.invoice_refuser.as_ref().and_then(|refuser| refuser(purpose)) {
                 if let Some(reason) = answer {
                     let (invoice_requests, req_id, recipient) =

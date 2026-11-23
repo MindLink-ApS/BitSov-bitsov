@@ -1254,8 +1254,10 @@ async fn create_payment_proof_via_invoice(
     // Only the prepayment exchange is cancellable by the promotion deadline.
     // Once an invoice is accepted below, dispatch and settlement keep their
     // existing financial outcome handling even if this deadline then elapses.
-    // A call-bound hangup that gets no invoice is never paid: no answer,
-    // however it fails, ends the call here instead (see `compose_call`).
+    // A call-bound hangup that gets no invoice is never paid. Only silence
+    // (the hangup deadline) ends the call here (see `compose_call`); a failed
+    // send or a request lost before any answer keeps the call so the hangup
+    // can be retried.
     let hangup = debit.is_call_hangup();
     let unanswered = |error: ApiError| if hangup {
         ApiError::NotDispatched(
@@ -1265,9 +1267,9 @@ async fn create_payment_proof_via_invoice(
     let response = async {
         debit.request_invoice(state.transport.send_raw_frame(peer_id, &frame_bytes))
             .await?
-            .map_err(|e| unanswered(ApiError::Internal(format!(
+            .map_err(|e| ApiError::Internal(format!(
                 "failed to send invoice request to peer: {e}"
-            ))))?;
+            )))?;
 
         tracing::info!(
             peer = %peer_id, %request_id, invoice_amount_msat, method = "invoice",
@@ -1279,9 +1281,9 @@ async fn create_payment_proof_via_invoice(
             .map_err(|_| unanswered(ApiError::Internal(
                 "Invoice request timed out — recipient did not respond within 30s".into()
             )))?
-            .map_err(|_| unanswered(ApiError::Lightning(
+            .map_err(|_| ApiError::Lightning(
                 "Recipient could not create invoice — their Lightning wallet may be unavailable".into()
-            )))?
+            ))?
             .map_err(|error| {
                 if error.recipient != *peer_id {
                     return ApiError::Lightning("invoice refusal came from another recipient".into());

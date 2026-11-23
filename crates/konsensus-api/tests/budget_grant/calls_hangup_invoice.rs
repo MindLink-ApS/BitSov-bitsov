@@ -140,6 +140,38 @@ async fn a_hangup_whose_invoice_request_goes_unanswered_ends_the_call_without_pa
     }
 }
 
+/// A hangup whose invoice request never reached the peer (the send failed,
+/// or its answer channel was dropped) is not "unanswered": the call stays
+/// live here, nothing is paid, and the hangup can be sent again.
+#[tokio::test]
+async fn a_hangup_whose_invoice_request_was_not_delivered_keeps_the_call_and_allows_a_retry() {
+    for fault in ["send", "dropped"] {
+        let (fx, token, transport) = live_call(true, &[HANGUP_CAP], Peer::Issues).await;
+        let prefix = konsensus_core::payloads::call::CALL_HANGUP_INVOICE_PREFIX.to_string();
+        let faults = if fault == "send" { &transport.fail_send_for } else { &transport.drop_answer_for };
+        faults.lock().unwrap().push(prefix);
+        let money = fx.wallet.money();
+        let operation = uuid::Uuid::new_v4().to_string();
+        let (status, body) = signal(&fx, &token, hangup_request(&fx, &operation)).await;
+        assert_ne!(status, StatusCode::OK, "{fault}: {body}");
+        assert_ne!(body["reason"], "call_hangup_unanswered", "{fault}: {body}");
+        assert_eq!(body["retry_allowed"], true, "{fault}: {body}");
+        assert_eq!(fx.wallet.money(), money, "{fault}: nothing was paid");
+        assert!(hangups_sent(&transport).is_empty(), "{fault}");
+        assert_eq!(phase(&fx).await, Phase::Live, "{fault}: the call stays live here");
+        assert!(fx.service.call_spend_status(&fx.peer.to_hex(), CALL).is_some_and(|hold| !hold.closed),
+            "{fault}: the hold is kept");
+
+        // Once the peer can be reached, the same hangup is paid once.
+        faults.lock().unwrap().clear();
+        let (status, body) = signal(&fx, &token, hangup_request(&fx, &operation)).await;
+        assert_eq!(status, StatusCode::OK, "{fault}: retry: {body}");
+        assert_eq!(fx.wallet.money(), money + 1, "{fault}: paid once on retry");
+        assert_eq!(hangups_sent(&transport).len(), 1, "{fault}");
+        assert_eq!(phase(&fx).await, Phase::Ended, "{fault}");
+    }
+}
+
 /// "Call ended" is honoured only as the answer to a call-bound hangup's own
 /// invoice request. The same answer to a block's invoice request is an
 /// ordinary refusal: nothing paid, the call stays live, the block retryable.

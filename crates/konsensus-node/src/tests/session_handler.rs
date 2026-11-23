@@ -8130,8 +8130,10 @@ async fn call_hangup_invoice_keeps_the_hangup_price_bounds_and_needs_a_session()
     let purpose = calls::hangup_invoice_purpose(id, calls::Side::Caller);
     let pricing = hangup_pricing(3_000);
 
-    // Above this node's hangup price, at zero, or below the admission floor: refused.
+    // Above or below this node's hangup price, at zero, or below the admission floor: refused.
     let refused = prepare_call_hangup_invoice(&storage, &pricing, &sessions, &peer, &purpose, 3_001, "high", &wallet, 0, &mut invoices).await;
+    assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::PRICE_CHANGED);
+    let refused = prepare_call_hangup_invoice(&storage, &pricing, &sessions, &peer, &purpose, 2_999, "low", &wallet, 0, &mut invoices).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::PRICE_CHANGED);
     let refused = prepare_call_hangup_invoice(&storage, &pricing, &sessions, &peer, &purpose, 0, "zero", &wallet, 0, &mut invoices).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::BELOW_ADMISSION_FLOOR);
@@ -8153,4 +8155,12 @@ async fn call_hangup_invoice_keeps_the_hangup_price_bounds_and_needs_a_session()
     let refused = prepare_call_hangup_invoice(&storage, &pricing, &sessions, &peer, &purpose, 3_000, "cap", &wallet, 0, &mut invoices).await;
     assert_eq!(refused.unwrap_err(), konsensus_api::invoice_refusal::INVOICE_LIMITED);
     assert!(wallet.list_payments(10).await.unwrap().is_empty());
+    // The cap holds at the binding itself, not only at the early count: a
+    // request that passed the count before the slot filled cannot bind a
+    // further invoice, so it is never returned to the peer.
+    assert!(storage.record_call_block_invoice(&peer, id, calls::HANGUP_INVOICE_SEQ, &[0xee; 32], u64::MAX / 2).await.is_err());
+    assert_eq!(
+        storage.call_block_invoice_count(&peer, id, calls::HANGUP_INVOICE_SEQ).await.unwrap(),
+        calls::MAX_CALL_BLOCK_INVOICES,
+    );
 }

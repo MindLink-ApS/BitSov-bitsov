@@ -3338,9 +3338,9 @@ async fn handle_call_hangup_invoice_requested(
     }
 }
 
-/// Check the call before the wallet and again before publishing. The price
-/// bounds are those of an ordinary hangup: above zero, at least the admission
-/// floor, at most this node's kind-403 price. A call that is not live here
+/// Check the call before the wallet and again before publishing. The amount
+/// must be above zero, at least the admission floor, and exactly this node's
+/// current kind-403 price: a caller-chosen lower amount is never invoiced. A call that is not live here
 /// for this pair is answered `call_hangup_ended`: the sender pays nothing.
 /// The invoice is bound to the peer and call in the call invoice bindings
 /// (slot [`calls::HANGUP_INVOICE_SEQ`]) before it is returned, and carries
@@ -3384,12 +3384,16 @@ async fn prepare_call_hangup_invoice(
         .get_price_msat(konsensus_core::kind::KIND_CALL_HANGUP)
         .await
         .map_err(|_| "konsensus:price_unavailable")?;
-    if amount_msat > konsensus_core::gate::price_with_floor_msat(price, min_admission_cost_msat) {
+    if amount_msat != konsensus_core::gate::price_with_floor_msat(price, min_admission_cost_msat) {
         return Err(refusal::PRICE_CHANGED);
     }
     // The binding cap bounds how many invoices one call's hangup may hold, so
     // retries and repeated requests for that hangup cannot fill the wallet.
     // It reuses the limit each call block has; at most one hangup is admitted.
+    // This count is only an early refusal before the wallet: the cap itself is
+    // enforced atomically by `record_call_block_invoice` (one conditional
+    // insert; an advisory lock on Postgres), and an invoice that loses that
+    // race is never returned to the peer.
     let outstanding = storage
         .call_block_invoice_count(peer, &call_id, calls::HANGUP_INVOICE_SEQ)
         .await
