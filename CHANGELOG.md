@@ -21,6 +21,9 @@ also live on the corresponding GitHub pre-release pages.
   without it, hangups are paid as before. Unpaid and duration-cap notices
   keep their existing path. No migration: the invoice is bound in the
   existing call invoice bindings.
+
+## [0.3.0-rc25] — 2026-11-22
+
 - Add `[calls] call_continuity_v1` (off by default; anything but `true`
   leaves it off). With it on, a call admitted under a live spend grant keeps
   its media socket and its pinned hold when that grant expires or is
@@ -126,6 +129,11 @@ also live on the corresponding GitHub pre-release pages.
   API refuses the same payloads before they are stored or paid for,
   including a partial update whose retained recurrence would exceed the cap
   from its new start.
+- Storage upgrades are forward-only: migrations 040, 041 and 042 add call media
+  teardown records, the caller's offer binding and free-reply receipts on SQLite
+  and PostgreSQL. New switches are off by default. See the
+  [rc25 notes and checklist](docs/releases/v0.3.0-rc25.md) and
+  [rc24 → rc25 upgrade steps](docs/UPGRADING.md#rc24--rc25).
 
 ## [0.3.0-rc24] — 2026-11-12
 

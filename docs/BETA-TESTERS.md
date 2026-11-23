@@ -1,7 +1,7 @@
-# Signet beta testers, phase 0 (v0.3.0-rc24)
+# Signet beta testers, phase 0 (v0.3.0-rc25)
 
 This guide is for the invited phase 0 testers. It installs the signed
-`v0.3.0-rc24` pre-release on **signet**, connects two testers' nodes over a
+`v0.3.0-rc25` pre-release on **signet**, connects two testers' nodes over a
 shared test tailnet, sends a paid message, and, when both sides are ready, makes
 a paid call. A helper bot may type commands for you. **Some steps are yours
 alone**, and the bot rules below say which.
@@ -35,13 +35,13 @@ it.
 ## 1. Download, check and install
 
 Follow [step 1b of the quickstart](QUICKSTART-SIGNET.md#1b-or-install-a-signed-pre-release-binary)
-with `v0.3.0-rc24`. Into an empty directory, download your platform's binary
+with `v0.3.0-rc25`. Into an empty directory, download your platform's binary
 (`bitsov-<os>-<arch>`), `SHA256SUMS` and `SHA256SUMS.asc` from the
-[`v0.3.0-rc24` release](https://github.com/MindLink-ApS/BitSov-bitsov/releases/tag/v0.3.0-rc24),
+[`v0.3.0-rc25` release](https://github.com/MindLink-ApS/BitSov-bitsov/releases/tag/v0.3.0-rc25),
 and the release key:
 
 ```sh
-TAG=v0.3.0-rc24   # the release you downloaded
+TAG=v0.3.0-rc25   # the release you downloaded
 curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/RELEASE_KEY.asc"
 ```
 
@@ -80,7 +80,7 @@ Look for `OK` after your binary's name.
 mv bitsov-darwin-aarch64 konsensus   # your platform's file; or: ln -s bitsov-darwin-aarch64 konsensus
 chmod +x konsensus
 xattr -d com.apple.quarantine konsensus 2>/dev/null   # macOS only
-./konsensus --version                # konsensus 0.3.0-rc24
+./konsensus --version                # konsensus 0.3.0-rc25
 export PATH="$PWD:$PATH"
 ```
 
@@ -91,7 +91,7 @@ curl -fLO "https://raw.githubusercontent.com/MindLink-ApS/BitSov-bitsov/$TAG/doc
 shasum -a 256 owner-token.sh   # Linux: sha256sum owner-token.sh
 ```
 
-For `v0.3.0-rc24` the hash is
+For `v0.3.0-rc25` the hash is
 `a23f002e754f91416c5580a3ff6b82ef8447cea7cc6a125e505fef3a5ff95764`. A different
 hash means stop. Read the script before you source it.
 
@@ -174,7 +174,7 @@ Run these in order and note pass or fail for each in your report.
 | S8 | Connected | `api $API/peers/connected \| jq .` | lists the other tester's node ID |
 | S9 | Channel (**your OK first**) | [quickstart step 7](QUICKSTART-SIGNET.md#7-open-a-channel-to-the-contact): preview with `dry_run`, then open; one tester opens it | `api $API/payments/channels \| jq .` shows the channel ready on both ends |
 | S10 | Paid message (**your OK first**) | [quickstart step 8](QUICKSTART-SIGNET.md#8-send-a-paid-message) | `"state": "acked"`, `"delivered": true`; the other tester reads it |
-| S11 | Paid call (**your OK first**) | [M6 call runbook](ops/M6-CALL-RUNBOOK.md) | **only when both nodes run `v0.3.0-rc24`.** Audio needs the matching M6 app build. If the other node is on another version, mark S11 "skipped (mixed versions)"; without the app build, "skipped (no M6 app build)" |
+| S11 | Paid call (**your OK first**) | [M6 call runbook](ops/M6-CALL-RUNBOOK.md) | **only when both nodes run `v0.3.0-rc25`.** Audio needs the matching M6 app build. If the other node is on another version, mark S11 "skipped (mixed versions)"; without the app build, "skipped (no M6 app build)" |
 
 For S11, follow the runbook's "Checks before dialing" first, and its "Capture
 proof without publishing private data" afterwards.
