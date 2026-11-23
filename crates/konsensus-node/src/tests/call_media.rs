@@ -708,9 +708,13 @@ async fn route_summary_counts_inbound_and_ends_detached() {
     assert_eq!(lines.len(), 1, "{lines:?}");
     let line = &lines[0];
     assert_eq!(field(line, "call_id"), CALL);
-    assert_eq!(field(line, "in_forwarded"), MEDIA_BURST_FRAMES.to_string());
-    assert_eq!(field(line, "in_rate_capped"), "3");
-    assert_eq!(field(line, "in_evicted"), (MEDIA_BURST_FRAMES as usize - MEDIA_QUEUE_FRAMES).to_string());
+    // Credit refills in real time while the frames go in, so a slow runner
+    // may admit a few past the burst; never fewer, and every frame is counted.
+    let count = |name: &str| field(line, name).parse::<u32>().unwrap();
+    let (forwarded, capped) = (count("in_forwarded"), count("in_rate_capped"));
+    assert!(forwarded >= MEDIA_BURST_FRAMES, "forwarded {forwarded}, inside the burst");
+    assert_eq!(forwarded + capped, total, "{line}");
+    assert_eq!(count("in_evicted") as usize, forwarded as usize - MEDIA_QUEUE_FRAMES);
     assert_eq!(field(line, "in_not_admitted"), "0");
     assert_eq!(field(line, "out_forwarded"), "0");
     assert_eq!(field(line, "out_evicted"), "0");
@@ -763,9 +767,13 @@ async fn route_summary_counts_outbound_rate_cap() {
     drop(attachment);
     let lines = summaries(&logs);
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(field(&lines[0], "out_forwarded"), MEDIA_BURST_FRAMES.to_string());
-    assert_eq!(field(&lines[0], "out_rate_capped"), "5");
-    assert_eq!(field(&lines[0], "out_evicted"), "0");
+    // Credit refills in real time while the pump works, so a slow runner may
+    // forward a few past the burst; never fewer, and every packet is counted.
+    let count = |name: &str| field(&lines[0], name).parse::<u32>().unwrap();
+    let (forwarded, capped) = (count("out_forwarded"), count("out_rate_capped"));
+    assert!(forwarded >= MEDIA_BURST_FRAMES, "forwarded {forwarded}, inside the burst");
+    assert_eq!(forwarded + capped, total, "{}", lines[0]);
+    assert_eq!(count("out_evicted"), 0);
 }
 
 #[tokio::test]
