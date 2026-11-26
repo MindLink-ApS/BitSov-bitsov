@@ -99,9 +99,14 @@ impl FaultProxy {
                     .send()
                     .await
                 {
+                    // A body that breaks off is a failed upstream too: 502, never a
+                    // panic in the proxy task (which a test would read as its own failure).
                     Ok(response) => {
                         let status = response.status();
-                        (status, response.bytes().await.unwrap()).into_response()
+                        match response.bytes().await {
+                            Ok(bytes) => (status, bytes).into_response(),
+                            Err(_) => axum::http::StatusCode::BAD_GATEWAY.into_response(),
+                        }
                     }
                     Err(_) => axum::http::StatusCode::BAD_GATEWAY.into_response(),
                 };
@@ -220,4 +225,53 @@ async fn proxy_forwards_then_rate_limits_then_recovers() {
     );
     server.abort();
     let _ = server.await;
+}
+
+// An upstream that promises a longer body than it sends, then closes. The
+// proxy must answer 502, as for a failed connection, and keep serving.
+#[tokio::test]
+async fn proxy_answers_502_when_the_upstream_body_breaks_and_keeps_serving() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for short in [true, false] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let reply: &[u8] = if short {
+                b"HTTP/1.1 200 OK\r\ncontent-length: 64\r\nconnection: close\r\n\r\nshort"
+            } else {
+                b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\nconnection: close\r\n\r\nfine"
+            };
+            stream.write_all(reply).await.unwrap();
+            let _ = stream.shutdown().await;
+        }
+    });
+    let proxy = FaultProxy::start(&upstream).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    let broken = client
+        .get(format!("{}/blocks/tip/height", proxy.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        broken.status(),
+        axum::http::StatusCode::BAD_GATEWAY,
+        "{SYNC}"
+    );
+
+    let next = client
+        .get(format!("{}/blocks/tip/height", proxy.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(next.status(), axum::http::StatusCode::OK, "{SYNC}");
+    assert_eq!(next.text().await.unwrap(), "fine", "{SYNC}");
+    server.await.unwrap();
 }
