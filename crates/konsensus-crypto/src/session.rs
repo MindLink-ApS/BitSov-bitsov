@@ -1075,6 +1075,17 @@ impl SessionManager {
         .unwrap_or(false)
     }
 
+    /// How many one-time pre-keys this node holds (offered or not, none
+    /// consumed). Offers rotate, so a bundle does not show which key is next.
+    pub async fn one_time_prekey_count(&self) -> usize {
+        self.one_time_prekeys.read().await.len()
+    }
+
+    /// Whether the one-time pre-key `id` is still held, that is, not consumed.
+    pub async fn holds_one_time_prekey(&self, id: u32) -> bool {
+        self.one_time_prekeys.read().await.iter().any(|k| k.id == id)
+    }
+
     /// Replenish one-time pre-keys when running low.
     async fn replenish_prekeys(&self) {
         let mut otpks = self.one_time_prekeys.write().await;

@@ -6425,6 +6425,7 @@ async fn malformed_session_init_leaves_the_working_session_alone() {
     let mut negotiations = std::collections::HashMap::new();
 
     let held = high_mgr.prekey_bundle().await.one_time_prekey_id.unwrap();
+    let pool = high_mgr.one_time_prekey_count().await;
     let key = hex::encode([2u8; 32]);
     let inits = [
         ("not an init", serde_json::json!("not an init")),
@@ -6459,9 +6460,8 @@ async fn malformed_session_init_leaves_the_working_session_alone() {
         );
         assert_session_works(&low, &low_mgr, &high, &high_mgr, label).await;
     }
-    assert_eq!(
-        high_mgr.prekey_bundle().await.one_time_prekey_id,
-        Some(held),
+    assert!(
+        high_mgr.holds_one_time_prekey(held).await && high_mgr.one_time_prekey_count().await == pool,
         "a refused init consumes no one-time pre-key"
     );
 
@@ -7447,16 +7447,21 @@ async fn offer_with_the_identity_key_point_in_other_bytes_changes_nothing() {
 #[tokio::test]
 async fn init_with_an_identity_key_other_than_the_hello_key_changes_nothing() {
     let (low, low_mgr, high, high_mgr) = established_pair().await;
-    let held = high_mgr.prekey_bundle().await.one_time_prekey_id;
+    let offer = high_mgr.prekey_bundle().await;
+    let held = offer.one_time_prekey_id.unwrap();
+    let pool = high_mgr.one_time_prekey_count().await;
     let other = Arc::new(NodeIdentity::generate().unwrap().1);
     let init = SessionManager::new(Arc::clone(&other))
-        .initiate_session(high.node_id(), &high_mgr.prekey_bundle().await)
+        .initiate_session(high.node_id(), &offer)
         .await
         .unwrap();
     let init = serde_json::to_value(&init).unwrap();
     for (label, connection) in [("the sender's key", connection_of(&low)), ("no key", no_hello_connection())] {
         assert!(!init_accepted(&low, &high_mgr, init.clone(), &connection).await, "{label}");
-        assert_eq!(high_mgr.prekey_bundle().await.one_time_prekey_id, held, "{label}: no pre-key consumed");
+        assert!(
+            high_mgr.holds_one_time_prekey(held).await && high_mgr.one_time_prekey_count().await == pool,
+            "{label}: no pre-key consumed"
+        );
         assert_session_works(&low, &low_mgr, &high, &high_mgr, label).await;
     }
     assert!(init_accepted(&low, &high_mgr, init, &connection_of(&other)).await, "the same init from its own key");
