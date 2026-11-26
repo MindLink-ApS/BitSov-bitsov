@@ -1491,21 +1491,16 @@ async fn recovery_handover_holds_marked_sends_but_allows_recovery_probes() {
     }
 }
 
-/// BUG-SIM-1 (found by the many-node simulation, konsensus-node
-/// `sim_many_nodes`): `prekey_bundle` offers the same first one-time prekey
-/// to every peer until a SessionInit consumes it. When two peers initiate
-/// from bundles offered before either init arrived, the second
-/// `accept_session` finds the referenced one-time prekey gone, silently runs
-/// X3DH without it, and stores a session whose keys differ from the
-/// initiator's. Nothing fails until the first ratchet message: the acceptor
-/// cannot decrypt, drops the session, and every paid message sent on it in
-/// the meantime is acked yet unreadable.
-///
-/// Fails today. Either each offer must carry a distinct one-time prekey, or
-/// `accept_session` must refuse an init whose one-time prekey is unknown
-/// (so the initiator never holds a session the acceptor cannot match).
+/// Found by the many-node simulation (konsensus-node `sim_many_nodes`).
+/// `prekey_bundle` used to offer the same first one-time prekey to every peer
+/// until a SessionInit consumed it. When two peers initiated from bundles
+/// offered before either init arrived, the second init named a prekey that
+/// was already gone. It is refused (an unknown prekey is never used to derive
+/// a mismatched session), but the second initiator then holds a session the
+/// acceptor never stored, and its first messages wait for repair (10 to 25 s,
+/// behind the repair cooldown). Each offer must carry its own one-time prekey,
+/// so both concurrent first contacts get working sessions at once.
 #[tokio::test]
-#[ignore = "BUG-SIM-1: one-time prekey offered twice; second session silently mismatched (still failing)"]
 async fn two_initiators_from_concurrent_offers_both_get_working_sessions() {
     let id_b = make_identity(TEST_MNEMONIC_B);
     let node_b = *id_b.node_id();
@@ -1519,23 +1514,55 @@ async fn two_initiators_from_concurrent_offers_both_get_working_sessions() {
     // B offers its bundle to both before either SessionInit arrives.
     let offer_1 = mgr_b.prekey_bundle().await;
     let offer_2 = mgr_b.prekey_bundle().await;
+    assert!(offer_1.one_time_prekey_id.is_some() && offer_2.one_time_prekey_id.is_some());
+    assert_ne!(offer_1.one_time_prekey_id, offer_2.one_time_prekey_id, "each offer carries its own one-time prekey");
     let init_1 = mgr_a1.initiate_session(&node_b, &offer_1).await.unwrap();
     let init_2 = mgr_a2.initiate_session(&node_b, &offer_2).await.unwrap();
 
-    let accepted_1 = mgr_b.accept_session(&node_a1, &init_1).await;
-    let accepted_2 = mgr_b.accept_session(&node_a2, &init_2).await;
-    assert!(accepted_1.is_ok());
+    // Both are accepted, in either order of arrival, and both decrypt.
+    mgr_b.accept_session(&node_a2, &init_2).await.expect("the second offer's init is accepted");
+    mgr_b.accept_session(&node_a1, &init_1).await.expect("the first offer's init is accepted");
+    for (mgr, node) in [(&mgr_a1, node_a1), (&mgr_a2, node_a2)] {
+        let message = mgr.encrypt(&node_b, b"ratchet-init").await.unwrap();
+        assert_eq!(mgr_b.decrypt(&node, &message).await.unwrap(), b"ratchet-init");
+    }
+}
 
-    let m1 = mgr_a1.encrypt(&node_b, b"ratchet-init").await.unwrap();
-    assert_eq!(mgr_b.decrypt(&node_a1, &m1).await.unwrap(), b"ratchet-init");
-    // An accepted session must decrypt its initiator's first message; a
-    // refused init is fine (the initiator re-negotiates), a silent mismatch is not.
-    if accepted_2.is_ok() {
-        let m2 = mgr_a2.encrypt(&node_b, b"ratchet-init").await.unwrap();
-        assert_eq!(
-            mgr_b.decrypt(&node_a2, &m2).await.ok().as_deref(),
-            Some(&b"ratchet-init"[..]),
-            "B accepted A2's SessionInit but cannot decrypt A2's first message (one-time prekey reused across offers)"
-        );
+/// A burst of first contacts larger than the pool still gets a distinct
+/// one-time prekey per offer up to the pool's size, every offered key stays
+/// usable until it is consumed, and a consumed key is never offered again.
+#[tokio::test]
+async fn offers_rotate_through_the_pool_and_never_repeat_a_consumed_key() {
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_b = *id_b.node_id();
+    let mgr_b = SessionManager::new(id_b);
+    let mut offers = Vec::new();
+    for _ in 0..10 {
+        offers.push(mgr_b.prekey_bundle().await);
+    }
+    let mut ids: Vec<u32> = offers.iter().map(|o| o.one_time_prekey_id.unwrap()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 10, "ten concurrent offers name ten different one-time prekeys");
+
+    // Every one of those offers works, whatever order the inits arrive in.
+    let mut peers = Vec::new();
+    for offer in offers.iter().rev() {
+        let (_, id) = NodeIdentity::generate().unwrap();
+        let node = *id.node_id();
+        let mgr = SessionManager::new(Arc::new(id));
+        let init = mgr.initiate_session(&node_b, offer).await.unwrap();
+        mgr_b.accept_session(&node, &init).await.expect("an offered key stays usable until consumed");
+        peers.push((mgr, node, offer.one_time_prekey_id.unwrap()));
+    }
+    for (mgr, node, _) in &peers {
+        let message = mgr.encrypt(&node_b, b"hello").await.unwrap();
+        assert_eq!(mgr_b.decrypt(node, &message).await.unwrap(), b"hello");
+    }
+    // A consumed key is never offered again.
+    let consumed: Vec<u32> = peers.iter().map(|(_, _, id)| *id).collect();
+    for _ in 0..30 {
+        let id = mgr_b.prekey_bundle().await.one_time_prekey_id.unwrap();
+        assert!(!consumed.contains(&id), "offered a consumed one-time prekey {id}");
     }
 }

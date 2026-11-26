@@ -22,6 +22,7 @@
 //! far fewer active sessions.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::record_cipher::{RecordCipher, LegacyReadPolicy, SESSION_KEY_CONTEXT};
@@ -260,6 +261,9 @@ pub struct SessionManager {
     one_time_prekeys: RwLock<Vec<OneTimePreKey>>,
     /// Next OPK ID counter.
     next_opk_id: RwLock<u32>,
+    /// Which one-time pre-key the next bundle offers: offers rotate through
+    /// the pool, so concurrent first contacts name different keys.
+    next_offer: AtomicUsize,
     /// Active sessions keyed by peer NodeId. Shared with the detached tasks that save
     /// them; see [`Self::encrypt`].
     sessions: Arc<RwLock<HashMap<NodeId, PeerSession>>>,
@@ -310,6 +314,7 @@ impl SessionManager {
             signed_prekey: RwLock::new(spk),
             one_time_prekeys: RwLock::new(otpks),
             next_opk_id: RwLock::new(base + 10),
+            next_offer: AtomicUsize::new(0),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             store,
             session_cipher,
@@ -517,6 +522,12 @@ impl SessionManager {
     /// Get our prekey bundle for distribution to peers.
     ///
     /// This is what we send to peers so they can initiate X3DH with us.
+    ///
+    /// Each bundle offers the next one-time pre-key in the pool, in turn. Two
+    /// peers that fetch bundles before either SessionInit arrives therefore
+    /// name different keys (up to the pool's size), and both inits can be
+    /// accepted. An offered key stays usable until a SessionInit consumes it;
+    /// a consumed key is gone from the pool and is never offered again.
     pub async fn prekey_bundle(&self) -> SerializablePrekeyBundle {
         let spk = self.signed_prekey.read().await;
         let otpks = self.one_time_prekeys.read().await;
@@ -527,7 +538,11 @@ impl SessionManager {
             .ed25519_signing_key()
             .sign(spk.public.as_bytes());
 
-        let (otpk, otpk_id) = if let Some(otpk) = otpks.first() {
+        let offered = match otpks.len() {
+            0 => None,
+            len => otpks.get(self.next_offer.fetch_add(1, Ordering::Relaxed) % len),
+        };
+        let (otpk, otpk_id) = if let Some(otpk) = offered {
             (Some(hex::encode(otpk.public.as_bytes())), Some(otpk.id))
         } else {
             (None, None)
