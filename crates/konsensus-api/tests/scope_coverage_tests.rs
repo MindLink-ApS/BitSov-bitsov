@@ -4,8 +4,13 @@
 //! this work missed `send_onchain`, `open_channel` and `close_channel` purely because
 //! their parameter is named `_user` rather than `_auth` — three spend routes left
 //! unenforced while the change appeared complete. This test reads the handler sources
-//! and fails if a listed handler still takes a bare `AuthUser`, so that gap cannot
-//! reopen silently.
+//! and fails if a listed handler still takes a bare `AuthUser`, so that gap is caught if
+//! it reopens in the same shape.
+//!
+//! These guards are source-text heuristics, not proofs. Each one matches the specific
+//! shape of a defect that has already happened, and was checked by reverting its fix. A
+//! route that goes wrong in a different shape can pass all of them; the behavioural
+//! tests are the substantive evidence of what a token may and may not do.
 
 use std::path::{Path, PathBuf};
 
@@ -152,7 +157,7 @@ fn representative_admin_routes_demand_admin_scope() {
     assert_scoped(ADMIN, "Admin");
 }
 
-/// The exhaustive invariant, and the one that actually closes this hole.
+/// The broadest guard, for the shape that opened this hole.
 ///
 /// The per-scope lists above are hand-written, so they only prove what someone remembered
 /// to list. Twice during this ticket that was not enough: a first pass missed three spend
@@ -161,8 +166,9 @@ fn representative_admin_routes_demand_admin_scope() {
 /// valid token, including a loopback one, while the lists above were green.
 ///
 /// A bare `AuthUser` extractor performs authentication but no authorization. This test
-/// therefore admits no allowlist: every authenticated handler must name the scope it
-/// requires. A new route cannot be added unscoped without failing here.
+/// admits no allowlist: any handler parameter of the literal shape `: AuthUser,` fails it.
+/// It does not see a route that authenticates some other way (that is how `/ws` escaped
+/// the first pass), so it is a net for this shape, not proof that no route is unscoped.
 #[test]
 fn no_handler_accepts_an_unscoped_token() {
     let mut bad = Vec::new();
@@ -235,8 +241,9 @@ fn function_text(src: &str, name: &str) -> String {
 /// that moves value. The list-driven spend check did not name those handlers, so it saw
 /// nothing.
 ///
-/// The rule is the invariant, not the list: if a function can reach the payment helper, it
-/// must demand `spend`.
+/// The rule is stated over the source, not as a list: a function that calls the payment
+/// helper must demand `spend`. It recognises a direct call and the signature shape; it does
+/// not follow calls, so a payment reached through one more layer of indirection would pass.
 #[test]
 fn every_function_that_can_pay_demands_spend() {
     let mut bad = Vec::new();
@@ -282,7 +289,8 @@ fn every_function_that_can_pay_demands_spend() {
 
 /// Any endpoint that validates a token itself, instead of going through `ScopedAuth`, must
 /// also authorize it. `src/ws.rs` did the first and not the second: a token the REST routes
-/// refused was upgraded and subscribed to plaintext message broadcasts.
+/// refused was upgraded and subscribed to plaintext message broadcasts. The check looks for
+/// `Scope::` and a binding check anywhere in the file, not for a check on the actual path.
 #[test]
 fn self_authenticating_endpoints_also_check_scope() {
     let mut bad = Vec::new();

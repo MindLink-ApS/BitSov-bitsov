@@ -159,11 +159,14 @@ needs an explicit operator action; the button should say so rather than fail opa
 The funding flow the app actually ships — identity display, funding address, balance polling —
 continues to work on `read` + `receive`.
 
-## Enforcement is exhaustive, not listed
+## Source guards: a cheap net, not a proof
 
-`scope_coverage_tests::no_handler_accepts_an_unscoped_token` fails if **any** handler takes a
-bare `AuthUser`. A bare `AuthUser` authenticates but does not authorize: it accepts any valid
-token, loopback included.
+The behavioural tests (a real token sent to a real route, refused or accepted) are the
+substantive evidence for these scope rules. Beside them, `scope_coverage_tests` reads the
+source and fails on the specific shapes that have already gone wrong.
+`scope_coverage_tests::no_handler_accepts_an_unscoped_token` fails if any handler parameter
+has the literal shape `: AuthUser,`. A bare `AuthUser` authenticates but does not
+authorize: it accepts any valid token, loopback included.
 
 This matters because the hand-written lists were repeatedly insufficient. A first pass
 missed three spend routes whose parameter happened to be named `_user`. A second missed
@@ -171,14 +174,28 @@ every handler declared `pub(super) async fn` — 45 authenticated handlers still
 unscoped token while the targeted tests were green. Review then found three more classes
 the guard could not see at all:
 
-| defect | why the guard missed it | invariant that now catches it |
+| defect | why the guard missed it | guard that now catches that shape |
 |---|---|---|
 | `/ws` upgraded any valid token | the guard walked only `src/handlers`; `/ws` authenticates itself | `self_authenticating_endpoints_also_check_scope`, and the walk now covers all of `src/` |
 | three calendar handlers could pay with `admin` alone | the spend list did not name them | `every_function_that_can_pay_demands_spend` — any function reaching `create_payment_proof` must demand `spend` |
 | `/onboarding/start` demanded `admin`, breaking the app's funding flow | nothing checked that the *preserved* paths still worked | a behavioural test posting the app's exact body, asserting the funding address and the state it then polls |
 
-The pattern in all three: a rule stated as a list of names proves only what someone
-remembered to list. Each is now stated as an invariant over the source instead.
+The pattern in all three: a rule stated as a list of names covers only what someone
+remembered to list. Each guard is now stated over the source instead, and each catches the
+defect that motivated it (checked by reverting its fix). They are still text heuristics,
+not proofs that a future omission is impossible:
+
+- `no_handler_accepts_an_unscoped_token` matches the parameter shape `: AuthUser,`. A route
+  that authenticates some other way is invisible to it, which is how `/ws` escaped the
+  first pass.
+- `self_authenticating_endpoints_also_check_scope` looks for `Scope::` and a binding check
+  anywhere in the file, not for a check on the actual path.
+- `every_function_that_can_pay_demands_spend` recognises a direct call to the payment
+  helper and the signature shape. It does not follow calls, so a payment reached through
+  one more layer of indirection would pass.
+
+A new route therefore still needs review for its scope; a green guard says only that it does
+not repeat one of these shapes.
 
 ## What the tests can and cannot show
 
