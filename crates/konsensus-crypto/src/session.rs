@@ -22,7 +22,6 @@
 //! far fewer active sessions.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::record_cipher::{RecordCipher, LegacyReadPolicy, SESSION_KEY_CONTEXT};
@@ -257,13 +256,11 @@ pub struct SessionManager {
     identity: Arc<NodeIdentity>,
     /// Our current signed pre-key (rotated periodically).
     signed_prekey: RwLock<SignedPreKey>,
-    /// Our one-time pre-keys (consumed on use).
+    /// Our one-time pre-keys (consumed on use), in offer order: keys never
+    /// offered first, then offered keys from the longest ago to the latest.
     one_time_prekeys: RwLock<Vec<OneTimePreKey>>,
     /// Next OPK ID counter.
     next_opk_id: RwLock<u32>,
-    /// Which one-time pre-key the next bundle offers: offers rotate through
-    /// the pool, so concurrent first contacts name different keys.
-    next_offer: AtomicUsize,
     /// Active sessions keyed by peer NodeId. Shared with the detached tasks that save
     /// them; see [`Self::encrypt`].
     sessions: Arc<RwLock<HashMap<NodeId, PeerSession>>>,
@@ -314,7 +311,6 @@ impl SessionManager {
             signed_prekey: RwLock::new(spk),
             one_time_prekeys: RwLock::new(otpks),
             next_opk_id: RwLock::new(base + 10),
-            next_offer: AtomicUsize::new(0),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             store,
             session_cipher,
@@ -523,14 +519,17 @@ impl SessionManager {
     ///
     /// This is what we send to peers so they can initiate X3DH with us.
     ///
-    /// Each bundle offers the next one-time pre-key in the pool, in turn. Two
-    /// peers that fetch bundles before either SessionInit arrives therefore
-    /// name different keys (up to the pool's size), and both inits can be
-    /// accepted. An offered key stays usable until a SessionInit consumes it;
-    /// a consumed key is gone from the pool and is never offered again.
+    /// Each bundle offers the key at the front of the pool and moves it to
+    /// the back. The pool stays in offer order (never-offered keys first, and
+    /// replenished keys join at the front), so a key still waiting for its
+    /// SessionInit is offered again only when every held key is outstanding.
+    /// Concurrent first contacts therefore name different keys up to the
+    /// pool's size, whatever consumes or replenishes happen in between. An
+    /// offered key stays usable until a SessionInit consumes it; a consumed
+    /// key is gone from the pool and is never offered again.
     pub async fn prekey_bundle(&self) -> SerializablePrekeyBundle {
         let spk = self.signed_prekey.read().await;
-        let otpks = self.one_time_prekeys.read().await;
+        let mut otpks = self.one_time_prekeys.write().await;
 
         // Sign the signed pre-key with Ed25519
         let sig = self
@@ -538,15 +537,15 @@ impl SessionManager {
             .ed25519_signing_key()
             .sign(spk.public.as_bytes());
 
-        let offered = match otpks.len() {
-            0 => None,
-            len => otpks.get(self.next_offer.fetch_add(1, Ordering::Relaxed) % len),
-        };
-        let (otpk, otpk_id) = if let Some(otpk) = offered {
+        let (otpk, otpk_id) = if let Some(otpk) = otpks.first() {
             (Some(hex::encode(otpk.public.as_bytes())), Some(otpk.id))
         } else {
             (None, None)
         };
+        if !otpks.is_empty() {
+            otpks.rotate_left(1);
+        }
+        drop(otpks);
 
         SerializablePrekeyBundle {
             identity_key: hex::encode(self.identity.x25519_public().as_bytes()),
@@ -1092,10 +1091,15 @@ impl SessionManager {
         if otpks.len() < 5 {
             let mut next_id = self.next_opk_id.write().await;
             let batch_size = 10 - otpks.len();
-            for _ in 0..batch_size {
-                otpks.push(OneTimePreKey::generate(*next_id));
-                *next_id += 1;
-            }
+            // New keys were never offered: they go to the front of the pool.
+            let fresh: Vec<_> = (0..batch_size)
+                .map(|_| {
+                    let key = OneTimePreKey::generate(*next_id);
+                    *next_id += 1;
+                    key
+                })
+                .collect();
+            otpks.splice(0..0, fresh);
         }
     }
 }

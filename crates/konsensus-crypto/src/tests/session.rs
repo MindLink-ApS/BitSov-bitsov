@@ -1528,6 +1528,147 @@ async fn two_initiators_from_concurrent_offers_both_get_working_sessions() {
     }
 }
 
+/// One peer that took an offer: its own manager and the init it will send.
+struct Taker {
+    mgr: SessionManager,
+    node: NodeId,
+    init: SerializableSessionInit,
+    opk: u32,
+}
+
+async fn take_offer(acceptor: &SessionManager, acceptor_id: &NodeId) -> Taker {
+    let offer = acceptor.prekey_bundle().await;
+    let (_, id) = NodeIdentity::generate().unwrap();
+    let node = *id.node_id();
+    let mgr = SessionManager::new(Arc::new(id));
+    let init = mgr.initiate_session(acceptor_id, &offer).await.unwrap();
+    Taker { mgr, node, init, opk: offer.one_time_prekey_id.unwrap() }
+}
+
+async fn complete(acceptor: &SessionManager, acceptor_id: &NodeId, taker: &Taker) {
+    acceptor.accept_session(&taker.node, &taker.init).await.expect("an offered key is accepted");
+    let message = taker.mgr.encrypt(acceptor_id, b"first").await.unwrap();
+    assert_eq!(acceptor.decrypt(&taker.node, &message).await.unwrap(), b"first");
+}
+
+/// Offer, consume a key that is not the newest offered, offer again: the new
+/// offer names a key never offered, not one still waiting for its init.
+#[tokio::test]
+async fn an_offer_after_a_consumed_key_names_an_unused_key() {
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_b = *id_b.node_id();
+    let mgr_b = SessionManager::new(id_b);
+    // Three offers (K0, K1, K2); K1's init arrives first.
+    let takers = [take_offer(&mgr_b, &node_b).await, take_offer(&mgr_b, &node_b).await, take_offer(&mgr_b, &node_b).await];
+    complete(&mgr_b, &node_b, &takers[1]).await;
+    let outstanding = [takers[0].opk, takers[2].opk];
+    for _ in 0..5 {
+        let next = take_offer(&mgr_b, &node_b).await;
+        assert!(!outstanding.contains(&next.opk), "re-offered an outstanding key {} while unused keys exist", next.opk);
+    }
+}
+
+/// After a replenish, the next offer names a fresh key, not one of the keys
+/// still waiting for an init.
+#[tokio::test]
+async fn an_offer_after_a_replenish_names_a_fresh_key() {
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_b = *id_b.node_id();
+    let mgr_b = SessionManager::new(id_b);
+    // All ten boot keys offered; six inits complete (the pool tops up).
+    let mut takers = Vec::new();
+    for _ in 0..10 {
+        takers.push(take_offer(&mgr_b, &node_b).await);
+    }
+    let offered: Vec<u32> = takers.iter().map(|t| t.opk).collect();
+    for taker in &takers[..6] {
+        complete(&mgr_b, &node_b, taker).await;
+    }
+    assert!(mgr_b.one_time_prekey_count().await >= 10, "the pool was replenished");
+    let next = take_offer(&mgr_b, &node_b).await;
+    assert!(!offered.contains(&next.opk), "offered {} again instead of a fresh key", next.opk);
+    // The four still outstanding still work.
+    for taker in &takers[6..] {
+        complete(&mgr_b, &node_b, taker).await;
+    }
+}
+
+/// The two scenarios from review, as given: six offers, four consumed, then
+/// two more offers must not name K4 or K5 while K6..K9 were never offered;
+/// and after 22 one-by-one contacts, offer to Bob, offer to Alice, Alice's
+/// init lands, then Carol's offer must not be Bob's key.
+#[tokio::test]
+async fn reviewed_interleavings_never_repeat_an_outstanding_key() {
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_b = *id_b.node_id();
+    let mgr_b = SessionManager::new(id_b);
+    let mut takers = Vec::new();
+    for _ in 0..6 {
+        takers.push(take_offer(&mgr_b, &node_b).await);
+    }
+    for taker in &takers[..4] {
+        complete(&mgr_b, &node_b, taker).await;
+    }
+    let outstanding = [takers[4].opk, takers[5].opk];
+    for _ in 0..2 {
+        let next = take_offer(&mgr_b, &node_b).await;
+        assert!(!outstanding.contains(&next.opk), "scenario 1: re-offered outstanding {}", next.opk);
+    }
+
+    let (_, id_c) = NodeIdentity::generate().unwrap();
+    let node_c = *id_c.node_id();
+    let mgr_c = SessionManager::new(Arc::new(id_c));
+    for _ in 0..22 {
+        let one = take_offer(&mgr_c, &node_c).await;
+        complete(&mgr_c, &node_c, &one).await;
+    }
+    let bob = take_offer(&mgr_c, &node_c).await;
+    let alice = take_offer(&mgr_c, &node_c).await;
+    complete(&mgr_c, &node_c, &alice).await;
+    let carol = take_offer(&mgr_c, &node_c).await;
+    assert_ne!(carol.opk, bob.opk, "scenario 2: Carol was offered Bob's outstanding key");
+    complete(&mgr_c, &node_c, &bob).await;
+    complete(&mgr_c, &node_c, &carol).await;
+}
+
+/// Random offers and inits (consumes, and the replenishes they trigger): an
+/// offer never names a key still waiting for an init while an unused key
+/// exists, and every init that arrives is accepted.
+#[tokio::test]
+async fn random_offers_and_inits_never_repeat_an_outstanding_key_while_one_is_unused() {
+    let id_b = make_identity(TEST_MNEMONIC_B);
+    let node_b = *id_b.node_id();
+    let mgr_b = SessionManager::new(id_b);
+    let mut outstanding: Vec<Taker> = Vec::new();
+    let mut state: u64 = 0x0487_0487;
+    let mut next = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state >> 33
+    };
+    for step in 0..400 {
+        let offer = outstanding.is_empty() || next() % 5 < 3;
+        if offer {
+            let unused_exists = mgr_b.one_time_prekey_count().await > outstanding.len();
+            let taker = take_offer(&mgr_b, &node_b).await;
+            if unused_exists {
+                assert!(
+                    outstanding.iter().all(|t| t.opk != taker.opk),
+                    "step {step}: re-offered outstanding key {} while an unused key exists",
+                    taker.opk
+                );
+            }
+            // Past the pool's size a repeat is allowed; keep one taker per key.
+            if outstanding.iter().all(|t| t.opk != taker.opk) {
+                outstanding.push(taker);
+            }
+        } else {
+            let index = (next() as usize) % outstanding.len();
+            let taker = outstanding.swap_remove(index);
+            complete(&mgr_b, &node_b, &taker).await;
+        }
+    }
+}
+
 /// A burst of first contacts larger than the pool still gets a distinct
 /// one-time prekey per offer up to the pool's size, every offered key stays
 /// usable until it is consumed, and a consumed key is never offered again.
