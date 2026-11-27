@@ -36,11 +36,14 @@ impl Drop for Node {
         let _ = self.0.wait();
     }
 }
-fn address() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+/// `N` distinct free loopback addresses. Every listener stays bound until all
+/// are drawn, so the OS cannot hand the same port out twice (it did for the
+/// remote access and API ports when each was bound and dropped in turn).
+fn addresses<const N: usize>() -> [SocketAddr; N] {
+    let listeners: Vec<std::net::TcpListener> = (0..N)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    std::array::from_fn(|i| listeners[i].local_addr().unwrap())
 }
 fn logs(file: &std::fs::File) -> String {
     use std::os::unix::fs::FileExt;
@@ -97,10 +100,8 @@ impl Fixture {
             "Alice's Pi",
         )]))
         .unwrap();
-        let api = address();
-        let remote = address();
-        let peer = address();
-        cfg["setup_page"]["port"] = i64::from(address().port()).into();
+        let [api, remote, peer, setup] = addresses::<4>();
+        cfg["setup_page"]["port"] = i64::from(setup.port()).into();
         cfg["api"]["listen_addr"] = api.to_string().into();
         cfg["network"]["listen_addr"] = peer.to_string().into();
         cfg["lightning"]["backend"] = "mock".into();
@@ -981,4 +982,13 @@ async fn locked_mode_shutdown_mid_unlock_closes_listeners_without_starting_node(
     assert!(!logs(&log).contains("node built"));
     assert!(!logs(&log).contains(PASSWORD));
     assert!(!f.dir.path().join("node.log").exists());
+}
+
+#[test]
+fn drawn_addresses_are_distinct() {
+    for _ in 0..200 {
+        let drawn = addresses::<4>();
+        let ports: std::collections::HashSet<u16> = drawn.iter().map(|a| a.port()).collect();
+        assert_eq!(ports.len(), 4, "{drawn:?}");
+    }
 }
