@@ -529,14 +529,15 @@ impl SessionManager {
     /// key is gone from the pool and is never offered again.
     pub async fn prekey_bundle(&self) -> SerializablePrekeyBundle {
         let spk = self.signed_prekey.read().await;
-        let mut otpks = self.one_time_prekeys.write().await;
 
-        // Sign the signed pre-key with Ed25519
+        // Sign the signed pre-key with Ed25519 before taking the pool lock,
+        // so an accept waiting for the pool never waits on a signature.
         let sig = self
             .identity
             .ed25519_signing_key()
             .sign(spk.public.as_bytes());
 
+        let mut otpks = self.one_time_prekeys.write().await;
         let (otpk, otpk_id) = if let Some(otpk) = otpks.first() {
             (Some(hex::encode(otpk.public.as_bytes())), Some(otpk.id))
         } else {
