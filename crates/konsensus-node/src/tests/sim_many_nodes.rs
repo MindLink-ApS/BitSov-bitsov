@@ -25,10 +25,10 @@
 //! invariant violations (and the seed to rerun) when any invariant breaks.
 //!
 //! Findings (see the PR for details; each has a focused, ignored regression):
-//! - BUG-SIM-1: one-time prekey offered to every peer until consumed; a node
-//!   accepting two first contacts at once builds a mismatched session for the
-//!   second, so acked paid messages are unreadable until self-heal
-//!   (`sim_many_first_contact_fan_out`, konsensus-crypto
+//! - BUG-SIM-1 (fixed): one one-time prekey was offered to every peer until
+//!   consumed; a node accepting two first contacts at once could not match the
+//!   second, so acked paid messages waited for self-heal. Offers now rotate
+//!   through the pool (`sim_many_first_contact_fan_out`, konsensus-crypto
 //!   `two_initiators_from_concurrent_offers_both_get_working_sessions`).
 //! - The adversarial scenario can fail its "honest traffic still flows"
 //!   invariant; that finding is handled through SECURITY.md, not here.
@@ -1869,18 +1869,17 @@ async fn sim_many_height_skew_10() {
 
 /// BUG-SIM-1, node level: one hub pays first contact to K peers at once and
 /// keeps sending. Every peer with a lower NodeId initiates X3DH from the
-/// hub's PrekeyOffer, and every offer carries the SAME one-time prekey
-/// (`SessionManager::prekey_bundle` offers `otpks.first()`), so all but the
-/// first SessionInit the hub accepts build a mismatched session (the hub's
-/// `accept_session` silently runs X3DH without the already-consumed one-time
-/// prekey). The hub then fails the peer's ratchet init and drops the session
-/// while the peer keeps it. Observable: some composes 502 after the admission
+/// hub's PrekeyOffer. Every offer used to carry the SAME one-time prekey
+/// (`SessionManager::prekey_bundle` offered `otpks.first()`), so all but the
+/// first SessionInit the hub accepted could not be matched; offers now rotate
+/// through the pool, so concurrent first contacts name different keys.
+/// Before the fix the hub dropped or refused the session while the peer kept it. Observable: some composes 502 after the admission
 /// settled (no session in 25 s), and messages acked in the 10-25 s before
 /// self-heal re-keys reach the owner as `plaintext: None`, never readable.
 /// The crypto-level repro is
 /// `konsensus-crypto session::tests::two_initiators_from_concurrent_offers_both_get_working_sessions`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "BUG-SIM-1: paid first-contact messages acked as delivered but undecryptable (one-time prekey reuse); still failing"]
+#[ignore = "many-node simulation; run with --ignored (BUG-SIM-1 regression)"]
 async fn sim_many_first_contact_fan_out() {
     let k = env_or("SIM_PAIRS", 6) as usize;
     let cfg = SimConfig { seed: env_or("SIM_SEED", 1), nodes: k + 1, steps: env_or("SIM_STEPS", 3) as usize, per_step: k };

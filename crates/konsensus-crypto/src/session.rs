@@ -256,7 +256,8 @@ pub struct SessionManager {
     identity: Arc<NodeIdentity>,
     /// Our current signed pre-key (rotated periodically).
     signed_prekey: RwLock<SignedPreKey>,
-    /// Our one-time pre-keys (consumed on use).
+    /// Our one-time pre-keys (consumed on use), in offer order: keys never
+    /// offered first, then offered keys from the longest ago to the latest.
     one_time_prekeys: RwLock<Vec<OneTimePreKey>>,
     /// Next OPK ID counter.
     next_opk_id: RwLock<u32>,
@@ -517,9 +518,18 @@ impl SessionManager {
     /// Get our prekey bundle for distribution to peers.
     ///
     /// This is what we send to peers so they can initiate X3DH with us.
+    ///
+    /// Each bundle offers the key at the front of the pool and moves it to
+    /// the back. The pool stays in offer order (never-offered keys first, and
+    /// replenished keys join at the front), so a key still waiting for its
+    /// SessionInit is offered again only when every held key is outstanding.
+    /// Concurrent first contacts therefore name different keys up to the
+    /// pool's size, whatever consumes or replenishes happen in between. An
+    /// offered key stays usable until a SessionInit consumes it; a consumed
+    /// key is gone from the pool and is never offered again.
     pub async fn prekey_bundle(&self) -> SerializablePrekeyBundle {
         let spk = self.signed_prekey.read().await;
-        let otpks = self.one_time_prekeys.read().await;
+        let mut otpks = self.one_time_prekeys.write().await;
 
         // Sign the signed pre-key with Ed25519
         let sig = self
@@ -532,6 +542,10 @@ impl SessionManager {
         } else {
             (None, None)
         };
+        if !otpks.is_empty() {
+            otpks.rotate_left(1);
+        }
+        drop(otpks);
 
         SerializablePrekeyBundle {
             identity_key: hex::encode(self.identity.x25519_public().as_bytes()),
@@ -1060,16 +1074,32 @@ impl SessionManager {
         .unwrap_or(false)
     }
 
+    /// How many one-time pre-keys this node holds (offered or not, none
+    /// consumed). Offers rotate, so a bundle does not show which key is next.
+    pub async fn one_time_prekey_count(&self) -> usize {
+        self.one_time_prekeys.read().await.len()
+    }
+
+    /// Whether the one-time pre-key `id` is still held, that is, not consumed.
+    pub async fn holds_one_time_prekey(&self, id: u32) -> bool {
+        self.one_time_prekeys.read().await.iter().any(|k| k.id == id)
+    }
+
     /// Replenish one-time pre-keys when running low.
     async fn replenish_prekeys(&self) {
         let mut otpks = self.one_time_prekeys.write().await;
         if otpks.len() < 5 {
             let mut next_id = self.next_opk_id.write().await;
             let batch_size = 10 - otpks.len();
-            for _ in 0..batch_size {
-                otpks.push(OneTimePreKey::generate(*next_id));
-                *next_id += 1;
-            }
+            // New keys were never offered: they go to the front of the pool.
+            let fresh: Vec<_> = (0..batch_size)
+                .map(|_| {
+                    let key = OneTimePreKey::generate(*next_id);
+                    *next_id += 1;
+                    key
+                })
+                .collect();
+            otpks.splice(0..0, fresh);
         }
     }
 }
