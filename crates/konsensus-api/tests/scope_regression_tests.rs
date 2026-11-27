@@ -9,15 +9,19 @@
 //!    refused was still upgraded and subscribed to plaintext message broadcasts.
 //! 3. Three calendar handlers required only `admin` while calling `create_payment_proof`,
 //!    so an admin-without-spend token passed authorization for an operation that pays.
+//!    Each is now refused on a node that would really pay: the same request with every
+//!    scope reaches a payment, so the zero-payment count after the refusal is evidence.
 
 mod common;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{
-    test_router as build_router, test_state, test_state_with_lightning, CountingLightning,
+    setup_e2ee_session, test_router as build_router, test_state, test_state_with_lightning,
+    ConnectedStubTransport, CountingLightning,
 };
 use konsensus_api::auth::{self, Scope};
+use konsensus_api::state::AppState;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -219,94 +223,106 @@ async fn ws_upgrade_refuses_an_unpaired_read_scoped_token() {
 
 const ADMIN_NOT_SPEND: &[Scope] = &[Scope::Read, Scope::Receive, Scope::Admin];
 
-/// Refusal is asserted together with a dispatch count of zero, because a 403 alone does
-/// not distinguish "refused before the handler ran" from "ran, paid, then failed".
-async fn assert_no_payment_dispatched(method: &str, uri: &str, body: &str) {
+/// A node that would pay on every calendar path: a counting wallet, the default nonzero
+/// calendar prices, a peer that is connected, has an established E2EE session and a
+/// verified Lightning key (so a payment goes out as a keysend), and an event this node
+/// organizes with that peer attending (for the update path).
+///
+/// The refusals below are only evidence if the same request would otherwise have paid,
+/// so each test first sends it with an admin-without-spend token (refused, nothing
+/// dispatched) and then, on the same node, with a spend-authorized token (dispatched).
+async fn paying_node() -> (Arc<AppState>, Arc<CountingLightning>, String) {
     let ln = Arc::new(CountingLightning::default());
-    let state = test_state_with_lightning(Arc::clone(&ln) as Arc<_>);
-    let tok = token(ADMIN_NOT_SPEND.to_vec());
-
-    let resp = build_router(state)
-        .oneshot(request(method, uri, &tok, body))
+    let mut state = test_state_with_lightning(Arc::clone(&ln) as Arc<_>);
+    let peer_id = setup_e2ee_session(&state.session_manager).await;
+    let invoice_requests = state.invoice_requests.clone();
+    Arc::get_mut(&mut state).unwrap().transport =
+        Arc::new(ConnectedStubTransport::new(vec![peer_id], invoice_requests));
+    state.peer_ln_pubkeys.lock().await.insert(
+        peer_id,
+        konsensus_api::state::PeerLightningKey::Verified(format!("02{}", "aa".repeat(32))),
+    );
+    let peer = peer_id.to_hex();
+    state
+        .storage
+        .store_calendar_event(&konsensus_storage::CalendarEventRecord {
+            id: "evt-1".into(),
+            message_id: None,
+            organizer: state.identity.node_id().to_hex(),
+            title: "standup".into(),
+            description: None,
+            start_ms: 1_800_000_000_000,
+            end_ms: 1_800_003_600_000,
+            tz: "UTC".into(),
+            location: None,
+            attendees_json: serde_json::json!([peer]).to_string(),
+            recurrence_json: None,
+            color: None,
+            created_at: String::new(),
+            parent_id: None,
+        })
         .await
         .unwrap();
+    (state, ln, peer)
+}
 
+/// Every Lightning call that would move value or ask for an invoice.
+fn dispatched(ln: &CountingLightning) -> usize {
+    ln.money() + ln.invoices()
+}
+
+/// Refused with admin-without-spend and nothing dispatched; then, on the same node, the
+/// same request with every scope reaches a payment.
+async fn refused_on_a_path_that_pays(method: &str, uri: &str, body: &str) {
+    let (state, ln, _) = paying_node().await;
+    let refused = build_router(Arc::clone(&state))
+        .oneshot(request(method, uri, &token(ADMIN_NOT_SPEND.to_vec()), body))
+        .await
+        .unwrap();
     assert_eq!(
-        resp.status(),
+        refused.status(),
         StatusCode::FORBIDDEN,
         "{method} {uri} can dispatch a payment and must require spend, got {}",
-        resp.status()
+        refused.status()
     );
-    assert_eq!(
-        ln.money(),
-        0,
-        "{method} {uri} dispatched {} money-moving Lightning call(s) despite refusing",
-        ln.money()
-    );
-    assert_eq!(
-        ln.invoices(),
-        0,
-        "{method} {uri} requested {} invoice(s) despite refusing",
-        ln.invoices()
+    assert_eq!(dispatched(&ln), 0, "{method} {uri} dispatched a payment despite refusing");
+
+    let allowed = build_router(state)
+        .oneshot(request(method, uri, &token(Scope::all()), body))
+        .await
+        .unwrap();
+    let status = allowed.status();
+    let bytes = axum::body::to_bytes(allowed.into_body(), 100_000).await.unwrap();
+    assert!(
+        dispatched(&ln) > 0,
+        "{method} {uri} did not reach a payment with every scope ({status}: {}), so the refusal above proves nothing",
+        String::from_utf8_lossy(&bytes)
     );
 }
 
 #[tokio::test]
 async fn admin_without_spend_cannot_create_a_paid_calendar_event() {
-    assert_no_payment_dispatched(
-        "POST",
-        "/api/v1/calendar/events",
-        r#"{"title":"standup","start":1800000000,"end":1800003600,
-            "attendees":["aa","bb"],"description":"sync"}"#,
-    )
-    .await;
+    let (_, _, peer) = paying_node().await;
+    let body = serde_json::json!({
+        "title": "standup", "start": 1_800_000_000_000u64, "end": 1_800_003_600_000u64,
+        "attendees": [peer], "description": "sync",
+    });
+    refused_on_a_path_that_pays("POST", "/api/v1/calendar/events", &body.to_string()).await;
 }
 
 #[tokio::test]
 async fn admin_without_spend_cannot_update_a_paid_calendar_event() {
-    assert_no_payment_dispatched(
+    refused_on_a_path_that_pays(
         "PUT",
         "/api/v1/calendar/events/evt-1",
-        r#"{"title":"standup moved","start":1800007200,"end":1800010800}"#,
+        r#"{"title":"standup moved","start":1800007200000,"end":1800010800000}"#,
     )
     .await;
 }
 
 #[tokio::test]
 async fn admin_without_spend_cannot_rsvp() {
-    assert_no_payment_dispatched(
-        "POST",
-        "/api/v1/calendar/events/evt-1/rsvp",
-        r#"{"response":"accepted"}"#,
-    )
-    .await;
-}
-
-/// Positive control: a full-authority token is not stopped by the scope gate on these
-/// routes, so the three tests above are about `spend` and not about a broken route.
-#[tokio::test]
-async fn full_token_passes_the_calendar_scope_gate() {
-    for (method, uri, body) in [
-        (
-            "POST",
-            "/api/v1/calendar/events",
-            r#"{"title":"standup","start":1800000000,"end":1800003600,
-                "attendees":["aa"],"description":"sync"}"#,
-        ),
-        (
-            "POST",
-            "/api/v1/calendar/events/evt-1/rsvp",
-            r#"{"response":"accepted"}"#,
-        ),
-    ] {
-        let resp = build_router(test_state())
-            .oneshot(request(method, uri, &token(Scope::all()), body))
-            .await
-            .unwrap();
-        assert_ne!(
-            resp.status(),
-            StatusCode::FORBIDDEN,
-            "{method} {uri} must not refuse a full-authority token"
-        );
-    }
+    let (_, _, peer) = paying_node().await;
+    let body = serde_json::json!({ "response": "accepted", "organizer": peer });
+    refused_on_a_path_that_pays("POST", "/api/v1/calendar/events/evt-1/rsvp", &body.to_string()).await;
 }
