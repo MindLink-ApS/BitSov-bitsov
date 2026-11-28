@@ -36,14 +36,29 @@ impl Drop for Node {
         let _ = self.0.wait();
     }
 }
-/// `N` distinct free loopback addresses. Every listener stays bound until all
-/// are drawn, so the OS cannot hand the same port out twice (it did for the
-/// remote access and API ports when each was bound and dropped in turn).
+/// `N` free loopback addresses, never handed out before in this process.
+/// Every listener (rejected ones included) stays bound until all are drawn,
+/// so one call cannot get the same port twice, and a process-wide record of
+/// the ports already handed out keeps tests running in parallel from getting
+/// one another's ports after the listeners close.
 fn addresses<const N: usize>() -> [SocketAddr; N] {
-    let listeners: Vec<std::net::TcpListener> = (0..N)
-        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
-        .collect();
-    std::array::from_fn(|i| listeners[i].local_addr().unwrap())
+    static HANDED_OUT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::OnceLock::new();
+    let mut handed_out = HANDED_OUT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut held = Vec::new();
+    let mut drawn = Vec::with_capacity(N);
+    while drawn.len() < N {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        if handed_out.insert(address.port()) {
+            drawn.push(address);
+        }
+        held.push(listener);
+    }
+    std::array::from_fn(|i| drawn[i])
 }
 fn logs(file: &std::fs::File) -> String {
     use std::os::unix::fs::FileExt;
@@ -991,4 +1006,17 @@ fn drawn_addresses_are_distinct() {
         let ports: std::collections::HashSet<u16> = drawn.iter().map(|a| a.port()).collect();
         assert_eq!(ports.len(), 4, "{drawn:?}");
     }
+}
+
+#[test]
+fn addresses_drawn_on_parallel_threads_never_repeat() {
+    let threads: Vec<_> = (0..8)
+        .map(|_| std::thread::spawn(|| (0..25).flat_map(|_| addresses::<4>()).map(|a| a.port()).collect::<Vec<u16>>()))
+        .collect();
+    let mut all = Vec::new();
+    for thread in threads {
+        all.extend(thread.join().unwrap());
+    }
+    let distinct: std::collections::HashSet<u16> = all.iter().copied().collect();
+    assert_eq!(distinct.len(), all.len(), "a port was handed out twice across threads");
 }
